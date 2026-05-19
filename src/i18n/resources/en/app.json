@@ -296,6 +296,10 @@
     "noWorkspace": "Open a workspace to start.",
     "primarySwitcher": "Primary workspace view",
     "primarySurfaceTitle": "Switch to {{surface}}",
+    "zoomControls": "Middle pane zoom",
+    "zoomOut": "Zoom out middle pane",
+    "zoomIn": "Zoom in middle pane",
+    "zoomLevel": "Middle pane zoom {{percent}}%",
     "emptyPane": "Drag Chat, Terminal, or Editor here.",
     "closePane": "Close pane",
     "dropZones": {

@@ -6,6 +6,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
@@ -14,6 +15,8 @@ import {
 import {
   FilePen,
   MessageSquare,
+  Minus,
+  Plus,
   SquareTerminal,
   X,
 } from "lucide-react";
@@ -149,6 +152,9 @@ export function WorkspacePaneShell({ workspaceId }: WorkspacePaneShellProps) {
   const ensureWorkspace = useWorkspacePaneStore((state) => state.ensureWorkspace);
   const activateFocusedSurface = useWorkspacePaneStore((state) => state.activateFocusedSurface);
   const splitFocusedLeaf = useWorkspacePaneStore((state) => state.splitFocusedLeaf);
+  const workspacePaneZoomPercent = useUiStore((state) => state.workspacePaneZoomPercent);
+  const increaseWorkspacePaneZoom = useUiStore((state) => state.increaseWorkspacePaneZoom);
+  const decreaseWorkspacePaneZoom = useUiStore((state) => state.decreaseWorkspacePaneZoom);
   const layout = useWorkspacePaneStore((state) => state.workspaces[workspaceId]);
   const suppressSurfaceClickRef = useRef(false);
   const suppressSurfaceClickTimerRef = useRef<number | null>(null);
@@ -179,6 +185,9 @@ export function WorkspacePaneShell({ workspaceId }: WorkspacePaneShellProps) {
     }
     return focusedSurfaceKind(layout.root, layout.focusedLeafId);
   }, [layout]);
+  const workspacePaneCanvasStyle = useMemo(() => ({
+    zoom: workspacePaneZoomPercent / 100,
+  }) as CSSProperties, [workspacePaneZoomPercent]);
 
   useEffect(() => {
     if (editingThreadTitle) {
@@ -446,6 +455,39 @@ export function WorkspacePaneShell({ workspaceId }: WorkspacePaneShellProps) {
 
         <div className="workspace-pane-header-actions no-drag">
           <div
+            className="workspace-pane-zoom-controls"
+            role="group"
+            aria-label={t("workspacePanes.zoomControls")}
+          >
+            <button
+              type="button"
+              className="workspace-pane-zoom-btn"
+              title={t("workspacePanes.zoomOut")}
+              aria-label={t("workspacePanes.zoomOut")}
+              onClick={decreaseWorkspacePaneZoom}
+              disabled={workspacePaneZoomPercent <= 70}
+            >
+              <Minus size={12} />
+            </button>
+            <span
+              className="workspace-pane-zoom-readout"
+              aria-label={t("workspacePanes.zoomLevel", { percent: workspacePaneZoomPercent })}
+              title={t("workspacePanes.zoomLevel", { percent: workspacePaneZoomPercent })}
+            >
+              {workspacePaneZoomPercent}%
+            </span>
+            <button
+              type="button"
+              className="workspace-pane-zoom-btn"
+              title={t("workspacePanes.zoomIn")}
+              aria-label={t("workspacePanes.zoomIn")}
+              onClick={increaseWorkspacePaneZoom}
+              disabled={workspacePaneZoomPercent >= 200}
+            >
+              <Plus size={12} />
+            </button>
+          </div>
+          <div
             className="layout-mode-switcher"
             role="tablist"
             aria-label={t("workspacePanes.primarySwitcher")}
@@ -478,13 +520,15 @@ export function WorkspacePaneShell({ workspaceId }: WorkspacePaneShellProps) {
       </div>
 
       <div className="workspace-pane-canvas">
-        <PaneNodeView
-          node={layout.root}
-          workspaceId={workspaceId}
-          focusedLeafId={layout.focusedLeafId}
-          leafCount={countPaneLeaves(layout.root)}
-          surfaceDrag={surfaceDrag}
-        />
+        <div className="workspace-pane-canvas-content" style={workspacePaneCanvasStyle}>
+          <PaneNodeView
+            node={layout.root}
+            workspaceId={workspaceId}
+            focusedLeafId={layout.focusedLeafId}
+            leafCount={countPaneLeaves(layout.root)}
+            surfaceDrag={surfaceDrag}
+          />
+        </div>
       </div>
 
       {surfaceDrag && (

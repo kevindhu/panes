@@ -32,6 +32,7 @@ describe("uiStore focus mode", () => {
       showGitPanel: true,
       gitPanelPinned: true,
       showExplorer: true,
+      workspacePaneZoomPercent: 100,
       focusMode: false,
       focusModeSnapshot: null,
       activeView: "chat",
@@ -155,6 +156,30 @@ describe("uiStore focus mode", () => {
 
     expect(storage.setItem).toHaveBeenCalledWith("panes:explorerOpen", "false");
     expect(useUiStore.getState().showExplorer).toBe(false);
+  });
+
+  it("increments and decrements workspace pane zoom in fixed steps", () => {
+    const state = useUiStore.getState();
+
+    state.increaseWorkspacePaneZoom();
+    expect(useUiStore.getState().workspacePaneZoomPercent).toBe(110);
+
+    state.decreaseWorkspacePaneZoom();
+    state.decreaseWorkspacePaneZoom();
+    expect(useUiStore.getState().workspacePaneZoomPercent).toBe(90);
+  });
+
+  it("persists workspace pane zoom changes and reset", () => {
+    const storage = globalThis.localStorage as unknown as ReturnType<typeof createStorageStub>;
+    const state = useUiStore.getState();
+
+    state.setWorkspacePaneZoomPercent(999);
+    expect(useUiStore.getState().workspacePaneZoomPercent).toBe(200);
+    expect(storage.setItem).toHaveBeenCalledWith("panes:workspacePaneZoomPercent", "200");
+
+    state.resetWorkspacePaneZoom();
+    expect(useUiStore.getState().workspacePaneZoomPercent).toBe(100);
+    expect(storage.setItem).toHaveBeenCalledWith("panes:workspacePaneZoomPercent", "100");
   });
 
   it("opens the command palette with structured launch defaults", () => {

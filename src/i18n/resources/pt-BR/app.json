@@ -296,6 +296,10 @@
     "noWorkspace": "Abra um workspace para começar.",
     "primarySwitcher": "Visualização principal do workspace",
     "primarySurfaceTitle": "Ir para {{surface}}",
+    "zoomControls": "Zoom do painel central",
+    "zoomOut": "Diminuir zoom do painel central",
+    "zoomIn": "Aumentar zoom do painel central",
+    "zoomLevel": "Zoom do painel central {{percent}}%",
     "emptyPane": "Arraste Chat, Terminal ou Editor para cá.",
     "closePane": "Fechar painel",
     "dropZones": {
