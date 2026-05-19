@@ -14,7 +14,7 @@ export type ComposerRuntimeSnapshot = NewThreadRuntimeSelection;
 
 export const NEW_THREAD_FALLBACK_RUNTIME: NewThreadRuntimeSelection = {
   engineId: "codex",
-  modelId: "gpt-5.4",
+  modelId: "gpt-5.5",
   reasoningEffort: "high",
   serviceTier: null,
 };

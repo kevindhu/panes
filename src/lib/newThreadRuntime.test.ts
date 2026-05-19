@@ -11,11 +11,28 @@ const engines: EngineInfo[] = [
     name: "Codex",
     models: [
       {
-        id: "gpt-5.4",
-        displayName: "gpt-5.4",
+        id: "gpt-5.5",
+        displayName: "gpt-5.5",
         description: "Latest",
         hidden: false,
         isDefault: true,
+        inputModalities: ["text"],
+        attachmentModalities: ["text"],
+        supportsPersonality: true,
+        defaultReasoningEffort: "medium",
+        supportedReasoningEfforts: [
+          { reasoningEffort: "low", description: "Fast" },
+          { reasoningEffort: "medium", description: "Balanced" },
+          { reasoningEffort: "high", description: "Deep" },
+          { reasoningEffort: "xhigh", description: "Max" },
+        ],
+      },
+      {
+        id: "gpt-5.4",
+        displayName: "gpt-5.4",
+        description: "Previous",
+        hidden: true,
+        isDefault: false,
         inputModalities: ["text"],
         attachmentModalities: ["text"],
         supportsPersonality: true,
@@ -104,7 +121,7 @@ describe("resolveNewThreadRuntime", () => {
       engines,
       composerRuntime: {
         engineId: "codex",
-        modelId: "gpt-5.4",
+        modelId: "gpt-5.5",
         reasoningEffort: "low",
         serviceTier: "fast",
       },
@@ -123,7 +140,7 @@ describe("resolveNewThreadRuntime", () => {
 
     expect(runtime).toEqual({
       engineId: "codex",
-      modelId: "gpt-5.4",
+      modelId: "gpt-5.5",
       reasoningEffort: "low",
       serviceTier: "fast",
     });
@@ -170,7 +187,7 @@ describe("resolveNewThreadRuntime", () => {
     });
   });
 
-  it("falls back to codex gpt-5.4 high when no other preference exists", () => {
+  it("falls back to codex gpt-5.5 high when no other preference exists", () => {
     expect(
       resolveNewThreadRuntime({
         engines,
