@@ -1291,9 +1291,9 @@ function MessageRowView({
         alignItems: isUser ? "flex-end" : "flex-start",
         maxWidth: "100%",
         borderRadius: "var(--radius-md)",
-        outline: isHighlighted ? "2px solid rgba(255, 107, 107, 0.35)" : "none",
+        outline: isHighlighted ? "2px solid rgba(9, 105, 218, 0.35)" : "none",
         boxShadow: isHighlighted
-          ? "0 10px 28px rgba(255, 107, 107, 0.12)"
+          ? "0 10px 28px rgba(9, 105, 218, 0.12)"
           : "none",
         transition:
           "outline-color var(--duration-normal) var(--ease-out), box-shadow var(--duration-normal) var(--ease-out)",
@@ -1306,8 +1306,8 @@ function MessageRowView({
               maxWidth: "75%",
               padding: "10px 14px",
               borderRadius: "var(--radius-md)",
-              background: "rgba(255, 107, 107, 0.09)",
-              border: "1px solid rgba(255, 107, 107, 0.16)",
+              background: "rgba(9, 105, 218, 0.09)",
+              border: "1px solid rgba(9, 105, 218, 0.16)",
               fontSize: 13,
               lineHeight: 1.6,
               whiteSpace: "pre-wrap",
@@ -4720,7 +4720,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                   transition: "background var(--duration-fast) var(--ease-out)",
                 }}
                 onMouseEnter={(e) => {
-                  if (activeThread) e.currentTarget.style.background = "rgba(255,255,255,0.04)";
+                  if (activeThread) e.currentTarget.style.background = "rgba(31, 35, 40, 0.04)";
                 }}
                 onMouseLeave={(e) => {
                   e.currentTarget.style.background = "transparent";
@@ -4879,7 +4879,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                   transition: "background var(--duration-fast) var(--ease-out)",
                 }}
                 onMouseEnter={(e) => {
-                  if (activeThread) e.currentTarget.style.background = "rgba(255,255,255,0.04)";
+                  if (activeThread) e.currentTarget.style.background = "rgba(31, 35, 40, 0.04)";
                 }}
                 onMouseLeave={(e) => {
                   e.currentTarget.style.background = "transparent";
@@ -5116,7 +5116,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
               color: streaming ? "var(--info)" : "var(--text-2)",
               fontSize: 11.5,
               cursor: "pointer",
-              boxShadow: "0 8px 24px rgba(0,0,0,0.28)",
+              boxShadow: "0 8px 24px rgba(31, 35, 40, 0.18)",
               zIndex: 2,
             }}
           >

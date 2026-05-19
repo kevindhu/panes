@@ -2,7 +2,7 @@
 
 Panes publishes its macOS Homebrew cask through a separate tap repository:
 
-- Tap repo: `wygoralves/homebrew-tap`
+- Tap repo: `kevindhu/homebrew-tap`
 - Published file: `Casks/panes.rb`
 - Source of truth for metadata: the GitHub Release created by the main CI workflow
 
@@ -10,7 +10,7 @@ Panes publishes its macOS Homebrew cask through a separate tap repository:
 
 Before the `Publish Homebrew Cask` job can succeed, ensure:
 
-1. The `wygoralves/homebrew-tap` repository exists.
+1. The `kevindhu/homebrew-tap` repository exists.
 2. The repository has a `main` branch.
 3. The main Panes repo has a `HOMEBREW_TAP_TOKEN` secret with write access to the tap repository.
 

@@ -16,7 +16,7 @@ import {
   resolveUpdaterAssetPairs,
 } from "./lib/update-manifest.mjs";
 
-const DEFAULT_REPO = "wygoralves/panes";
+const DEFAULT_REPO = "kevindhu/panes";
 
 export function resolveReleaseTag(argv = process.argv, env = process.env) {
   return argv[2] || env.RELEASE_TAG || null;

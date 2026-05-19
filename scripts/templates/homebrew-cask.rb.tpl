@@ -5,7 +5,7 @@ cask "panes" do
   url "__URL__"
   name "Panes"
   desc "Local-first cockpit for AI-assisted coding"
-  homepage "https://github.com/wygoralves/panes"
+  homepage "https://github.com/kevindhu/panes"
 
   app "Panes.app"
 

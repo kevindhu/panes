@@ -908,7 +908,7 @@ function ActionGroupView({
         <div
           className="action-group-body-inner"
           style={{
-            background: expanded ? "rgba(255, 255, 255, 0.02)" : undefined,
+            background: expanded ? "rgba(31, 35, 40, 0.02)" : undefined,
             borderRadius: "var(--radius-sm)",
             display: "flex",
             flexDirection: "column",

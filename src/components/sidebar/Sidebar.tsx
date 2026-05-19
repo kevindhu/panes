@@ -453,7 +453,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
       </div>
 
       {/* ── Scrollable content ── */}
-      <div style={{ flex: 1, minHeight: 0, overflow: "auto", paddingBottom: 4, borderTop: "1px solid rgba(255,255,255,0.06)", marginTop: 4 }}>
+      <div style={{ flex: 1, minHeight: 0, overflow: "auto", paddingBottom: 4, borderTop: "1px solid rgba(31, 35, 40, 0.06)", marginTop: 4 }}>
         <div className="sb-section-label">
           <span>{t("app:sidebar.workspaces")}</span>
           <button
@@ -608,7 +608,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
         )}
 
         {/* Archived section */}
-        <div style={{ marginTop: 8, borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: 4 }}>
+        <div style={{ marginTop: 8, borderTop: "1px solid rgba(31, 35, 40, 0.06)", paddingTop: 4 }}>
           <button
             type="button"
             className="sb-archived-toggle"
@@ -851,7 +851,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                 style={{
                   display: "inline-flex",
                   alignItems: "center",
-                  background: "rgba(255,255,255,0.06)",
+                  background: "rgba(31, 35, 40, 0.06)",
                   borderRadius: 6,
                   padding: 2,
                   gap: 2,
@@ -1076,7 +1076,7 @@ function CollapsedRail({
             <rect x="10" y="36" width="94" height="94" stroke="white" strokeWidth="6"/>
             <rect x="36" y="10" width="94" height="94" stroke="white" strokeWidth="6"/>
             <rect x="23" y="23" width="94" height="94" stroke="white" strokeWidth="6"/>
-            <rect x="50" y="50" width="40" height="40" fill="#FF6B6B"/>
+            <rect x="50" y="50" width="40" height="40" fill="#0969DA"/>
           </svg>
         </button>
       </div>

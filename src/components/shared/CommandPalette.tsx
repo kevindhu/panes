@@ -823,7 +823,7 @@ const STYLES = {
     position: "fixed" as const,
     inset: 0,
     zIndex: 10001,
-    background: "rgba(0, 0, 0, 0.55)",
+    background: "rgba(27, 31, 36, 0.5)",
     backdropFilter: "blur(16px)",
     WebkitBackdropFilter: "blur(16px)",
     display: "flex",
@@ -838,10 +838,11 @@ const STYLES = {
     display: "grid",
     gridTemplateRows: "auto 1fr auto",
     borderRadius: "var(--radius-lg)",
-    background: "rgba(14, 14, 16, 0.95)",
+    background: "rgba(255, 255, 255, 0.96)",
     boxShadow:
-      "0 0 0 1px rgba(255, 255, 255, 0.08), " +
-      "0 24px 68px rgba(0, 0, 0, 0.55)",
+      "0 0 0 1px rgba(208, 215, 222, 0.9), " +
+      "0 16px 32px rgba(27, 31, 36, 0.12), " +
+      "0 8px 24px rgba(140, 149, 159, 0.2)",
     animation: "slide-up 180ms cubic-bezier(0.16, 1, 0.3, 1) both",
   },
   inputRow: {
@@ -912,7 +913,7 @@ const STYLES = {
     width: "calc(100% - 12px)",
     border: "none",
     borderRadius: "var(--radius-sm)",
-    background: active ? "rgba(255, 255, 255, 0.07)" : "transparent",
+    background: active ? "var(--bg-2)" : "transparent",
     cursor: "pointer",
     textAlign: "left" as const,
     fontFamily: "inherit",
@@ -2326,7 +2327,7 @@ export function CommandPalette({ open, onClose }: Props) {
         return (
           <span style={STYLES.modeBadge}>
             {labels[subFlow.type]}
-            <span style={{ color: "rgba(255,107,107,0.35)" }}>{"\u00B7"}</span>
+            <span style={{ color: "rgba(31, 35, 40, 0.35)" }}>{"\u00B7"}</span>
             {scopedRepo.name}
           </span>
         );

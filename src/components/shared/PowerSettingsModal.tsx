@@ -358,11 +358,11 @@ export function PowerSettingsModal() {
             padding: "14px 16px",
             borderRadius: "var(--radius-md)",
             background: keepAwakeEnabled
-              ? "rgba(255, 107, 107, 0.06)"
-              : "rgba(255, 255, 255, 0.03)",
+              ? "rgba(9, 105, 218, 0.06)"
+              : "rgba(31, 35, 40, 0.03)",
             border: keepAwakeEnabled
-              ? "1px solid rgba(255, 107, 107, 0.14)"
-              : "1px solid rgba(255, 255, 255, 0.06)",
+              ? "1px solid rgba(9, 105, 218, 0.14)"
+              : "1px solid rgba(31, 35, 40, 0.06)",
             transition: "all var(--duration-normal) var(--ease-out)",
             marginBottom: 6,
           }}>
@@ -402,7 +402,7 @@ export function PowerSettingsModal() {
               />
             </SettingsRow>
 
-            <div style={{ height: 1, background: "rgba(255,255,255,0.04)", margin: "0 -2px" }} />
+            <div style={{ height: 1, background: "rgba(31, 35, 40, 0.04)", margin: "0 -2px" }} />
 
             <SettingsRow
               label={t("powerModal.preventScreenSaver")}
@@ -444,7 +444,7 @@ export function PowerSettingsModal() {
               />
             </SettingsRow>
 
-            <div style={{ height: 1, background: "rgba(255,255,255,0.04)", margin: "0 -2px" }} />
+            <div style={{ height: 1, background: "rgba(31, 35, 40, 0.04)", margin: "0 -2px" }} />
 
             <SettingsRow
               label={t("powerModal.batteryThreshold")}
@@ -508,8 +508,8 @@ export function PowerSettingsModal() {
                   marginTop: 6,
                   padding: "10px 14px",
                   borderRadius: "var(--radius-md)",
-                  background: "rgba(255, 255, 255, 0.02)",
-                  border: "1px solid rgba(255, 255, 255, 0.06)",
+                  background: "rgba(31, 35, 40, 0.02)",
+                  border: "1px solid rgba(31, 35, 40, 0.06)",
                   animation: "fade-in var(--duration-fast) var(--ease-out)",
                 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -629,11 +629,11 @@ export function PowerSettingsModal() {
                           fontWeight: 500,
                           borderRadius: "var(--radius-sm)",
                           border: isActive
-                            ? "1px solid rgba(255, 107, 107, 0.25)"
-                            : "1px solid rgba(255, 255, 255, 0.08)",
+                            ? "1px solid rgba(9, 105, 218, 0.25)"
+                            : "1px solid rgba(31, 35, 40, 0.08)",
                           background: isActive
-                            ? "rgba(255, 107, 107, 0.10)"
-                            : "rgba(255, 255, 255, 0.03)",
+                            ? "rgba(9, 105, 218, 0.10)"
+                            : "rgba(31, 35, 40, 0.03)",
                           color: isActive ? "var(--accent)" : "var(--text-2)",
                           cursor: disabled ? "not-allowed" : "pointer",
                           transition: "all var(--duration-fast) var(--ease-out)",
@@ -649,11 +649,11 @@ export function PowerSettingsModal() {
                   {(() => {
                     const isCustomActive = hasCustomTime(customHours, customMinutes);
                     const customBorder = isCustomActive
-                      ? "1px solid rgba(255, 107, 107, 0.25)"
-                      : "1px solid rgba(255, 255, 255, 0.08)";
+                      ? "1px solid rgba(9, 105, 218, 0.25)"
+                      : "1px solid rgba(31, 35, 40, 0.08)";
                     const customBg = isCustomActive
-                      ? "rgba(255, 107, 107, 0.10)"
-                      : "rgba(255, 255, 255, 0.03)";
+                      ? "rgba(9, 105, 218, 0.10)"
+                      : "rgba(31, 35, 40, 0.03)";
                     const inputColor = isCustomActive ? "var(--accent)" : "var(--text-2)";
                     const inputStyle = {
                       width: 32,
@@ -826,8 +826,8 @@ function SettingsCard({
   return (
     <div style={{
       borderRadius: "var(--radius-md)",
-      background: "rgba(255, 255, 255, 0.02)",
-      border: "1px solid rgba(255, 255, 255, 0.06)",
+      background: "rgba(31, 35, 40, 0.02)",
+      border: "1px solid rgba(31, 35, 40, 0.06)",
       padding: "2px 14px",
       opacity: disabled ? 0.35 : 1,
       transition: "opacity var(--duration-normal) var(--ease-out)",
@@ -918,10 +918,10 @@ function RadioPill({
         fontWeight: 500,
         borderRadius: "var(--radius-sm)",
         border: checked
-          ? "1px solid rgba(255, 107, 107, 0.25)"
-          : "1px solid rgba(255, 255, 255, 0.10)",
+          ? "1px solid rgba(9, 105, 218, 0.25)"
+          : "1px solid rgba(31, 35, 40, 0.10)",
         background: checked
-          ? "rgba(255, 107, 107, 0.08)"
+          ? "rgba(9, 105, 218, 0.08)"
           : "transparent",
         color: checked ? "var(--accent)" : "var(--text-2)",
         cursor: disabled ? "not-allowed" : "pointer",
@@ -950,8 +950,8 @@ function StatusPill({
       gap: 6,
       padding: "4px 10px",
       borderRadius: 99,
-      background: "rgba(255, 255, 255, 0.03)",
-      border: "1px solid rgba(255, 255, 255, 0.06)",
+      background: "rgba(31, 35, 40, 0.03)",
+      border: "1px solid rgba(31, 35, 40, 0.06)",
       fontSize: 10.5,
       fontWeight: 500,
       color: "var(--text-2)",

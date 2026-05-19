@@ -23,7 +23,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/wygoralves/panes/releases/latest"><img src="https://img.shields.io/github/v/release/wygoralves/panes?label=download&color=blue" alt="Latest Release" /></a>
+  <a href="https://github.com/kevindhu/panes/releases/latest"><img src="https://img.shields.io/github/v/release/kevindhu/panes?label=download&color=blue" alt="Latest Release" /></a>
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg" alt="Platform" />
   <img src="https://img.shields.io/badge/tauri-v2-blue?logo=tauri" alt="Tauri v2" />
@@ -88,12 +88,12 @@ Panes is not a full IDE, but it does ship with a built-in multi-tab editor for q
 ### Install on macOS
 
 ```bash
-brew install --cask wygoralves/tap/panes
+brew install --cask kevindhu/tap/panes
 ```
 
 Homebrew is the primary macOS install path for prebuilt Panes releases. The macOS release is shipped as a universal app, so the same DMG works on both Apple Silicon and Intel Macs. The app updater then handles later versions in-app.
 
-Panes is not currently signed and notarized with Apple, so Homebrew only reduces Gatekeeper friction; it does not eliminate it. The tap applies a best-effort quarantine removal step during install, but macOS may still require a manual first-launch confirmation depending on system policy. If that happens, use Finder's Open flow or download the DMG directly from [GitHub Releases](https://github.com/wygoralves/panes/releases/latest).
+Panes is not currently signed and notarized with Apple, so Homebrew only reduces Gatekeeper friction; it does not eliminate it. The tap applies a best-effort quarantine removal step during install, but macOS may still require a manual first-launch confirmation depending on system policy. If that happens, use Finder's Open flow or download the DMG directly from [GitHub Releases](https://github.com/kevindhu/panes/releases/latest).
 
 If Gatekeeper blocks a direct DMG install, use these commands instead of disabling Gatekeeper globally:
 
@@ -111,13 +111,13 @@ Maintainers can find the tap/release automation setup in [docs/homebrew-distribu
 
 ### Install on Windows
 
-Download the latest `*-setup.exe` installer from [GitHub Releases](https://github.com/wygoralves/panes/releases/latest) and run it. Later updates are delivered in-app through the Tauri updater.
+Download the latest `*-setup.exe` installer from [GitHub Releases](https://github.com/kevindhu/panes/releases/latest) and run it. Later updates are delivered in-app through the Tauri updater.
 
 For this Windows release, the validated scope is installer, updater, startup, and bundled-runtime compatibility. It does not guarantee that Codex and Claude are fully validated end to end through the in-app chat flow yet, so expect some rough edges there.
 
 ### Install on Linux
 
-Download the latest `.AppImage` or `.deb` from [GitHub Releases](https://github.com/wygoralves/panes/releases/latest).
+Download the latest `.AppImage` or `.deb` from [GitHub Releases](https://github.com/kevindhu/panes/releases/latest).
 
 For AppImage:
 
@@ -139,7 +139,7 @@ Panes does not currently publish an APT repository, so the supported Debian-fami
 ### Install and Run from Source
 
 ```bash
-git clone https://github.com/wygoralves/panes.git
+git clone https://github.com/kevindhu/panes.git
 cd panes
 pnpm install
 pnpm tauri:dev

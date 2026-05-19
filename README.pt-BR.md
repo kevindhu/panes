@@ -23,7 +23,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/wygoralves/panes/releases/latest"><img src="https://img.shields.io/github/v/release/wygoralves/panes?label=download&color=blue" alt="Latest Release" /></a>
+  <a href="https://github.com/kevindhu/panes/releases/latest"><img src="https://img.shields.io/github/v/release/kevindhu/panes?label=download&color=blue" alt="Latest Release" /></a>
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg" alt="Platform" />
   <img src="https://img.shields.io/badge/tauri-v2-blue?logo=tauri" alt="Tauri v2" />
@@ -88,25 +88,25 @@ O Panes não é uma IDE completa, mas inclui um editor multiaba embutido para re
 ### Instalar no macOS
 
 ```bash
-brew install --cask wygoralves/tap/panes
+brew install --cask kevindhu/tap/panes
 ```
 
 O Homebrew é o caminho principal de instalação do Panes pré-compilado no macOS. O release para macOS é um app universal, então o mesmo DMG funciona tanto em Apple Silicon quanto em Macs Intel. Depois disso, o updater do app cuida das próximas versões dentro do próprio app.
 
-O Panes ainda não é assinado nem notarizado pela Apple, então o Homebrew só reduz o atrito com o Gatekeeper; ele não elimina isso de vez. O tap aplica uma remoção best-effort da quarantine durante a instalação, mas o macOS ainda pode exigir confirmação manual na primeira abertura, dependendo da política da máquina. Se isso acontecer, use o fluxo "Abrir" pelo Finder ou baixe o DMG direto em [GitHub Releases](https://github.com/wygoralves/panes/releases/latest).
+O Panes ainda não é assinado nem notarizado pela Apple, então o Homebrew só reduz o atrito com o Gatekeeper; ele não elimina isso de vez. O tap aplica uma remoção best-effort da quarantine durante a instalação, mas o macOS ainda pode exigir confirmação manual na primeira abertura, dependendo da política da máquina. Se isso acontecer, use o fluxo "Abrir" pelo Finder ou baixe o DMG direto em [GitHub Releases](https://github.com/kevindhu/panes/releases/latest).
 
 Quem mantém o release pode ver a configuração do tap e da automação em [docs/homebrew-distribution.md](./docs/homebrew-distribution.md).
 
 ### Instalar no Windows
 
-Baixe o instalador `*-setup.exe` mais recente em [GitHub Releases](https://github.com/wygoralves/panes/releases/latest) e execute-o. As próximas versões passam a chegar pelo updater embutido do Tauri.
+Baixe o instalador `*-setup.exe` mais recente em [GitHub Releases](https://github.com/kevindhu/panes/releases/latest) e execute-o. As próximas versões passam a chegar pelo updater embutido do Tauri.
 
 Neste release para Windows, o escopo validado cobre instalador, updater, inicialização do app e compatibilidade do runtime empacotado. Isso ainda não garante validação completa de ponta a ponta do Codex e do Claude dentro do fluxo de chat do app, então ainda pode haver arestas nessa parte.
 
 ### Instalar e Rodar a partir do código-fonte
 
 ```bash
-git clone https://github.com/wygoralves/panes.git
+git clone https://github.com/kevindhu/panes.git
 cd panes
 pnpm install
 pnpm tauri:dev

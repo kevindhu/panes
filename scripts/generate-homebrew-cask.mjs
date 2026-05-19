@@ -14,7 +14,7 @@ function parseArgs(argv) {
   const positionals = [];
   const options = {
     output: null,
-    repo: process.env.GITHUB_REPOSITORY || "wygoralves/panes",
+    repo: process.env.GITHUB_REPOSITORY || "kevindhu/panes",
     template: join(root, "scripts", "templates", "homebrew-cask.rb.tpl"),
   };
 

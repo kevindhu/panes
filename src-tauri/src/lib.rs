@@ -882,7 +882,7 @@ fn build_app_menu(handle: &tauri::AppHandle, locale: &str) -> tauri::Result<Menu
                 comments: Some(strings.about_comments.to_string()),
                 copyright: Some("Copyright © 2026 Wygor Alves".to_string()),
                 license: Some("MIT".to_string()),
-                website: Some("https://github.com/wygoralves/panes".to_string()),
+                website: Some("https://github.com/kevindhu/panes".to_string()),
                 website_label: Some("GitHub".to_string()),
                 icon: match Image::from_bytes(include_bytes!("../icons/128x128@2x.png")) {
                     Ok(img) => Some(img),
