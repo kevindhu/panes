@@ -76,12 +76,32 @@ pub fn delete_message(db: &Database, message_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn clone_thread_messages(
     db: &Database,
     source_thread_id: &str,
     target_thread_id: &str,
 ) -> anyhow::Result<usize> {
     let messages = get_thread_messages(db, source_thread_id)?;
+    clone_message_slice(db, target_thread_id, &messages)
+}
+
+pub fn clone_thread_messages_for_branch(
+    db: &Database,
+    source_thread_id: &str,
+    target_thread_id: &str,
+    rollback_turns: Option<u32>,
+) -> anyhow::Result<usize> {
+    let messages = get_thread_messages(db, source_thread_id)?;
+    let retained_count = retained_message_count_after_rollback(&messages, rollback_turns)?;
+    clone_message_slice(db, target_thread_id, &messages[..retained_count])
+}
+
+fn clone_message_slice(
+    db: &Database,
+    target_thread_id: &str,
+    messages: &[MessageDto],
+) -> anyhow::Result<usize> {
     let mut conn = db.connect()?;
     let tx = conn
         .transaction()
@@ -125,6 +145,36 @@ pub fn clone_thread_messages(
     tx.commit()
         .context("failed to commit thread message clone transaction")?;
     Ok(messages.len())
+}
+
+fn retained_message_count_after_rollback(
+    messages: &[MessageDto],
+    rollback_turns: Option<u32>,
+) -> anyhow::Result<usize> {
+    let Some(num_turns) = rollback_turns else {
+        return Ok(messages.len());
+    };
+
+    let user_message_indexes = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            (message.role == "user" && !message_has_steer_marker(message)).then_some(index)
+        })
+        .collect::<Vec<_>>();
+
+    let turns_to_drop = usize::try_from(num_turns).unwrap_or(usize::MAX);
+    if turns_to_drop == 0 {
+        anyhow::bail!("num_turns must be at least 1");
+    }
+    if user_message_indexes.len() < turns_to_drop {
+        anyhow::bail!(
+            "cannot drop {turns_to_drop} turns from local thread history with only {} user turns",
+            user_message_indexes.len()
+        );
+    }
+
+    Ok(user_message_indexes[user_message_indexes.len() - turns_to_drop])
 }
 
 pub fn replace_thread_messages(
@@ -190,6 +240,7 @@ pub fn replace_thread_messages(
     Ok(messages.len())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn drop_last_turns(db: &Database, thread_id: &str, num_turns: u32) -> anyhow::Result<usize> {
     let messages = get_thread_messages(db, thread_id)?;
     let user_message_indexes = messages
@@ -1783,6 +1834,64 @@ mod tests {
         );
         assert_eq!(target_messages[0].created_at, "2026-05-19 12:00:00.000");
         assert_eq!(target_messages[1].created_at, "2026-05-19 12:00:01.000");
+    }
+
+    #[test]
+    fn clone_thread_messages_for_branch_keeps_only_prefix_before_rolled_back_turns() {
+        let db = test_db();
+        let source_thread_id = test_thread(&db);
+        let target_thread_id = test_thread(&db);
+
+        insert_user_message(&db, &source_thread_id, "turn 1", None, None, None, None).unwrap();
+        insert_message(
+            &db,
+            &source_thread_id,
+            "assistant",
+            Some("answer 1".to_string()),
+            Some(json!([{ "type": "text", "content": "answer 1" }])),
+            MessageStatusDto::Completed,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        insert_user_message(&db, &source_thread_id, "turn 2", None, None, None, None).unwrap();
+        insert_message(
+            &db,
+            &source_thread_id,
+            "assistant",
+            Some("working".to_string()),
+            Some(json!([{ "type": "text", "content": "working" }])),
+            MessageStatusDto::Completed,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        insert_user_message(
+            &db,
+            &source_thread_id,
+            "focus on tests",
+            Some(steer_blocks_json("focus on tests")),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let cloned = clone_thread_messages_for_branch(
+            &db,
+            &source_thread_id,
+            &target_thread_id,
+            Some(1),
+        )
+        .unwrap();
+        assert_eq!(cloned, 2);
+
+        let target_messages = get_thread_messages(&db, &target_thread_id).unwrap();
+        assert_eq!(target_messages.len(), 2);
+        assert_eq!(target_messages[0].content.as_deref(), Some("turn 1"));
+        assert_eq!(target_messages[1].content.as_deref(), Some("answer 1"));
     }
 
     #[test]

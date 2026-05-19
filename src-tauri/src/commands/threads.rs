@@ -1,4 +1,11 @@
-use chrono::{DateTime, Utc};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::PathBuf,
+    time::Instant,
+};
+
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 use tauri::{Emitter, State};
 
@@ -17,6 +24,71 @@ use crate::{
 };
 
 const MAX_THREAD_TITLE_CHARS: usize = 120;
+const BRANCH_PROFILE_LOG_FILE_NAME: &str = "codex-branch-profile.log";
+
+fn branch_profile_log_path() -> PathBuf {
+    crate::runtime_env::app_data_dir()
+        .join("logs")
+        .join(BRANCH_PROFILE_LOG_FILE_NAME)
+}
+
+fn sanitize_branch_profile_field(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+}
+
+fn format_elapsed_ms(started_at: Instant) -> String {
+    format!("{:.1}", started_at.elapsed().as_secs_f64() * 1000.0)
+}
+
+fn append_branch_profile_log_entry(
+    operation_id: &str,
+    step: &str,
+    details: Option<&str>,
+) -> std::io::Result<PathBuf> {
+    let path = branch_profile_log_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    write!(
+        file,
+        "{}\top={}\tstep={}",
+        timestamp,
+        sanitize_branch_profile_field(operation_id),
+        sanitize_branch_profile_field(step)
+    )?;
+    if let Some(details) = details.filter(|value| !value.is_empty()) {
+        write!(file, "\tdetails={}", sanitize_branch_profile_field(details))?;
+    }
+    writeln!(file)?;
+    Ok(path)
+}
+
+fn log_branch_profile_step(operation_id: Option<&str>, step: &str, details: Option<String>) {
+    let Some(operation_id) = operation_id.filter(|value| !value.trim().is_empty()) else {
+        return;
+    };
+    if let Err(error) = append_branch_profile_log_entry(operation_id, step, details.as_deref()) {
+        log::warn!("failed to append branch profile log entry for {operation_id}: {error}");
+    }
+}
+
+#[tauri::command]
+pub async fn append_branch_profile_log(
+    operation_id: String,
+    step: String,
+    details: Option<String>,
+) -> Result<String, String> {
+    append_branch_profile_log_entry(&operation_id, &step, details.as_deref())
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(err_to_string)
+}
 
 async fn run_db<T, F>(db: crate::db::Database, operation: F) -> Result<T, String>
 where
@@ -1217,11 +1289,28 @@ fn imported_messages_have_streaming_turn(snapshot: &ThreadSyncSnapshot) -> bool 
 pub async fn fork_codex_thread(
     state: State<'_, AppState>,
     thread_id: String,
+    profile_operation_id: Option<String>,
 ) -> Result<ThreadDto, String> {
+    let profile_operation_id = profile_operation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let total_started_at = Instant::now();
+    log_branch_profile_step(
+        profile_operation_id,
+        "backend.fork.command.start",
+        Some(format!("thread_id={thread_id}")),
+    );
     if state.turns.get(&thread_id).await.is_some() {
+        log_branch_profile_step(
+            profile_operation_id,
+            "backend.fork.command.rejected_active_turn",
+            Some(format!("thread_id={thread_id}")),
+        );
         return Err("cannot fork a thread while a turn is still active".to_string());
     }
 
+    let load_thread_started_at = Instant::now();
     let db = state.db.clone();
     let thread = run_db(db.clone(), {
         let thread_id = thread_id.clone();
@@ -1229,23 +1318,62 @@ pub async fn fork_codex_thread(
     })
     .await?
     .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+    log_branch_profile_step(
+        profile_operation_id,
+        "backend.fork.load_thread.done",
+        Some(format!(
+            "elapsed_ms={}; engine_id={}; has_engine_thread_id={}",
+            format_elapsed_ms(load_thread_started_at),
+            thread.engine_id,
+            thread.engine_thread_id.is_some()
+        )),
+    );
 
     if thread.engine_id != "codex" {
+        log_branch_profile_step(
+            profile_operation_id,
+            "backend.fork.command.rejected_non_codex",
+            Some(format!("thread_id={thread_id}; engine_id={}", thread.engine_id)),
+        );
         return Err("native fork is only available for Codex threads".to_string());
     }
     let engine_thread_id = thread
         .engine_thread_id
         .clone()
         .ok_or_else(|| "Codex thread has not been initialized yet".to_string())?;
+    let build_context_started_at = Instant::now();
     let (cwd, model_id, sandbox) = build_codex_branch_context(state.inner(), &thread).await?;
+    log_branch_profile_step(
+        profile_operation_id,
+        "backend.fork.build_context.done",
+        Some(format!(
+            "elapsed_ms={}; model_id={}; cwd={}",
+            format_elapsed_ms(build_context_started_at),
+            model_id,
+            cwd
+        )),
+    );
 
+    let remote_fork_started_at = Instant::now();
     let forked = state
         .engines
         .fork_codex_thread(&engine_thread_id, &cwd, &model_id, sandbox)
         .await
         .map_err(err_to_string)?;
+    log_branch_profile_step(
+        profile_operation_id,
+        "backend.fork.remote_fork.done",
+        Some(format!(
+            "elapsed_ms={}; source_engine_thread_id={}; forked_engine_thread_id={}; model_id={}",
+            format_elapsed_ms(remote_fork_started_at),
+            engine_thread_id,
+            forked.engine_thread_id,
+            forked.model_id
+        )),
+    );
 
-    create_codex_branch_thread(
+    let create_branch_started_at = Instant::now();
+    let created = create_codex_branch_thread(
         state.inner(),
         &thread,
         &forked.engine_thread_id,
@@ -1255,8 +1383,20 @@ pub async fn fork_codex_thread(
         forked.raw_status.as_deref(),
         &forked.active_flags,
         None,
+        profile_operation_id,
     )
-    .await
+    .await?;
+    log_branch_profile_step(
+        profile_operation_id,
+        "backend.fork.local_branch_create.done",
+        Some(format!(
+            "elapsed_ms={}; created_thread_id={}; total_elapsed_ms={}",
+            format_elapsed_ms(create_branch_started_at),
+            created.id,
+            format_elapsed_ms(total_started_at)
+        )),
+    );
+    Ok(created)
 }
 
 #[tauri::command]
@@ -1264,14 +1404,36 @@ pub async fn rollback_codex_thread(
     state: State<'_, AppState>,
     thread_id: String,
     num_turns: u32,
+    profile_operation_id: Option<String>,
 ) -> Result<ThreadDto, String> {
+    let profile_operation_id = profile_operation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let total_started_at = Instant::now();
+    log_branch_profile_step(
+        profile_operation_id,
+        "backend.rollback.command.start",
+        Some(format!("thread_id={thread_id}; num_turns={num_turns}")),
+    );
     if num_turns == 0 {
+        log_branch_profile_step(
+            profile_operation_id,
+            "backend.rollback.command.rejected_zero_turns",
+            Some(format!("thread_id={thread_id}")),
+        );
         return Err("rollback requires at least one turn".to_string());
     }
     if state.turns.get(&thread_id).await.is_some() {
+        log_branch_profile_step(
+            profile_operation_id,
+            "backend.rollback.command.rejected_active_turn",
+            Some(format!("thread_id={thread_id}")),
+        );
         return Err("cannot rollback a thread while a turn is still active".to_string());
     }
 
+    let load_thread_started_at = Instant::now();
     let db = state.db.clone();
     let thread = run_db(db.clone(), {
         let thread_id = thread_id.clone();
@@ -1279,28 +1441,88 @@ pub async fn rollback_codex_thread(
     })
     .await?
     .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+    log_branch_profile_step(
+        profile_operation_id,
+        "backend.rollback.load_thread.done",
+        Some(format!(
+            "elapsed_ms={}; engine_id={}; has_engine_thread_id={}",
+            format_elapsed_ms(load_thread_started_at),
+            thread.engine_id,
+            thread.engine_thread_id.is_some()
+        )),
+    );
 
     if thread.engine_id != "codex" {
+        log_branch_profile_step(
+            profile_operation_id,
+            "backend.rollback.command.rejected_non_codex",
+            Some(format!("thread_id={thread_id}; engine_id={}", thread.engine_id)),
+        );
         return Err("native rollback is only available for Codex threads".to_string());
     }
     let engine_thread_id = thread
         .engine_thread_id
         .clone()
         .ok_or_else(|| "Codex thread has not been initialized yet".to_string())?;
+    let build_context_started_at = Instant::now();
     let (cwd, model_id, sandbox) = build_codex_branch_context(state.inner(), &thread).await?;
+    log_branch_profile_step(
+        profile_operation_id,
+        "backend.rollback.build_context.done",
+        Some(format!(
+            "elapsed_ms={}; model_id={}; cwd={}",
+            format_elapsed_ms(build_context_started_at),
+            model_id,
+            cwd
+        )),
+    );
 
+    let remote_fork_started_at = Instant::now();
     let forked = state
         .engines
         .fork_codex_thread(&engine_thread_id, &cwd, &model_id, sandbox)
         .await
         .map_err(err_to_string)?;
+    log_branch_profile_step(
+        profile_operation_id,
+        "backend.rollback.remote_fork.done",
+        Some(format!(
+            "elapsed_ms={}; source_engine_thread_id={}; forked_engine_thread_id={}; model_id={}",
+            format_elapsed_ms(remote_fork_started_at),
+            engine_thread_id,
+            forked.engine_thread_id,
+            forked.model_id
+        )),
+    );
+    let remote_rollback_started_at = Instant::now();
     let rollback_snapshot = match state
         .engines
         .rollback_codex_thread(&forked.engine_thread_id, num_turns)
         .await
     {
-        Ok(snapshot) => snapshot,
+        Ok(snapshot) => {
+            log_branch_profile_step(
+                profile_operation_id,
+                "backend.rollback.remote_rollback.done",
+                Some(format!(
+                    "elapsed_ms={}; forked_engine_thread_id={}",
+                    format_elapsed_ms(remote_rollback_started_at),
+                    forked.engine_thread_id
+                )),
+            );
+            snapshot
+        }
         Err(rollback_error) => {
+            log_branch_profile_step(
+                profile_operation_id,
+                "backend.rollback.remote_rollback.failed",
+                Some(format!(
+                    "elapsed_ms={}; forked_engine_thread_id={}; error={}",
+                    format_elapsed_ms(remote_rollback_started_at),
+                    forked.engine_thread_id,
+                    rollback_error
+                )),
+            );
             if let Err(cleanup_error) = state
                 .engines
                 .archive_codex_thread(&forked.engine_thread_id)
@@ -1310,12 +1532,21 @@ pub async fn rollback_codex_thread(
                     "failed to clean up forked engine thread {} after rollback failure: {cleanup_error}",
                     forked.engine_thread_id
                 );
+                log_branch_profile_step(
+                    profile_operation_id,
+                    "backend.rollback.remote_cleanup.failed",
+                    Some(format!(
+                        "forked_engine_thread_id={}; error={cleanup_error}",
+                        forked.engine_thread_id
+                    )),
+                );
             }
             return Err(err_to_string(rollback_error));
         }
     };
 
-    create_codex_branch_thread(
+    let create_branch_started_at = Instant::now();
+    let created = create_codex_branch_thread(
         state.inner(),
         &thread,
         &forked.engine_thread_id,
@@ -1334,8 +1565,20 @@ pub async fn rollback_codex_thread(
             .or(forked.raw_status.as_deref()),
         &rollback_snapshot.active_flags,
         Some(num_turns),
+        profile_operation_id,
     )
-    .await
+    .await?;
+    log_branch_profile_step(
+        profile_operation_id,
+        "backend.rollback.local_branch_create.done",
+        Some(format!(
+            "elapsed_ms={}; created_thread_id={}; total_elapsed_ms={}",
+            format_elapsed_ms(create_branch_started_at),
+            created.id,
+            format_elapsed_ms(total_started_at)
+        )),
+    );
+    Ok(created)
 }
 
 #[tauri::command]
@@ -1980,8 +2223,29 @@ async fn create_codex_branch_thread(
     raw_status: Option<&str>,
     active_flags: &[String],
     rollback_turns: Option<u32>,
+    profile_operation_id: Option<&str>,
 ) -> Result<ThreadDto, String> {
+    let profile_operation_id = profile_operation_id.map(str::to_string);
+    let total_started_at = Instant::now();
+    log_branch_profile_step(
+        profile_operation_id.as_deref(),
+        "backend.branch.create_local.start",
+        Some(format!(
+            "source_thread_id={}; engine_thread_id={}; model_id={}; rollback_turns={}",
+            source_thread.id,
+            engine_thread_id,
+            model_id,
+            rollback_turns
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        )),
+    );
     if !codex_transcript_imported(source_thread.engine_metadata.as_ref()) {
+        log_branch_profile_step(
+            profile_operation_id.as_deref(),
+            "backend.branch.create_local.rejected_transcript_unimported",
+            Some(format!("source_thread_id={}", source_thread.id)),
+        );
         return Err(
             "native Codex history tools require a locally mirrored transcript. Attached remote threads without imported history cannot be forked or rolled back yet."
                 .to_string(),
@@ -1997,8 +2261,10 @@ async fn create_codex_branch_thread(
         let preview = preview.map(str::to_string);
         let raw_status = raw_status.map(str::to_string);
         let active_flags = active_flags.to_vec();
+        let profile_operation_id = profile_operation_id.clone();
         move |db| {
             let clone_local_history = should_clone_local_branch_history(&source_thread);
+            let create_thread_started_at = Instant::now();
             let created = db::threads::create_thread(
                 db,
                 &source_thread.workspace_id,
@@ -2007,14 +2273,69 @@ async fn create_codex_branch_thread(
                 &model_id,
                 title.as_deref().unwrap_or(&source_thread.title),
             )?;
+            log_branch_profile_step(
+                profile_operation_id.as_deref(),
+                "backend.branch.db_create_thread.done",
+                Some(format!(
+                    "elapsed_ms={}; created_thread_id={}",
+                    format_elapsed_ms(create_thread_started_at),
+                    created.id
+                )),
+            );
+            let set_engine_thread_id_started_at = Instant::now();
             db::threads::set_engine_thread_id(db, &created.id, &engine_thread_id)?;
+            log_branch_profile_step(
+                profile_operation_id.as_deref(),
+                "backend.branch.db_set_engine_thread_id.done",
+                Some(format!(
+                    "elapsed_ms={}; created_thread_id={}; engine_thread_id={}",
+                    format_elapsed_ms(set_engine_thread_id_started_at),
+                    created.id,
+                    engine_thread_id
+                )),
+            );
             if clone_local_history {
-                db::messages::clone_thread_messages(db, &source_thread.id, &created.id)?;
-                if let Some(turns) = rollback_turns {
-                    db::messages::drop_last_turns(db, &created.id, turns)?;
-                }
+                let clone_history_started_at = Instant::now();
+                let cloned_count = db::messages::clone_thread_messages_for_branch(
+                    db,
+                    &source_thread.id,
+                    &created.id,
+                    rollback_turns,
+                )?;
+                log_branch_profile_step(
+                    profile_operation_id.as_deref(),
+                    "backend.branch.db_clone_history.done",
+                    Some(format!(
+                        "elapsed_ms={}; created_thread_id={}; cloned_messages={}; rollback_turns={}",
+                        format_elapsed_ms(clone_history_started_at),
+                        created.id,
+                        cloned_count,
+                        rollback_turns
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "none".to_string())
+                    )),
+                );
+            } else {
+                log_branch_profile_step(
+                    profile_operation_id.as_deref(),
+                    "backend.branch.db_clone_history.skipped",
+                    Some(format!(
+                        "created_thread_id={}; reason=sync_required_or_no_local_messages",
+                        created.id
+                    )),
+                );
             }
+            let refresh_stats_started_at = Instant::now();
             db::threads::refresh_thread_message_stats(db, &created.id)?;
+            log_branch_profile_step(
+                profile_operation_id.as_deref(),
+                "backend.branch.db_refresh_stats.done",
+                Some(format!(
+                    "elapsed_ms={}; created_thread_id={}",
+                    format_elapsed_ms(refresh_stats_started_at),
+                    created.id
+                )),
+            );
 
             let metadata = clone_codex_branch_metadata(
                 source_thread.engine_metadata.as_ref(),
@@ -2027,13 +2348,25 @@ async fn create_codex_branch_thread(
             );
             let next_status =
                 map_codex_thread_status_to_local(raw_status.as_deref(), &active_flags, false);
-            db::threads::update_thread_runtime_snapshot(
+            let update_snapshot_started_at = Instant::now();
+            let updated = db::threads::update_thread_runtime_snapshot(
                 db,
                 &created.id,
                 title.as_deref(),
                 next_status,
                 Some(&metadata),
-            )
+            )?;
+            log_branch_profile_step(
+                profile_operation_id.as_deref(),
+                "backend.branch.db_update_snapshot.done",
+                Some(format!(
+                    "elapsed_ms={}; created_thread_id={}; total_elapsed_ms={}",
+                    format_elapsed_ms(update_snapshot_started_at),
+                    created.id,
+                    format_elapsed_ms(total_started_at)
+                )),
+            );
+            Ok(updated)
         }
     })
     .await
@@ -3271,6 +3604,7 @@ mod tests {
             None,
             Some("idle"),
             &[],
+            None,
             None,
         )
         .await

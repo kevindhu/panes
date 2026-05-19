@@ -46,8 +46,12 @@ interface ThreadState {
   refreshAllThreads: (workspaceIds: string[]) => Promise<void>;
   removeThread: (threadId: string) => Promise<void>;
   restoreThread: (threadId: string) => Promise<void>;
-  forkCodexThread: (threadId: string) => Promise<Thread | null>;
-  rollbackCodexThread: (threadId: string, numTurns: number) => Promise<Thread | null>;
+  forkCodexThread: (threadId: string, profileOperationId?: string | null) => Promise<Thread | null>;
+  rollbackCodexThread: (
+    threadId: string,
+    numTurns: number,
+    profileOperationId?: string | null,
+  ) => Promise<Thread | null>;
   compactCodexThread: (threadId: string) => Promise<Thread | null>;
   attachCodexRemoteThread: (
     workspaceId: string,
@@ -457,10 +461,10 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       set({ loading: false, error: String(error) });
     }
   },
-  forkCodexThread: async (threadId) => {
+  forkCodexThread: async (threadId, profileOperationId) => {
     set({ loading: true, error: undefined });
     try {
-      const forked = await ipc.forkCodexThread(threadId);
+      const forked = await ipc.forkCodexThread(threadId, profileOperationId ?? null);
       localStorage.setItem(LAST_THREAD_KEY, forked.id);
       set((state) => {
         const workspaceId = forked.workspaceId;
@@ -488,10 +492,14 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       return null;
     }
   },
-  rollbackCodexThread: async (threadId, numTurns) => {
+  rollbackCodexThread: async (threadId, numTurns, profileOperationId) => {
     set({ loading: true, error: undefined });
     try {
-      const rolledBack = await ipc.rollbackCodexThread(threadId, numTurns);
+      const rolledBack = await ipc.rollbackCodexThread(
+        threadId,
+        numTurns,
+        profileOperationId ?? null,
+      );
       localStorage.setItem(LAST_THREAD_KEY, rolledBack.id);
       set((state) => {
         const workspaceId = rolledBack.workspaceId;

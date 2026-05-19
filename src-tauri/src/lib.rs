@@ -296,6 +296,7 @@ pub fn run() {
             commands::threads::restore_thread,
             commands::threads::sync_thread_from_engine,
             commands::threads::refresh_thread_usage_limits,
+            commands::threads::append_branch_profile_log,
             commands::threads::fork_codex_thread,
             commands::threads::rollback_codex_thread,
             commands::threads::compact_codex_thread,

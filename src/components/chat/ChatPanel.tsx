@@ -1218,6 +1218,14 @@ function extractMessageCopyText(message: Message): string {
     .join("\n\n");
 }
 
+function createBranchProfileOperationId(kind: string, threadId: string): string {
+  return `${kind}:${threadId}:${crypto.randomUUID()}`;
+}
+
+function formatBranchProfileElapsedMs(elapsedMs: number): string {
+  return elapsedMs.toFixed(1);
+}
+
 function MessageActionButton({
   onClick,
   label,
@@ -2422,6 +2430,20 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     !streaming &&
     activeThread?.engineMetadata?.codexSyncRequired !== true &&
     activeThread?.engineMetadata?.codexTranscriptImported !== false;
+  const appendBranchProfileLogBestEffort = useCallback(
+    (operationId: string, step: string, details?: Record<string, unknown> | string | null) => {
+      let serializedDetails: string | null = null;
+      if (typeof details === "string") {
+        serializedDetails = details;
+      } else if (details && Object.keys(details).length > 0) {
+        serializedDetails = JSON.stringify(details);
+      }
+      void ipc.appendBranchProfileLog(operationId, step, serializedDetails).catch((error) => {
+        console.warn(`Failed to append branch profile log for ${operationId}:`, error);
+      });
+    },
+    [],
+  );
 
   const recordSubmittedInput = useCallback((submittedText: string) => {
     if (!submittedText) {
@@ -2502,6 +2524,25 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       setThreadReasoningEffortLocal(options.thread.id, options.reasoningEffort);
       if (!(await applyCodexConfigToThread(options.thread.id, {
         engineId: options.engineId,
+        personality: options.personality,
+        serviceTier: options.serviceTier,
+        outputSchemaText: options.outputSchemaText,
+        customApprovalPolicyText: options.customApprovalPolicyText,
+      }))) {
+        return "failed";
+      }
+      if (!(await applyOpenCodeConfigToThread(options.thread.id, {
+        engineId: options.engineId,
+        agent: options.openCodeAgent,
+      }))) {
+        return "failed";
+      }
+      setThreadLastModelLocal(options.thread.id, options.modelId);
+
+      const sent = await send(options.text, {
+        threadIdOverride: options.thread.id,
+        engineId: options.engineId,
+        modelId: options.modelId,
         reasoningEffort: options.reasoningEffort,
         attachments: options.attachments.length > 0 ? options.attachments : undefined,
         inputItems: options.inputItems,
@@ -2581,15 +2622,49 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       return;
     }
 
+    const profileOperationId = createBranchProfileOperationId("edit-rollback", activeThread.id);
+    const totalStartedAt = performance.now();
+    appendBranchProfileLogBestEffort(profileOperationId, "frontend.edit_branch.start", {
+      threadId: activeThread.id,
+      messageId: draft.messageId,
+      rollbackTurns,
+      textLength: text.length,
+      attachmentCount: draft.attachments.length,
+      planMode: draft.planMode,
+    });
+
     setEditingMessageBusy(true);
     try {
+      const resolveInputItemsStartedAt = performance.now();
       const inputItems = await resolveCodexInputItems(text, activeThread.engineId);
-      const rollbackBranch = await rollbackCodexThread(activeThread.id, rollbackTurns);
+      appendBranchProfileLogBestEffort(
+        profileOperationId,
+        "frontend.edit_branch.resolve_input_items.done",
+        {
+          elapsedMs: formatBranchProfileElapsedMs(performance.now() - resolveInputItemsStartedAt),
+          inputItemCount: inputItems?.length ?? 0,
+        },
+      );
+      const rollbackStartedAt = performance.now();
+      const rollbackBranch = await rollbackCodexThread(
+        activeThread.id,
+        rollbackTurns,
+        profileOperationId,
+      );
+      appendBranchProfileLogBestEffort(
+        profileOperationId,
+        "frontend.edit_branch.rollback_command.done",
+        {
+          elapsedMs: formatBranchProfileElapsedMs(performance.now() - rollbackStartedAt),
+          createdThreadId: rollbackBranch?.id ?? null,
+        },
+      );
       if (!rollbackBranch) {
         throw new Error(t("panel.toasts.codexThreadRollbackFailed"));
       }
 
       manualThreadBindTargetRef.current = rollbackBranch.id;
+      const bindStartedAt = performance.now();
       try {
         await bindChatThread(rollbackBranch.id);
       } finally {
@@ -2597,12 +2672,21 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
           manualThreadBindTargetRef.current = null;
         }
       }
+      appendBranchProfileLogBestEffort(
+        profileOperationId,
+        "frontend.edit_branch.bind_chat_thread.done",
+        {
+          elapsedMs: formatBranchProfileElapsedMs(performance.now() - bindStartedAt),
+          createdThreadId: rollbackBranch.id,
+        },
+      );
 
       const nextModelId = readThreadLastModelId(rollbackBranch) ?? rollbackBranch.modelId;
       const nextReasoningEffort =
         typeof rollbackBranch.engineMetadata?.reasoningEffort === "string"
           ? rollbackBranch.engineMetadata.reasoningEffort
           : activeThreadReasoningEffort ?? null;
+      const sendPreparedTurnStartedAt = performance.now();
       const submission = await sendPreparedTurn({
         text,
         attachments: draft.attachments,
@@ -2618,16 +2702,34 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         customApprovalPolicyText: readCodexThreadCustomApprovalPolicyText(rollbackBranch),
         openCodeAgent: readThreadOpenCodeAgentValue(rollbackBranch),
       });
+      appendBranchProfileLogBestEffort(
+        profileOperationId,
+        "frontend.edit_branch.send_prepared_turn.done",
+        {
+          elapsedMs: formatBranchProfileElapsedMs(
+            performance.now() - sendPreparedTurnStartedAt,
+          ),
+          submission,
+        },
+      );
       if (submission === "sent") {
         recordSubmittedInput(text);
         inputHistCursorRef.current = -1;
         inputLiveDraftRef.current = "";
         setEditingMessageDraft(null);
+        appendBranchProfileLogBestEffort(profileOperationId, "frontend.edit_branch.success", {
+          totalElapsedMs: formatBranchProfileElapsedMs(performance.now() - totalStartedAt),
+          createdThreadId: rollbackBranch.id,
+        });
       } else if (submission === "failed") {
         restoreComposerFromEditDraft({
           text,
           attachments: draft.attachments,
           planMode: draft.planMode,
+        });
+        appendBranchProfileLogBestEffort(profileOperationId, "frontend.edit_branch.failed", {
+          totalElapsedMs: formatBranchProfileElapsedMs(performance.now() - totalStartedAt),
+          submission,
         });
       }
     } catch (error) {
@@ -2635,6 +2737,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         text,
         attachments: draft.attachments,
         planMode: draft.planMode,
+      });
+      appendBranchProfileLogBestEffort(profileOperationId, "frontend.edit_branch.error", {
+        totalElapsedMs: formatBranchProfileElapsedMs(performance.now() - totalStartedAt),
+        error: String(error),
       });
       toast.error(
         t("panel.toasts.codexThreadEditFailedWithError", {
@@ -2648,6 +2754,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     activeThread,
     activeThreadReasoningEffort,
     activeWorkspaceId,
+    appendBranchProfileLogBestEffort,
     bindChatThread,
     editingMessageBusy,
     editingMessageDraft,
@@ -3938,13 +4045,36 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       throw new Error(t("panel.toasts.codexThreadToolUnavailable"));
     }
 
-    const forkedThread = await forkCodexThread(activeThread.id);
+    const profileOperationId = createBranchProfileOperationId("fork", activeThread.id);
+    const totalStartedAt = performance.now();
+    appendBranchProfileLogBestEffort(profileOperationId, "frontend.fork.start", {
+      threadId: activeThread.id,
+    });
+
+    const forkStartedAt = performance.now();
+    const forkedThread = await forkCodexThread(activeThread.id, profileOperationId);
+    appendBranchProfileLogBestEffort(profileOperationId, "frontend.fork.store_command.done", {
+      elapsedMs: formatBranchProfileElapsedMs(performance.now() - forkStartedAt),
+      createdThreadId: forkedThread?.id ?? null,
+    });
     if (!forkedThread) {
+      appendBranchProfileLogBestEffort(profileOperationId, "frontend.fork.failed", {
+        totalElapsedMs: formatBranchProfileElapsedMs(performance.now() - totalStartedAt),
+      });
       throw new Error(t("panel.toasts.codexThreadForkFailed"));
     }
 
     setActiveThreadInStore(forkedThread.id);
+    const bindStartedAt = performance.now();
     await bindChatThread(forkedThread.id);
+    appendBranchProfileLogBestEffort(profileOperationId, "frontend.fork.bind_chat_thread.done", {
+      elapsedMs: formatBranchProfileElapsedMs(performance.now() - bindStartedAt),
+      createdThreadId: forkedThread.id,
+    });
+    appendBranchProfileLogBestEffort(profileOperationId, "frontend.fork.success", {
+      totalElapsedMs: formatBranchProfileElapsedMs(performance.now() - totalStartedAt),
+      createdThreadId: forkedThread.id,
+    });
     toast.success(t("panel.toasts.codexThreadForked"));
   }
 
@@ -3983,13 +4113,50 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       throw new Error(t("panel.toasts.codexThreadToolUnavailable"));
     }
 
-    const rolledBackThread = await rollbackCodexThread(activeThread.id, numTurns);
+    const profileOperationId = createBranchProfileOperationId("rollback", activeThread.id);
+    const totalStartedAt = performance.now();
+    appendBranchProfileLogBestEffort(profileOperationId, "frontend.rollback.start", {
+      threadId: activeThread.id,
+      numTurns,
+    });
+
+    const rollbackStartedAt = performance.now();
+    const rolledBackThread = await rollbackCodexThread(
+      activeThread.id,
+      numTurns,
+      profileOperationId,
+    );
+    appendBranchProfileLogBestEffort(
+      profileOperationId,
+      "frontend.rollback.store_command.done",
+      {
+        elapsedMs: formatBranchProfileElapsedMs(performance.now() - rollbackStartedAt),
+        createdThreadId: rolledBackThread?.id ?? null,
+      },
+    );
     if (!rolledBackThread) {
+      appendBranchProfileLogBestEffort(profileOperationId, "frontend.rollback.failed", {
+        totalElapsedMs: formatBranchProfileElapsedMs(performance.now() - totalStartedAt),
+      });
       throw new Error(t("panel.toasts.codexThreadRollbackFailed"));
     }
 
     setActiveThreadInStore(rolledBackThread.id);
+    const bindStartedAt = performance.now();
     await bindChatThread(rolledBackThread.id);
+    appendBranchProfileLogBestEffort(
+      profileOperationId,
+      "frontend.rollback.bind_chat_thread.done",
+      {
+        elapsedMs: formatBranchProfileElapsedMs(performance.now() - bindStartedAt),
+        createdThreadId: rolledBackThread.id,
+      },
+    );
+    appendBranchProfileLogBestEffort(profileOperationId, "frontend.rollback.success", {
+      totalElapsedMs: formatBranchProfileElapsedMs(performance.now() - totalStartedAt),
+      createdThreadId: rolledBackThread.id,
+      numTurns,
+    });
     toast.success(t("panel.toasts.codexThreadRolledBack", { count: numTurns }));
   }
 

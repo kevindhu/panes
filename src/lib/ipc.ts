@@ -328,10 +328,27 @@ export const ipc = {
     invoke<Thread>("sync_thread_from_engine", { threadId }),
   refreshThreadUsageLimits: (threadId: string) =>
     invoke<boolean>("refresh_thread_usage_limits", { threadId }),
-  forkCodexThread: (threadId: string) =>
-    invoke<Thread>("fork_codex_thread", { threadId }),
-  rollbackCodexThread: (threadId: string, numTurns: number) =>
-    invoke<Thread>("rollback_codex_thread", { threadId, numTurns }),
+  appendBranchProfileLog: (operationId: string, step: string, details?: string | null) =>
+    invoke<string>("append_branch_profile_log", {
+      operationId,
+      step,
+      details: details ?? null,
+    }),
+  forkCodexThread: (threadId: string, profileOperationId?: string | null) =>
+    invoke<Thread>("fork_codex_thread", {
+      threadId,
+      profileOperationId: profileOperationId ?? null,
+    }),
+  rollbackCodexThread: (
+    threadId: string,
+    numTurns: number,
+    profileOperationId?: string | null,
+  ) =>
+    invoke<Thread>("rollback_codex_thread", {
+      threadId,
+      numTurns,
+      profileOperationId: profileOperationId ?? null,
+    }),
   compactCodexThread: (threadId: string) =>
     invoke<Thread>("compact_codex_thread", { threadId }),
   deleteThread: (threadId: string) => invoke<void>("delete_thread", { threadId }),
