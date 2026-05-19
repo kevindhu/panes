@@ -87,7 +87,7 @@ pub fn clone_thread_messages(
         .transaction()
         .context("failed to start thread message clone transaction")?;
 
-    for (index, message) in messages.iter().enumerate() {
+    for message in messages.iter() {
         let token_usage = message
             .token_usage
             .as_ref()
@@ -96,9 +96,6 @@ pub fn clone_thread_messages(
                 input: 0,
                 output: 0,
             });
-        let created_at = (Utc::now() + ChronoDuration::milliseconds(index as i64))
-            .format("%Y-%m-%d %H:%M:%S%.3f")
-            .to_string();
 
         tx.execute(
             "INSERT INTO messages (
@@ -119,7 +116,7 @@ pub fn clone_thread_messages(
                 message.status.as_str(),
                 token_usage.input as i64,
                 token_usage.output as i64,
-                created_at,
+                message.created_at.as_str(),
             ],
         )
         .context("failed to clone thread message")?;
@@ -1737,6 +1734,16 @@ mod tests {
             params![assistant_message.id],
         )
         .unwrap();
+        conn.execute(
+            "UPDATE messages SET created_at = ?1 WHERE id = ?2",
+            params!["2026-05-19 12:00:00.000", user_message.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE messages SET created_at = ?1 WHERE id = ?2",
+            params!["2026-05-19 12:00:01.000", assistant_message.id],
+        )
+        .unwrap();
         drop(conn);
 
         let cloned = clone_thread_messages(&db, &source_thread_id, &target_thread_id).unwrap();
@@ -1774,11 +1781,8 @@ mod tests {
                 .map(|usage| (usage.input, usage.output)),
             Some((7, 11))
         );
-        assert!(
-            target_messages[0].created_at <= target_messages[1].created_at,
-            "cloned message ordering should be preserved",
-        );
-        let _ = user_message;
+        assert_eq!(target_messages[0].created_at, "2026-05-19 12:00:00.000");
+        assert_eq!(target_messages[1].created_at, "2026-05-19 12:00:01.000");
     }
 
     #[test]

@@ -1000,6 +1000,64 @@ describe("chatStore send", () => {
     });
   });
 
+  it("sorts bound message windows chronologically before rendering", async () => {
+    mockIpc.getThreadMessagesWindow.mockResolvedValueOnce({
+      messages: [
+        {
+          id: "assistant-late",
+          threadId: "thread-1",
+          role: "assistant",
+          content: null,
+          blocks: [{ type: "text", content: "late" }],
+          turnEngineId: "codex",
+          turnModelId: "gpt-5.3-codex",
+          turnReasoningEffort: "medium",
+          schemaVersion: 1,
+          status: "completed",
+          tokenUsage: null,
+          createdAt: "2026-05-19 12:00:01.000",
+        },
+        {
+          id: "user-early",
+          threadId: "thread-1",
+          role: "user",
+          content: "first",
+          blocks: [{ type: "text", content: "first" }],
+          turnEngineId: "codex",
+          turnModelId: "gpt-5.3-codex",
+          turnReasoningEffort: "medium",
+          schemaVersion: 1,
+          status: "completed",
+          tokenUsage: null,
+          createdAt: "2026-05-19T11:59:59.000Z",
+        },
+        {
+          id: "assistant-mid",
+          threadId: "thread-1",
+          role: "assistant",
+          content: null,
+          blocks: [{ type: "text", content: "mid" }],
+          turnEngineId: "codex",
+          turnModelId: "gpt-5.3-codex",
+          turnReasoningEffort: "medium",
+          schemaVersion: 1,
+          status: "completed",
+          tokenUsage: null,
+          createdAt: "2026-05-19T12:00:00.500Z",
+        },
+      ],
+      nextCursor: null,
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    expect(useChatStore.getState().messages.map((message) => message.id)).toEqual([
+      "user-early",
+      "assistant-mid",
+      "assistant-late",
+    ]);
+  });
+
   it("keeps regular user turns intact when loading older history", async () => {
     mockIpc.getThreadMessagesWindow
       .mockResolvedValueOnce({

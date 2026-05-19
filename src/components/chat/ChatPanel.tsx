@@ -1222,11 +1222,13 @@ function MessageActionButton({
   onClick,
   label,
   disabled,
+  color,
   children,
 }: {
   onClick: () => void;
   label: string;
   disabled?: boolean;
+  color?: string;
   children: ReactNode;
 }) {
   return (
@@ -1243,7 +1245,7 @@ function MessageActionButton({
         padding: "2px 4px",
         display: "inline-flex",
         alignItems: "center",
-        color: disabled ? "var(--text-4)" : "var(--text-3)",
+        color: disabled ? "var(--text-4)" : (color ?? "var(--text-3)"),
         opacity: disabled ? 0.55 : 1,
       }}
     >
@@ -1269,7 +1271,11 @@ function MessageCopyButton({
     });
   }, [message]);
   return (
-    <MessageActionButton onClick={handleCopy} label={label}>
+    <MessageActionButton
+      onClick={handleCopy}
+      label={label}
+      color={copied ? "var(--success)" : undefined}
+    >
       {copied ? <Check size={11} /> : <Copy size={11} />}
     </MessageActionButton>
   );
@@ -2044,14 +2050,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     selectedModelId,
   ]);
   const showCodexUsageStatus = messages.length > 0 && activeThread?.engineId === "codex";
-  const canEditUserMessages = false;
-  const editingMessageId: string | null = null;
-  const editingDraftText = "";
-  const editingBusy = false;
-  const handleStartEdit = useCallback((_message: Message) => {}, []);
-  const handleChangeEditText = useCallback((_text: string) => {}, []);
-  const handleCancelEdit = useCallback(() => {}, []);
-  const handleSubmitEdit = useCallback(async () => {}, []);
 
   const handleRefreshUsageLimits = useCallback(async () => {
     if (!threadId || activeThread?.engineId !== "codex" || usageRefreshInFlight) {
@@ -2418,6 +2416,258 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   );
   const pendingPlanImplementationThreadIdRef = useRef<string | null>(null);
   const previousStreamingRef = useRef(false);
+  const canEditActiveThreadMessages =
+    activeThread?.engineId === "codex" &&
+    !!activeThread.engineThreadId &&
+    !streaming &&
+    activeThread?.engineMetadata?.codexSyncRequired !== true &&
+    activeThread?.engineMetadata?.codexTranscriptImported !== false;
+
+  const recordSubmittedInput = useCallback((submittedText: string) => {
+    if (!submittedText) {
+      return;
+    }
+    const hist = inputHistoryRef.current;
+    if (hist[0] !== submittedText) {
+      inputHistoryRef.current = [submittedText, ...hist].slice(0, 50);
+    }
+  }, []);
+
+  const restoreComposerFromEditDraft = useCallback(
+    (draft: { text: string; attachments: ChatAttachment[]; planMode: boolean }) => {
+      setInput(draft.text);
+      setAttachments(draft.attachments);
+      setPlanMode(draft.planMode);
+    },
+    [],
+  );
+
+  const sendPreparedTurn = useCallback(
+    async (options: {
+      text: string;
+      attachments: ChatAttachment[];
+      inputItems?: ChatInputItem[];
+      planMode: boolean;
+      thread: Thread;
+      engineId: string;
+      modelId: string;
+      reasoningEffort: string | null;
+      personality: CodexPersonalityValue;
+      serviceTier: CodexServiceTierValue;
+      outputSchemaText: string;
+      customApprovalPolicyText: string;
+      openCodeAgent: string;
+    }): Promise<"sent" | "prompted" | "failed"> => {
+      if (
+        options.thread.repoId === null &&
+        repos.length > 1 &&
+        readThreadSandboxModeValue(options.thread) !== "read-only"
+      ) {
+        const availableRepoPaths = repos.map((repo) => repo.path);
+        const optIn = Boolean(options.thread.engineMetadata?.workspaceWriteOptIn);
+        const confirmedWritableRoots = readThreadWorkspaceWritableRoots(options.thread);
+        const hasValidConfirmedRoots = confirmedWritableRoots.some((root) =>
+          availableRepoPaths.includes(root),
+        );
+        if (!optIn || !hasValidConfirmedRoots) {
+          const repoNames = repos.map((repo) => repo.name).join(", ");
+          setWorkspaceOptInPrompt({
+            repoNames,
+            workspaceId: options.thread.workspaceId,
+            threadId: options.thread.id,
+            threadPaths: availableRepoPaths,
+            text: options.text,
+            attachments: [...options.attachments],
+            inputItems: options.inputItems ?? null,
+            planMode: options.planMode,
+            engineId: options.engineId,
+            modelId: options.modelId,
+            effort: options.reasoningEffort,
+            personality: options.personality,
+            serviceTier: options.serviceTier,
+            outputSchemaText: options.outputSchemaText,
+            customApprovalPolicyText: options.customApprovalPolicyText,
+            openCodeAgent: options.openCodeAgent,
+            restorePlanModeOnCancel: false,
+          });
+          return "prompted";
+        }
+      }
+
+      await ipc.setThreadReasoningEffort(
+        options.thread.id,
+        options.reasoningEffort,
+        options.modelId,
+      );
+      setThreadReasoningEffortLocal(options.thread.id, options.reasoningEffort);
+      if (!(await applyCodexConfigToThread(options.thread.id, {
+        engineId: options.engineId,
+        reasoningEffort: options.reasoningEffort,
+        attachments: options.attachments.length > 0 ? options.attachments : undefined,
+        inputItems: options.inputItems,
+        planMode: options.planMode,
+      });
+      if (!sent) {
+        return "failed";
+      }
+
+      pendingPlanImplementationThreadIdRef.current = options.planMode
+        ? options.thread.id
+        : null;
+      return "sent";
+    },
+    [
+      repos,
+      send,
+      setThreadLastModelLocal,
+      setThreadReasoningEffortLocal,
+    ],
+  );
+
+  const startEditingUserMessage = useCallback((message: Message) => {
+    if (!canEditActiveThreadMessages) {
+      return;
+    }
+    const context = extractEditableMessageContext(message);
+    if (!context) {
+      return;
+    }
+    setEditingMessageBusy(false);
+    setEditingMessageDraft({
+      messageId: message.id,
+      text: context.text,
+      attachments: context.attachments,
+      planMode: context.planMode,
+    });
+  }, [canEditActiveThreadMessages]);
+
+  const changeEditingMessageText = useCallback((text: string) => {
+    setEditingMessageDraft((current) =>
+      current ? { ...current, text } : current,
+    );
+  }, []);
+
+  const cancelEditingUserMessage = useCallback(() => {
+    if (editingMessageBusy) {
+      return;
+    }
+    setEditingMessageDraft(null);
+  }, [editingMessageBusy]);
+
+  const submitEditedUserMessage = useCallback(async () => {
+    const draft = editingMessageDraft;
+    if (
+      !draft ||
+      editingMessageBusy ||
+      !activeThread ||
+      activeThread.engineId !== "codex" ||
+      !activeWorkspaceId ||
+      streaming
+    ) {
+      return;
+    }
+
+    const text = draft.text.trim();
+    if (!text) {
+      return;
+    }
+
+    const rollbackTurns = computeRollbackTurnsForEditedMessage(
+      messages,
+      draft.messageId,
+    );
+    if (!rollbackTurns) {
+      toast.error(t("panel.toasts.codexThreadEditFailed"));
+      return;
+    }
+
+    setEditingMessageBusy(true);
+    try {
+      const inputItems = await resolveCodexInputItems(text, activeThread.engineId);
+      const rollbackBranch = await rollbackCodexThread(activeThread.id, rollbackTurns);
+      if (!rollbackBranch) {
+        throw new Error(t("panel.toasts.codexThreadRollbackFailed"));
+      }
+
+      manualThreadBindTargetRef.current = rollbackBranch.id;
+      try {
+        await bindChatThread(rollbackBranch.id);
+      } finally {
+        if (manualThreadBindTargetRef.current === rollbackBranch.id) {
+          manualThreadBindTargetRef.current = null;
+        }
+      }
+
+      const nextModelId = readThreadLastModelId(rollbackBranch) ?? rollbackBranch.modelId;
+      const nextReasoningEffort =
+        typeof rollbackBranch.engineMetadata?.reasoningEffort === "string"
+          ? rollbackBranch.engineMetadata.reasoningEffort
+          : activeThreadReasoningEffort ?? null;
+      const submission = await sendPreparedTurn({
+        text,
+        attachments: draft.attachments,
+        inputItems,
+        planMode: draft.planMode,
+        thread: rollbackBranch,
+        engineId: rollbackBranch.engineId,
+        modelId: nextModelId,
+        reasoningEffort: nextReasoningEffort,
+        personality: readThreadPersonalityValue(rollbackBranch),
+        serviceTier: readThreadServiceTierValue(rollbackBranch),
+        outputSchemaText: readThreadOutputSchemaText(rollbackBranch),
+        customApprovalPolicyText: readCodexThreadCustomApprovalPolicyText(rollbackBranch),
+        openCodeAgent: readThreadOpenCodeAgentValue(rollbackBranch),
+      });
+      if (submission === "sent") {
+        recordSubmittedInput(text);
+        inputHistCursorRef.current = -1;
+        inputLiveDraftRef.current = "";
+        setEditingMessageDraft(null);
+      } else if (submission === "failed") {
+        restoreComposerFromEditDraft({
+          text,
+          attachments: draft.attachments,
+          planMode: draft.planMode,
+        });
+      }
+    } catch (error) {
+      restoreComposerFromEditDraft({
+        text,
+        attachments: draft.attachments,
+        planMode: draft.planMode,
+      });
+      toast.error(
+        t("panel.toasts.codexThreadEditFailedWithError", {
+          error: String(error),
+        }),
+      );
+    } finally {
+      setEditingMessageBusy(false);
+    }
+  }, [
+    activeThread,
+    activeThreadReasoningEffort,
+    activeWorkspaceId,
+    bindChatThread,
+    editingMessageBusy,
+    editingMessageDraft,
+    messages,
+    recordSubmittedInput,
+    restoreComposerFromEditDraft,
+    rollbackCodexThread,
+    sendPreparedTurn,
+    streaming,
+    t,
+    resolveCodexInputItems,
+  ]);
+  const canEditUserMessages = canEditActiveThreadMessages;
+  const editingMessageId = editingMessageDraft?.messageId ?? null;
+  const editingDraftText = editingMessageDraft?.text ?? "";
+  const editingBusy = editingMessageBusy;
+  const handleStartEdit = startEditingUserMessage;
+  const handleChangeEditText = changeEditingMessageText;
+  const handleCancelEdit = cancelEditingUserMessage;
+  const handleSubmitEdit = submitEditedUserMessage;
 
   useEffect(() => {
     if (!selectedPendingToolInputApprovalId) {
@@ -3239,6 +3489,11 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     engines,
     selectedEngineId,
   ]);
+
+  useEffect(() => {
+    setEditingMessageDraft(null);
+    setEditingMessageBusy(false);
+  }, [activeThread?.id]);
 
   useEffect(() => {
     if (!activeWorkspaceId) {
@@ -4070,13 +4325,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         planMode,
       });
       if (steered) {
-        const trimmed = input.trim();
-        if (trimmed) {
-          const hist = inputHistoryRef.current;
-          if (hist[0] !== trimmed) {
-            inputHistoryRef.current = [trimmed, ...hist].slice(0, 50);
-          }
-        }
+        recordSubmittedInput(text);
         inputHistCursorRef.current = -1;
         inputLiveDraftRef.current = "";
         setInput("");
@@ -4151,75 +4400,27 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       useThreadStore.getState().threads.find((thread) => thread.id === targetThreadId) ??
       activeThread;
 
-    if (
-      currentThread &&
-      currentThread.repoId === null &&
-      repos.length > 1 &&
-      readThreadSandboxModeValue(currentThread) !== "read-only"
-    ) {
-      const availableRepoPaths = repos.map((repo) => repo.path);
-      const optIn = Boolean(currentThread.engineMetadata?.workspaceWriteOptIn);
-      const confirmedWritableRoots = readThreadWorkspaceWritableRoots(currentThread);
-      const hasValidConfirmedRoots = confirmedWritableRoots.some((root) =>
-        availableRepoPaths.includes(root),
-      );
-      if (!optIn || !hasValidConfirmedRoots) {
-        const repoNames = repos.map((repo) => repo.name).join(", ");
-        setWorkspaceOptInPrompt({
-          repoNames,
-          workspaceId: activeWorkspaceId,
-          threadId: targetThreadId,
-          threadPaths: availableRepoPaths,
-          text,
-          attachments: [...attachments],
-          inputItems: inputItems ?? null,
-          planMode: submitPlanMode,
-          engineId: submitEngineId,
-          modelId: submitModelId,
-          effort: submitReasoningEffort,
-          personality: selectedPersonality,
-          serviceTier: selectedServiceTier,
-          outputSchemaText,
-          customApprovalPolicyText,
-          openCodeAgent: selectedOpenCodeAgentRef.current,
-          restorePlanModeOnCancel: false,
-        });
-        return;
-      }
-    }
-
-    await ipc.setThreadReasoningEffort(
-      targetThreadId,
-      submitReasoningEffort,
-      submitModelId,
-    );
-    setThreadReasoningEffortLocal(targetThreadId, submitReasoningEffort);
-    if (!(await applyCodexConfigToThread(targetThreadId))) {
+    if (!currentThread) {
       return;
     }
-    if (!(await applyOpenCodeConfigToThread(targetThreadId))) {
-      return;
-    }
-    setThreadLastModelLocal(targetThreadId, submitModelId);
 
-    const sent = await send(text, {
-      threadIdOverride: targetThreadId,
+    const submission = await sendPreparedTurn({
+      text,
+      attachments: currentAttachments,
+      inputItems,
+      planMode: submitPlanMode,
+      thread: currentThread,
       engineId: submitEngineId,
       modelId: submitModelId,
       reasoningEffort: submitReasoningEffort,
-      attachments: currentAttachments.length > 0 ? currentAttachments : undefined,
-      inputItems,
-      planMode: submitPlanMode,
+      personality: selectedPersonality,
+      serviceTier: selectedServiceTier,
+      outputSchemaText,
+      customApprovalPolicyText,
+      openCodeAgent: selectedOpenCodeAgentRef.current,
     });
-    if (sent) {
-      pendingPlanImplementationThreadIdRef.current = submitPlanMode ? targetThreadId : null;
-      const trimmed = input.trim();
-      if (trimmed) {
-        const hist = inputHistoryRef.current;
-        if (hist[0] !== trimmed) {
-          inputHistoryRef.current = [trimmed, ...hist].slice(0, 50);
-        }
-      }
+    if (submission === "sent") {
+      recordSubmittedInput(text);
       inputHistCursorRef.current = -1;
       inputLiveDraftRef.current = "";
       setInput("");

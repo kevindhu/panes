@@ -343,6 +343,13 @@
     "planImplementationOptionImplementDescription": "Leave plan mode and ask Codex to start executing this plan in the current thread.",
     "planImplementationOptionStay": "Stay in plan mode",
     "planImplementationOptionStayDescription": "Keep plan mode enabled so the next message stays in planning mode.",
+    "messageActions": {
+      "copy": "Copy message",
+      "edit": "Edit message",
+      "save": "Save and branch",
+      "cancel": "Cancel",
+      "branching": "Branching..."
+    },
     "placeholders": {
       "plan": "Describe what you want to plan...",
       "chat": "Ask for follow-up changes"
@@ -390,6 +397,8 @@
       "codexReviewDetachedStarted": "Started a detached Codex review thread.",
       "codexThreadForkFailed": "Failed to fork the active Codex thread.",
       "codexThreadRollbackFailed": "Failed to rollback the active Codex thread.",
+      "codexThreadEditFailed": "Failed to branch from the selected user message.",
+      "codexThreadEditFailedWithError": "Failed to branch from the selected user message: {{error}}",
       "codexThreadCompactFailed": "Failed to start Codex thread compaction.",
       "codexThreadResumeUnavailable": "Select a workspace and Codex model before resuming a remote thread.",
       "codexThreadResumeFailed": "Failed to attach the selected Codex thread.",

@@ -1059,11 +1059,62 @@ function applyHydrationWindow(messages: Message[]): Message[] {
   return nextMessages;
 }
 
+const SQLITE_MESSAGE_TIMESTAMP_PATTERN =
+  /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/;
+
+function parseMessageCreatedAtTimestamp(createdAt: string): number | null {
+  if (SQLITE_MESSAGE_TIMESTAMP_PATTERN.test(createdAt)) {
+    const normalized = `${createdAt.replace(" ", "T")}Z`;
+    const parsed = Date.parse(normalized);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  const direct = Date.parse(createdAt);
+  return Number.isFinite(direct) ? direct : null;
+}
+
+function compareMessagesChronologically(
+  left: { message: Message; index: number },
+  right: { message: Message; index: number },
+): number {
+  const leftTimestamp = parseMessageCreatedAtTimestamp(left.message.createdAt);
+  const rightTimestamp = parseMessageCreatedAtTimestamp(right.message.createdAt);
+  if (leftTimestamp !== null && rightTimestamp !== null && leftTimestamp !== rightTimestamp) {
+    return leftTimestamp - rightTimestamp;
+  }
+  return left.index - right.index;
+}
+
+function sortMessagesChronologically(messages: Message[]): Message[] {
+  if (messages.length < 2) {
+    return messages;
+  }
+
+  const indexedMessages = messages.map((message, index) => ({ message, index }));
+  let needsSort = false;
+  for (let index = 1; index < indexedMessages.length; index += 1) {
+    if (
+      compareMessagesChronologically(indexedMessages[index - 1], indexedMessages[index]) > 0
+    ) {
+      needsSort = true;
+      break;
+    }
+  }
+
+  if (!needsSort) {
+    return messages;
+  }
+
+  return [...indexedMessages]
+    .sort(compareMessagesChronologically)
+    .map(({ message }) => message);
+}
+
 function normalizeMessages(
   messages: Message[],
   options?: { collapseTrailingSteers?: boolean },
 ): Message[] {
-  let nextMessages = messages;
+  let nextMessages = sortMessagesChronologically(messages);
   for (let index = 0; index < nextMessages.length; index += 1) {
     const message = nextMessages[index];
     const normalizedBlocks = normalizeBlocks(message.blocks);

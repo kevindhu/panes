@@ -343,6 +343,13 @@
     "planImplementationOptionImplementDescription": "Sair do modo de plano e pedir ao Codex que comece a executar este plano na thread atual.",
     "planImplementationOptionStay": "Continuar no modo de plano",
     "planImplementationOptionStayDescription": "Manter o modo de plano ativo para que a próxima mensagem continue em planejamento.",
+    "messageActions": {
+      "copy": "Copiar mensagem",
+      "edit": "Editar mensagem",
+      "save": "Salvar e ramificar",
+      "cancel": "Cancelar",
+      "branching": "Ramificando..."
+    },
     "placeholders": {
       "plan": "Descreva o que você quer planejar...",
       "chat": "Peça alterações de continuação"
@@ -390,6 +397,8 @@
       "codexReviewDetachedStarted": "Uma thread destacada de review do Codex foi iniciada.",
       "codexThreadForkFailed": "Falha ao ramificar a thread ativa do Codex.",
       "codexThreadRollbackFailed": "Falha ao fazer rollback da thread ativa do Codex.",
+      "codexThreadEditFailed": "Falha ao ramificar a partir da mensagem de usuário selecionada.",
+      "codexThreadEditFailedWithError": "Falha ao ramificar a partir da mensagem de usuário selecionada: {{error}}",
       "codexThreadCompactFailed": "Falha ao iniciar a compactação da thread do Codex.",
       "codexThreadResumeUnavailable": "Selecione um workspace e um modelo do Codex antes de retomar uma thread remota.",
       "codexThreadResumeFailed": "Falha ao anexar a thread do Codex selecionada.",
