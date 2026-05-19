@@ -1006,6 +1006,17 @@ function extractAnswerText(raw: unknown): string | null {
   return null;
 }
 
+function extractApprovalAnswerMap(
+  responseData: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!responseData) return undefined;
+  const nestedAnswers = responseData.answers;
+  if (typeof nestedAnswers === "object" && nestedAnswers !== null && !Array.isArray(nestedAnswers)) {
+    return nestedAnswers as Record<string, unknown>;
+  }
+  return responseData;
+}
+
 function ToolInputApprovalCard({
   block,
   questions,
@@ -1021,12 +1032,13 @@ function ToolInputApprovalCard({
   const { t } = useTranslation("chat");
   if (questions.length <= 0) return null;
 
-  const rawAnswers = block.responseData?.answers;
-  const answers = typeof rawAnswers === "object" && rawAnswers !== null && !Array.isArray(rawAnswers)
-    ? rawAnswers as Record<string, unknown>
-    : undefined;
-  const isAnswered = !isPending && block.decision;
-  const hasAnswers = isAnswered && answers;
+  const answers = extractApprovalAnswerMap(block.responseData);
+  const isAnswered = block.status === "answered";
+  const hasAnswers = Boolean(
+    isAnswered &&
+    answers &&
+    questions.some((question) => extractAnswerText(answers[question.id] ?? answers[question.question])),
+  );
   const [expanded, setExpanded] = useState(false);
   const toggleExpanded = useCallback(() => setExpanded((v) => !v), []);
 
@@ -1055,7 +1067,7 @@ function ToolInputApprovalCard({
       {hasAnswers && expanded && (
         <div className="tool-input-qa-body">
           {questions.map((q) => {
-            const text = extractAnswerText(answers[q.id]);
+            const text = extractAnswerText(answers?.[q.id] ?? answers?.[q.question]);
             if (!text) return null;
             return (
               <div key={q.id} className="tool-input-qa-row">

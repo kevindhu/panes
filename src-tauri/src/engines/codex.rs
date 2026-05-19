@@ -1085,7 +1085,9 @@ impl CodexEngine {
         self.ensure_ready_transport().await.map(|_| ())
     }
 
-    pub async fn read_usage_limits_snapshot(&self) -> anyhow::Result<Option<super::UsageLimitsSnapshot>> {
+    pub async fn read_usage_limits_snapshot(
+        &self,
+    ) -> anyhow::Result<Option<super::UsageLimitsSnapshot>> {
         let transport = self.ensure_ready_transport().await?;
         let snapshot = request_with_fallback(
             transport.as_ref(),

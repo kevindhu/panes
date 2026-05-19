@@ -85,6 +85,7 @@ pub fn insert_approval(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn answer_approval(db: &Database, approval_id: &str, decision: &str) -> anyhow::Result<()> {
     answer_approval_with_response(db, approval_id, decision, None)
 }

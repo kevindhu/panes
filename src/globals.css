@@ -485,6 +485,16 @@ button, input, textarea, select {
   background: var(--content-bg);
 }
 
+.content-panel-with-git-rail {
+  display: flex;
+}
+
+.content-panel-main {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+}
+
 /* ── Buttons ── */
 .btn {
   display: inline-flex;
@@ -1134,7 +1144,7 @@ button, input, textarea, select {
 }
 .git-toolbar-btn:focus-visible,
 .shell-pin-btn:focus-visible,
-.git-flyout-trigger:focus-visible {
+.git-collapsed-rail-btn:focus-visible {
   outline: 1px solid var(--border-accent);
   outline-offset: -1px;
 }
@@ -1146,59 +1156,60 @@ button, input, textarea, select {
   background: transparent;
   color: var(--text-3);
 }
-.git-toolbar-btn.shell-pin-btn {
-  padding: 0;
+
+.git-toolbar-btn-hide {
+  gap: 5px;
+  padding-inline: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--text-2);
 }
 
-.git-flyout-trigger {
-  position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  width: 12px;
-  border: none;
-  border-left: 1px solid transparent;
-  background: transparent;
-  cursor: pointer;
-  z-index: 5;
-  transition: background var(--duration-fast) var(--ease-out),
-              border-color var(--duration-fast) var(--ease-out);
+.git-toolbar-btn-hide:hover {
+  background: var(--accent-dim);
+  border-color: var(--border-accent);
 }
 
-.git-flyout-trigger::after {
-  content: "";
-  position: absolute;
-  top: 18px;
-  right: 4px;
-  bottom: 18px;
-  width: 1px;
-  background: rgba(31, 35, 40, 0.08);
-  transition: background var(--duration-fast) var(--ease-out),
-              opacity var(--duration-fast) var(--ease-out);
+.git-toolbar-btn-label {
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
 }
 
-.git-flyout-trigger:hover,
-.git-flyout-trigger:focus-visible,
-.git-flyout-trigger-active {
-  background: rgba(31, 35, 40, 0.03);
-  border-left-color: rgba(31, 35, 40, 0.05);
+.git-collapsed-rail {
+  width: 34px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--border);
+  background: linear-gradient(180deg, var(--bg-2), var(--bg-1));
 }
 
-.git-flyout-trigger:hover::after,
-.git-flyout-trigger:focus-visible::after,
-.git-flyout-trigger-active::after {
-  background: var(--accent);
-}
-
-.git-flyout-wrapper {
-  position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
+.git-collapsed-rail-btn {
+  width: 100%;
+  height: 100%;
+  padding: 10px 6px;
   display: flex;
-  justify-content: flex-end;
-  z-index: 6;
-  pointer-events: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--text-3);
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--ease-out),
+              color var(--duration-fast) var(--ease-out);
+}
+
+.git-collapsed-rail-btn:hover {
+  background: var(--accent-dim);
+  color: var(--text-1);
+}
+
+.git-collapsed-rail-label {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 /* Repo bar (multi-repo switcher) */

@@ -590,8 +590,9 @@ pub fn mark_approval_block_answered(
     message_id: &str,
     approval_id: &str,
     decision: &str,
+    response_data: Option<&Value>,
 ) -> anyhow::Result<bool> {
-    mark_approval_block_resolved(db, message_id, approval_id, Some(decision))
+    mark_approval_block_resolved(db, message_id, approval_id, Some(decision), response_data)
 }
 
 pub fn mark_approval_block_resolved(
@@ -599,6 +600,7 @@ pub fn mark_approval_block_resolved(
     message_id: &str,
     approval_id: &str,
     decision: Option<&str>,
+    response_data: Option<&Value>,
 ) -> anyhow::Result<bool> {
     let conn = db.connect()?;
     let Some(raw_blocks): Option<String> = conn
@@ -618,7 +620,10 @@ pub fn mark_approval_block_resolved(
     let mut resolved = HashMap::new();
     resolved.insert(
         approval_id.to_string(),
-        decision.map(std::string::ToString::to_string),
+        ResolvedApprovalState {
+            decision: decision.map(std::string::ToString::to_string),
+            response_data: response_data.cloned(),
+        },
     );
     let changed = apply_resolved_approvals_to_blocks(&mut blocks_value, &resolved);
     if !changed {
@@ -910,7 +915,7 @@ fn map_message_row(row: &Row<'_>) -> rusqlite::Result<MessageDto> {
 
 fn apply_resolved_approvals_to_blocks(
     blocks: &mut Value,
-    resolved: &HashMap<String, Option<String>>,
+    resolved: &HashMap<String, ResolvedApprovalState>,
 ) -> bool {
     let Some(items) = blocks.as_array_mut() else {
         return false;
@@ -934,7 +939,7 @@ fn apply_resolved_approvals_to_blocks(
             continue;
         };
 
-        let Some(decision) = resolved.get(approval_id) else {
+        let Some(state) = resolved.get(approval_id) else {
             continue;
         };
 
@@ -948,7 +953,7 @@ fn apply_resolved_approvals_to_blocks(
             object.insert("status".to_string(), Value::String("answered".to_string()));
             changed = true;
         }
-        if let Some(decision) = decision {
+        if let Some(decision) = state.decision.as_deref() {
             let should_update_decision = object
                 .get("decision")
                 .and_then(Value::as_str)
@@ -959,9 +964,25 @@ fn apply_resolved_approvals_to_blocks(
                 changed = true;
             }
         }
+        if let Some(response_data) = state.response_data.as_ref() {
+            let should_update_response = object
+                .get("responseData")
+                .map(|value| value != response_data)
+                .unwrap_or(true);
+            if should_update_response {
+                object.insert("responseData".to_string(), response_data.clone());
+                changed = true;
+            }
+        }
     }
 
     changed
+}
+
+#[derive(Debug, Clone, Default)]
+struct ResolvedApprovalState {
+    decision: Option<String>,
+    response_data: Option<Value>,
 }
 
 fn normalize_blocks_json_for_message(
@@ -1025,10 +1046,10 @@ fn reconcile_answered_approvals_for_message(
 fn load_resolved_approvals_for_message(
     conn: &Connection,
     message_id: &str,
-) -> anyhow::Result<HashMap<String, Option<String>>> {
+) -> anyhow::Result<HashMap<String, ResolvedApprovalState>> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, decision
+            "SELECT id, decision, response_json
          FROM approvals
          WHERE message_id = ?1
            AND status = 'answered'",
@@ -1036,14 +1057,24 @@ fn load_resolved_approvals_for_message(
         .context("failed to prepare approval lookup for message")?;
     let rows = stmt
         .query_map(params![message_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })
         .context("failed to query answered approvals for message")?;
 
     let mut resolved = HashMap::new();
     for row in rows {
-        let (approval_id, decision) = row?;
-        resolved.insert(approval_id, decision);
+        let (approval_id, decision, response_json) = row?;
+        resolved.insert(
+            approval_id,
+            ResolvedApprovalState {
+                decision,
+                response_data: parse_response_json(response_json.as_deref()),
+            },
+        );
     }
 
     Ok(resolved)
@@ -1052,7 +1083,7 @@ fn load_resolved_approvals_for_message(
 fn load_resolved_approvals_for_message_ids(
     conn: &Connection,
     message_ids: &[String],
-) -> anyhow::Result<HashMap<String, HashMap<String, Option<String>>>> {
+) -> anyhow::Result<HashMap<String, HashMap<String, ResolvedApprovalState>>> {
     if message_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -1061,7 +1092,7 @@ fn load_resolved_approvals_for_message_ids(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT message_id, id, decision
+        "SELECT message_id, id, decision, response_json
          FROM approvals
          WHERE message_id IS NOT NULL
            AND status = 'answered'
@@ -1076,20 +1107,33 @@ fn load_resolved_approvals_for_message_ids(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
             ))
         })
         .context("failed to query answered approvals for messages")?;
 
-    let mut resolved_by_message: HashMap<String, HashMap<String, Option<String>>> = HashMap::new();
+    let mut resolved_by_message: HashMap<String, HashMap<String, ResolvedApprovalState>> =
+        HashMap::new();
     for row in rows {
-        let (message_id, approval_id, decision) = row?;
-        resolved_by_message
-            .entry(message_id)
-            .or_default()
-            .insert(approval_id, decision);
+        let (message_id, approval_id, decision, response_json) = row?;
+        resolved_by_message.entry(message_id).or_default().insert(
+            approval_id,
+            ResolvedApprovalState {
+                decision,
+                response_data: parse_response_json(response_json.as_deref()),
+            },
+        );
     }
 
     Ok(resolved_by_message)
+}
+
+fn parse_response_json(raw: Option<&str>) -> Option<Value> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    serde_json::from_str(raw).ok()
 }
 
 #[cfg(test)]
@@ -1167,6 +1211,12 @@ mod tests {
             approval.get("status")?.as_str()?,
             approval.get("decision").and_then(Value::as_str),
         ))
+    }
+
+    fn approval_block_response_data<'a>(blocks: &'a Value) -> Option<&'a Value> {
+        let items = blocks.as_array()?;
+        let approval = items.first()?.as_object()?;
+        approval.get("responseData")
     }
 
     #[test]
@@ -1574,6 +1624,83 @@ mod tests {
         let (status, decision) = approval_block_status(blocks).unwrap();
         assert_eq!(status, "answered");
         assert_eq!(decision, None);
+    }
+
+    #[test]
+    fn answered_tool_input_approvals_preserve_response_data_in_blocks_and_window() {
+        let db = test_db();
+        let thread_id = test_thread(&db);
+        let approval_id = "approval-questionnaire-1";
+        let pending_blocks = approval_blocks_json(approval_id);
+        let message = insert_message(
+            &db,
+            &thread_id,
+            "assistant",
+            None,
+            Some(pending_blocks.clone()),
+            MessageStatusDto::Streaming,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let response = json!({
+            "answers": {
+                "question-1": { "answers": ["Use pnpm"] },
+                "question-2": { "answers": ["Run typecheck and tests"] }
+            }
+        });
+
+        actions::insert_approval(
+            &db,
+            approval_id,
+            &thread_id,
+            &message.id,
+            &ActionType::Command,
+            "Answer questions",
+            &json!({
+                "questions": [
+                    { "id": "question-1", "question": "Which package manager?" },
+                    { "id": "question-2", "question": "Which checks?" }
+                ]
+            }),
+        )
+        .unwrap();
+        actions::answer_approval_with_response(&db, approval_id, "custom", Some(&response))
+            .unwrap();
+
+        update_assistant_blocks_json(
+            &db,
+            &message.id,
+            &pending_blocks.to_string(),
+            MessageStatusDto::Completed,
+            None,
+        )
+        .unwrap();
+
+        let stored_blocks = get_message_blocks(&db, &message.id).unwrap().unwrap();
+        let (status, decision) = approval_block_status(&stored_blocks).unwrap();
+        assert_eq!(status, "answered");
+        assert_eq!(decision, Some("custom"));
+        assert_eq!(
+            approval_block_response_data(&stored_blocks),
+            Some(&response)
+        );
+
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE messages SET blocks_json = ?1 WHERE id = ?2",
+            params![pending_blocks.to_string(), message.id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let window = get_thread_messages_window(&db, &thread_id, None, 20).unwrap();
+        let window_blocks = window.messages[0].blocks.as_ref().unwrap();
+        let (window_status, window_decision) = approval_block_status(window_blocks).unwrap();
+        assert_eq!(window_status, "answered");
+        assert_eq!(window_decision, Some("custom"));
+        assert_eq!(approval_block_response_data(window_blocks), Some(&response));
     }
 
     #[test]

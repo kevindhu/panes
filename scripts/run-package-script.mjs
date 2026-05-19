@@ -6,4 +6,9 @@ if (!scriptName) {
   throw new Error("Usage: node scripts/run-package-script.mjs <script-name> [...args]");
 }
 
-await runWorkspaceScript(scriptName, { args });
+const allowedExitCodes =
+  process.platform === "win32" && scriptName === "dev"
+    ? [-1]
+    : [];
+
+await runWorkspaceScript(scriptName, { args, allowedExitCodes });

@@ -1,4 +1,4 @@
-import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import {
@@ -6,7 +6,6 @@ import {
   ArrowDown,
   ArrowUp,
   X,
-  PanelRightOpen,
   Undo2,
   FileDiff,
   GitBranch as GitBranchIcon,
@@ -18,15 +17,12 @@ import {
 } from "lucide-react";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
 import { useGitStore, type GitPanelView } from "../../stores/gitStore";
+import { useUiStore } from "../../stores/uiStore";
 import { ipc, listenGitRepoChanged } from "../../lib/ipc";
 import { handleDragMouseDown, handleDragDoubleClick } from "../../lib/windowDrag";
 import { toast } from "../../stores/toastStore";
 import { Dropdown } from "../shared/Dropdown";
 import { ConfirmDialog } from "../shared/ConfirmDialog";
-import {
-  closeGitFlyoutIfFocusLeft,
-  GitFlyoutContext,
-} from "../../lib/gitFlyoutRegion";
 import type { GitInitRepoStatus } from "../../types";
 import { GitChangesView } from "./GitChangesView";
 import { MultiRepoChangesView } from "./MultiRepoChangesView";
@@ -39,13 +35,7 @@ const GIT_WATCHER_REFRESH_DEBOUNCE_MS_CHANGES = 550;
 const GIT_WATCHER_REFRESH_DEBOUNCE_MS_BACKGROUND = 1100;
 const GIT_WORKING_TREE_POLL_INTERVAL_MS = 5000;
 
-interface Props {
-  mode?: "docked" | "flyout";
-  visible?: boolean;
-  onPin?: () => void;
-}
-
-export function GitPanel({ mode = "docked", visible = true, onPin }: Props) {
+export function GitPanel() {
   const { t } = useTranslation("git");
   const {
     workspaces,
@@ -80,6 +70,7 @@ export function GitPanel({ mode = "docked", visible = true, onPin }: Props) {
     flushDrafts,
     clearError,
   } = useGitStore();
+  const setGitPanelVisible = useUiStore((state) => state.setGitPanelVisible);
 
   const [localError, setLocalError] = useState<string | undefined>();
   const [softResetConfirmOpen, setSoftResetConfirmOpen] = useState(false);
@@ -94,8 +85,7 @@ export function GitPanel({ mode = "docked", visible = true, onPin }: Props) {
   const watcherRefreshTimerRef = useRef<number | null>(null);
   const watcherRefreshInFlightRef = useRef(false);
   const watcherRefreshQueuedRef = useRef(false);
-  const gitFlyoutContext = useContext(GitFlyoutContext);
-  const panelActive = mode === "docked" || visible;
+  const panelActive = true;
   const moreMenuWidth = 220;
   const viewOptions = useMemo(
     () => [
@@ -594,18 +584,6 @@ export function GitPanel({ mode = "docked", visible = true, onPin }: Props) {
           </span>
         )}
 
-        {mode === "flyout" && onPin ? (
-          <button
-            type="button"
-            className="git-toolbar-btn shell-pin-btn no-drag"
-            onClick={onPin}
-            title={t("panel.pin")}
-            aria-label={t("panel.pin")}
-          >
-            <PanelRightOpen size={13} />
-          </button>
-        ) : null}
-
         <button
           type="button"
           className="git-toolbar-btn no-drag"
@@ -638,6 +616,17 @@ export function GitPanel({ mode = "docked", visible = true, onPin }: Props) {
           title={t("panel.moreActions")}
         >
           <MoreHorizontal size={14} />
+        </button>
+
+        <button
+          type="button"
+          className="git-toolbar-btn git-toolbar-btn-hide no-drag"
+          onClick={() => setGitPanelVisible(false)}
+          title={t("panel.collapse")}
+          aria-label={t("panel.collapse")}
+        >
+          <X size={13} />
+          <span className="git-toolbar-btn-label">{t("panel.hide")}</span>
         </button>
       </div>
 
@@ -790,7 +779,6 @@ export function GitPanel({ mode = "docked", visible = true, onPin }: Props) {
           <div
             ref={moreMenuRef}
             className="git-action-menu"
-            data-git-flyout-region={gitFlyoutContext ? "true" : undefined}
             style={{
               position: "fixed",
               top: moreMenuPos.top,
@@ -798,12 +786,6 @@ export function GitPanel({ mode = "docked", visible = true, onPin }: Props) {
                 ? { right: moreMenuPos.right }
                 : { left: moreMenuPos.left }),
             }}
-            onMouseEnter={() => gitFlyoutContext?.openFlyout()}
-            onMouseLeave={() => gitFlyoutContext?.scheduleClose(150)}
-            onFocusCapture={() => gitFlyoutContext?.openFlyout()}
-            onBlurCapture={(event) =>
-              closeGitFlyoutIfFocusLeft(gitFlyoutContext, event.relatedTarget)
-            }
           >
             {isMultiRepoChanges ? (
               <>

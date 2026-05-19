@@ -3,8 +3,8 @@ import { COMMAND_PALETTE_DEFAULT_LAUNCH } from "../lib/commandPalette";
 
 type UiStoreModule = typeof import("./uiStore");
 
-function createStorageStub() {
-  const storage = new Map<string, string>();
+function createStorageStub(initial: Record<string, string> = {}) {
+  const storage = new Map<string, string>(Object.entries(initial));
   return {
     getItem: vi.fn((key: string) => storage.get(key) ?? null),
     setItem: vi.fn((key: string, value: string) => {
@@ -22,29 +22,39 @@ function createStorageStub() {
 describe("uiStore focus mode", () => {
   let useUiStore: UiStoreModule["useUiStore"];
 
-  beforeEach(async () => {
+  async function loadStore(storageState?: Record<string, string>) {
     vi.resetModules();
-    vi.stubGlobal("localStorage", createStorageStub());
+    vi.stubGlobal("localStorage", createStorageStub(storageState));
     ({ useUiStore } = await import("./uiStore"));
+    const initialState = useUiStore.getState();
     useUiStore.setState({
       showSidebar: true,
       sidebarPinned: true,
-      showGitPanel: true,
-      gitPanelPinned: true,
-      showExplorer: true,
-      workspacePaneZoomPercent: 100,
-      focusMode: false,
-      focusModeSnapshot: null,
+      showGitPanel: initialState.showGitPanel,
+      showExplorer: initialState.showExplorer,
+      workspacePaneZoomPercent: initialState.workspacePaneZoomPercent,
+      focusMode: initialState.focusMode,
+      focusModeSnapshot: initialState.focusModeSnapshot,
       activeView: "chat",
       settingsWorkspaceId: null,
       commandPaletteOpen: false,
       commandPaletteLaunch: COMMAND_PALETTE_DEFAULT_LAUNCH,
       messageFocusTarget: null,
     });
+  }
+
+  beforeEach(async () => {
+    await loadStore();
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it("loads persisted git panel visibility", async () => {
+    await loadStore({ "panes:gitPanelVisible": "false" });
+
+    expect(useUiStore.getState().showGitPanel).toBe(false);
   });
 
   it("captures the current shell state and hides the left sidebar on entry", () => {
@@ -79,7 +89,6 @@ describe("uiStore focus mode", () => {
     useUiStore.setState({
       showSidebar: true,
       showGitPanel: false,
-      gitPanelPinned: true,
       focusMode: false,
       focusModeSnapshot: null,
     });
@@ -98,11 +107,29 @@ describe("uiStore focus mode", () => {
     });
   });
 
+  it("persists the restored git panel visibility when leaving focus mode", () => {
+    const storage = globalThis.localStorage as unknown as ReturnType<typeof createStorageStub>;
+
+    useUiStore.setState({
+      showSidebar: true,
+      showGitPanel: false,
+      focusMode: false,
+      focusModeSnapshot: null,
+    });
+
+    const state = useUiStore.getState();
+    state.setFocusMode(true);
+    state.toggleGitPanel();
+    state.setFocusMode(false);
+
+    expect(storage.setItem).toHaveBeenCalledWith("panes:gitPanelVisible", "false");
+    expect(useUiStore.getState().showGitPanel).toBe(false);
+  });
+
   it("does not overwrite the original snapshot on repeated activation", () => {
     useUiStore.setState({
       showSidebar: false,
       showGitPanel: true,
-      gitPanelPinned: false,
       focusMode: false,
       focusModeSnapshot: null,
     });
@@ -117,36 +144,21 @@ describe("uiStore focus mode", () => {
       focusMode: false,
       showSidebar: false,
       showGitPanel: true,
-      gitPanelPinned: false,
       focusModeSnapshot: null,
     });
   });
 
-  it("keeps git pin state separate from visibility toggles", () => {
-    const state = useUiStore.getState();
-
-    state.setGitPanelPinned(false);
-    state.toggleGitPanel();
-    state.toggleGitPanel();
-
-    expect(useUiStore.getState()).toMatchObject({
-      showGitPanel: true,
-      gitPanelPinned: false,
-    });
-  });
-
-  it("persists git pin state changes and forces the panel visible", () => {
+  it("persists explicit git visibility changes", () => {
     const storage = globalThis.localStorage as unknown as ReturnType<typeof createStorageStub>;
     const state = useUiStore.getState();
 
-    useUiStore.setState({ showGitPanel: false, gitPanelPinned: true });
-    state.toggleGitPanelPin();
+    state.setGitPanelVisible(false);
+    expect(storage.setItem).toHaveBeenCalledWith("panes:gitPanelVisible", "false");
+    expect(useUiStore.getState().showGitPanel).toBe(false);
 
-    expect(storage.setItem).toHaveBeenCalledWith("panes:gitPanelPinned", "false");
-    expect(useUiStore.getState()).toMatchObject({
-      showGitPanel: true,
-      gitPanelPinned: false,
-    });
+    state.toggleGitPanel();
+    expect(storage.setItem).toHaveBeenCalledWith("panes:gitPanelVisible", "true");
+    expect(useUiStore.getState().showGitPanel).toBe(true);
   });
 
   it("persists explicit explorer visibility changes", () => {
@@ -183,7 +195,11 @@ describe("uiStore focus mode", () => {
   });
 
   it("opens the command palette with structured launch defaults", () => {
-    useUiStore.getState().openCommandPalette({ variant: "search", initialQuery: "?", searchScope: "threads" });
+    useUiStore.getState().openCommandPalette({
+      variant: "search",
+      initialQuery: "?",
+      searchScope: "threads",
+    });
 
     expect(useUiStore.getState()).toMatchObject({
       commandPaletteOpen: true,

@@ -1358,14 +1358,21 @@ async fn respond_to_approval_inner(
         let approval_id = approval_id.clone();
         let thread_id = thread_id.clone();
         let decision = decision.to_string();
+        let normalized_response = normalized_response.clone();
         move |db| {
-            db::actions::answer_approval(db, &approval_id, &decision)?;
+            db::actions::answer_approval_with_response(
+                db,
+                &approval_id,
+                &decision,
+                Some(&normalized_response),
+            )?;
             if let Some(message_id) = db::actions::find_approval_message_id(db, &approval_id)? {
                 let _ = db::messages::mark_approval_block_answered(
                     db,
                     &message_id,
                     &approval_id,
                     &decision,
+                    Some(&normalized_response),
                 );
             }
             db::threads::update_thread_status(db, &thread_id, ThreadStatusDto::Streaming)?;

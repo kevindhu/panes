@@ -5,7 +5,7 @@ import {
 } from "../lib/commandPalette";
 
 const SIDEBAR_PINNED_KEY = "panes:sidebarPinned";
-const GIT_PANEL_PINNED_KEY = "panes:gitPanelPinned";
+const GIT_PANEL_VISIBLE_KEY = "panes:gitPanelVisible";
 const EXPLORER_OPEN_KEY = "panes:explorerOpen";
 const WORKSPACE_PANE_ZOOM_PERCENT_KEY = "panes:workspacePaneZoomPercent";
 const DEFAULT_WORKSPACE_PANE_ZOOM_PERCENT = 100;
@@ -44,11 +44,18 @@ function persistWorkspacePaneZoomPercent(value: number) {
   }
 }
 
+function persistGitPanelVisible(value: boolean) {
+  try {
+    localStorage.setItem(GIT_PANEL_VISIBLE_KEY, String(value));
+  } catch {
+    // Ignore storage failures in non-browser/test environments.
+  }
+}
+
 interface UiState {
   showSidebar: boolean;
   sidebarPinned: boolean;
   showGitPanel: boolean;
-  gitPanelPinned: boolean;
   showExplorer: boolean;
   workspacePaneZoomPercent: number;
   focusMode: boolean;
@@ -64,8 +71,7 @@ interface UiState {
   toggleSidebarPin: () => void;
   setSidebarPinned: (pinned: boolean) => void;
   toggleGitPanel: () => void;
-  toggleGitPanelPin: () => void;
-  setGitPanelPinned: (pinned: boolean) => void;
+  setGitPanelVisible: (visible: boolean) => void;
   toggleExplorer: () => void;
   setExplorerOpen: (open: boolean) => void;
   setWorkspacePaneZoomPercent: (percent: number) => void;
@@ -88,9 +94,9 @@ const savedPinned = (() => {
   }
 })();
 
-const savedGitPanelPinned = (() => {
+const savedGitPanelVisible = (() => {
   try {
-    return localStorage.getItem(GIT_PANEL_PINNED_KEY);
+    return localStorage.getItem(GIT_PANEL_VISIBLE_KEY);
   } catch {
     return null;
   }
@@ -115,8 +121,7 @@ const savedWorkspacePaneZoomPercent = (() => {
 export const useUiStore = create<UiState>((set) => ({
   showSidebar: true,
   sidebarPinned: savedPinned !== null ? savedPinned === "true" : true,
-  showGitPanel: true,
-  gitPanelPinned: savedGitPanelPinned !== null ? savedGitPanelPinned === "true" : true,
+  showGitPanel: savedGitPanelVisible !== null ? savedGitPanelVisible === "true" : true,
   showExplorer: savedExplorerOpen !== null ? savedExplorerOpen === "true" : true,
   workspacePaneZoomPercent: clampWorkspacePaneZoomPercent(
     savedWorkspacePaneZoomPercent == null
@@ -162,24 +167,15 @@ export const useUiStore = create<UiState>((set) => ({
     }
     set({ sidebarPinned: pinned, showSidebar: true });
   },
-  toggleGitPanel: () => set((state) => ({ showGitPanel: !state.showGitPanel })),
-  toggleGitPanelPin: () =>
+  toggleGitPanel: () =>
     set((state) => {
-      const next = !state.gitPanelPinned;
-      try {
-        localStorage.setItem(GIT_PANEL_PINNED_KEY, String(next));
-      } catch {
-        // Ignore storage failures in non-browser/test environments.
-      }
-      return { gitPanelPinned: next, showGitPanel: true };
+      const next = !state.showGitPanel;
+      persistGitPanelVisible(next);
+      return { showGitPanel: next };
     }),
-  setGitPanelPinned: (pinned) => {
-    try {
-      localStorage.setItem(GIT_PANEL_PINNED_KEY, String(pinned));
-    } catch {
-      // Ignore storage failures in non-browser/test environments.
-    }
-    set({ gitPanelPinned: pinned, showGitPanel: true });
+  setGitPanelVisible: (visible) => {
+    persistGitPanelVisible(visible);
+    set({ showGitPanel: visible });
   },
   toggleExplorer: () =>
     set((state) => {
@@ -259,11 +255,13 @@ export const useUiStore = create<UiState>((set) => ({
       }
 
       const snapshot = state.focusModeSnapshot;
+      const restoredGitPanel = snapshot?.showGitPanel ?? state.showGitPanel;
+      persistGitPanelVisible(restoredGitPanel);
       return {
         focusMode: false,
         focusModeSnapshot: null,
         showSidebar: snapshot?.showSidebar ?? state.showSidebar,
-        showGitPanel: snapshot?.showGitPanel ?? state.showGitPanel,
+        showGitPanel: restoredGitPanel,
       };
     }),
   toggleFocusMode: () =>
@@ -280,11 +278,13 @@ export const useUiStore = create<UiState>((set) => ({
       }
 
       const snapshot = state.focusModeSnapshot;
+      const restoredGitPanel = snapshot?.showGitPanel ?? state.showGitPanel;
+      persistGitPanelVisible(restoredGitPanel);
       return {
         focusMode: false,
         focusModeSnapshot: null,
         showSidebar: snapshot?.showSidebar ?? state.showSidebar,
-        showGitPanel: snapshot?.showGitPanel ?? state.showGitPanel,
+        showGitPanel: restoredGitPanel,
       };
     }),
   setActiveView: (view) => {

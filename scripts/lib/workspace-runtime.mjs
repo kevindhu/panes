@@ -57,10 +57,22 @@ export function withToolchainPath(baseEnv = process.env) {
   return env;
 }
 
+function normalizeExitCode(code) {
+  if (typeof code !== "number") {
+    return null;
+  }
+
+  if (!isWindows) {
+    return code;
+  }
+
+  return code | 0;
+}
+
 export function run(
   command,
   args,
-  { cwd = repoRoot, env = process.env, shell = isWindows } = {},
+  { cwd = repoRoot, env = process.env, shell = false, allowedExitCodes = [] } = {},
 ) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -73,16 +85,27 @@ export function run(
 
     child.on("error", reject);
     child.on("exit", (code, signal) => {
-      if (code === 0) {
+      const normalizedCode = normalizeExitCode(code);
+      const isAllowedExit =
+        normalizedCode === 0 ||
+        allowedExitCodes.includes(normalizedCode) ||
+        (typeof code === "number" && allowedExitCodes.includes(code));
+
+      if (isAllowedExit) {
         resolve();
         return;
       }
+
+      const displayCode =
+        typeof code === "number" && normalizedCode !== null && normalizedCode !== code
+          ? `${normalizedCode} (${code})`
+          : `${normalizedCode ?? code}`;
 
       reject(
         new Error(
           signal
             ? `${command} ${args.join(" ")} exited with signal ${signal}`
-            : `${command} ${args.join(" ")} exited with code ${code}`,
+            : `${command} ${args.join(" ")} exited with code ${displayCode}`,
         ),
       );
     });
@@ -103,23 +126,23 @@ function packageManagerInvocation(env = process.env) {
   const userAgent = env.npm_config_user_agent ?? "";
 
   if (userAgent.startsWith("npm/")) {
-    return { command: "npm", args: ["run"] };
+    return { command: isWindows ? "npm.cmd" : "npm", args: ["run"] };
   }
 
   if (userAgent.startsWith("pnpm/")) {
-    return { command: "pnpm", args: ["run"] };
+    return { command: isWindows ? "pnpm.cmd" : "pnpm", args: ["run"] };
   }
 
   if (userAgent.startsWith("yarn/")) {
-    return { command: "yarn", args: ["run"] };
+    return { command: isWindows ? "yarn.cmd" : "yarn", args: ["run"] };
   }
 
-  return { command: "pnpm", args: ["run"] };
+  return { command: isWindows ? "pnpm.cmd" : "pnpm", args: ["run"] };
 }
 
 export async function runWorkspaceScript(
   scriptName,
-  { args = [], env = withToolchainPath() } = {},
+  { args = [], env = withToolchainPath(), allowedExitCodes = [] } = {},
 ) {
   const invocation = packageManagerInvocation(env);
   const passthroughArgs = args.length > 0 ? ["--", ...args] : [];
@@ -127,6 +150,6 @@ export async function runWorkspaceScript(
   await run(
     invocation.command,
     [...invocation.args, scriptName, ...passthroughArgs],
-    { env },
+    { env, allowedExitCodes },
   );
 }
