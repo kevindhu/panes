@@ -1333,7 +1333,10 @@ pub async fn fork_codex_thread(
         log_branch_profile_step(
             profile_operation_id,
             "backend.fork.command.rejected_non_codex",
-            Some(format!("thread_id={thread_id}; engine_id={}", thread.engine_id)),
+            Some(format!(
+                "thread_id={thread_id}; engine_id={}",
+                thread.engine_id
+            )),
         );
         return Err("native fork is only available for Codex threads".to_string());
     }
@@ -1456,7 +1459,10 @@ pub async fn rollback_codex_thread(
         log_branch_profile_step(
             profile_operation_id,
             "backend.rollback.command.rejected_non_codex",
-            Some(format!("thread_id={thread_id}; engine_id={}", thread.engine_id)),
+            Some(format!(
+                "thread_id={thread_id}; engine_id={}",
+                thread.engine_id
+            )),
         );
         return Err("native rollback is only available for Codex threads".to_string());
     }

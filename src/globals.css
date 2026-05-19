@@ -6674,7 +6674,7 @@ button, input, textarea, select {
 .chat-attachment-chip {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
   padding: 4px 8px;
   border-radius: var(--radius-sm);
   background: var(--bg-3);
@@ -6683,6 +6683,34 @@ button, input, textarea, select {
   color: var(--text-2);
   max-width: 200px;
   animation: fade-in var(--duration-fast) var(--ease-out) both;
+}
+
+.chat-attachment-chip-preview {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.chat-attachment-chip-openable .chat-attachment-chip-preview {
+  cursor: zoom-in;
+}
+
+.chat-attachment-chip-preview[role="button"] {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  margin: 0;
+  padding: 0;
+}
+
+.chat-attachment-chip-preview[role="button"]:focus-visible {
+  outline: 2px solid rgba(9, 105, 218, 0.38);
+  outline-offset: 3px;
+  border-radius: var(--radius-xs);
 }
 
 .chat-attachment-chip-compact {
@@ -6694,6 +6722,11 @@ button, input, textarea, select {
 .chat-attachment-chip-image {
   padding-left: 4px;
   max-width: 260px;
+}
+
+.chat-attachment-chip-openable:hover {
+  border-color: rgba(9, 105, 218, 0.28);
+  box-shadow: 0 8px 20px rgba(9, 105, 218, 0.08);
 }
 
 .chat-attachment-thumbnail {
@@ -6712,6 +6745,11 @@ button, input, textarea, select {
 }
 
 .chat-attachment-chip > svg {
+  flex-shrink: 0;
+  color: var(--text-3);
+}
+
+.chat-attachment-chip-preview > svg {
   flex-shrink: 0;
   color: var(--text-3);
 }
@@ -6749,6 +6787,175 @@ button, input, textarea, select {
 .chat-attachment-chip-remove:hover {
   background: rgba(248, 113, 113, 0.15);
   color: var(--danger);
+}
+
+.chat-image-viewer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1400;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(15, 23, 42, 0.78);
+  backdrop-filter: blur(8px);
+}
+
+.chat-image-viewer-dialog {
+  width: min(1100px, 96vw);
+  max-height: min(88vh, 920px);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background:
+    linear-gradient(180deg, rgba(17, 24, 39, 0.98), rgba(15, 23, 42, 0.98));
+  box-shadow: 0 28px 80px rgba(15, 23, 42, 0.48);
+  padding: 16px;
+  color: rgba(255, 255, 255, 0.92);
+  outline: none;
+}
+
+.chat-image-viewer-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.chat-image-viewer-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.chat-image-viewer-file-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.chat-image-viewer-zoom-label {
+  flex-shrink: 0;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.09);
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 11px;
+  font-family: "JetBrains Mono", monospace;
+}
+
+.chat-image-viewer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.chat-image-viewer-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  color: rgba(255, 255, 255, 0.88);
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    transform var(--duration-fast) var(--ease-out),
+    background var(--duration-fast) var(--ease-out),
+    border-color var(--duration-fast) var(--ease-out);
+}
+
+.chat-image-viewer-action:hover:not(:disabled) {
+  transform: translateY(-1px);
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.chat-image-viewer-action:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.chat-image-viewer-stage {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: min(68vh, 720px);
+  border-radius: 14px;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at top, rgba(59, 130, 246, 0.14), transparent 42%),
+    rgba(2, 6, 23, 0.88);
+  cursor: default;
+}
+
+.chat-image-viewer-stage.is-zoomed {
+  cursor: grab;
+}
+
+.chat-image-viewer-stage.is-dragging {
+  cursor: grabbing;
+}
+
+.chat-image-viewer-image {
+  max-width: min(92vw, 1040px);
+  max-height: min(76vh, 760px);
+  object-fit: contain;
+  user-select: none;
+  transform-origin: center center;
+  transition: transform 120ms ease-out;
+  will-change: transform;
+}
+
+.chat-image-viewer-stage.is-dragging .chat-image-viewer-image {
+  transition: none;
+}
+
+.chat-image-viewer-status {
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 13px;
+}
+
+@media (max-width: 760px) {
+  .chat-image-viewer-backdrop {
+    padding: 12px;
+  }
+
+  .chat-image-viewer-dialog {
+    width: 100%;
+    max-height: 92vh;
+    padding: 12px;
+  }
+
+  .chat-image-viewer-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .chat-image-viewer-actions {
+    justify-content: stretch;
+  }
+
+  .chat-image-viewer-action {
+    justify-content: center;
+  }
+
+  .chat-image-viewer-stage {
+    min-height: 52vh;
+  }
 }
 
 /* ── Plan Mode ─────────────────────────────────────────────────────── */

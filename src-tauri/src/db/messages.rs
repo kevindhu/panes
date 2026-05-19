@@ -1879,13 +1879,9 @@ mod tests {
         )
         .unwrap();
 
-        let cloned = clone_thread_messages_for_branch(
-            &db,
-            &source_thread_id,
-            &target_thread_id,
-            Some(1),
-        )
-        .unwrap();
+        let cloned =
+            clone_thread_messages_for_branch(&db, &source_thread_id, &target_thread_id, Some(1))
+                .unwrap();
         assert_eq!(cloned, 2);
 
         let target_messages = get_thread_messages(&db, &target_thread_id).unwrap();

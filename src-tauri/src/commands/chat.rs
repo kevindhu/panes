@@ -1,9 +1,11 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     path::Path,
     time::{Duration, Instant},
 };
 
+use arboard::{Clipboard, ImageData};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{value::RawValue, Value};
@@ -293,6 +295,35 @@ pub async fn read_attachment_preview(
     }))
 }
 
+#[tauri::command]
+pub async fn copy_attachment_image_to_clipboard(
+    file_path: String,
+    mime_type: Option<String>,
+) -> Result<(), String> {
+    let normalized_file_path = file_path.trim().to_string();
+    if normalized_file_path.is_empty() {
+        return Err("Attachment path is empty.".to_string());
+    }
+
+    let Some(normalized_mime_type) =
+        normalize_image_preview_mime_type(&normalized_file_path, mime_type.as_deref())
+    else {
+        return Err("Attachment is not an image.".to_string());
+    };
+
+    if !supports_native_clipboard_image_copy(&normalized_mime_type) {
+        return Err("Attachment image type does not support native clipboard copy.".to_string());
+    }
+
+    tokio::task::spawn_blocking(move || {
+        copy_attachment_image_to_clipboard_blocking(&normalized_file_path)
+    })
+    .await
+    .map_err(|error| format!("failed to join clipboard image copy task: {error}"))??;
+
+    Ok(())
+}
+
 fn pasted_image_extension(_file_name: &str, mime_type: &str) -> Option<&'static str> {
     match mime_type {
         "image/png" => Some("png"),
@@ -335,6 +366,41 @@ fn image_mime_type_for_extension(extension: &str) -> Option<&'static str> {
         "svg" => Some("image/svg+xml"),
         _ => None,
     }
+}
+
+fn supports_native_clipboard_image_copy(mime_type: &str) -> bool {
+    matches!(
+        mime_type,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp" | "image/tiff"
+    )
+}
+
+fn copy_attachment_image_to_clipboard_blocking(file_path: &str) -> Result<(), String> {
+    let metadata = std::fs::metadata(file_path)
+        .map_err(|error| format!("failed to read attachment metadata: {error}"))?;
+    if !metadata.is_file() {
+        return Err("Attachment path does not point to a file.".to_string());
+    }
+
+    let image = image::ImageReader::open(file_path)
+        .map_err(|error| format!("failed to open attachment image: {error}"))?
+        .with_guessed_format()
+        .map_err(|error| format!("failed to detect attachment image format: {error}"))?
+        .decode()
+        .map_err(|error| format!("failed to decode attachment image: {error}"))?;
+    let rgba = image.into_rgba8();
+    let (width, height) = rgba.dimensions();
+    let bytes = rgba.into_raw();
+
+    let mut clipboard =
+        Clipboard::new().map_err(|error| format!("failed to access clipboard: {error}"))?;
+    clipboard
+        .set_image(ImageData {
+            width: width as usize,
+            height: height as usize,
+            bytes: Cow::Owned(bytes),
+        })
+        .map_err(|error| format!("failed to write attachment image to clipboard: {error}"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -61,6 +61,16 @@
     "opencodeWarning": "O modelo OpenCode selecionado não suporta esse tipo de anexo.",
     "remove": "Remover anexo",
     "pasteFailed": "Falha ao anexar a imagem colada.",
+    "viewer": {
+      "open": "Abrir imagem",
+      "copy": "Copiar imagem",
+      "copySuccess": "Imagem copiada para a area de transferencia.",
+      "copyFailed": "Falha ao copiar a imagem.",
+      "resetZoom": "Redefinir zoom",
+      "close": "Fechar visualizador",
+      "loading": "Carregando imagem...",
+      "loadFailed": "Nao foi possivel carregar esta imagem."
+    },
     "filters": {
       "supportedFiles": "Arquivos compatíveis",
       "images": "Imagens",

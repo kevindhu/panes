@@ -127,6 +127,17 @@ async function archiveLinuxSdkNodeModules() {
   console.log("Archived Claude SDK node_modules for Linux runtime staging.");
 }
 
+async function pruneNodeModulesMetadata() {
+  await Promise.all(
+    [".pnpm", ".ignored"].map(async (entry) => {
+      await rm(path.join(sdkDistNodeModulesDir, entry), {
+        recursive: true,
+        force: true,
+      });
+    }),
+  );
+}
+
 await rm(outDir, { recursive: true, force: true });
 await mkdir(outDir, { recursive: true });
 
@@ -140,6 +151,7 @@ await cp(sdkPackageDir, sdkDistNodeModulesDir, {
   force: true,
 });
 
+await pruneNodeModulesMetadata();
 await pruneUnusedRipgrepVendors();
 await archiveLinuxSdkNodeModules();
 

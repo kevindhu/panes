@@ -61,6 +61,16 @@
     "opencodeWarning": "The selected OpenCode model does not support that attachment type.",
     "remove": "Remove attachment",
     "pasteFailed": "Failed to attach pasted image.",
+    "viewer": {
+      "open": "Open image",
+      "copy": "Copy image",
+      "copySuccess": "Image copied to clipboard.",
+      "copyFailed": "Failed to copy image.",
+      "resetZoom": "Reset zoom",
+      "close": "Close viewer",
+      "loading": "Loading image...",
+      "loadFailed": "Unable to load this image."
+    },
     "filters": {
       "supportedFiles": "Supported files",
       "images": "Images",

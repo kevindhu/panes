@@ -373,6 +373,11 @@ export const ipc = {
       filePath,
       mimeType: mimeType ?? null,
     }),
+  copyAttachmentImageToClipboard: (filePath: string, mimeType?: string | null) =>
+    invoke<void>("copy_attachment_image_to_clipboard", {
+      filePath,
+      mimeType: mimeType ?? null,
+    }),
   sendMessage: (
     threadId: string,
     message: string,

@@ -1,6 +1,21 @@
-import { useEffect, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 import { File, FileText, Image, X } from "lucide-react";
-import { ipc } from "../../lib/ipc";
+import { useTranslation } from "react-i18next";
+import {
+  getAttachmentImageSources,
+  getAttachmentOriginalImageSrc,
+  isImageAttachmentMimeType,
+  loadAttachmentPreviewDataUrl,
+  resolveAttachmentImageMimeType,
+} from "../../lib/attachmentImages";
+import { ImageAttachmentViewer } from "./ImageAttachmentViewer";
 
 interface AttachmentChipData {
   fileName: string;
@@ -24,6 +39,31 @@ function getFileExtension(fileName: string): string {
 
 function guessAttachmentMimeType(fileName: string): string | undefined {
   switch (getFileExtension(fileName)) {
+    case "txt":
+      return "text/plain";
+    case "md":
+      return "text/markdown";
+    case "json":
+      return "application/json";
+    case "js":
+      return "text/javascript";
+    case "ts":
+    case "tsx":
+      return "text/typescript";
+    case "jsx":
+      return "text/javascript";
+    case "py":
+      return "text/x-python";
+    case "rs":
+      return "text/x-rust";
+    case "go":
+      return "text/x-go";
+    case "css":
+      return "text/css";
+    case "html":
+      return "text/html";
+    case "svg":
+      return "image/svg+xml";
     case "png":
       return "image/png";
     case "jpg":
@@ -35,11 +75,21 @@ function guessAttachmentMimeType(fileName: string): string | undefined {
       return "image/webp";
     case "bmp":
       return "image/bmp";
-    case "tif":
-    case "tiff":
-      return "image/tiff";
-    case "svg":
-      return "image/svg+xml";
+    case "pdf":
+      return "application/pdf";
+    case "yaml":
+    case "yml":
+      return "text/yaml";
+    case "toml":
+      return "text/toml";
+    case "xml":
+      return "text/xml";
+    case "sql":
+      return "text/x-sql";
+    case "sh":
+      return "text/x-shellscript";
+    case "csv":
+      return "text/csv";
     default:
       return undefined;
   }
@@ -47,14 +97,14 @@ function guessAttachmentMimeType(fileName: string): string | undefined {
 
 function getEffectiveMimeType(attachment: AttachmentChipData): string | undefined {
   const guessedMimeType = guessAttachmentMimeType(attachment.fileName);
-  if (isImageAttachment(guessedMimeType) && !isImageAttachment(attachment.mimeType)) {
-    return guessedMimeType;
+  const resolvedImageMimeType = resolveAttachmentImageMimeType(
+    attachment.fileName,
+    attachment.mimeType,
+  );
+  if (isImageAttachmentMimeType(resolvedImageMimeType)) {
+    return resolvedImageMimeType;
   }
-  return attachment.mimeType || guessedMimeType;
-}
-
-function isImageAttachment(mimeType?: string): boolean {
-  return Boolean(mimeType?.toLowerCase().startsWith("image/"));
+  return attachment.mimeType ?? guessedMimeType;
 }
 
 function getAttachmentIcon(mimeType?: string) {
@@ -79,66 +129,172 @@ export function AttachmentChip({
   removeLabel,
   onRemove,
 }: AttachmentChipProps) {
+  const { t } = useTranslation("chat");
   const effectiveMimeType = getEffectiveMimeType(attachment);
-  const [thumbnailSrc, setThumbnailSrc] = useState<string | null>(null);
-  const [thumbnailFailed, setThumbnailFailed] = useState(false);
+  const [previewSrc, setPreviewSrc] = useState<string | null>(null);
+  const [sourceState, setSourceState] = useState<"preferred" | "fallback" | "failed">("preferred");
+  const [viewerOpen, setViewerOpen] = useState(false);
+  const previewRequestRef = useRef<Promise<string | null> | null>(null);
+  const previewRequestTokenRef = useRef(0);
+  const isImageAttachment = isImageAttachmentMimeType(effectiveMimeType);
+  const originalImageSrc = useMemo(
+    () => (isImageAttachment ? getAttachmentOriginalImageSrc(attachment.filePath) : null),
+    [attachment.filePath, isImageAttachment],
+  );
+  const { primarySrc, fallbackSrc } = useMemo(
+    () => getAttachmentImageSources(originalImageSrc, previewSrc),
+    [originalImageSrc, previewSrc],
+  );
+  const thumbnailSrc = sourceState === "preferred"
+    ? primarySrc
+    : sourceState === "fallback"
+      ? fallbackSrc
+      : null;
+
+  useEffect(() => {
+    previewRequestTokenRef.current += 1;
+    previewRequestRef.current = null;
+    setPreviewSrc(null);
+    setSourceState("preferred");
+  }, [attachment.filePath, effectiveMimeType, isImageAttachment]);
+
+  const requestPreview = useCallback(async (): Promise<string | null> => {
+    if (!isImageAttachment || !attachment.filePath) {
+      return null;
+    }
+    if (previewSrc) {
+      return previewSrc;
+    }
+    if (!previewRequestRef.current) {
+      const requestToken = previewRequestTokenRef.current;
+      previewRequestRef.current = loadAttachmentPreviewDataUrl(
+        attachment.filePath,
+        effectiveMimeType,
+      )
+        .then((nextPreviewSrc) => {
+          if (previewRequestTokenRef.current === requestToken && nextPreviewSrc) {
+            setPreviewSrc(nextPreviewSrc);
+          }
+          return nextPreviewSrc;
+        })
+        .finally(() => {
+          if (previewRequestTokenRef.current === requestToken) {
+            previewRequestRef.current = null;
+          }
+        });
+    }
+
+    return previewRequestRef.current;
+  }, [attachment.filePath, effectiveMimeType, isImageAttachment, previewSrc]);
 
   useEffect(() => {
     let cancelled = false;
-    setThumbnailSrc(null);
-    setThumbnailFailed(false);
 
-    if (!isImageAttachment(effectiveMimeType) || !attachment.filePath) {
+    if (!isImageAttachment || originalImageSrc) {
       return () => {
         cancelled = true;
       };
     }
 
-    ipc.readAttachmentPreview(attachment.filePath, effectiveMimeType)
-      .then((preview) => {
-        if (cancelled || !preview) {
-          return;
+    void requestPreview()
+      .then((nextPreviewSrc) => {
+        if (!cancelled && !nextPreviewSrc) {
+          setSourceState("failed");
         }
-        setThumbnailSrc(`data:${preview.mimeType};base64,${preview.dataBase64}`);
       })
       .catch(() => {
         if (!cancelled) {
-          setThumbnailFailed(true);
+          setSourceState("failed");
         }
       });
 
     return () => {
       cancelled = true;
     };
-  }, [attachment.filePath, effectiveMimeType]);
+  }, [isImageAttachment, originalImageSrc, requestPreview]);
 
   const IconComponent = getAttachmentIcon(effectiveMimeType);
   const sizeBytes = attachment.sizeBytes ?? 0;
+  const interactive = isImageAttachment;
   const className = [
     "chat-attachment-chip",
     compact ? "chat-attachment-chip-compact" : "",
-    thumbnailSrc && !thumbnailFailed ? "chat-attachment-chip-image" : "",
+    thumbnailSrc ? "chat-attachment-chip-image" : "",
+    interactive ? "chat-attachment-chip-openable" : "",
   ]
     .filter(Boolean)
     .join(" ");
 
+  function openViewer() {
+    if (!interactive) {
+      return;
+    }
+    setViewerOpen(true);
+  }
+
+  function handlePreviewKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (!interactive) {
+      return;
+    }
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      openViewer();
+    }
+  }
+
+  function handleThumbnailError() {
+    if (sourceState === "preferred" && fallbackSrc) {
+      setSourceState("fallback");
+      return;
+    }
+
+    if (sourceState === "preferred") {
+      void requestPreview()
+        .then((nextPreviewSrc) => {
+          if (nextPreviewSrc) {
+            setSourceState(originalImageSrc ? "fallback" : "preferred");
+            return;
+          }
+          setSourceState("failed");
+        })
+        .catch(() => {
+          setSourceState("failed");
+        });
+      return;
+    }
+
+    setSourceState("failed");
+  }
+
   return (
     <div className={className}>
-      {thumbnailSrc && !thumbnailFailed ? (
-        <img
-          src={thumbnailSrc}
-          alt=""
-          className="chat-attachment-thumbnail"
-          draggable={false}
-          onError={() => setThumbnailFailed(true)}
-        />
-      ) : (
-        <IconComponent size={compact ? 10 : 12} />
-      )}
-      <span className="chat-attachment-chip-name">{attachment.fileName}</span>
-      {showSize && sizeBytes > 0 && (
-        <span className="chat-attachment-chip-size">{formatFileSize(sizeBytes)}</span>
-      )}
+      <div
+        className="chat-attachment-chip-preview"
+        role={interactive ? "button" : undefined}
+        tabIndex={interactive ? 0 : undefined}
+        onClick={interactive ? openViewer : undefined}
+        onKeyDown={interactive ? handlePreviewKeyDown : undefined}
+        title={interactive ? t("attachments.viewer.open") : undefined}
+        aria-label={interactive ? t("attachments.viewer.open") : undefined}
+      >
+        {thumbnailSrc ? (
+          <img
+            src={thumbnailSrc}
+            alt=""
+            className="chat-attachment-thumbnail"
+            draggable={false}
+            loading="lazy"
+            decoding="async"
+            onError={handleThumbnailError}
+          />
+        ) : (
+          <IconComponent size={compact ? 10 : 12} />
+        )}
+        <span className="chat-attachment-chip-name">{attachment.fileName}</span>
+        {showSize && sizeBytes > 0 && (
+          <span className="chat-attachment-chip-size">{formatFileSize(sizeBytes)}</span>
+        )}
+      </div>
       {onRemove && (
         <button
           type="button"
@@ -149,6 +305,18 @@ export function AttachmentChip({
         >
           <X size={10} />
         </button>
+      )}
+      {interactive && (
+        <ImageAttachmentViewer
+          open={viewerOpen}
+          filePath={attachment.filePath}
+          fileName={attachment.fileName}
+          mimeType={effectiveMimeType}
+          originalSrc={originalImageSrc}
+          previewSrc={previewSrc}
+          requestPreview={requestPreview}
+          onClose={() => setViewerOpen(false)}
+        />
       )}
     </div>
   );
