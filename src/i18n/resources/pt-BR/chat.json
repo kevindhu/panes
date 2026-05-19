@@ -356,9 +356,14 @@
     "messageActions": {
       "copy": "Copiar mensagem",
       "edit": "Editar mensagem",
+      "rollback": "Fazer rollback da mensagem",
       "save": "Salvar e ramificar",
+      "saveRollback": "Salvar e fazer rollback",
       "cancel": "Cancelar",
-      "branching": "Ramificando..."
+      "branching": "Ramificando...",
+      "rollingBack": "Fazendo rollback...",
+      "rollbackWarning_one": "Isso rebobina a thread atual e remove o ultimo {{count}} turno antes de reenviar sua mensagem editada. Isso nao desfaz mudancas no sistema de arquivos.",
+      "rollbackWarning_other": "Isso rebobina a thread atual e remove os ultimos {{count}} turnos antes de reenviar sua mensagem editada. Isso nao desfaz mudancas no sistema de arquivos."
     },
     "placeholders": {
       "plan": "Descreva o que você quer planejar...",
@@ -410,6 +415,9 @@
       "codexThreadEditFailed": "Falha ao ramificar a partir da mensagem de usuário selecionada.",
       "codexThreadEditFailedWithError": "Falha ao ramificar a partir da mensagem de usuário selecionada: {{error}}",
       "codexThreadCompactFailed": "Falha ao iniciar a compactação da thread do Codex.",
+      "codexThreadRollbackEditFailed": "Falha ao fazer rollback da thread atual a partir da mensagem de usuario selecionada.",
+      "codexThreadRollbackEditFailedWithError": "Falha ao fazer rollback da thread atual a partir da mensagem de usuario selecionada: {{error}}",
+      "codexThreadRollbackEditIncomplete": "A thread atual sofreu rollback, mas houve falha ao enviar a mensagem editada. A thread permanece rebobinada.",
       "codexThreadResumeUnavailable": "Selecione um workspace e um modelo do Codex antes de retomar uma thread remota.",
       "codexThreadResumeFailed": "Falha ao anexar a thread do Codex selecionada.",
       "openCodeSessionResumeUnavailable": "Selecione um workspace e um modelo do OpenCode antes de retomar uma sessão remota.",

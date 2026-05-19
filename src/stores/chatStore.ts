@@ -33,7 +33,12 @@ interface ChatState {
   usageLimits: ContextUsage | null;
   error?: string;
   unlisten?: () => void;
-  setActiveThread: (threadId: string | null) => Promise<void>;
+  setActiveThread: (
+    threadId: string | null,
+    options?: {
+      forceReload?: boolean;
+    },
+  ) => Promise<void>;
   loadOlderMessages: () => Promise<void>;
   send: (
     message: string,
@@ -1590,10 +1595,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
   status: "idle",
   streaming: false,
   usageLimits: null,
-  setActiveThread: async (threadId) => {
+  setActiveThread: async (threadId, options) => {
     const currentThreadId = get().threadId;
     const currentUnlisten = get().unlisten;
-    if (threadId && threadId === currentThreadId && currentUnlisten) {
+    if (threadId && threadId === currentThreadId && currentUnlisten && !options?.forceReload) {
       return;
     }
 

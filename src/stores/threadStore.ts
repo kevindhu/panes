@@ -52,6 +52,11 @@ interface ThreadState {
     numTurns: number,
     profileOperationId?: string | null,
   ) => Promise<Thread | null>;
+  rollbackCodexThreadInPlace: (
+    threadId: string,
+    numTurns: number,
+    profileOperationId?: string | null,
+  ) => Promise<Thread | null>;
   compactCodexThread: (threadId: string) => Promise<Thread | null>;
   attachCodexRemoteThread: (
     workspaceId: string,
@@ -518,6 +523,40 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
           threadsByWorkspace,
           threads: flattenThreadsByWorkspace(threadsByWorkspace),
           activeThreadId: rolledBack.id,
+          loading: false,
+        };
+      });
+      return rolledBack;
+    } catch (error) {
+      set({ loading: false, error: String(error) });
+      return null;
+    }
+  },
+  rollbackCodexThreadInPlace: async (threadId, numTurns, profileOperationId) => {
+    set({ loading: true, error: undefined });
+    try {
+      const rolledBack = await ipc.rollbackCodexThreadInPlace(
+        threadId,
+        numTurns,
+        profileOperationId ?? null,
+      );
+      localStorage.setItem(LAST_THREAD_KEY, rolledBack.id);
+      set((state) => {
+        const workspaceId = rolledBack.workspaceId;
+        const workspaceThreads = state.threadsByWorkspace[workspaceId] ?? [];
+        const nextWorkspaceThreads = workspaceThreads.map((thread) =>
+          thread.id === rolledBack.id ? rolledBack : thread,
+        );
+        const threadsByWorkspace = mergeWorkspaceThreads(
+          state.threadsByWorkspace,
+          workspaceId,
+          nextWorkspaceThreads,
+        );
+
+        return {
+          threadsByWorkspace,
+          threads: flattenThreadsByWorkspace(threadsByWorkspace),
+          activeThreadId: state.activeThreadId === rolledBack.id ? rolledBack.id : state.activeThreadId,
           loading: false,
         };
       });

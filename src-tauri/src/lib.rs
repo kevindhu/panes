@@ -300,6 +300,7 @@ pub fn run() {
             commands::threads::append_branch_profile_log,
             commands::threads::fork_codex_thread,
             commands::threads::rollback_codex_thread,
+            commands::threads::rollback_codex_thread_in_place,
             commands::threads::compact_codex_thread,
             commands::threads::delete_thread,
             commands::terminal::terminal_create_session,

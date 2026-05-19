@@ -349,6 +349,16 @@ export const ipc = {
       numTurns,
       profileOperationId: profileOperationId ?? null,
     }),
+  rollbackCodexThreadInPlace: (
+    threadId: string,
+    numTurns: number,
+    profileOperationId?: string | null,
+  ) =>
+    invoke<Thread>("rollback_codex_thread_in_place", {
+      threadId,
+      numTurns,
+      profileOperationId: profileOperationId ?? null,
+    }),
   compactCodexThread: (threadId: string) =>
     invoke<Thread>("compact_codex_thread", { threadId }),
   deleteThread: (threadId: string) => invoke<void>("delete_thread", { threadId }),

@@ -1588,6 +1588,133 @@ pub async fn rollback_codex_thread(
 }
 
 #[tauri::command]
+pub async fn rollback_codex_thread_in_place(
+    state: State<'_, AppState>,
+    thread_id: String,
+    num_turns: u32,
+    profile_operation_id: Option<String>,
+) -> Result<ThreadDto, String> {
+    let profile_operation_id = profile_operation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let total_started_at = Instant::now();
+    log_branch_profile_step(
+        profile_operation_id,
+        "backend.rollback_in_place.command.start",
+        Some(format!("thread_id={thread_id}; num_turns={num_turns}")),
+    );
+    if num_turns == 0 {
+        log_branch_profile_step(
+            profile_operation_id,
+            "backend.rollback_in_place.command.rejected_zero_turns",
+            Some(format!("thread_id={thread_id}")),
+        );
+        return Err("rollback requires at least one turn".to_string());
+    }
+    if state.turns.get(&thread_id).await.is_some() {
+        log_branch_profile_step(
+            profile_operation_id,
+            "backend.rollback_in_place.command.rejected_active_turn",
+            Some(format!("thread_id={thread_id}")),
+        );
+        return Err("cannot rollback a thread while a turn is still active".to_string());
+    }
+
+    let load_thread_started_at = Instant::now();
+    let db = state.db.clone();
+    let thread = run_db(db.clone(), {
+        let thread_id = thread_id.clone();
+        move |db| db::threads::get_thread(db, &thread_id)
+    })
+    .await?
+    .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+    log_branch_profile_step(
+        profile_operation_id,
+        "backend.rollback_in_place.load_thread.done",
+        Some(format!(
+            "elapsed_ms={}; engine_id={}; has_engine_thread_id={}",
+            format_elapsed_ms(load_thread_started_at),
+            thread.engine_id,
+            thread.engine_thread_id.is_some()
+        )),
+    );
+
+    if thread.engine_id != "codex" {
+        log_branch_profile_step(
+            profile_operation_id,
+            "backend.rollback_in_place.command.rejected_non_codex",
+            Some(format!(
+                "thread_id={thread_id}; engine_id={}",
+                thread.engine_id
+            )),
+        );
+        return Err("native rollback is only available for Codex threads".to_string());
+    }
+    if !codex_transcript_imported(thread.engine_metadata.as_ref()) {
+        log_branch_profile_step(
+            profile_operation_id,
+            "backend.rollback_in_place.command.rejected_transcript_unimported",
+            Some(format!("thread_id={thread_id}")),
+        );
+        return Err(
+            "native Codex rollback requires a locally mirrored transcript. Attach the remote thread again or wait for transcript sync before retrying."
+                .to_string(),
+        );
+    }
+    if is_codex_thread_sync_required(thread.engine_metadata.as_ref()) {
+        log_branch_profile_step(
+            profile_operation_id,
+            "backend.rollback_in_place.command.rejected_sync_required",
+            Some(format!("thread_id={thread_id}")),
+        );
+        return Err(
+            "native Codex rollback is unavailable while this thread still requires sync from the remote transcript."
+                .to_string(),
+        );
+    }
+
+    let engine_thread_id = thread
+        .engine_thread_id
+        .clone()
+        .ok_or_else(|| "Codex thread has not been initialized yet".to_string())?;
+    let remote_rollback_started_at = Instant::now();
+    let rollback_snapshot = state
+        .engines
+        .rollback_codex_thread(&engine_thread_id, num_turns)
+        .await
+        .map_err(err_to_string)?;
+    log_branch_profile_step(
+        profile_operation_id,
+        "backend.rollback_in_place.remote_rollback.done",
+        Some(format!(
+            "elapsed_ms={}; engine_thread_id={}",
+            format_elapsed_ms(remote_rollback_started_at),
+            engine_thread_id
+        )),
+    );
+
+    let persist_started_at = Instant::now();
+    let updated = run_db(db, {
+        let thread = thread.clone();
+        let rollback_snapshot = rollback_snapshot.clone();
+        move |db| persist_codex_in_place_rollback(db, &thread, &rollback_snapshot, num_turns)
+    })
+    .await?;
+    log_branch_profile_step(
+        profile_operation_id,
+        "backend.rollback_in_place.db_persist.done",
+        Some(format!(
+            "elapsed_ms={}; thread_id={}; total_elapsed_ms={}",
+            format_elapsed_ms(persist_started_at),
+            updated.id,
+            format_elapsed_ms(total_started_at)
+        )),
+    );
+    Ok(updated)
+}
+
+#[tauri::command]
 pub async fn compact_codex_thread(
     state: State<'_, AppState>,
     thread_id: String,
@@ -2383,6 +2510,41 @@ fn is_codex_thread_sync_required(metadata: Option<&Value>) -> bool {
         .and_then(|value| value.get("codexSyncRequired"))
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+fn persist_codex_in_place_rollback(
+    db: &crate::db::Database,
+    thread: &ThreadDto,
+    rollback_snapshot: &ThreadSyncSnapshot,
+    num_turns: u32,
+) -> anyhow::Result<ThreadDto> {
+    db::messages::drop_last_turns(db, &thread.id, num_turns)?;
+    db::threads::refresh_thread_message_stats(db, &thread.id)?;
+
+    let metadata = mark_codex_transcript_imported(
+        merge_codex_runtime_metadata(
+            thread.engine_metadata.clone(),
+            rollback_snapshot.raw_status.as_deref(),
+            &rollback_snapshot.active_flags,
+            rollback_snapshot.preview.as_deref(),
+            false,
+            None,
+        ),
+        true,
+    );
+    let next_status = map_codex_thread_status_to_local(
+        rollback_snapshot.raw_status.as_deref(),
+        &rollback_snapshot.active_flags,
+        false,
+    );
+
+    db::threads::update_thread_runtime_snapshot(
+        db,
+        &thread.id,
+        rollback_snapshot.title.as_deref(),
+        next_status,
+        Some(&metadata),
+    )
 }
 
 fn should_clone_local_branch_history(source_thread: &ThreadDto) -> bool {
@@ -3617,6 +3779,113 @@ mod tests {
         .expect_err("expected branch creation to reject missing local transcript");
 
         assert!(error.contains("locally mirrored transcript"));
+    }
+
+    #[test]
+    fn persist_codex_in_place_rollback_trims_local_history_and_updates_metadata() {
+        let state = test_app_state();
+        let thread = test_thread(&state, "codex", "gpt-5.4");
+
+        db::messages::replace_thread_messages(
+            &state.db,
+            &thread.id,
+            &[
+                db::messages::ImportedMessageRecord {
+                    role: "user".to_string(),
+                    content: Some("First".to_string()),
+                    blocks: json!([{ "type": "text", "content": "First" }]),
+                    status: MessageStatusDto::Completed,
+                    turn_engine_id: Some("codex".to_string()),
+                    turn_model_id: Some("gpt-5.4".to_string()),
+                    turn_reasoning_effort: None,
+                    token_input: 1,
+                    token_output: 0,
+                    created_at: Some("2026-03-13 00:00:00.000".to_string()),
+                },
+                db::messages::ImportedMessageRecord {
+                    role: "assistant".to_string(),
+                    content: Some("Reply 1".to_string()),
+                    blocks: json!([{ "type": "text", "content": "Reply 1" }]),
+                    status: MessageStatusDto::Completed,
+                    turn_engine_id: Some("codex".to_string()),
+                    turn_model_id: Some("gpt-5.4".to_string()),
+                    turn_reasoning_effort: None,
+                    token_input: 0,
+                    token_output: 1,
+                    created_at: Some("2026-03-13 00:00:01.000".to_string()),
+                },
+                db::messages::ImportedMessageRecord {
+                    role: "user".to_string(),
+                    content: Some("Second".to_string()),
+                    blocks: json!([{ "type": "text", "content": "Second" }]),
+                    status: MessageStatusDto::Completed,
+                    turn_engine_id: Some("codex".to_string()),
+                    turn_model_id: Some("gpt-5.4".to_string()),
+                    turn_reasoning_effort: None,
+                    token_input: 1,
+                    token_output: 0,
+                    created_at: Some("2026-03-13 00:00:02.000".to_string()),
+                },
+                db::messages::ImportedMessageRecord {
+                    role: "assistant".to_string(),
+                    content: Some("Reply 2".to_string()),
+                    blocks: json!([{ "type": "text", "content": "Reply 2" }]),
+                    status: MessageStatusDto::Completed,
+                    turn_engine_id: Some("codex".to_string()),
+                    turn_model_id: Some("gpt-5.4".to_string()),
+                    turn_reasoning_effort: None,
+                    token_input: 0,
+                    token_output: 1,
+                    created_at: Some("2026-03-13 00:00:03.000".to_string()),
+                },
+            ],
+        )
+        .expect("expected thread messages to be inserted");
+        db::threads::refresh_thread_message_stats(&state.db, &thread.id)
+            .expect("expected thread stats to refresh");
+
+        let updated = persist_codex_in_place_rollback(
+            &state.db,
+            &thread,
+            &ThreadSyncSnapshot {
+                title: Some("Rolled back".to_string()),
+                preview: Some("First".to_string()),
+                raw_status: Some("idle".to_string()),
+                active_flags: Vec::new(),
+                imported_messages: Vec::new(),
+            },
+            1,
+        )
+        .expect("expected rollback persistence to succeed");
+
+        let messages =
+            db::messages::get_thread_messages(&state.db, &thread.id).expect("expected messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content.as_deref(), Some("First"));
+        assert_eq!(messages[1].content.as_deref(), Some("Reply 1"));
+        assert_eq!(updated.message_count, 2);
+        assert_eq!(updated.title, "Rolled back");
+        assert_eq!(
+            updated
+                .engine_metadata
+                .as_ref()
+                .and_then(|value| value.get("codexTranscriptImported")),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            updated
+                .engine_metadata
+                .as_ref()
+                .and_then(|value| value.get("codexPreview")),
+            Some(&json!("First"))
+        );
+        assert_eq!(
+            updated
+                .engine_metadata
+                .as_ref()
+                .and_then(|value| value.get("codexSyncRequired")),
+            Some(&json!(false))
+        );
     }
 
     #[test]

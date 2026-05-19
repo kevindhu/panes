@@ -129,6 +129,52 @@ describe("chatStore send", () => {
     expect(state.messages).toEqual([]);
   });
 
+  it("reloads the current thread when forceReload is requested", async () => {
+    const firstUnlisten = vi.fn();
+    const secondUnlisten = vi.fn();
+    mockListenThreadEvents
+      .mockResolvedValueOnce(firstUnlisten)
+      .mockResolvedValueOnce(secondUnlisten);
+    mockIpc.getThreadMessagesWindow
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            id: "message-1",
+            threadId: "thread-1",
+            role: "user",
+            content: "before",
+            blocks: [{ type: "text", content: "before" }],
+            status: "completed",
+            schemaVersion: 1,
+            createdAt: new Date().toISOString(),
+          },
+        ],
+        nextCursor: null,
+      })
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            id: "message-2",
+            threadId: "thread-1",
+            role: "user",
+            content: "after",
+            blocks: [{ type: "text", content: "after" }],
+            status: "completed",
+            schemaVersion: 1,
+            createdAt: new Date().toISOString(),
+          },
+        ],
+        nextCursor: null,
+      });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+    await useChatStore.getState().setActiveThread("thread-1", { forceReload: true });
+
+    expect(firstUnlisten).toHaveBeenCalledTimes(1);
+    expect(mockIpc.getThreadMessagesWindow).toHaveBeenCalledTimes(2);
+    expect(useChatStore.getState().messages[0]?.id).toBe("message-2");
+  });
+
   it("routes streamed content to the matching optimistic assistant via clientTurnId", async () => {
     vi.useFakeTimers();
 
