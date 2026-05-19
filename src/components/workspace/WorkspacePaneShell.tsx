@@ -87,6 +87,38 @@ function focusedSurfaceKind(layoutRoot: WorkspacePaneNode, focusedLeafId: string
 type DropPlacement = "left" | "right" | "top" | "bottom";
 const PANE_LEAF_SELECTOR = "[data-workspace-pane-leaf-id]";
 const SURFACE_DRAG_THRESHOLD_PX = 5;
+const LEAF_FOCUS_CLICK_THRESHOLD_PX = 4;
+
+interface LeafFocusGesture {
+  startX: number;
+  startY: number;
+}
+
+export function hasMeaningfulTextSelection(selection: Selection | null | undefined): boolean {
+  return Boolean(selection && !selection.isCollapsed && selection.toString().trim().length > 0);
+}
+
+export function shouldFocusLeafFromMouseGesture({
+  startX,
+  startY,
+  endX,
+  endY,
+  selection,
+  thresholdPx = LEAF_FOCUS_CLICK_THRESHOLD_PX,
+}: {
+  startX: number;
+  startY: number;
+  endX: number;
+  endY: number;
+  selection?: Selection | null;
+  thresholdPx?: number;
+}): boolean {
+  if (hasMeaningfulTextSelection(selection)) {
+    return false;
+  }
+
+  return Math.hypot(endX - startX, endY - startY) <= thresholdPx;
+}
 
 function directionForDropPlacement(placement: DropPlacement): WorkspacePaneSplitDirection {
   return placement === "left" || placement === "right" ? "vertical" : "horizontal";
@@ -832,6 +864,7 @@ function PaneLeafView({
   const { t } = useTranslation("app");
   const focusLeaf = useWorkspacePaneStore((state) => state.focusLeaf);
   const closeLeaf = useWorkspacePaneStore((state) => state.closeLeaf);
+  const focusGestureRef = useRef<LeafFocusGesture | null>(null);
   const activeTab = getWorkspacePaneActiveTab(leaf);
   const activeSurfaceKind = activeTab?.kind ?? null;
   const showSnapPreview =
@@ -840,13 +873,47 @@ function PaneLeafView({
     surfaceDrag.placement !== null &&
     surfaceDrag.kind !== activeSurfaceKind;
 
+  const handleMouseDownCapture = useCallback((event: ReactMouseEvent<HTMLElement>) => {
+    if (event.button !== 0) {
+      focusGestureRef.current = null;
+      return;
+    }
+    focusGestureRef.current = {
+      startX: event.clientX,
+      startY: event.clientY,
+    };
+  }, []);
+
+  const handleMouseUpCapture = useCallback((event: ReactMouseEvent<HTMLElement>) => {
+    const gesture = focusGestureRef.current;
+    focusGestureRef.current = null;
+    if (event.button !== 0 || !gesture) {
+      return;
+    }
+
+    // Focus on completed clicks, not on drag gestures, so browser text selection
+    // can establish first without a capture-phase rerender interrupting it.
+    if (!shouldFocusLeafFromMouseGesture({
+      startX: gesture.startX,
+      startY: gesture.startY,
+      endX: event.clientX,
+      endY: event.clientY,
+      selection: globalThis.getSelection?.(),
+    })) {
+      return;
+    }
+
+    focusLeaf(workspaceId, leaf.id);
+  }, [focusLeaf, leaf.id, workspaceId]);
+
   return (
     <section
       className={`workspace-pane-leaf${focused ? " workspace-pane-leaf-focused" : ""}${
         leafCount > 1 ? " workspace-pane-leaf-has-close" : ""
       }`}
       data-workspace-pane-leaf-id={leaf.id}
-      onMouseDownCapture={() => focusLeaf(workspaceId, leaf.id)}
+      onMouseDownCapture={handleMouseDownCapture}
+      onMouseUpCapture={handleMouseUpCapture}
     >
       {leafCount > 1 && (
         <button

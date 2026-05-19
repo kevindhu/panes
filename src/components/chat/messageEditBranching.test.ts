@@ -4,6 +4,8 @@ import {
   computeRollbackTurnsForEditedMessage,
   extractEditableMessageContext,
   isEditableUserTurn,
+  mergeUniqueChatAttachments,
+  removeChatAttachmentById,
 } from "./messageEditBranching";
 
 function createUserMessage(
@@ -122,5 +124,59 @@ describe("messageEditBranching", () => {
       ],
       planMode: true,
     });
+  });
+
+  it("merges attachments by file path without duplicates", () => {
+    const current = [
+      {
+        id: "existing",
+        fileName: "before.png",
+        filePath: "/workspace/before.png",
+        sizeBytes: 10,
+        mimeType: "image/png",
+      },
+    ];
+    const incoming = [
+      {
+        id: "duplicate",
+        fileName: "before.png",
+        filePath: "/workspace/before.png",
+        sizeBytes: 10,
+        mimeType: "image/png",
+      },
+      {
+        id: "new",
+        fileName: "after.png",
+        filePath: "/workspace/after.png",
+        sizeBytes: 20,
+        mimeType: "image/png",
+      },
+    ];
+
+    expect(mergeUniqueChatAttachments(current, incoming)).toEqual([
+      current[0],
+      incoming[1],
+    ]);
+  });
+
+  it("removes attachments by id", () => {
+    const attachments = [
+      {
+        id: "keep",
+        fileName: "keep.png",
+        filePath: "/workspace/keep.png",
+        sizeBytes: 10,
+        mimeType: "image/png",
+      },
+      {
+        id: "drop",
+        fileName: "drop.png",
+        filePath: "/workspace/drop.png",
+        sizeBytes: 20,
+        mimeType: "image/png",
+      },
+    ];
+
+    expect(removeChatAttachmentById(attachments, "drop")).toEqual([attachments[0]]);
   });
 });

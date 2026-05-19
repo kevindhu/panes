@@ -71,6 +71,8 @@ import {
   computeRollbackTurnsForEditedMessage,
   extractEditableMessageContext,
   isEditableUserTurn,
+  mergeUniqueChatAttachments,
+  removeChatAttachmentById,
 } from "./messageEditBranching";
 import {
   getPlanImplementationCodingMessage,
@@ -1174,11 +1176,14 @@ interface MessageRowProps {
   editingMessageId: string | null;
   editingMode: MessageEditMode | null;
   editingDraftText: string;
+  editingDraftAttachments: ChatAttachment[];
   editingRollbackTurns: number | null;
   editingBusy: boolean;
   onStartEdit: (message: Message) => void;
   onStartRollback: (message: Message) => void;
   onChangeEditText: (text: string) => void;
+  onRemoveEditAttachment: (attachmentId: string) => void;
+  onPasteEditAttachments: (files: File[]) => void;
   onCancelEdit: () => void;
   onSubmitEdit: () => Promise<void>;
   onApproval: (approvalId: string, response: ApprovalResponse) => void;
@@ -1306,7 +1311,7 @@ function MessageCopyButton({
   );
 }
 
-function MessageRowView({
+export function MessageRowView({
   message,
   index,
   isHighlighted,
@@ -1316,11 +1321,14 @@ function MessageRowView({
   editingMessageId,
   editingMode,
   editingDraftText,
+  editingDraftAttachments,
   editingRollbackTurns,
   editingBusy,
   onStartEdit,
   onStartRollback,
   onChangeEditText,
+  onRemoveEditAttachment,
+  onPasteEditAttachments,
   onCancelEdit,
   onSubmitEdit,
   onApproval,
@@ -1341,11 +1349,18 @@ function MessageRowView({
       .map((block) => block.content)
       .join("\n");
   }, [message.blocks, message.content]);
-  const userAuxiliaryBlocks = useMemo(
+  const userAttachmentBlocks = useMemo(
+    () =>
+      (message.blocks ?? []).filter(
+        (block): block is Extract<ContentBlock, { type: "attachment" }> =>
+          block.type === "attachment",
+      ),
+    [message.blocks],
+  );
+  const userNonAttachmentBlocks = useMemo(
     () =>
       (message.blocks ?? []).filter(
         (block) =>
-          block.type === "attachment" ||
           block.type === "skill" ||
           block.type === "mention",
       ),
@@ -1365,6 +1380,19 @@ function MessageRowView({
   const isEditingUserMessage = isUser && editingMessageId === message.id;
   const isRollbackEditing = isEditingUserMessage && editingMode === "rollback";
   const canEditThisMessage = canEditUserMessages && isEditableUserTurn(message);
+  const displayedUserAttachments = useMemo(
+    () =>
+      isEditingUserMessage
+        ? editingDraftAttachments
+        : userAttachmentBlocks.map((attachment, index) => ({
+            id: `${message.id}:attachment:${index}`,
+            fileName: attachment.fileName,
+            filePath: attachment.filePath,
+            sizeBytes: attachment.sizeBytes,
+            mimeType: attachment.mimeType,
+          })),
+    [editingDraftAttachments, isEditingUserMessage, message.id, userAttachmentBlocks],
+  );
   const editRows = useMemo(() => {
     const source = isEditingUserMessage ? editingDraftText : userContent;
     return Math.max(3, source.split(/\r?\n/).length);
@@ -1404,32 +1432,33 @@ function MessageRowView({
               wordBreak: "break-word",
             }}
           >
-            {userAuxiliaryBlocks.length > 0 && (
+            {(displayedUserAttachments.length > 0 || userNonAttachmentBlocks.length > 0) && (
               <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 6 }}>
-                {userAuxiliaryBlocks.map((block, i) => {
-                  if (block.type === "attachment") {
-                    return (
-                      <AttachmentChip
-                        key={i}
-                        attachment={block}
-                        compact
-                      />
-                    );
-                  }
-
-                  return (
-                    <span key={i} className="chat-attachment-chip">
-                      {block.type === "skill" ? (
-                        <SquareTerminal size={10} />
-                      ) : (
-                        <MessageSquare size={10} />
-                      )}
-                      <span className="chat-attachment-chip-name" style={{ fontSize: 10 }}>
-                        {block.name}
-                      </span>
+                {displayedUserAttachments.map((attachment) => (
+                  <AttachmentChip
+                    key={attachment.id}
+                    attachment={attachment}
+                    compact
+                    removeLabel={isEditingUserMessage ? t("attachments.remove") : undefined}
+                    onRemove={
+                      isEditingUserMessage && !editingBusy
+                        ? () => onRemoveEditAttachment(attachment.id)
+                        : undefined
+                    }
+                  />
+                ))}
+                {userNonAttachmentBlocks.map((block, i) => (
+                  <span key={i} className="chat-attachment-chip">
+                    {block.type === "skill" ? (
+                      <SquareTerminal size={10} />
+                    ) : (
+                      <MessageSquare size={10} />
+                    )}
+                    <span className="chat-attachment-chip-name" style={{ fontSize: 10 }}>
+                      {block.name}
                     </span>
-                  );
-                })}
+                  </span>
+                ))}
               </div>
             )}
             {userPlanMode && (
@@ -1462,6 +1491,14 @@ function MessageRowView({
               <textarea
                 value={editingDraftText}
                 onChange={(event) => onChangeEditText(event.target.value)}
+                onPaste={(event) => {
+                  const imageFiles = clipboardImageFiles(event.clipboardData);
+                  if (imageFiles.length === 0) {
+                    return;
+                  }
+                  event.preventDefault();
+                  onPasteEditAttachments(imageFiles);
+                }}
                 onKeyDown={(event) => {
                   if (event.key === "Escape") {
                     event.preventDefault();
@@ -1644,11 +1681,14 @@ const MessageRow = memo(
     prev.editingMessageId === next.editingMessageId &&
     prev.editingMode === next.editingMode &&
     prev.editingDraftText === next.editingDraftText &&
+    prev.editingDraftAttachments === next.editingDraftAttachments &&
     prev.editingRollbackTurns === next.editingRollbackTurns &&
     prev.editingBusy === next.editingBusy &&
     prev.onStartEdit === next.onStartEdit &&
     prev.onStartRollback === next.onStartRollback &&
     prev.onChangeEditText === next.onChangeEditText &&
+    prev.onRemoveEditAttachment === next.onRemoveEditAttachment &&
+    prev.onPasteEditAttachments === next.onPasteEditAttachments &&
     prev.onCancelEdit === next.onCancelEdit &&
     prev.onSubmitEdit === next.onSubmitEdit &&
     prev.onApproval === next.onApproval &&
@@ -1700,6 +1740,15 @@ function guessMimeType(fileName: string): string | undefined {
     csv: "text/csv",
   };
   return mimeMap[ext];
+}
+
+function filterSupportedAttachments(
+  attachments: ChatAttachment[],
+  supportedExtensions: ReadonlySet<string>,
+): ChatAttachment[] {
+  return attachments.filter((attachment) =>
+    isSupportedAttachmentName(attachment.fileName, supportedExtensions),
+  );
 }
 
 function imageExtensionForMimeType(mimeType: string): string | null {
@@ -2651,6 +2700,20 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     );
   }, []);
 
+  const removeEditingMessageAttachment = useCallback((attachmentId: string) => {
+    if (editingMessageBusy) {
+      return;
+    }
+    setEditingMessageDraft((current) =>
+      current
+        ? {
+            ...current,
+            attachments: removeChatAttachmentById(current.attachments, attachmentId),
+          }
+        : current,
+    );
+  }, [editingMessageBusy]);
+
   const cancelEditingUserMessage = useCallback(() => {
     if (editingMessageBusy) {
       return;
@@ -2953,6 +3016,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const handleStartEdit = startEditingUserMessage;
   const handleStartRollback = startRollbackUserMessage;
   const handleChangeEditText = changeEditingMessageText;
+  const handleRemoveEditAttachment = removeEditingMessageAttachment;
   const handleCancelEdit = cancelEditingUserMessage;
   const handleSubmitEdit = submitEditedUserMessage;
 
@@ -3145,9 +3209,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     const attachmentFilterConfig = getAttachmentFilterConfig(t, selectedEngineId, selectedModel);
     if (attachmentFilterConfig) {
       const supportedExtensions = new Set(attachmentFilterConfig.supportedExtensions);
-      const supportedAttachments = nextAttachments.filter((attachment) =>
-        isSupportedAttachmentName(attachment.fileName, supportedExtensions),
-      );
+      const supportedAttachments = filterSupportedAttachments(nextAttachments, supportedExtensions);
       const skippedCount = nextAttachments.length - supportedAttachments.length;
       if (skippedCount > 0) {
         toast.warning(attachmentFilterConfig.warningMessage);
@@ -3159,73 +3221,80 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       return;
     }
 
-    setAttachments((prev) => {
-      const knownPaths = new Set(prev.map((attachment) => attachment.filePath));
-      const merged = [...prev];
-      for (const attachment of nextAttachments) {
-        if (knownPaths.has(attachment.filePath)) {
-          continue;
-        }
-        knownPaths.add(attachment.filePath);
-        merged.push(attachment);
-      }
-      return merged;
-    });
+    setAttachments((prev) => mergeUniqueChatAttachments(prev, nextAttachments));
   }, [activeWorkspaceId, selectedEngineId, selectedModel, t]);
+
+  const savePastedImageFilesAsAttachments = useCallback(
+    async (files: File[]): Promise<ChatAttachment[]> => {
+      if (!activeWorkspaceId || files.length === 0) {
+        return [];
+      }
+
+      const attachmentFilterConfig = getAttachmentFilterConfig(t, selectedEngineId, selectedModel);
+      if (!attachmentFilterConfig || attachmentFilterConfig.imageExtensions.length === 0) {
+        toast.warning(attachmentFilterConfig?.warningMessage ?? t("attachments.pasteFailed"));
+        return [];
+      }
+
+      const supportedImageExtensions = new Set(attachmentFilterConfig.imageExtensions);
+      const supportedFiles = files.filter((file) =>
+        pastedImageFileSupported(file, supportedImageExtensions),
+      );
+      if (supportedFiles.length < files.length) {
+        toast.warning(attachmentFilterConfig.warningMessage);
+      }
+      if (supportedFiles.length === 0) {
+        return [];
+      }
+
+      try {
+        return await Promise.all(
+          supportedFiles.map(async (file, index) => {
+            const fileName = fileNameForPastedImage(file, index);
+            const mimeType = file.type || guessMimeType(fileName) || "image/png";
+            const dataBase64 = await blobToBase64(file);
+            const savedAttachment = await ipc.savePastedImageAttachment(
+              fileName,
+              mimeType,
+              dataBase64,
+            );
+            return {
+              ...savedAttachment,
+              id: crypto.randomUUID(),
+            };
+          }),
+        );
+      } catch (error) {
+        console.warn("Failed to attach pasted image", error);
+        toast.warning(t("attachments.pasteFailed"));
+        return [];
+      }
+    },
+    [activeWorkspaceId, selectedEngineId, selectedModel, t],
+  );
 
   const appendPastedImageFiles = useCallback(async (files: File[]) => {
-    if (!activeWorkspaceId || files.length === 0) {
+    const nextAttachments = await savePastedImageFilesAsAttachments(files);
+    if (nextAttachments.length === 0) {
       return;
     }
+    setAttachments((prev) => mergeUniqueChatAttachments(prev, nextAttachments));
+  }, [savePastedImageFilesAsAttachments]);
 
-    const attachmentFilterConfig = getAttachmentFilterConfig(t, selectedEngineId, selectedModel);
-    if (!attachmentFilterConfig || attachmentFilterConfig.imageExtensions.length === 0) {
-      toast.warning(attachmentFilterConfig?.warningMessage ?? t("attachments.pasteFailed"));
+  const appendPastedImageFilesToEditingDraft = useCallback(async (files: File[]) => {
+    const nextAttachments = await savePastedImageFilesAsAttachments(files);
+    if (nextAttachments.length === 0) {
       return;
     }
-
-    const supportedImageExtensions = new Set(attachmentFilterConfig.imageExtensions);
-    const supportedFiles = files.filter((file) =>
-      pastedImageFileSupported(file, supportedImageExtensions),
-    );
-    if (supportedFiles.length < files.length) {
-      toast.warning(attachmentFilterConfig.warningMessage);
-    }
-    if (supportedFiles.length === 0) {
-      return;
-    }
-
-    try {
-      const nextAttachments = await Promise.all(
-        supportedFiles.map(async (file, index) => {
-          const fileName = fileNameForPastedImage(file, index);
-          const mimeType = file.type || guessMimeType(fileName) || "image/png";
-          const dataBase64 = await blobToBase64(file);
-          const savedAttachment = await ipc.savePastedImageAttachment(fileName, mimeType, dataBase64);
-          return {
-            ...savedAttachment,
-            id: crypto.randomUUID(),
-          };
-        }),
-      );
-
-      setAttachments((prev) => {
-        const knownPaths = new Set(prev.map((attachment) => attachment.filePath));
-        const merged = [...prev];
-        for (const attachment of nextAttachments) {
-          if (knownPaths.has(attachment.filePath)) {
-            continue;
+    setEditingMessageDraft((current) =>
+      current
+        ? {
+            ...current,
+            attachments: mergeUniqueChatAttachments(current.attachments, nextAttachments),
           }
-          knownPaths.add(attachment.filePath);
-          merged.push(attachment);
-        }
-        return merged;
-      });
-    } catch (error) {
-      console.warn("Failed to attach pasted image", error);
-      toast.warning(t("attachments.pasteFailed"));
-    }
-  }, [activeWorkspaceId, selectedEngineId, selectedModel, t]);
+        : current,
+    );
+  }, [savePastedImageFilesAsAttachments]);
 
   const handleInputPaste = useCallback((event: ReactClipboardEvent<HTMLElement>) => {
     if (showSpecialInputComposer) {
@@ -3240,6 +3309,13 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     void appendPastedImageFiles(imageFiles);
   }, [appendPastedImageFiles, showSpecialInputComposer]);
 
+  const handleEditDraftPaste = useCallback((files: File[]) => {
+    if (editingMessageBusy) {
+      return;
+    }
+    void appendPastedImageFilesToEditingDraft(files);
+  }, [appendPastedImageFilesToEditingDraft, editingMessageBusy]);
+
   useEffect(() => {
     const attachmentFilterConfig = getAttachmentFilterConfig(t, selectedEngineId, selectedModel);
     if (!attachmentFilterConfig) {
@@ -3247,15 +3323,38 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     }
 
     const supportedExtensions = new Set(attachmentFilterConfig.supportedExtensions);
+    let warned = false;
+    const warnOnce = () => {
+      if (warned) {
+        return;
+      }
+      warned = true;
+      toast.warning(attachmentFilterConfig.warningMessage);
+    };
     setAttachments((prev) => {
-      const supportedAttachments = prev.filter((attachment) =>
-        isSupportedAttachmentName(attachment.fileName, supportedExtensions),
-      );
+      const supportedAttachments = filterSupportedAttachments(prev, supportedExtensions);
       if (supportedAttachments.length === prev.length) {
         return prev;
       }
-      toast.warning(attachmentFilterConfig.warningMessage);
+      warnOnce();
       return supportedAttachments;
+    });
+    setEditingMessageDraft((current) => {
+      if (!current) {
+        return current;
+      }
+      const supportedAttachments = filterSupportedAttachments(
+        current.attachments,
+        supportedExtensions,
+      );
+      if (supportedAttachments.length === current.attachments.length) {
+        return current;
+      }
+      warnOnce();
+      return {
+        ...current,
+        attachments: supportedAttachments,
+      };
     });
   }, [selectedEngineId, selectedModel, t]);
 
@@ -5810,11 +5909,14 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                         editingMessageId={editingMessageId}
                         editingMode={editingMode}
                         editingDraftText={editingDraftText}
+                        editingDraftAttachments={editingMessageDraft?.attachments ?? []}
                         editingRollbackTurns={editingRollbackTurns}
                         editingBusy={editingBusy}
                         onStartEdit={handleStartEdit}
                         onStartRollback={handleStartRollback}
                         onChangeEditText={handleChangeEditText}
+                        onRemoveEditAttachment={handleRemoveEditAttachment}
+                        onPasteEditAttachments={handleEditDraftPaste}
                         onCancelEdit={handleCancelEdit}
                         onSubmitEdit={handleSubmitEdit}
                         onApproval={handleApproval}
@@ -5845,11 +5947,14 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                   editingMessageId={editingMessageId}
                   editingMode={editingMode}
                   editingDraftText={editingDraftText}
+                  editingDraftAttachments={editingMessageDraft?.attachments ?? []}
                   editingRollbackTurns={editingRollbackTurns}
                   editingBusy={editingBusy}
                   onStartEdit={handleStartEdit}
                   onStartRollback={handleStartRollback}
                   onChangeEditText={handleChangeEditText}
+                  onRemoveEditAttachment={handleRemoveEditAttachment}
+                  onPasteEditAttachments={handleEditDraftPaste}
                   onCancelEdit={handleCancelEdit}
                   onSubmitEdit={handleSubmitEdit}
                   onApproval={handleApproval}

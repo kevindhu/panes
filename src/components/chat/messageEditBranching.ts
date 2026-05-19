@@ -52,6 +52,33 @@ export interface EditableMessageContext {
   planMode: boolean;
 }
 
+export function mergeUniqueChatAttachments(
+  current: ChatAttachment[],
+  incoming: ChatAttachment[],
+): ChatAttachment[] {
+  if (incoming.length === 0) {
+    return current;
+  }
+
+  const knownPaths = new Set(current.map((attachment) => attachment.filePath));
+  const merged = [...current];
+  for (const attachment of incoming) {
+    if (knownPaths.has(attachment.filePath)) {
+      continue;
+    }
+    knownPaths.add(attachment.filePath);
+    merged.push(attachment);
+  }
+  return merged;
+}
+
+export function removeChatAttachmentById(
+  attachments: ChatAttachment[],
+  attachmentId: string,
+): ChatAttachment[] {
+  return attachments.filter((attachment) => attachment.id !== attachmentId);
+}
+
 export function extractEditableMessageContext(
   message: Message,
 ): EditableMessageContext | null {
