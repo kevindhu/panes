@@ -656,7 +656,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
             )}
             <Archive size={11} style={{ flexShrink: 0, opacity: 0.6 }} />
             <span style={{ flex: 1, textAlign: "left" }}>{t("app:sidebar.archived")}</span>
-            <span className="sb-project-count" style={{ fontSize: 9 }}>
+            <span className="sb-project-count" style={{ fontSize: 11 }}>
               {archivedWorkspaces.length + archivedThreads.length}
             </span>
           </button>

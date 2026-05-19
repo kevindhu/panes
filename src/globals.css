@@ -3677,7 +3677,7 @@ button, input, textarea, select {
   background: transparent;
   border: none;
   color: var(--text-2);
-  font-size: 13px;
+  font-size: 16px;
   cursor: pointer;
   transition: background var(--duration-fast) var(--ease-out),
               color var(--duration-fast) var(--ease-out);
@@ -3696,13 +3696,13 @@ button, input, textarea, select {
 
 .sb-nav-item-shortcut {
   margin-left: auto;
-  font-size: 11px;
+  font-size: 13px;
   color: var(--text-3);
 }
 
 /* Section headers */
 .sb-section-label {
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.1em;
@@ -3767,7 +3767,7 @@ button, input, textarea, select {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 13px;
+  font-size: 16px;
   font-weight: 500;
   text-align: left;
 }
@@ -3784,10 +3784,10 @@ button, input, textarea, select {
 }
 
 .sb-project-count {
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 500;
-  min-width: 18px;
-  height: 18px;
+  min-width: 20px;
+  height: 20px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -3887,7 +3887,7 @@ button, input, textarea, select {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 12.5px;
+  font-size: 15px;
   font-weight: 400;
 }
 
@@ -3934,7 +3934,7 @@ button, input, textarea, select {
 }
 
 .sb-thread-time {
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-3);
   font-variant-numeric: tabular-nums;
   opacity: 1;
@@ -3988,7 +3988,7 @@ button, input, textarea, select {
   background: rgba(9, 105, 218, 0.06);
   border: 1px solid rgba(9, 105, 218, 0.12);
   color: var(--accent);
-  font-size: 12.5px;
+  font-size: 15px;
   font-weight: 500;
   cursor: pointer;
   transition: all var(--duration-fast) var(--ease-out);
@@ -4012,7 +4012,7 @@ button, input, textarea, select {
   background: transparent;
   border: 1px solid var(--border);
   color: var(--text-2);
-  font-size: 12px;
+  font-size: 14px;
   cursor: pointer;
   transition: all var(--duration-fast) var(--ease-out);
   margin: 0 12px;
@@ -4039,7 +4039,7 @@ button, input, textarea, select {
   padding: 8px 16px;
   cursor: pointer;
   color: var(--text-3);
-  font-size: 11.5px;
+  font-size: 14px;
   transition: color var(--duration-fast) var(--ease-out);
 }
 
@@ -4052,7 +4052,7 @@ button, input, textarea, select {
   align-items: center;
   gap: 8px;
   padding: 5px 12px 5px 38px;
-  font-size: 11.5px;
+  font-size: 14px;
   color: var(--text-2);
   border-radius: var(--radius-sm);
 }
@@ -4089,7 +4089,7 @@ button, input, textarea, select {
   align-items: center;
   gap: 8px;
   padding: 6px 4px;
-  font-size: 12.5px;
+  font-size: 15px;
   color: var(--text-3);
   cursor: pointer;
   width: 100%;
@@ -4184,7 +4184,7 @@ button, input, textarea, select {
 /* Show more link */
 .sb-show-more {
   padding: 4px 8px;
-  font-size: 11px;
+  font-size: 13px;
   color: var(--text-3);
   cursor: pointer;
   transition: color var(--duration-fast) var(--ease-out);
@@ -4216,13 +4216,13 @@ button, input, textarea, select {
   padding: 24px 16px;
   text-align: center;
   color: var(--text-3);
-  font-size: 12px;
+  font-size: 14px;
   line-height: 1.6;
 }
 
 .sb-no-threads {
   padding: 4px 8px;
-  font-size: 11.5px;
+  font-size: 13.5px;
   color: var(--text-3);
   font-style: italic;
 }
