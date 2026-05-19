@@ -64,6 +64,11 @@ import { MessageBlocks, shouldShowClaudeUnsupportedApproval } from "./MessageBlo
 import { resolveEngineCapabilities } from "./engineCapabilities";
 import { buildCodexInputItems } from "./codexInputItems";
 import {
+  computeRollbackTurnsForEditedMessage,
+  extractEditableMessageContext,
+  isEditableUserTurn,
+} from "./messageEditBranching";
+import {
   getPlanImplementationCodingMessage,
   shouldPromptToImplementPlan,
 } from "./planModePrompt";
@@ -1161,6 +1166,14 @@ interface MessageRowProps {
   isHighlighted: boolean;
   assistantLabel: string;
   assistantEngineId: string;
+  canEditUserMessages: boolean;
+  editingMessageId: string | null;
+  editingDraftText: string;
+  editingBusy: boolean;
+  onStartEdit: (message: Message) => void;
+  onChangeEditText: (text: string) => void;
+  onCancelEdit: () => void;
+  onSubmitEdit: () => Promise<void>;
   onApproval: (approvalId: string, response: ApprovalResponse) => void;
   onLoadActionOutput: (messageId: string, actionId: string) => Promise<void>;
 }
@@ -1205,7 +1218,47 @@ function extractMessageCopyText(message: Message): string {
     .join("\n\n");
 }
 
-function MessageCopyButton({ message }: { message: Message }) {
+function MessageActionButton({
+  onClick,
+  label,
+  disabled,
+  children,
+}: {
+  onClick: () => void;
+  label: string;
+  disabled?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      title={label}
+      aria-label={label}
+      style={{
+        cursor: disabled ? "default" : "pointer",
+        background: "none",
+        border: "none",
+        padding: "2px 4px",
+        display: "inline-flex",
+        alignItems: "center",
+        color: disabled ? "var(--text-4)" : "var(--text-3)",
+        opacity: disabled ? 0.55 : 1,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function MessageCopyButton({
+  message,
+  label,
+}: {
+  message: Message;
+  label: string;
+}) {
   const [copied, setCopied] = useState(false);
   const handleCopy = useCallback(() => {
     const text = extractMessageCopyText(message);
@@ -1216,22 +1269,9 @@ function MessageCopyButton({ message }: { message: Message }) {
     });
   }, [message]);
   return (
-    <button
-      type="button"
-      onClick={handleCopy}
-      style={{
-        cursor: "pointer",
-        background: "none",
-        border: "none",
-        padding: "2px 4px",
-        display: "inline-flex",
-        alignItems: "center",
-        color: copied ? "var(--success)" : "var(--text-3)",
-      }}
-      aria-label="Copy message"
-    >
+    <MessageActionButton onClick={handleCopy} label={label}>
       {copied ? <Check size={11} /> : <Copy size={11} />}
-    </button>
+    </MessageActionButton>
   );
 }
 
@@ -1241,6 +1281,14 @@ function MessageRowView({
   isHighlighted,
   assistantLabel,
   assistantEngineId,
+  canEditUserMessages,
+  editingMessageId,
+  editingDraftText,
+  editingBusy,
+  onStartEdit,
+  onChangeEditText,
+  onCancelEdit,
+  onSubmitEdit,
   onApproval,
   onLoadActionOutput,
 }: MessageRowProps) {
@@ -1280,6 +1328,12 @@ function MessageRowView({
   const showAssistantShell = !isUser && (hasAssistantContent || message.status === "streaming");
   const showThinkingPlaceholder = showAssistantShell && !hasAssistantContent;
   const thinkingVariant = useThinkingVariant(showThinkingPlaceholder);
+  const isEditingUserMessage = isUser && editingMessageId === message.id;
+  const canEditThisMessage = canEditUserMessages && isEditableUserTurn(message);
+  const editRows = useMemo(() => {
+    const source = isEditingUserMessage ? editingDraftText : userContent;
+    return Math.max(3, source.split(/\r?\n/).length);
+  }, [editingDraftText, isEditingUserMessage, userContent]);
 
   return (
     <div
@@ -1349,10 +1403,108 @@ function MessageRowView({
                 <span>{t("panel.planMode")}</span>
               </div>
             )}
-            {userContent}
+            {isEditingUserMessage ? (
+              <textarea
+                value={editingDraftText}
+                onChange={(event) => onChangeEditText(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    onCancelEdit();
+                    return;
+                  }
+                  if (shouldSubmitChatInput({
+                    key: event.key,
+                    ctrlKey: event.ctrlKey,
+                    metaKey: event.metaKey,
+                    shiftKey: event.shiftKey,
+                    isComposing: event.nativeEvent.isComposing,
+                  })) {
+                    event.preventDefault();
+                    void onSubmitEdit();
+                  }
+                }}
+                autoFocus
+                rows={editRows}
+                disabled={editingBusy}
+                aria-label={t("panel.messageActions.edit")}
+                style={{
+                  width: "100%",
+                  minHeight: 72,
+                  resize: "vertical",
+                  border: "none",
+                  outline: "none",
+                  background: "transparent",
+                  color: "var(--text-1)",
+                  fontSize: 13,
+                  lineHeight: 1.6,
+                  fontFamily: "inherit",
+                  padding: 0,
+                  margin: 0,
+                }}
+              />
+            ) : (
+              userContent
+            )}
           </div>
           <div className="msg-row-timestamp" style={{ display: "flex", alignItems: "center", gap: 2, justifyContent: "flex-end", marginTop: 4, paddingRight: 4 }}>
-            <MessageCopyButton message={message} />
+            {isEditingUserMessage ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => void onSubmitEdit()}
+                  disabled={editingBusy || editingDraftText.trim().length === 0}
+                  style={{
+                    cursor:
+                      editingBusy || editingDraftText.trim().length === 0
+                        ? "default"
+                        : "pointer",
+                    background: "none",
+                    border: "none",
+                    padding: "2px 4px",
+                    color:
+                      editingBusy || editingDraftText.trim().length === 0
+                        ? "var(--text-4)"
+                        : "var(--accent)",
+                    fontSize: 11,
+                  }}
+                >
+                  {editingBusy
+                    ? t("panel.messageActions.branching")
+                    : t("panel.messageActions.save")}
+                </button>
+                <button
+                  type="button"
+                  onClick={onCancelEdit}
+                  disabled={editingBusy}
+                  style={{
+                    cursor: editingBusy ? "default" : "pointer",
+                    background: "none",
+                    border: "none",
+                    padding: "2px 4px",
+                    color: editingBusy ? "var(--text-4)" : "var(--text-3)",
+                    fontSize: 11,
+                  }}
+                >
+                  {t("panel.messageActions.cancel")}
+                </button>
+              </>
+            ) : (
+              <>
+                <MessageCopyButton
+                  message={message}
+                  label={t("panel.messageActions.copy")}
+                />
+                {canEditThisMessage && (
+                  <MessageActionButton
+                    onClick={() => onStartEdit(message)}
+                    label={t("panel.messageActions.edit")}
+                  >
+                    <FilePen size={11} />
+                  </MessageActionButton>
+                )}
+              </>
+            )}
             {messageTimestamp && <span>{messageTimestamp}</span>}
           </div>
         </>
@@ -1398,7 +1550,10 @@ function MessageRowView({
             )}
           </div>
           <div className="msg-row-timestamp" style={{ display: "flex", alignItems: "center", gap: 2, marginTop: 2, paddingLeft: 14 }}>
-            <MessageCopyButton message={message} />
+            <MessageCopyButton
+              message={message}
+              label={t("panel.messageActions.copy")}
+            />
             {messageTimestamp && <span>{messageTimestamp}</span>}
           </div>
         </>
@@ -1415,6 +1570,14 @@ const MessageRow = memo(
     prev.isHighlighted === next.isHighlighted &&
     prev.assistantLabel === next.assistantLabel &&
     prev.assistantEngineId === next.assistantEngineId &&
+    prev.canEditUserMessages === next.canEditUserMessages &&
+    prev.editingMessageId === next.editingMessageId &&
+    prev.editingDraftText === next.editingDraftText &&
+    prev.editingBusy === next.editingBusy &&
+    prev.onStartEdit === next.onStartEdit &&
+    prev.onChangeEditText === next.onChangeEditText &&
+    prev.onCancelEdit === next.onCancelEdit &&
+    prev.onSubmitEdit === next.onSubmitEdit &&
     prev.onApproval === next.onApproval &&
     prev.onLoadActionOutput === next.onLoadActionOutput,
 );
@@ -1602,6 +1765,13 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(
     null,
   );
+  const [editingMessageDraft, setEditingMessageDraft] = useState<{
+    messageId: string;
+    text: string;
+    attachments: ChatAttachment[];
+    planMode: boolean;
+  } | null>(null);
+  const [editingMessageBusy, setEditingMessageBusy] = useState(false);
   const {
     messages,
     status,
@@ -1874,6 +2044,14 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     selectedModelId,
   ]);
   const showCodexUsageStatus = messages.length > 0 && activeThread?.engineId === "codex";
+  const canEditUserMessages = false;
+  const editingMessageId: string | null = null;
+  const editingDraftText = "";
+  const editingBusy = false;
+  const handleStartEdit = useCallback((_message: Message) => {}, []);
+  const handleChangeEditText = useCallback((_text: string) => {}, []);
+  const handleCancelEdit = useCallback(() => {}, []);
+  const handleSubmitEdit = useCallback(async () => {}, []);
 
   const handleRefreshUsageLimits = useCallback(async () => {
     if (!threadId || activeThread?.engineId !== "codex" || usageRefreshInFlight) {
@@ -5081,6 +5259,14 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                         isHighlighted={message.id === highlightedMessageId}
                         assistantLabel={assistantIdentity?.label ?? ""}
                         assistantEngineId={assistantIdentity?.engineId ?? ""}
+                        canEditUserMessages={canEditUserMessages}
+                        editingMessageId={editingMessageId}
+                        editingDraftText={editingDraftText}
+                        editingBusy={editingBusy}
+                        onStartEdit={handleStartEdit}
+                        onChangeEditText={handleChangeEditText}
+                        onCancelEdit={handleCancelEdit}
+                        onSubmitEdit={handleSubmitEdit}
                         onApproval={handleApproval}
                         onLoadActionOutput={handleLoadActionOutput}
                       />
@@ -5105,6 +5291,14 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                   isHighlighted={message.id === highlightedMessageId}
                   assistantLabel={assistantIdentity?.label ?? ""}
                   assistantEngineId={assistantIdentity?.engineId ?? ""}
+                  canEditUserMessages={canEditUserMessages}
+                  editingMessageId={editingMessageId}
+                  editingDraftText={editingDraftText}
+                  editingBusy={editingBusy}
+                  onStartEdit={handleStartEdit}
+                  onChangeEditText={handleChangeEditText}
+                  onCancelEdit={handleCancelEdit}
+                  onSubmitEdit={handleSubmitEdit}
                   onApproval={handleApproval}
                   onLoadActionOutput={handleLoadActionOutput}
                 />

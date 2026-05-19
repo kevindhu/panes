@@ -86,12 +86,21 @@ pub fn insert_approval(
 }
 
 pub fn answer_approval(db: &Database, approval_id: &str, decision: &str) -> anyhow::Result<()> {
+    answer_approval_with_response(db, approval_id, decision, None)
+}
+
+pub fn answer_approval_with_response(
+    db: &Database,
+    approval_id: &str,
+    decision: &str,
+    response: Option<&Value>,
+) -> anyhow::Result<()> {
     let conn = db.connect()?;
     conn.execute(
         "UPDATE approvals
-     SET status = 'answered', decision = ?1, answered_at = datetime('now')
-     WHERE id = ?2",
-        params![decision, approval_id],
+     SET status = 'answered', decision = ?1, response_json = ?2, answered_at = datetime('now')
+     WHERE id = ?3",
+        params![decision, response.map(Value::to_string), approval_id],
     )
     .context("failed to answer approval")?;
     Ok(())

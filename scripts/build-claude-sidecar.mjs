@@ -79,7 +79,18 @@ function run(command, args, options = {}) {
 
 async function pruneUnusedRipgrepVendors() {
   const keepTargets = resolveRipgrepTargets();
-  const entries = await readdir(ripgrepVendorDir, { withFileTypes: true });
+  let entries;
+  try {
+    entries = await readdir(ripgrepVendorDir, { withFileTypes: true });
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      console.log(
+        "Claude SDK ripgrep vendor assets are not present in the current package layout; skipping vendor pruning.",
+      );
+      return;
+    }
+    throw error;
+  }
 
   await Promise.all(
     entries.map(async (entry) => {

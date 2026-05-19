@@ -129,6 +129,7 @@ impl Database {
         ensure_workspace_startup_columns(&conn)?;
         ensure_runtime_columns(&conn)?;
         ensure_messages_audit_columns(&conn)?;
+        ensure_approval_response_columns(&conn)?;
         repair_normalized_workspace_and_repo_paths(&mut conn)?;
         Ok(())
     }
@@ -221,6 +222,11 @@ fn ensure_messages_audit_columns(conn: &Connection) -> anyhow::Result<()> {
         .context("failed to add messages.turn_reasoning_effort column")?;
     }
 
+    Ok(())
+}
+
+fn ensure_approval_response_columns(conn: &Connection) -> anyhow::Result<()> {
+    ensure_column(conn, "approvals", "response_json", "TEXT")?;
     Ok(())
 }
 
