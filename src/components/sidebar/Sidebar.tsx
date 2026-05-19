@@ -7,6 +7,7 @@ import {
   Plus,
   FolderGit2,
   MessageSquare,
+  GitBranch,
   ChevronDown,
   ChevronRight,
   Archive,
@@ -32,6 +33,7 @@ import { useUpdateStore } from "../../stores/updateStore";
 import { canToggleKeepAwake, useKeepAwakeStore } from "../../stores/keepAwakeStore";
 import { useTerminalNotificationSettingsStore } from "../../stores/terminalNotificationSettingsStore";
 import { toast } from "../../stores/toastStore";
+import { canUseNativeCodexHistoryTools } from "../../lib/codexThreadCapabilities";
 import { ipc } from "../../lib/ipc";
 import { formatRelativeTime } from "../../lib/formatters";
 import {
@@ -45,6 +47,7 @@ import {
 } from "../../lib/locale";
 import { handleDragMouseDown, handleDragDoubleClick } from "../../lib/windowDrag";
 import { createAndActivateWorkspaceThread } from "../../lib/newThreadActions";
+import { getActionMenuPosition } from "../git/actionMenuPosition";
 import { UpdateDialog } from "../onboarding/UpdateDialog";
 import { ConfirmDialog } from "../shared/ConfirmDialog";
 import { WorkspaceMoreMenu } from "../workspace/WorkspaceMoreMenu";
@@ -54,6 +57,13 @@ import type { Thread, Workspace } from "../../types";
 interface ProjectGroup {
   workspace: Workspace;
   threads: Thread[];
+}
+
+interface ThreadContextMenuState {
+  thread: Thread;
+  top: number;
+  left: number;
+  triggerRect: { top: number; bottom: number; right: number };
 }
 
 const MAX_VISIBLE_THREADS = 8;
@@ -81,7 +91,7 @@ function readLegacyDefaultScanDepth(): number | undefined {
    ───────────────────────────────────────────────────── */
 
 function SidebarContent({ onPin }: { onPin?: () => void }) {
-  const { t, i18n } = useTranslation(["app", "common"]);
+  const { t, i18n } = useTranslation(["app", "common", "chat"]);
   const {
     workspaces,
     archivedWorkspaces,
@@ -99,6 +109,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
     archivedThreadsByWorkspace,
     activeThreadId,
     setActiveThread,
+    forkCodexThread,
     removeThread,
     restoreThread,
     refreshArchivedThreads,
@@ -154,13 +165,16 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   } | null>(null);
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
   const [settingsMenuPos, setSettingsMenuPos] = useState({ top: 0, left: 0 });
+  const [threadContextMenu, setThreadContextMenu] = useState<ThreadContextMenuState | null>(null);
   const [terminalAcceleratedRendering, setTerminalAcceleratedRendering] = useState(true);
   const settingsMenuRef = useRef<HTMLDivElement>(null);
   const settingsTriggerRef = useRef<HTMLButtonElement>(null);
+  const threadContextMenuRef = useRef<HTMLDivElement>(null);
   const previousSyncedActiveWorkspaceIdRef = useRef<string | null>(activeWorkspaceId);
   const activeLocale = normalizeAppLocale(i18n.language);
 
   const closeSettingsMenu = useCallback(() => setSettingsMenuOpen(false), []);
+  const closeThreadContextMenu = useCallback(() => setThreadContextMenu(null), []);
 
   useEffect(() => {
     if (!settingsMenuOpen) return;
@@ -183,6 +197,31 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
       document.removeEventListener("keydown", onKeyDown, true);
     };
   }, [settingsMenuOpen, closeSettingsMenu]);
+
+  useEffect(() => {
+    if (!threadContextMenu) return;
+    function onPointerDown(e: PointerEvent) {
+      const target = e.target as Node;
+      if (threadContextMenuRef.current?.contains(target)) {
+        return;
+      }
+      closeThreadContextMenu();
+    }
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") closeThreadContextMenu();
+    }
+    function onScroll() {
+      closeThreadContextMenu();
+    }
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown, true);
+    document.addEventListener("scroll", onScroll, true);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+      document.removeEventListener("scroll", onScroll, true);
+    };
+  }, [threadContextMenu, closeThreadContextMenu]);
 
   useEffect(() => {
     let cancelled = false;
@@ -243,6 +282,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   }
 
   async function onSelectThread(thread: Thread) {
+    closeThreadContextMenu();
     if (activeView !== "chat") setActiveView("chat");
     if (thread.workspaceId !== activeWorkspaceId) {
       await setActiveWorkspace(thread.workspaceId);
@@ -257,6 +297,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   }
 
   async function onSelectProject(wsId: string) {
+    closeThreadContextMenu();
     if (activeView !== "chat") setActiveView("chat");
     setCollapsed(
       Object.fromEntries(projects.map((p) => [p.workspace.id, p.workspace.id !== wsId]))
@@ -271,6 +312,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   }
 
   function onDeleteWorkspace(project: Workspace) {
+    closeThreadContextMenu();
     setArchiveWorkspacePrompt({ workspace: project });
   }
 
@@ -285,7 +327,58 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   }
 
   function onDeleteThread(thread: Thread) {
+    closeThreadContextMenu();
     setArchiveThreadPrompt({ thread });
+  }
+
+  function onThreadContextMenu(
+    event: React.MouseEvent<HTMLDivElement>,
+    thread: Thread,
+    busy: boolean,
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+    closeSettingsMenu();
+
+    if (thread.engineId !== "codex") {
+      closeThreadContextMenu();
+      return;
+    }
+
+    const triggerRect = {
+      top: event.clientY,
+      bottom: event.clientY,
+      right: event.clientX,
+    };
+    const position = getActionMenuPosition({
+      triggerRect,
+      menuWidth: 200,
+      menuHeight: 44,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+    });
+    setThreadContextMenu({
+      thread,
+      top: position.top,
+      left: position.left,
+      triggerRect,
+    });
+  }
+
+  async function onForkThread(thread: Thread, busy: boolean) {
+    closeThreadContextMenu();
+    if (!canUseNativeCodexHistoryTools(thread, busy)) {
+      return;
+    }
+
+    const forkedThread = await forkCodexThread(thread.id);
+    if (!forkedThread) {
+      toast.error(t("chat:panel.toasts.codexThreadForkFailed"));
+      return;
+    }
+
+    await onSelectThread(forkedThread);
+    toast.success(t("chat:panel.toasts.codexThreadForked"));
   }
 
   async function executeArchiveThread(thread: Thread) {
@@ -395,6 +488,12 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
     (terminalNotificationLoading && !terminalNotificationLoadedOnce)
     || terminalNotificationUpdatingChatEnabled
     || terminalNotificationUpdatingTerminalEnabled;
+  const threadContextMenuBusy = threadContextMenu
+    ? isThreadRunning(threadContextMenu.thread)
+    : false;
+  const threadContextMenuCanFork = threadContextMenu
+    ? canUseNativeCodexHistoryTools(threadContextMenu.thread, threadContextMenuBusy)
+    : false;
 
   return (
     <div
@@ -568,6 +667,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                               className={`sb-thread sb-thread-animate ${isActive ? "sb-thread-active" : ""}`}
                               style={{ animationDelay: `${i * 20}ms` }}
                               onClick={() => void onSelectThread(thread)}
+                              onContextMenu={(event) => onThreadContextMenu(event, thread, isRunning)}
                               onKeyDown={(e) => {
                                 if (e.key === "Enter" || e.key === " ") {
                                   e.preventDefault();
@@ -605,6 +705,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                                   aria-label={t("app:sidebar.archiveThread")}
                                   className="sb-thread-archive"
                                   onMouseDown={(e) => e.stopPropagation()}
+                                  onContextMenu={(e) => e.stopPropagation()}
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     void onDeleteThread(thread);
@@ -978,6 +1079,32 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                   }}
                 />
               )}
+            </button>
+          </div>,
+          document.body,
+        )}
+
+      {threadContextMenu &&
+        createPortal(
+          <div
+            ref={threadContextMenuRef}
+            className="git-action-menu"
+            role="menu"
+            style={{
+              position: "fixed",
+              top: threadContextMenu.top,
+              left: threadContextMenu.left,
+              minWidth: 200,
+            }}
+          >
+            <button
+              type="button"
+              className="git-action-menu-item"
+              disabled={!threadContextMenuCanFork}
+              onClick={() => void onForkThread(threadContextMenu.thread, threadContextMenuBusy)}
+            >
+              <GitBranch size={13} />
+              {t("commandPalette.commands.codexFork")}
             </button>
           </div>,
           document.body,

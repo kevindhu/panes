@@ -1651,7 +1651,7 @@ pub async fn rollback_codex_thread_in_place(
         );
         return Err("native rollback is only available for Codex threads".to_string());
     }
-    if !codex_transcript_imported(thread.engine_metadata.as_ref()) {
+    if !codex_thread_has_local_transcript_for_history_tools(&thread) {
         log_branch_profile_step(
             profile_operation_id,
             "backend.rollback_in_place.command.rejected_transcript_unimported",
@@ -1679,26 +1679,162 @@ pub async fn rollback_codex_thread_in_place(
         .clone()
         .ok_or_else(|| "Codex thread has not been initialized yet".to_string())?;
     let remote_rollback_started_at = Instant::now();
-    let rollback_snapshot = state
+    let mut rollback_engine_thread_id = engine_thread_id.clone();
+    let rollback_snapshot = match state
         .engines
         .rollback_codex_thread(&engine_thread_id, num_turns)
         .await
-        .map_err(err_to_string)?;
-    log_branch_profile_step(
-        profile_operation_id,
-        "backend.rollback_in_place.remote_rollback.done",
-        Some(format!(
-            "elapsed_ms={}; engine_thread_id={}",
-            format_elapsed_ms(remote_rollback_started_at),
-            engine_thread_id
-        )),
-    );
+    {
+        Ok(snapshot) => {
+            log_branch_profile_step(
+                profile_operation_id,
+                "backend.rollback_in_place.remote_rollback.done",
+                Some(format!(
+                    "elapsed_ms={}; engine_thread_id={}",
+                    format_elapsed_ms(remote_rollback_started_at),
+                    engine_thread_id
+                )),
+            );
+            snapshot
+        }
+        Err(rollback_error) => {
+            let rollback_error = err_to_string(rollback_error);
+            log_branch_profile_step(
+                profile_operation_id,
+                "backend.rollback_in_place.remote_rollback.failed",
+                Some(format!(
+                    "elapsed_ms={}; engine_thread_id={}; error={}",
+                    format_elapsed_ms(remote_rollback_started_at),
+                    engine_thread_id,
+                    rollback_error
+                )),
+            );
+
+            let build_context_started_at = Instant::now();
+            let (cwd, model_id, sandbox) =
+                build_codex_branch_context(state.inner(), &thread).await?;
+            log_branch_profile_step(
+                profile_operation_id,
+                "backend.rollback_in_place.fallback_build_context.done",
+                Some(format!(
+                    "elapsed_ms={}; model_id={}; cwd={}",
+                    format_elapsed_ms(build_context_started_at),
+                    model_id,
+                    cwd
+                )),
+            );
+
+            let remote_fork_started_at = Instant::now();
+            let forked = match state
+                .engines
+                .fork_codex_thread(&engine_thread_id, &cwd, &model_id, sandbox)
+                .await
+            {
+                Ok(forked) => {
+                    log_branch_profile_step(
+                        profile_operation_id,
+                        "backend.rollback_in_place.fallback_fork.done",
+                        Some(format!(
+                            "elapsed_ms={}; source_engine_thread_id={}; forked_engine_thread_id={}; model_id={}",
+                            format_elapsed_ms(remote_fork_started_at),
+                            engine_thread_id,
+                            forked.engine_thread_id,
+                            forked.model_id
+                        )),
+                    );
+                    forked
+                }
+                Err(fork_error) => {
+                    let fork_error = err_to_string(fork_error);
+                    log_branch_profile_step(
+                        profile_operation_id,
+                        "backend.rollback_in_place.fallback_fork.failed",
+                        Some(format!(
+                            "elapsed_ms={}; source_engine_thread_id={}; error={}",
+                            format_elapsed_ms(remote_fork_started_at),
+                            engine_thread_id,
+                            fork_error
+                        )),
+                    );
+                    return Err(format!(
+                        "{rollback_error}; fallback fork for legacy rollback failed: {fork_error}"
+                    ));
+                }
+            };
+
+            let fallback_rollback_started_at = Instant::now();
+            match state
+                .engines
+                .rollback_codex_thread(&forked.engine_thread_id, num_turns)
+                .await
+            {
+                Ok(snapshot) => {
+                    log_branch_profile_step(
+                        profile_operation_id,
+                        "backend.rollback_in_place.fallback_rollback.done",
+                        Some(format!(
+                            "elapsed_ms={}; forked_engine_thread_id={}",
+                            format_elapsed_ms(fallback_rollback_started_at),
+                            forked.engine_thread_id
+                        )),
+                    );
+                    rollback_engine_thread_id = forked.engine_thread_id.clone();
+                    snapshot
+                }
+                Err(fallback_error) => {
+                    let fallback_error = err_to_string(fallback_error);
+                    log_branch_profile_step(
+                        profile_operation_id,
+                        "backend.rollback_in_place.fallback_rollback.failed",
+                        Some(format!(
+                            "elapsed_ms={}; forked_engine_thread_id={}; error={}",
+                            format_elapsed_ms(fallback_rollback_started_at),
+                            forked.engine_thread_id,
+                            fallback_error
+                        )),
+                    );
+                    if let Err(cleanup_error) = state
+                        .engines
+                        .archive_codex_thread(&forked.engine_thread_id)
+                        .await
+                    {
+                        log::warn!(
+                            "failed to clean up forked engine thread {} after fallback rollback failure: {cleanup_error}",
+                            forked.engine_thread_id
+                        );
+                        log_branch_profile_step(
+                            profile_operation_id,
+                            "backend.rollback_in_place.fallback_cleanup.failed",
+                            Some(format!(
+                                "forked_engine_thread_id={}; error={cleanup_error}",
+                                forked.engine_thread_id
+                            )),
+                        );
+                    }
+                    return Err(format!(
+                        "{rollback_error}; fallback rollback on forked legacy thread failed: {fallback_error}"
+                    ));
+                }
+            }
+        }
+    };
 
     let persist_started_at = Instant::now();
+    let rebind_engine_thread_id =
+        (rollback_engine_thread_id != engine_thread_id).then_some(rollback_engine_thread_id);
     let updated = run_db(db, {
         let thread = thread.clone();
         let rollback_snapshot = rollback_snapshot.clone();
-        move |db| persist_codex_in_place_rollback(db, &thread, &rollback_snapshot, num_turns)
+        let rebind_engine_thread_id = rebind_engine_thread_id.clone();
+        move |db| {
+            persist_codex_in_place_rollback(
+                db,
+                &thread,
+                &rollback_snapshot,
+                num_turns,
+                rebind_engine_thread_id.as_deref(),
+            )
+        }
     })
     .await?;
     log_branch_profile_step(
@@ -2373,7 +2509,7 @@ async fn create_codex_branch_thread(
                 .unwrap_or_else(|| "none".to_string())
         )),
     );
-    if !codex_transcript_imported(source_thread.engine_metadata.as_ref()) {
+    if !codex_thread_has_local_transcript_for_history_tools(source_thread) {
         log_branch_profile_step(
             profile_operation_id.as_deref(),
             "backend.branch.create_local.rejected_transcript_unimported",
@@ -2517,8 +2653,12 @@ fn persist_codex_in_place_rollback(
     thread: &ThreadDto,
     rollback_snapshot: &ThreadSyncSnapshot,
     num_turns: u32,
+    rebind_engine_thread_id: Option<&str>,
 ) -> anyhow::Result<ThreadDto> {
     db::messages::drop_last_turns(db, &thread.id, num_turns)?;
+    if let Some(engine_thread_id) = rebind_engine_thread_id {
+        db::threads::set_engine_thread_id(db, &thread.id, engine_thread_id)?;
+    }
     db::threads::refresh_thread_message_stats(db, &thread.id)?;
 
     let metadata = mark_codex_transcript_imported(
@@ -2550,6 +2690,14 @@ fn persist_codex_in_place_rollback(
 fn should_clone_local_branch_history(source_thread: &ThreadDto) -> bool {
     !is_codex_thread_sync_required(source_thread.engine_metadata.as_ref())
         && source_thread.message_count > 0
+}
+
+fn codex_thread_has_local_transcript_for_history_tools(thread: &ThreadDto) -> bool {
+    if codex_transcript_imported(thread.engine_metadata.as_ref()) {
+        return true;
+    }
+
+    !is_codex_thread_sync_required(thread.engine_metadata.as_ref()) && thread.message_count > 0
 }
 
 fn clone_codex_branch_metadata(
@@ -3755,6 +3903,44 @@ mod tests {
         assert!(!should_clone_local_branch_history(&thread));
     }
 
+    #[test]
+    fn codex_history_tools_allow_legacy_local_history_marked_unimported() {
+        let mut thread = ThreadDto {
+            id: "thread-1".to_string(),
+            workspace_id: "workspace-1".to_string(),
+            repo_id: None,
+            engine_id: "codex".to_string(),
+            model_id: "gpt-5.4".to_string(),
+            engine_thread_id: Some("engine-thread-1".to_string()),
+            engine_metadata: Some(json!({
+                "codexTranscriptImported": false,
+                "codexSyncRequired": false,
+            })),
+            title: "Thread".to_string(),
+            status: ThreadStatusDto::Idle,
+            message_count: 2,
+            total_tokens: 0,
+            created_at: "2026-03-13T00:00:00Z".to_string(),
+            last_activity_at: "2026-03-13T00:00:00Z".to_string(),
+        };
+
+        assert!(codex_thread_has_local_transcript_for_history_tools(&thread));
+
+        thread.message_count = 0;
+        assert!(!codex_thread_has_local_transcript_for_history_tools(
+            &thread
+        ));
+
+        thread.message_count = 2;
+        thread.engine_metadata = Some(json!({
+            "codexTranscriptImported": false,
+            "codexSyncRequired": true,
+        }));
+        assert!(!codex_thread_has_local_transcript_for_history_tools(
+            &thread
+        ));
+    }
+
     #[tokio::test]
     async fn create_codex_branch_thread_rejects_threads_without_imported_transcript() {
         let state = test_app_state();
@@ -3855,6 +4041,7 @@ mod tests {
                 imported_messages: Vec::new(),
             },
             1,
+            Some("engine-thread-forked"),
         )
         .expect("expected rollback persistence to succeed");
 
@@ -3863,6 +4050,10 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content.as_deref(), Some("First"));
         assert_eq!(messages[1].content.as_deref(), Some("Reply 1"));
+        assert_eq!(
+            updated.engine_thread_id.as_deref(),
+            Some("engine-thread-forked")
+        );
         assert_eq!(updated.message_count, 2);
         assert_eq!(updated.title, "Rolled back");
         assert_eq!(

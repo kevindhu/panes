@@ -56,6 +56,10 @@ import { useWorkspaceStore } from "../../stores/workspaceStore";
 import { useGitStore } from "../../stores/gitStore";
 import { useTerminalStore, type LayoutMode } from "../../stores/terminalStore";
 import { toast } from "../../stores/toastStore";
+import {
+  canEditCodexMessageHistory,
+  canUseNativeCodexHistoryTools as canUseNativeCodexHistoryToolsForThread,
+} from "../../lib/codexThreadCapabilities";
 import { ipc } from "../../lib/ipc";
 import { resolvePreferredOnboardingChatSelection } from "../../lib/onboarding";
 import { recordPerfMetric } from "../../lib/perfTelemetry";
@@ -2476,12 +2480,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   );
   const pendingPlanImplementationThreadIdRef = useRef<string | null>(null);
   const previousStreamingRef = useRef(false);
-  const canEditActiveThreadMessages =
-    activeThread?.engineId === "codex" &&
-    !!activeThread.engineThreadId &&
-    !streaming &&
-    activeThread?.engineMetadata?.codexSyncRequired !== true &&
-    activeThread?.engineMetadata?.codexTranscriptImported !== false;
+  const canEditActiveThreadMessages = canEditCodexMessageHistory(activeThread, streaming);
   const appendBranchProfileLogBestEffort = useCallback(
     (operationId: string, step: string, details?: Record<string, unknown> | string | null) => {
       let serializedDetails: string | null = null;
@@ -4401,8 +4400,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     !!activeThread.engineThreadId &&
     !streaming;
   const canUseNativeCodexHistoryTools =
-    canManageActiveCodexThread &&
-    activeThread?.engineMetadata?.codexTranscriptImported !== false;
+    canUseNativeCodexHistoryToolsForThread(activeThread, streaming);
 
   const isCodexEngine = selectedEngineId === "codex";
   const isOpenCodeEngine = selectedEngineId === "opencode";
