@@ -580,6 +580,17 @@ impl EngineManager {
         self.codex.list_apps().await
     }
 
+    pub async fn read_thread_usage_limits(
+        &self,
+        thread: &ThreadDto,
+    ) -> anyhow::Result<Option<UsageLimitsSnapshot>> {
+        match thread.engine_id.as_str() {
+            "codex" => self.codex.read_usage_limits_snapshot().await,
+            "claude" | "opencode" => Ok(None),
+            _ => anyhow::bail!("unsupported engine_id {}", thread.engine_id),
+        }
+    }
+
     pub async fn opencode_runtime_catalog(
         &self,
         cwd: &str,

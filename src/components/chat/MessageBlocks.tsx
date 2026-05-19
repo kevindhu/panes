@@ -151,6 +151,12 @@ function handlePlainTextLinkClick(
     return;
   }
 
+  const selection = globalThis.getSelection?.();
+  if (selection && !selection.isCollapsed && selection.toString().trim().length > 0) {
+    event.preventDefault();
+    return;
+  }
+
   event.preventDefault();
   if (!event.shiftKey) {
     return;

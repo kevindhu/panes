@@ -1966,8 +1966,9 @@ async fn run_turn(
     match engine_task.await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
+            let error_message = err_to_string(error);
             blocks.push(ContentBlock::Error {
-                message: format!("Engine error: {error}"),
+                message: format!("Engine error: {error_message}"),
             });
             blocks_dirty = true;
             if message_status != MessageStatusDto::Error {
@@ -1981,7 +1982,7 @@ async fn run_turn(
             let _ = app.emit(
                 &stream_event_topic,
                 EngineEvent::Error {
-                    message: format!("{error}"),
+                    message: error_message,
                     recoverable: false,
                 },
             );
@@ -2517,8 +2518,9 @@ async fn run_codex_review_turn(
     match engine_task.await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
+            let error_message = err_to_string(error);
             blocks.push(ContentBlock::Error {
-                message: format!("Engine error: {error}"),
+                message: format!("Engine error: {error_message}"),
             });
             blocks_dirty = true;
             if message_status != MessageStatusDto::Error {
@@ -2532,7 +2534,7 @@ async fn run_codex_review_turn(
             let _ = app.emit(
                 &stream_event_topic,
                 EngineEvent::Error {
-                    message: format!("{error}"),
+                    message: error_message,
                     recoverable: false,
                 },
             );

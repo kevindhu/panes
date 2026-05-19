@@ -18,8 +18,8 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "check:codex-schema": "node scripts/check-codex-app-server-parity.mjs",
-    "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build",
+    "tauri:dev": "node scripts/run-tauri.mjs dev",
+    "tauri:build": "node scripts/run-tauri.mjs build",
     "release:check": "node scripts/should-release.mjs",
     "release": "release-it"
   },

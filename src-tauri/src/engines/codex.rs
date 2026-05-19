@@ -1085,6 +1085,27 @@ impl CodexEngine {
         self.ensure_ready_transport().await.map(|_| ())
     }
 
+    pub async fn read_usage_limits_snapshot(&self) -> anyhow::Result<Option<super::UsageLimitsSnapshot>> {
+        let transport = self.ensure_ready_transport().await?;
+        let snapshot = request_with_fallback(
+            transport.as_ref(),
+            ACCOUNT_RATE_LIMITS_READ_METHODS,
+            serde_json::Value::Null,
+            Duration::from_secs(5),
+        )
+        .await
+        .context("failed to read codex account rate limits")?;
+
+        let mut mapper = TurnEventMapper::default();
+        let Some(super::EngineEvent::UsageLimitsUpdated { usage }) =
+            mapper.map_rate_limits_snapshot(&snapshot)
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(usage))
+    }
+
     pub async fn list_skills(&self, cwd: &str) -> anyhow::Result<Vec<CodexSkillDto>> {
         let transport = self.ensure_ready_transport().await?;
         let response = request_with_fallback(
@@ -3906,7 +3927,7 @@ async fn request_with_fallback(
         match transport.request(method, params.clone(), timeout).await {
             Ok(result) => return Ok(result),
             Err(error) => {
-                errors.push(format!("{method}: {error}"));
+                errors.push(format!("{method}: {error:#}"));
             }
         }
     }
@@ -4102,11 +4123,6 @@ fn sandbox_policy_to_json(
             _ => serde_json::json!({
               "type": "workspaceWrite",
               "writableRoots": sandbox.writable_roots.clone(),
-              "readOnlyAccess": {
-                "type": "restricted",
-                "includePlatformDefaults": true,
-                "readableRoots": sandbox.writable_roots.clone(),
-              },
               "networkAccess": sandbox.allow_network,
               "excludeTmpdirEnvVar": false,
               "excludeSlashTmp": false,
@@ -6839,6 +6855,37 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn sandbox_policy_workspace_write_omits_legacy_read_only_access() {
+        let sandbox = SandboxPolicy {
+            writable_roots: vec!["/tmp/workspace".to_string()],
+            allow_network: false,
+            approval_policy: None,
+            permission_profile: None,
+            approvals_reviewer: None,
+            reasoning_effort: None,
+            sandbox_mode: Some("workspace-write".to_string()),
+            service_tier: None,
+            personality: None,
+            output_schema: None,
+            opencode_agent: None,
+        };
+
+        let payload = sandbox_policy_to_json(&sandbox, false);
+
+        assert_eq!(
+            payload,
+            json!({
+                "type": "workspaceWrite",
+                "writableRoots": ["/tmp/workspace"],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false,
+            })
+        );
+        assert!(payload.get("readOnlyAccess").is_none());
     }
 
     #[test]

@@ -2,13 +2,13 @@ import { describe, expect, it } from "vitest";
 import { shouldSubmitChatInput } from "./chatInputShortcuts";
 
 describe("shouldSubmitChatInput", () => {
-  it("submits on Shift+Enter", () => {
+  it("submits on plain Enter", () => {
     expect(
       shouldSubmitChatInput({
         key: "Enter",
         ctrlKey: false,
         metaKey: false,
-        shiftKey: true,
+        shiftKey: false,
       }),
     ).toBe(true);
   });
@@ -33,13 +33,13 @@ describe("shouldSubmitChatInput", () => {
     ).toBe(true);
   });
 
-  it("keeps plain Enter as newline", () => {
+  it("keeps Shift+Enter as newline", () => {
     expect(
       shouldSubmitChatInput({
         key: "Enter",
         ctrlKey: false,
         metaKey: false,
-        shiftKey: false,
+        shiftKey: true,
       }),
     ).toBe(false);
   });
@@ -50,7 +50,7 @@ describe("shouldSubmitChatInput", () => {
         key: "Enter",
         ctrlKey: false,
         metaKey: false,
-        shiftKey: true,
+        shiftKey: false,
         isComposing: true,
       }),
     ).toBe(false);

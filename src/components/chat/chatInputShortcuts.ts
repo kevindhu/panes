@@ -11,5 +11,9 @@ export function shouldSubmitChatInput(event: ChatInputShortcutEvent): boolean {
     return false;
   }
 
-  return event.shiftKey || event.ctrlKey || event.metaKey;
+  if (event.shiftKey) {
+    return false;
+  }
+
+  return true;
 }

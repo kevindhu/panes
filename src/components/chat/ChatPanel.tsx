@@ -29,6 +29,7 @@ import {
   Check,
   Clock,
   Zap,
+  RefreshCw,
   RotateCcw,
   Minimize2,
   Search,
@@ -1574,6 +1575,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const [commandPanelBusy, setCommandPanelBusy] = useState(false);
   const [commandPanelError, setCommandPanelError] = useState<string | null>(null);
   const commandPanelBusyRef = useRef(false);
+  const [usageRefreshInFlight, setUsageRefreshInFlight] = useState(false);
   const [selectedEngineId, setSelectedEngineId] = useState("codex");
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
   const [selectedEffort, setSelectedEffort] = useState("medium");
@@ -1871,6 +1873,22 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     selectedEngineId,
     selectedModelId,
   ]);
+  const showCodexUsageStatus = messages.length > 0 && activeThread?.engineId === "codex";
+
+  const handleRefreshUsageLimits = useCallback(async () => {
+    if (!threadId || activeThread?.engineId !== "codex" || usageRefreshInFlight) {
+      return;
+    }
+
+    setUsageRefreshInFlight(true);
+    try {
+      await ipc.refreshThreadUsageLimits(threadId);
+    } catch (refreshError) {
+      toast.error(String(refreshError));
+    } finally {
+      setUsageRefreshInFlight(false);
+    }
+  }, [activeThread?.engineId, t, threadId, usageRefreshInFlight]);
 
   useEffect(() => {
     selectedEngineIdRef.current = selectedEngineId;
@@ -4996,6 +5014,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
             {/* ── Messages ── */}
             <div
               ref={viewportRef}
+              className="chat-message-viewport"
               style={{
                 position: "relative",
                 flex: 1,
@@ -5956,75 +5975,104 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
           {/* Bottom status bar with context usage */}
           <div className="chat-status-bar">
-            {messages.length > 0 && selectedEngineId === "codex" && (
-              usageLimits ? (
+            {showCodexUsageStatus && (
                 <>
-                  <div className="chat-context-section">
-                    <Zap size={10} />
-                    <span>{t("status.context")}</span>
-                    <div className="chat-context-progress">
-                      <div
-                        className="chat-context-progress-fill"
-                        style={{ width: usagePercentToWidth(usageLimits.contextPercent) }}
-                      />
+                  {usageLimits ? (
+                    <>
+                      <div className="chat-context-section">
+                        <Zap size={10} />
+                        <span>{t("status.context")}</span>
+                        <div className="chat-context-progress">
+                          <div
+                            className="chat-context-progress-fill"
+                            style={{ width: usagePercentToWidth(usageLimits.contextPercent) }}
+                          />
+                        </div>
+                        <span className="chat-context-percent">
+                          {formatUsagePercent(usageLimits.contextPercent)}
+                        </span>
+                      </div>
+
+                      <span className="chat-context-divider">&middot;</span>
+
+                      <div className="chat-context-section">
+                        <Clock size={10} />
+                        <span>{t("status.windowFiveHoursLeft")}</span>
+                        <div className="chat-context-progress">
+                          <div
+                            className="chat-context-progress-fill chat-context-progress-fill-5h"
+                            style={{ width: usagePercentToWidth(usageLimits.windowFiveHourPercent) }}
+                          />
+                        </div>
+                        <span className="chat-context-percent">
+                          {formatUsagePercent(usageLimits.windowFiveHourPercent)}
+                        </span>
+                        {usageLimits.windowFiveHourResetsAt && (
+                          <span className="chat-context-reset">
+                            {t("status.resets", {
+                              time: formatResetTime(t, usageLimits.windowFiveHourResetsAt),
+                            })}
+                          </span>
+                        )}
+                      </div>
+
+                      <span className="chat-context-divider">&middot;</span>
+
+                      <div className="chat-context-section">
+                        <Clock size={10} />
+                        <span>{t("status.windowWeeklyLeft")}</span>
+                        <div className="chat-context-progress">
+                          <div
+                            className="chat-context-progress-fill chat-context-progress-fill-weekly"
+                            style={{ width: usagePercentToWidth(usageLimits.windowWeeklyPercent) }}
+                          />
+                        </div>
+                        <span className="chat-context-percent">
+                          {formatUsagePercent(usageLimits.windowWeeklyPercent)}
+                        </span>
+                        {usageLimits.windowWeeklyResetsAt && (
+                          <span className="chat-context-reset">
+                            {t("status.resets", {
+                              time: formatResetTime(t, usageLimits.windowWeeklyResetsAt),
+                            })}
+                          </span>
+                        )}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="chat-context-section">
+                      <Clock size={10} />
+                      <span>{t("status.usageUnavailable")}</span>
                     </div>
-                    <span className="chat-context-percent">
-                      {formatUsagePercent(usageLimits.contextPercent)}
-                    </span>
-                  </div>
+                  )}
 
-                  <span className="chat-context-divider">&middot;</span>
-
-                  <div className="chat-context-section">
-                    <Clock size={10} />
-                    <span>{t("status.windowFiveHoursLeft")}</span>
-                    <div className="chat-context-progress">
-                      <div
-                        className="chat-context-progress-fill chat-context-progress-fill-5h"
-                        style={{ width: usagePercentToWidth(usageLimits.windowFiveHourPercent) }}
-                      />
-                    </div>
-                    <span className="chat-context-percent">
-                      {formatUsagePercent(usageLimits.windowFiveHourPercent)}
-                    </span>
-                    {usageLimits.windowFiveHourResetsAt && (
-                      <span className="chat-context-reset">
-                        {t("status.resets", {
-                          time: formatResetTime(t, usageLimits.windowFiveHourResetsAt),
-                        })}
-                      </span>
-                    )}
-                  </div>
-
-                  <span className="chat-context-divider">&middot;</span>
-
-                  <div className="chat-context-section">
-                    <Clock size={10} />
-                    <span>{t("status.windowWeeklyLeft")}</span>
-                    <div className="chat-context-progress">
-                      <div
-                        className="chat-context-progress-fill chat-context-progress-fill-weekly"
-                        style={{ width: usagePercentToWidth(usageLimits.windowWeeklyPercent) }}
-                      />
-                    </div>
-                    <span className="chat-context-percent">
-                      {formatUsagePercent(usageLimits.windowWeeklyPercent)}
-                    </span>
-                    {usageLimits.windowWeeklyResetsAt && (
-                      <span className="chat-context-reset">
-                        {t("status.resets", {
-                          time: formatResetTime(t, usageLimits.windowWeeklyResetsAt),
-                        })}
-                      </span>
-                    )}
-                  </div>
+                  <button
+                    type="button"
+                    className="chat-context-refresh-btn"
+                    onClick={handleRefreshUsageLimits}
+                    disabled={usageRefreshInFlight || !threadId}
+                    title={
+                      usageRefreshInFlight
+                        ? t("status.refreshingUsage")
+                        : t("status.refreshUsage")
+                    }
+                    aria-label={
+                      usageRefreshInFlight
+                        ? t("status.refreshingUsage")
+                        : t("status.refreshUsage")
+                    }
+                  >
+                    <RefreshCw
+                      size={11}
+                      style={{
+                        animation: usageRefreshInFlight
+                          ? "spin 1s linear infinite"
+                          : "none",
+                      }}
+                    />
+                    <span>{t("status.refresh")}</span>
+                  </button>
                 </>
-              ) : (
-                <div className="chat-context-section">
-                  <Clock size={10} />
-                  <span>{t("status.usageUnavailable")}</span>
-                </div>
-              )
             )}
 
             <div style={{ flex: 1 }} />

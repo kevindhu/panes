@@ -506,7 +506,10 @@
     "windowFiveHoursLeft": "5h left",
     "windowWeeklyLeft": "Weekly left",
     "resets": "resets {{time}}",
-    "usageUnavailable": "Usage limits unavailable from server"
+    "usageUnavailable": "Usage limits unavailable from server",
+    "refresh": "Refresh",
+    "refreshUsage": "Refresh usage limits",
+    "refreshingUsage": "Refreshing usage limits"
   },
   "slashCommands": {
     "panels": {

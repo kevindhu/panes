@@ -203,6 +203,12 @@ function handleMarkdownLinkClick(event: ReactMouseEvent<HTMLDivElement>): void {
     return;
   }
 
+  const selection = globalThis.getSelection?.();
+  if (selection && !selection.isCollapsed && selection.toString().trim().length > 0) {
+    event.preventDefault();
+    return;
+  }
+
   const targetKind = classifyLinkTarget(rawHref);
   if (targetKind === "other") {
     return;

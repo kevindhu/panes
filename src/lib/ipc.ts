@@ -326,6 +326,8 @@ export const ipc = {
   restoreThread: (threadId: string) => invoke<Thread>("restore_thread", { threadId }),
   syncThreadFromEngine: (threadId: string) =>
     invoke<Thread>("sync_thread_from_engine", { threadId }),
+  refreshThreadUsageLimits: (threadId: string) =>
+    invoke<boolean>("refresh_thread_usage_limits", { threadId }),
   forkCodexThread: (threadId: string) =>
     invoke<Thread>("fork_codex_thread", { threadId }),
   rollbackCodexThread: (threadId: string, numTurns: number) =>

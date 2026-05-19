@@ -61,6 +61,10 @@ const LEGACY_SCAN_DEPTH_STORAGE_KEY = "panes.workspace.scanDepth";
 const LEGACY_SCAN_DEPTH_MIN = 0;
 const LEGACY_SCAN_DEPTH_MAX = 12;
 
+function isRunningThreadStatus(status: Thread["status"]): boolean {
+  return status === "streaming" || status === "awaiting_approval";
+}
+
 function readLegacyDefaultScanDepth(): number | undefined {
   const stored = window.localStorage.getItem(LEGACY_SCAN_DEPTH_STORAGE_KEY);
   if (!stored) return undefined;
@@ -107,6 +111,9 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   const openWorkspaceSettings = useUiStore((state) => state.openWorkspaceSettings);
   const openCommandPalette = useUiStore((state) => state.openCommandPalette);
   const bindChatThread = useChatStore((s) => s.setActiveThread);
+  const boundChatThreadId = useChatStore((s) => s.threadId);
+  const boundChatStatus = useChatStore((s) => s.status);
+  const boundChatStreaming = useChatStore((s) => s.streaming);
   const updateStatus = useUpdateStore((s) => s.status);
   const updateSnoozed = useUpdateStore((s) => s.snoozed);
   const keepAwakeState = useKeepAwakeStore((s) => s.state);
@@ -331,6 +338,17 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
     return thread.title?.trim() || t("app:sidebar.untitledThread");
   }
 
+  function isThreadRunning(thread: Thread) {
+    if (isRunningThreadStatus(thread.status)) {
+      return true;
+    }
+
+    return (
+      thread.id === boundChatThreadId &&
+      (boundChatStreaming || isRunningThreadStatus(boundChatStatus))
+    );
+  }
+
   const keepAwakeDescription = useMemo(() => {
     if (!keepAwakeState) {
       return t("app:sidebar.keepAwakeDescription");
@@ -540,6 +558,8 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                       <>
                         {visibleThreads.map((thread, i) => {
                           const isActive = thread.id === activeThreadId;
+                          const isRunning = isThreadRunning(thread);
+                          const threadLabel = getThreadLabel(thread);
                           return (
                             <div
                               key={thread.id}
@@ -556,7 +576,22 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                               }}
                             >
                               <span className="sb-thread-title">
-                                {getThreadLabel(thread)}
+                                {isRunning && (
+                                  <span
+                                    className="sb-thread-running-indicator"
+                                    aria-hidden="true"
+                                  >
+                                    <span />
+                                    <span />
+                                    <span />
+                                  </span>
+                                )}
+                                <span
+                                  className="sb-thread-title-label"
+                                  title={threadLabel}
+                                >
+                                  {threadLabel}
+                                </span>
                               </span>
                               <span className="sb-thread-trailing">
                                 <span className="sb-thread-time">

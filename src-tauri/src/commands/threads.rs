@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
-use tauri::State;
+use tauri::{Emitter, State};
 
 use crate::{
     db,
@@ -1159,6 +1159,41 @@ pub async fn sync_thread_from_engine(
         }
     })
     .await
+}
+
+#[tauri::command]
+pub async fn refresh_thread_usage_limits(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> Result<bool, String> {
+    let db = state.db.clone();
+    let thread = run_db(db, {
+        let thread_id = thread_id.clone();
+        move |db| db::threads::get_thread(db, &thread_id)
+    })
+    .await?
+    .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+
+    let Some(usage) = state
+        .engines
+        .read_thread_usage_limits(&thread)
+        .await
+        .map_err(err_to_string)?
+    else {
+        return Ok(false);
+    };
+
+    let stream_event_topic = format!("stream-event-{thread_id}");
+    let _ = app.emit(
+        &stream_event_topic,
+        serde_json::json!({
+            "type": "UsageLimitsUpdated",
+            "usage": usage,
+        }),
+    );
+
+    Ok(true)
 }
 
 fn mark_codex_transcript_imported(mut metadata: Value, imported: bool) -> Value {

@@ -506,6 +506,9 @@
     "windowFiveHoursLeft": "5h restantes",
     "windowWeeklyLeft": "Semana restante",
     "resets": "reinicia {{time}}",
+    "refresh": "Atualizar",
+    "refreshUsage": "Atualizar limites de uso",
+    "refreshingUsage": "Atualizando limites de uso",
     "usageUnavailable": "Limites de uso indisponíveis no servidor"
   },
   "slashCommands": {
