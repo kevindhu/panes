@@ -10,10 +10,11 @@ const staleOnly = args.has("--stale");
 const checkOnly = args.has("--check") || !apply;
 const olderThanDays = parseOlderThanDays(rawArgs);
 const staleCutoffMs = Date.now() - olderThanDays * 24 * 60 * 60 * 1000;
-const rustTargetRelativePath = "src-tauri/target";
+const tauriRootRelativePath = "src-tauri";
+const rustTargetRelativePath = `${tauriRootRelativePath}/target`;
 const cargoCacheDirectoryNames = new Set(["incremental", "deps", "build", ".fingerprint"]);
 
-const targets = [
+const baseTargets = [
   {
     relativePath: rustTargetRelativePath,
     label: "Rust/Tauri build artifacts",
@@ -27,6 +28,31 @@ const targets = [
     label: "Remotion browser/runtime cache",
   },
 ];
+
+async function collectManagedTargets() {
+  const targets = [...baseTargets];
+  const tauriRoot = path.join(repoRoot, tauriRootRelativePath);
+
+  try {
+    for (const entry of await readdir(tauriRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !entry.name.startsWith("target-")) {
+        continue;
+      }
+
+      targets.push({
+        relativePath: `${tauriRootRelativePath}/${entry.name}`,
+        label: "Rust/Tauri build artifacts",
+      });
+    }
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return targets;
+    }
+    throw error;
+  }
+
+  return targets;
+}
 
 function formatBytes(bytes) {
   if (bytes < 1024) return `${bytes} B`;
@@ -141,9 +167,9 @@ async function inspectTarget(target) {
   }
 }
 
-function assertManagedPath(absolutePath, { allowNested = false } = {}) {
+function assertManagedPath(absolutePath, managedTargets, { allowNested = false } = {}) {
   const resolvedPath = path.resolve(absolutePath);
-  const matchesManagedTarget = targets.some((target) => {
+  const matchesManagedTarget = managedTargets.some((target) => {
     const managedRoot = path.join(repoRoot, target.relativePath);
     const relativeToTarget = path.relative(managedRoot, resolvedPath);
 
@@ -176,20 +202,21 @@ function isOlderThanCutoff(stats) {
   return stats.mtimeMs < staleCutoffMs;
 }
 
-async function collectStaleTargetCandidates() {
-  const targetRoot = path.join(repoRoot, rustTargetRelativePath);
-
-  try {
-    await lstat(targetRoot);
-  } catch (error) {
-    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-      return [];
-    }
-    throw error;
-  }
-
+async function collectStaleTargetCandidates(rustTargetRelativePaths) {
   const candidates = [];
-  await walkRustTargetTree(targetRoot, candidates);
+  for (const relativePath of rustTargetRelativePaths) {
+    const targetRoot = path.join(repoRoot, relativePath);
+    try {
+      await lstat(targetRoot);
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+        continue;
+      }
+      throw error;
+    }
+
+    await walkRustTargetTree(targetRoot, candidates);
+  }
 
   const seenHardLinks = new Set();
   candidates.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
@@ -286,7 +313,8 @@ function summarizeStaleCandidates(candidates) {
 }
 
 async function runFullPruneMode() {
-  const inspected = await Promise.all(targets.map(inspectTarget));
+  const managedTargets = await collectManagedTargets();
+  const inspected = await Promise.all(managedTargets.map(inspectTarget));
   const existing = inspected.filter((target) => target.exists);
   const totalBytes = existing.reduce((sum, target) => sum + target.sizeBytes, 0);
 
@@ -312,7 +340,7 @@ async function runFullPruneMode() {
   }
 
   for (const target of existing) {
-    assertManagedPath(target.absolutePath);
+    assertManagedPath(target.absolutePath, managedTargets);
     await rm(target.absolutePath, { recursive: true, force: true });
     console.log(`Removed ${target.relativePath} (${formatBytes(target.sizeBytes)})`);
   }
@@ -325,7 +353,11 @@ async function runFullPruneMode() {
 }
 
 async function runStalePruneMode() {
-  const candidates = await collectStaleTargetCandidates();
+  const managedTargets = await collectManagedTargets();
+  const rustTargetRelativePaths = managedTargets
+    .map((target) => target.relativePath)
+    .filter((relativePath) => relativePath === rustTargetRelativePath || relativePath.startsWith(`${tauriRootRelativePath}/target-`));
+  const candidates = await collectStaleTargetCandidates(rustTargetRelativePaths);
   const groups = summarizeStaleCandidates(candidates);
   const totalBytes = candidates.reduce((sum, candidate) => sum + candidate.sizeBytes, 0);
   const ageWindow = formatDays(olderThanDays);
@@ -354,7 +386,7 @@ async function runStalePruneMode() {
   }
 
   for (const candidate of candidates) {
-    assertManagedPath(candidate.absolutePath, { allowNested: true });
+    assertManagedPath(candidate.absolutePath, managedTargets, { allowNested: true });
     await rm(candidate.absolutePath, { recursive: true, force: true });
   }
 
