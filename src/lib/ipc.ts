@@ -41,6 +41,7 @@ import type {
   KeepAwakeState,
   PowerSettings,
   PowerSettingsInput,
+  RefreshThreadUsageLimitsResult,
   Message,
   MessageWindow,
   MessageWindowCursor,
@@ -327,7 +328,7 @@ export const ipc = {
   syncThreadFromEngine: (threadId: string) =>
     invoke<Thread>("sync_thread_from_engine", { threadId }),
   refreshThreadUsageLimits: (threadId: string) =>
-    invoke<boolean>("refresh_thread_usage_limits", { threadId }),
+    invoke<RefreshThreadUsageLimitsResult>("refresh_thread_usage_limits", { threadId }),
   appendBranchProfileLog: (operationId: string, step: string, details?: string | null) =>
     invoke<string>("append_branch_profile_log", {
       operationId,

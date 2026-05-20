@@ -17,7 +17,9 @@ import type {
   NoticeBlock,
   SkillBlock,
   SteerBlock,
+  StreamTokenUsage,
   StreamEvent,
+  TurnCompletionSource,
   ThreadStatus
 } from "../types";
 
@@ -912,7 +914,207 @@ function upsertNoticeBlock(blocks: ContentBlock[], block: NoticeBlock): ContentB
     return next;
   }
 
+  if (block.kind === "turn_status") {
+    return [...blocks, block];
+  }
+
   return [block, ...blocks];
+}
+
+type TurnStatusState =
+  | "streaming"
+  | "awaiting_approval"
+  | "completed"
+  | "interrupted"
+  | "failed";
+
+interface TurnBlockStats {
+  actionsTotal: number;
+  actionsDone: number;
+  actionsError: number;
+  actionsRunning: number;
+  actionsPending: number;
+  approvalsPending: number;
+  approvalsAnswered: number;
+  diffBlocks: number;
+  errorBlocks: number;
+}
+
+function collectTurnBlockStats(blocks: ContentBlock[]): TurnBlockStats {
+  const stats: TurnBlockStats = {
+    actionsTotal: 0,
+    actionsDone: 0,
+    actionsError: 0,
+    actionsRunning: 0,
+    actionsPending: 0,
+    approvalsPending: 0,
+    approvalsAnswered: 0,
+    diffBlocks: 0,
+    errorBlocks: 0,
+  };
+
+  for (const block of blocks) {
+    if (block.type === "action") {
+      stats.actionsTotal += 1;
+      if (block.status === "done") {
+        stats.actionsDone += 1;
+      } else if (block.status === "error") {
+        stats.actionsError += 1;
+      } else if (block.status === "pending") {
+        stats.actionsPending += 1;
+      } else {
+        stats.actionsRunning += 1;
+      }
+      continue;
+    }
+
+    if (block.type === "approval") {
+      if (block.status === "pending") {
+        stats.approvalsPending += 1;
+      } else {
+        stats.approvalsAnswered += 1;
+      }
+      continue;
+    }
+
+    if (block.type === "diff") {
+      stats.diffBlocks += 1;
+      continue;
+    }
+
+    if (block.type === "error") {
+      stats.errorBlocks += 1;
+    }
+  }
+
+  return stats;
+}
+
+function describeTurnCompletionSource(source?: TurnCompletionSource | null): string | null {
+  switch (source) {
+    case "engine":
+      return "explicit engine terminal event";
+    case "reconciled_stream_lost":
+      return "reconciled from thread history after live stream loss";
+    case "reconciled_timeout":
+      return "reconciled from thread history after completion timeout";
+    case "timeout_fallback":
+      return "Panes timeout fallback";
+    default:
+      return null;
+  }
+}
+
+function turnStatusNoticeLevel(state: TurnStatusState): NoticeBlock["level"] {
+  if (state === "failed") {
+    return "error";
+  }
+  if (state === "interrupted" || state === "awaiting_approval") {
+    return "warning";
+  }
+  return "info";
+}
+
+function turnStatusNoticeTitle(state: TurnStatusState): string {
+  switch (state) {
+    case "completed":
+      return "Turn completed";
+    case "interrupted":
+      return "Turn interrupted";
+    case "failed":
+      return "Turn failed";
+    case "awaiting_approval":
+      return "Waiting for approval";
+    default:
+      return "Turn still open";
+  }
+}
+
+function turnStatusNoticeMessage(
+  state: TurnStatusState,
+  source?: TurnCompletionSource | null,
+): string {
+  switch (state) {
+    case "completed":
+      if (source === "engine") {
+        return "Codex reported a normal terminal completion.";
+      }
+      if (source === "reconciled_timeout") {
+        return "Panes recovered the completed turn from thread history after the live completion timed out.";
+      }
+      return "The turn reached a terminal completion.";
+    case "interrupted":
+      return "The turn ended before a normal completion.";
+    case "failed":
+      if (source === "reconciled_stream_lost") {
+        return "Panes recovered the turn after losing the live Codex stream. The transcript may be incomplete.";
+      }
+      if (source === "timeout_fallback") {
+        return "Panes timed out waiting for Codex to finish and marked the turn as failed.";
+      }
+      return "The turn ended with a terminal failure.";
+    case "awaiting_approval":
+      return "Waiting for approval before the turn can continue.";
+    default:
+      return "No terminal completion event has been recorded yet.";
+  }
+}
+
+function buildTurnStatusNotice(
+  blocks: ContentBlock[],
+  options: {
+    state: TurnStatusState;
+    source?: TurnCompletionSource | null;
+    tokenUsage?: StreamTokenUsage | null;
+  },
+): NoticeBlock {
+  const { state, source, tokenUsage } = options;
+  const stats = collectTurnBlockStats(blocks);
+  const details: string[] = [];
+  const sourceLabel = describeTurnCompletionSource(source);
+
+  if (sourceLabel) {
+    details.push(`Completion source: ${sourceLabel}`);
+  }
+
+  if (tokenUsage) {
+    details.push(`Token usage: ${tokenUsage.input} input, ${tokenUsage.output} output`);
+  }
+
+  if (stats.actionsTotal > 0) {
+    details.push(
+      `Actions: ${stats.actionsTotal} total, ${stats.actionsDone} done, ${stats.actionsError} error, ${stats.actionsRunning} running, ${stats.actionsPending} pending`,
+    );
+  }
+
+  if (stats.approvalsPending > 0 || stats.approvalsAnswered > 0) {
+    details.push(
+      `Approvals: ${stats.approvalsPending} pending, ${stats.approvalsAnswered} answered`,
+    );
+  }
+
+  if (stats.diffBlocks > 0) {
+    details.push(`Diff blocks: ${stats.diffBlocks}`);
+  }
+
+  if (stats.errorBlocks > 0) {
+    details.push(`Error blocks: ${stats.errorBlocks}`);
+  }
+
+  if (state === "streaming" && details.length === 0) {
+    details.push("No tool, approval, diff, or error activity has been recorded yet.");
+  }
+
+  return {
+    type: "notice",
+    kind: "turn_status",
+    level: turnStatusNoticeLevel(state),
+    title: turnStatusNoticeTitle(state),
+    message: turnStatusNoticeMessage(state, source),
+    details: details.length > 0 ? details : undefined,
+    status: state,
+    source: source ?? undefined,
+  };
 }
 
 function normalizeBlocks(blocks?: ContentBlock[]): ContentBlock[] | undefined {
@@ -1561,6 +1763,9 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
           : "info",
       title: String(event.title ?? "Notice"),
       message: String(event.message ?? ""),
+      details: undefined,
+      status: undefined,
+      source: undefined,
     });
   }
 
@@ -1574,6 +1779,20 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
 
   if (event.type === "TurnCompleted") {
     const status = String(event.status ?? "completed");
+    const nextState =
+      status === "failed"
+        ? "failed"
+        : status === "interrupted"
+          ? "interrupted"
+          : "completed";
+    assistant.blocks = upsertNoticeBlock(
+      assistant.blocks ?? [],
+      buildTurnStatusNotice(assistant.blocks ?? [], {
+        state: nextState,
+        source: event.diagnostics?.source,
+        tokenUsage: event.token_usage ?? undefined,
+      }),
+    );
     if (status === "failed") {
       assistant.status = "error";
     } else if (status === "interrupted") {

@@ -352,6 +352,62 @@ describe("chatStore send", () => {
     vi.useRealTimers();
   });
 
+  it("stores turn completion diagnostics as terminal notice blocks", async () => {
+    vi.useFakeTimers();
+
+    let streamHandler: ((event: StreamEvent) => void) | null = null;
+    mockListenThreadEvents.mockImplementationOnce(async (_threadId, onEvent) => {
+      streamHandler = onEvent;
+      return () => {};
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    mockIpc.sendMessage.mockResolvedValueOnce("assistant-message-id");
+    await expect(
+      useChatStore.getState().send("hello", {
+        engineId: "codex",
+        modelId: "gpt-5.3-codex",
+      }),
+    ).resolves.toBe(true);
+
+    streamHandler!({
+      type: "TurnCompleted",
+      status: "completed",
+      token_usage: {
+        input: 12,
+        output: 34,
+      },
+      diagnostics: {
+        source: "engine",
+      },
+    });
+
+    await vi.advanceTimersByTimeAsync(20);
+
+    const assistant = useChatStore
+      .getState()
+      .messages.find((message) => message.role === "assistant" && message.blocks?.length);
+    expect(assistant?.status).toBe("completed");
+    expect(assistant?.blocks).toEqual([
+      expect.objectContaining({
+        type: "notice",
+        kind: "turn_status",
+        level: "info",
+        title: "Turn completed",
+        message: "Codex reported a normal terminal completion.",
+        status: "completed",
+        source: "engine",
+        details: expect.arrayContaining([
+          "Completion source: explicit engine terminal event",
+          "Token usage: 12 input, 34 output",
+        ]),
+      }),
+    ]);
+
+    vi.useRealTimers();
+  });
+
   it("derives context usage from current context tokens instead of cumulative totals", async () => {
     vi.useFakeTimers();
 

@@ -1383,6 +1383,7 @@ impl Engine for ClaudeSidecarEngine {
                                                 cost_usd: None,
                                             }),
                                             status: completion_status,
+                                            diagnostics: None,
                                         })
                                         .await
                                         .ok();
@@ -1486,6 +1487,7 @@ impl Engine for ClaudeSidecarEngine {
                                 .send(EngineEvent::TurnCompleted {
                                     token_usage: None,
                                     status: TurnCompletionStatus::Failed,
+                                    diagnostics: None,
                                 })
                                 .await
                                 .ok();
@@ -1510,6 +1512,7 @@ impl Engine for ClaudeSidecarEngine {
                                 .send(EngineEvent::TurnCompleted {
                                     token_usage: None,
                                     status: TurnCompletionStatus::Failed,
+                                    diagnostics: None,
                                 })
                                 .await
                                 .ok();

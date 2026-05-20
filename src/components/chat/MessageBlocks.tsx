@@ -509,7 +509,219 @@ function ThinkingBlockView({ block, isStreaming }: { block: ThinkingBlock; isStr
   );
 }
 
+function buildLiveTurnStatusNotice(blocks: ContentBlock[]): NoticeBlock {
+  let actionsTotal = 0;
+  let actionsDone = 0;
+  let actionsError = 0;
+  let actionsRunning = 0;
+  let actionsPending = 0;
+  let approvalsPending = 0;
+  let approvalsAnswered = 0;
+  let diffBlocks = 0;
+  let errorBlocks = 0;
+
+  for (const block of blocks) {
+    if (block.type === "action") {
+      actionsTotal += 1;
+      if (block.status === "done") {
+        actionsDone += 1;
+      } else if (block.status === "error") {
+        actionsError += 1;
+      } else if (block.status === "pending") {
+        actionsPending += 1;
+      } else {
+        actionsRunning += 1;
+      }
+      continue;
+    }
+
+    if (block.type === "approval") {
+      if (block.status === "pending") {
+        approvalsPending += 1;
+      } else {
+        approvalsAnswered += 1;
+      }
+      continue;
+    }
+
+    if (block.type === "diff") {
+      diffBlocks += 1;
+      continue;
+    }
+
+    if (block.type === "error") {
+      errorBlocks += 1;
+    }
+  }
+
+  const details: string[] = [];
+  if (actionsTotal > 0) {
+    details.push(
+      `Actions: ${actionsTotal} total, ${actionsDone} done, ${actionsError} error, ${actionsRunning} running, ${actionsPending} pending`,
+    );
+  }
+  if (approvalsPending > 0 || approvalsAnswered > 0) {
+    details.push(`Approvals: ${approvalsPending} pending, ${approvalsAnswered} answered`);
+  }
+  if (diffBlocks > 0) {
+    details.push(`Diff blocks: ${diffBlocks}`);
+  }
+  if (errorBlocks > 0) {
+    details.push(`Error blocks: ${errorBlocks}`);
+  }
+  if (details.length === 0) {
+    details.push("No tool, approval, diff, or error activity has been recorded yet.");
+  }
+
+  const awaitingApproval = approvalsPending > 0;
+  return {
+    type: "notice",
+    kind: "turn_status",
+    level: awaitingApproval ? "warning" : "info",
+    title: awaitingApproval ? "Waiting for approval" : "Turn still open",
+    message: awaitingApproval
+      ? "Waiting for approval before the turn can continue."
+      : "No terminal completion event has been recorded yet.",
+    details,
+    status: awaitingApproval ? "awaiting_approval" : "streaming",
+  };
+}
+
+function humanizeTurnStatusSource(source?: string): string | null {
+  switch (source) {
+    case "engine":
+      return "engine";
+    case "reconciled_stream_lost":
+      return "reconciled after stream loss";
+    case "reconciled_timeout":
+      return "reconciled after timeout";
+    case "timeout_fallback":
+      return "timeout fallback";
+    default:
+      return null;
+  }
+}
+
+function TurnStatusNoticeView({ block }: { block: NoticeBlock }) {
+  const { t } = useTranslation("chat");
+  const [expanded, setExpanded] = useState(() => block.level !== "info");
+
+  useEffect(() => {
+    if (block.level !== "info") {
+      setExpanded(true);
+    }
+  }, [block.level, block.message]);
+
+  const toggleExpanded = useCallback(() => setExpanded((value) => !value), []);
+  const status = String(block.status ?? "");
+  const sourceLabel = humanizeTurnStatusSource(block.source);
+  const details = Array.isArray(block.details) ? block.details : [];
+
+  let Icon = Info;
+  let accent = "var(--info)";
+  let background = "rgba(56, 189, 248, 0.10)";
+  let border = "rgba(56, 189, 248, 0.18)";
+
+  if (status === "completed") {
+    Icon = CheckCircle2;
+    accent = "var(--success)";
+    background = "rgba(34, 197, 94, 0.10)";
+    border = "rgba(34, 197, 94, 0.18)";
+  } else if (status === "failed") {
+    Icon = XCircle;
+    accent = "var(--danger)";
+    background = "rgba(248, 113, 113, 0.10)";
+    border = "rgba(248, 113, 113, 0.18)";
+  } else if (status === "interrupted" || status === "awaiting_approval") {
+    Icon = AlertTriangle;
+    accent = "var(--warning)";
+    background = "rgba(245, 158, 11, 0.10)";
+    border = "rgba(245, 158, 11, 0.18)";
+  } else if (status === "streaming") {
+    Icon = Loader2;
+  }
+
+  return (
+    <div
+      className="msg-notice-block"
+      style={{
+        border: `1px solid ${border}`,
+        background,
+        alignItems: "flex-start",
+      }}
+    >
+      <Icon
+        size={14}
+        style={{
+          flexShrink: 0,
+          color: accent,
+          marginTop: 1,
+          animation: status === "streaming" ? "spin 1s linear infinite" : undefined,
+        }}
+      />
+      <div style={{ minWidth: 0, flex: 1, display: "flex", flexDirection: "column", gap: 6 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <div style={{ fontSize: 11, fontWeight: 600, color: accent }}>
+            {block.title}
+          </div>
+          {sourceLabel && (
+            <span
+              style={{
+                fontSize: 10,
+                lineHeight: 1.4,
+                padding: "1px 6px",
+                borderRadius: 999,
+                border: `1px solid ${border}`,
+                color: "var(--text-3)",
+              }}
+            >
+              {sourceLabel}
+            </span>
+          )}
+        </div>
+        <div style={{ color: "var(--text-2)" }}>{block.message}</div>
+        {details.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <button
+              type="button"
+              className="acard-toggle"
+              onClick={toggleExpanded}
+              style={{ alignSelf: "flex-start" }}
+            >
+              {expanded
+                ? t("messageBlocks.approval.hideDetails")
+                : t("messageBlocks.approval.showDetails")}
+            </button>
+            {expanded && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                {details.map((detail, index) => (
+                  <div
+                    key={`${detail}:${index}`}
+                    style={{
+                      fontSize: 11.5,
+                      color: "var(--text-2)",
+                      fontFamily: '"JetBrains Mono", monospace',
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-word",
+                    }}
+                  >
+                    <LinkifiedPlainText text={detail} />
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function NoticeBlockView({ block }: { block: NoticeBlock }) {
+  if (block.kind === "turn_status") {
+    return <TurnStatusNoticeView block={block} />;
+  }
+
   return (
     <div className="msg-notice-block msg-notice-block--info">
       <Info size={14} style={{ flexShrink: 0, color: "var(--info)", marginTop: 1 }} />
@@ -1608,7 +1820,19 @@ function MessageBlocksView({ blocks = [], status, engineId, onApproval, onLoadAc
   );
 
   const isStreaming = status === "streaming";
-  const blockSegments = useMemo(() => buildBlockSegments(safeBlocks, isStreaming), [safeBlocks, isStreaming]);
+  const renderedBlocks = useMemo(() => {
+    const hasTurnStatus = safeBlocks.some(
+      (block) => block.type === "notice" && block.kind === "turn_status",
+    );
+    if (!isStreaming || hasTurnStatus) {
+      return safeBlocks;
+    }
+    return [...safeBlocks, buildLiveTurnStatusNotice(safeBlocks)];
+  }, [isStreaming, safeBlocks]);
+  const blockSegments = useMemo(
+    () => buildBlockSegments(renderedBlocks, isStreaming),
+    [renderedBlocks, isStreaming],
+  );
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
@@ -1691,7 +1915,7 @@ function MessageBlocksView({ blocks = [], status, engineId, onApproval, onLoadAc
         return renderSingleBlock(
           segment.block,
           segment.index,
-          safeBlocks,
+          renderedBlocks,
           status,
           engineId,
           onApproval,

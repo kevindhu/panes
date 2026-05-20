@@ -358,6 +358,23 @@ pub struct ImportedThreadMessage {
     pub created_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct UsageLimitsReadDiagnostics {
+    pub thread_read_attempted: bool,
+    pub thread_read_succeeded: bool,
+    pub account_read_attempted: bool,
+    pub account_read_succeeded: bool,
+    pub thread_read_error: Option<String>,
+    pub account_read_error: Option<String>,
+    pub fatal_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UsageLimitsReadResult {
+    pub usage: Option<UsageLimitsSnapshot>,
+    pub diagnostics: UsageLimitsReadDiagnostics,
+}
+
 #[derive(Debug, Clone)]
 pub struct CodexRemoteThreadSummary {
     pub engine_thread_id: String,
@@ -583,14 +600,14 @@ impl EngineManager {
     pub async fn read_thread_usage_limits(
         &self,
         thread: &ThreadDto,
-    ) -> anyhow::Result<Option<UsageLimitsSnapshot>> {
+    ) -> anyhow::Result<UsageLimitsReadResult> {
         match thread.engine_id.as_str() {
             "codex" => {
                 self.codex
                     .read_usage_limits_snapshot(thread.engine_thread_id.as_deref())
                     .await
             }
-            "claude" | "opencode" => Ok(None),
+            "claude" | "opencode" => Ok(UsageLimitsReadResult::default()),
             _ => anyhow::bail!("unsupported engine_id {}", thread.engine_id),
         }
     }

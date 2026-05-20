@@ -6,6 +6,7 @@ use std::{
 };
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{Emitter, State};
 
@@ -77,6 +78,50 @@ fn log_branch_profile_step(operation_id: Option<&str>, step: &str, details: Opti
     if let Err(error) = append_branch_profile_log_entry(operation_id, step, details.as_deref()) {
         log::warn!("failed to append branch profile log entry for {operation_id}: {error}");
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshThreadUsageLimitsDiagnosticsDto {
+    pub thread_id: String,
+    pub engine_id: String,
+    pub model_id: String,
+    pub thread_status: String,
+    pub message_count: i64,
+    pub last_activity_at: String,
+    pub engine_thread_id: Option<String>,
+    pub thread_read_attempted: bool,
+    pub thread_read_succeeded: bool,
+    pub account_read_attempted: bool,
+    pub account_read_succeeded: bool,
+    pub current_tokens: Option<u64>,
+    pub max_context_tokens: Option<u64>,
+    pub context_window_percent: Option<u8>,
+    pub five_hour_percent: Option<u8>,
+    pub weekly_percent: Option<u8>,
+    pub five_hour_resets_at: Option<i64>,
+    pub weekly_resets_at: Option<i64>,
+    pub thread_read_error: Option<String>,
+    pub account_read_error: Option<String>,
+    pub fatal_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshThreadUsageLimitsResultDto {
+    pub refreshed: bool,
+    pub missing_context: bool,
+    pub diagnostics: RefreshThreadUsageLimitsDiagnosticsDto,
+}
+
+fn usage_snapshot_missing_context(usage: Option<&crate::engines::UsageLimitsSnapshot>) -> bool {
+    let Some(usage) = usage else {
+        return true;
+    };
+
+    usage.current_tokens.is_none()
+        && usage.max_context_tokens.is_none()
+        && usage.context_window_percent.is_none()
 }
 
 #[tauri::command]
@@ -1238,7 +1283,7 @@ pub async fn refresh_thread_usage_limits(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     thread_id: String,
-) -> Result<bool, String> {
+) -> Result<RefreshThreadUsageLimitsResultDto, String> {
     let db = state.db.clone();
     let thread = run_db(db, {
         let thread_id = thread_id.clone();
@@ -1247,25 +1292,59 @@ pub async fn refresh_thread_usage_limits(
     .await?
     .ok_or_else(|| format!("thread not found: {thread_id}"))?;
 
-    let Some(usage) = state
-        .engines
-        .read_thread_usage_limits(&thread)
-        .await
-        .map_err(err_to_string)?
-    else {
-        return Ok(false);
+    let read_result = match state.engines.read_thread_usage_limits(&thread).await {
+        Ok(read_result) => read_result,
+        Err(error) => crate::engines::UsageLimitsReadResult {
+            usage: None,
+            diagnostics: crate::engines::UsageLimitsReadDiagnostics {
+                fatal_error: Some(err_to_string(error)),
+                ..crate::engines::UsageLimitsReadDiagnostics::default()
+            },
+        },
     };
 
-    let stream_event_topic = format!("stream-event-{thread_id}");
-    let _ = app.emit(
-        &stream_event_topic,
-        serde_json::json!({
-            "type": "UsageLimitsUpdated",
-            "usage": usage,
-        }),
-    );
+    let refreshed = if let Some(usage) = read_result.usage.clone() {
+        let stream_event_topic = format!("stream-event-{thread_id}");
+        let _ = app.emit(
+            &stream_event_topic,
+            serde_json::json!({
+                "type": "UsageLimitsUpdated",
+                "usage": usage,
+            }),
+        );
+        true
+    } else {
+        false
+    };
 
-    Ok(true)
+    let usage = read_result.usage.as_ref();
+    Ok(RefreshThreadUsageLimitsResultDto {
+        refreshed,
+        missing_context: usage_snapshot_missing_context(usage),
+        diagnostics: RefreshThreadUsageLimitsDiagnosticsDto {
+            thread_id,
+            engine_id: thread.engine_id.clone(),
+            model_id: thread.model_id.clone(),
+            thread_status: thread.status.as_str().to_string(),
+            message_count: thread.message_count,
+            last_activity_at: thread.last_activity_at.clone(),
+            engine_thread_id: thread.engine_thread_id.clone(),
+            thread_read_attempted: read_result.diagnostics.thread_read_attempted,
+            thread_read_succeeded: read_result.diagnostics.thread_read_succeeded,
+            account_read_attempted: read_result.diagnostics.account_read_attempted,
+            account_read_succeeded: read_result.diagnostics.account_read_succeeded,
+            current_tokens: usage.and_then(|value| value.current_tokens),
+            max_context_tokens: usage.and_then(|value| value.max_context_tokens),
+            context_window_percent: usage.and_then(|value| value.context_window_percent),
+            five_hour_percent: usage.and_then(|value| value.five_hour_percent),
+            weekly_percent: usage.and_then(|value| value.weekly_percent),
+            five_hour_resets_at: usage.and_then(|value| value.five_hour_resets_at),
+            weekly_resets_at: usage.and_then(|value| value.weekly_resets_at),
+            thread_read_error: read_result.diagnostics.thread_read_error.clone(),
+            account_read_error: read_result.diagnostics.account_read_error.clone(),
+            fatal_error: read_result.diagnostics.fatal_error.clone(),
+        },
+    })
 }
 
 fn mark_codex_transcript_imported(mut metadata: Value, imported: bool) -> Value {

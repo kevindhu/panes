@@ -31,13 +31,17 @@ use crate::models::{
 use crate::{process_utils, runtime_env};
 
 use super::{
-    codex_event_mapper::TurnEventMapper,
+    codex_event_mapper::{
+        extract_terminal_turn_completion_status as extract_live_terminal_turn_completion_status,
+        TurnEventMapper,
+    },
     codex_protocol::{raw_value_to_value, IncomingMessage},
     codex_transport::CodexTransport,
     ActionResult, ApprovalRequestRoute, CodexRemoteThreadSummary, Engine, EngineEvent,
     EngineThread, ImportedThreadMessage, ModelAvailabilityNux, ModelInfo, ModelUpgradeInfo,
     ReasoningEffortOption, SandboxPolicy, ThreadScope, ThreadSyncSnapshot, TurnAttachment,
-    TurnCompletionStatus, TurnInput, TurnInputItem,
+    TurnCompletionDiagnostics, TurnCompletionSource, TurnCompletionStatus, TurnInput,
+    TurnInputItem,
 };
 
 const INITIALIZE_METHODS: &[&str] = &["initialize"];
@@ -706,7 +710,9 @@ impl Engine for CodexEngine {
                       continue;
                     }
 
-                    if normalized_method == "turn/completed" {
+                    if normalized_method == "turn/completed"
+                      && extract_live_terminal_turn_completion_status(&params).is_some()
+                    {
                       self.clear_active_turn(&thread_id).await;
                     }
                     if turn_request_done && !completion_seen {
@@ -936,6 +942,9 @@ impl Engine for CodexEngine {
                     .send(EngineEvent::TurnCompleted {
                         token_usage: None,
                         status: TurnCompletionStatus::Failed,
+                        diagnostics: Some(TurnCompletionDiagnostics {
+                            source: TurnCompletionSource::TimeoutFallback,
+                        }),
                     })
                     .await
                     .ok();
@@ -1088,15 +1097,16 @@ impl CodexEngine {
     pub async fn read_usage_limits_snapshot(
         &self,
         engine_thread_id: Option<&str>,
-    ) -> anyhow::Result<Option<super::UsageLimitsSnapshot>> {
+    ) -> anyhow::Result<super::UsageLimitsReadResult> {
         let transport = self.ensure_ready_transport().await?;
         let mut mapper = TurnEventMapper::default();
-        let mut last_error: Option<anyhow::Error> = None;
+        let mut diagnostics = super::UsageLimitsReadDiagnostics::default();
 
         if let Some(engine_thread_id) = engine_thread_id
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
+            diagnostics.thread_read_attempted = true;
             let params = serde_json::json!({
               "threadId": engine_thread_id,
               "includeTurns": false,
@@ -1112,17 +1122,19 @@ impl CodexEngine {
             .context("failed to read codex thread usage snapshot")
             {
                 Ok(snapshot) => {
+                    diagnostics.thread_read_succeeded = true;
                     mapper.merge_usage_snapshot_payload(&snapshot);
                 }
                 Err(error) => {
                     log::debug!(
                         "failed to read codex thread usage snapshot for {engine_thread_id}: {error}"
                     );
-                    last_error = Some(error);
+                    diagnostics.thread_read_error = Some(format!("{error:#}"));
                 }
             }
         }
 
+        diagnostics.account_read_attempted = true;
         match request_with_fallback(
             transport.as_ref(),
             ACCOUNT_RATE_LIMITS_READ_METHODS,
@@ -1133,23 +1145,19 @@ impl CodexEngine {
         .context("failed to read codex account rate limits")
         {
             Ok(snapshot) => {
+                diagnostics.account_read_succeeded = true;
                 mapper.merge_usage_snapshot_payload(&snapshot);
             }
             Err(error) => {
                 log::debug!("failed to read codex account rate limits: {error}");
-                last_error = Some(error);
+                diagnostics.account_read_error = Some(format!("{error:#}"));
             }
         }
 
-        if let Some(usage) = mapper.latest_usage_limits_snapshot() {
-            return Ok(Some(usage));
-        }
-
-        if let Some(error) = last_error {
-            return Err(error);
-        }
-
-        Ok(None)
+        Ok(super::UsageLimitsReadResult {
+            usage: mapper.latest_usage_limits_snapshot(),
+            diagnostics,
+        })
     }
 
     pub async fn list_skills(&self, cwd: &str) -> anyhow::Result<Vec<CodexSkillDto>> {
@@ -1500,7 +1508,9 @@ impl CodexEngine {
                       continue;
                     }
 
-                    if normalized_method == "turn/completed" {
+                    if normalized_method == "turn/completed"
+                      && extract_live_terminal_turn_completion_status(&params).is_some()
+                    {
                       self.clear_active_turn(&active_thread_id).await;
                     }
                     if turn_request_done && !completion_seen {
@@ -1730,6 +1740,9 @@ impl CodexEngine {
                     .send(EngineEvent::TurnCompleted {
                         token_usage: None,
                         status: TurnCompletionStatus::Failed,
+                        diagnostics: Some(TurnCompletionDiagnostics {
+                            source: TurnCompletionSource::TimeoutFallback,
+                        }),
                     })
                     .await
                     .ok();
@@ -4470,6 +4483,11 @@ fn build_reconciled_turn_completion_events(
         });
     }
 
+    let source = match mode {
+        TurnCompletionRecoveryMode::StreamLost => TurnCompletionSource::ReconciledStreamLost,
+        TurnCompletionRecoveryMode::CompletionTimeout => TurnCompletionSource::ReconciledTimeout,
+    };
+
     let status = if matches!(mode, TurnCompletionRecoveryMode::StreamLost)
         && reconciled.status == TurnCompletionStatus::Completed
     {
@@ -4487,6 +4505,7 @@ fn build_reconciled_turn_completion_events(
     events.push(EngineEvent::TurnCompleted {
         token_usage: None,
         status,
+        diagnostics: Some(TurnCompletionDiagnostics { source }),
     });
 
     events
@@ -7383,9 +7402,14 @@ mod tests {
             EngineEvent::TurnCompleted {
                 status,
                 token_usage,
+                diagnostics,
             } => {
                 assert_eq!(*status, TurnCompletionStatus::Failed);
                 assert!(token_usage.is_none());
+                assert_eq!(
+                    diagnostics.as_ref().map(|value| &value.source),
+                    Some(&TurnCompletionSource::ReconciledStreamLost)
+                );
             }
             other => panic!("expected turn completed event, got {other:?}"),
         }
@@ -7416,9 +7440,14 @@ mod tests {
             EngineEvent::TurnCompleted {
                 status,
                 token_usage,
+                diagnostics,
             } => {
                 assert_eq!(*status, TurnCompletionStatus::Completed);
                 assert!(token_usage.is_none());
+                assert_eq!(
+                    diagnostics.as_ref().map(|value| &value.source),
+                    Some(&TurnCompletionSource::ReconciledTimeout)
+                );
             }
             other => panic!("expected turn completed event, got {other:?}"),
         }

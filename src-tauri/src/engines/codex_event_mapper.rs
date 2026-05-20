@@ -5,7 +5,8 @@ use uuid::Uuid;
 
 use super::{
     trim_action_output_delta_content, ActionResult, ActionType, ApprovalRequestRoute, DiffScope,
-    EngineEvent, OutputStream, TokenUsage, TurnCompletionStatus, UsageLimitsSnapshot,
+    EngineEvent, OutputStream, TokenUsage, TurnCompletionDiagnostics, TurnCompletionSource,
+    TurnCompletionStatus, UsageLimitsSnapshot,
 };
 
 pub const APPROVAL_DETAIL_SERVER_METHOD_KEY: &str = "_serverMethod";
@@ -27,6 +28,11 @@ pub struct ApprovalRequest {
     pub approval_id: String,
     pub server_method: String,
     pub event: EngineEvent,
+}
+
+enum ParsedTurnStatus {
+    Active,
+    Terminal(TurnCompletionStatus),
 }
 
 impl TurnEventMapper {
@@ -65,7 +71,6 @@ impl TurnEventMapper {
                 let mut events = Vec::new();
                 let token_usage =
                     extract_token_usage(params).or_else(|| self.latest_token_usage.clone());
-                let status = extract_turn_completion_status(params);
                 if let Some(context_update) = extract_context_usage_limits(params) {
                     merge_context_usage_snapshot(&mut self.latest_usage_limits, &context_update);
                     events.push(EngineEvent::UsageLimitsUpdated {
@@ -73,24 +78,29 @@ impl TurnEventMapper {
                     });
                 }
 
-                if status == TurnCompletionStatus::Failed {
-                    let message = extract_nested_string(params, &["turn", "error", "message"])
-                        .or_else(|| extract_nested_string(params, &["error", "message"]))
-                        .unwrap_or_else(|| "Codex turn failed".to_string());
+                if let Some(status) = extract_terminal_turn_completion_status(params) {
+                    if status == TurnCompletionStatus::Failed {
+                        let message = extract_nested_string(params, &["turn", "error", "message"])
+                            .or_else(|| extract_nested_string(params, &["error", "message"]))
+                            .unwrap_or_else(|| "Codex turn failed".to_string());
 
-                    events.push(EngineEvent::Error {
-                        message,
-                        recoverable: false,
+                        events.push(EngineEvent::Error {
+                            message,
+                            recoverable: false,
+                        });
+                    }
+
+                    events.push(EngineEvent::TurnCompleted {
+                        token_usage,
+                        status,
+                        diagnostics: Some(TurnCompletionDiagnostics {
+                            source: TurnCompletionSource::Engine,
+                        }),
                     });
+                    self.latest_token_usage = None;
+                    self.reasoning_summary_parts_by_item_id.clear();
+                    self.streamed_realtime_transcript = false;
                 }
-
-                events.push(EngineEvent::TurnCompleted {
-                    token_usage,
-                    status,
-                });
-                self.latest_token_usage = None;
-                self.reasoning_summary_parts_by_item_id.clear();
-                self.streamed_realtime_transcript = false;
                 events
             }
             "turndiffupdated" => {
@@ -287,29 +297,36 @@ impl TurnEventMapper {
         if out.is_empty() {
             if let Some(turn) = result.get("turn") {
                 if let Some(status) = turn.get("status").and_then(Value::as_str) {
-                    let normalized_status = status.to_lowercase();
-                    if normalized_status == "inprogress" {
-                        out.push(EngineEvent::TurnStarted {
-                            client_turn_id: None,
-                        });
-                    } else {
-                        let completion_status = parse_turn_completion_status(status);
-                        if completion_status == TurnCompletionStatus::Failed {
-                            let message = extract_nested_string(turn, &["error", "message"])
-                                .or_else(|| extract_nested_string(result, &["error", "message"]))
-                                .unwrap_or_else(|| "Codex turn failed".to_string());
-                            out.push(EngineEvent::Error {
-                                message,
-                                recoverable: false,
+                    match parse_turn_status(status) {
+                        Some(ParsedTurnStatus::Active) => {
+                            out.push(EngineEvent::TurnStarted {
+                                client_turn_id: None,
                             });
                         }
-                        let token_usage =
-                            extract_token_usage(result).or_else(|| self.latest_token_usage.clone());
-                        out.push(EngineEvent::TurnCompleted {
-                            token_usage,
-                            status: completion_status,
-                        });
-                        self.latest_token_usage = None;
+                        Some(ParsedTurnStatus::Terminal(completion_status)) => {
+                            if completion_status == TurnCompletionStatus::Failed {
+                                let message = extract_nested_string(turn, &["error", "message"])
+                                    .or_else(|| {
+                                        extract_nested_string(result, &["error", "message"])
+                                    })
+                                    .unwrap_or_else(|| "Codex turn failed".to_string());
+                                out.push(EngineEvent::Error {
+                                    message,
+                                    recoverable: false,
+                                });
+                            }
+                            let token_usage = extract_token_usage(result)
+                                .or_else(|| self.latest_token_usage.clone());
+                            out.push(EngineEvent::TurnCompleted {
+                                token_usage,
+                                status: completion_status,
+                                diagnostics: Some(TurnCompletionDiagnostics {
+                                    source: TurnCompletionSource::Engine,
+                                }),
+                            });
+                            self.latest_token_usage = None;
+                        }
+                        None => {}
                     }
                 }
             }
@@ -803,13 +820,17 @@ fn extract_item_error(item: &Value) -> Option<String> {
     None
 }
 
-fn extract_turn_completion_status(params: &Value) -> TurnCompletionStatus {
+pub fn extract_terminal_turn_completion_status(params: &Value) -> Option<TurnCompletionStatus> {
     let status = params
         .get("turn")
         .and_then(|turn| turn.get("status"))
+        .or_else(|| params.get("status"))
         .and_then(Value::as_str)
-        .unwrap_or("completed");
-    parse_turn_completion_status(status)
+        .and_then(|status| match parse_turn_status(status) {
+            Some(ParsedTurnStatus::Terminal(status)) => Some(status),
+            _ => None,
+        });
+    status
 }
 
 fn render_plan_update(params: &Value) -> String {
@@ -850,13 +871,25 @@ fn normalize_plan_step_status_for_display(status: &str) -> String {
     }
 }
 
-fn parse_turn_completion_status(status: &str) -> TurnCompletionStatus {
-    if status.eq_ignore_ascii_case("failed") {
-        TurnCompletionStatus::Failed
-    } else if status.eq_ignore_ascii_case("interrupted") {
-        TurnCompletionStatus::Interrupted
-    } else {
-        TurnCompletionStatus::Completed
+fn parse_turn_status(status: &str) -> Option<ParsedTurnStatus> {
+    match method_signature(status).as_str() {
+        "completed" => Some(ParsedTurnStatus::Terminal(TurnCompletionStatus::Completed)),
+        "interrupted" | "cancelled" | "canceled" => {
+            Some(ParsedTurnStatus::Terminal(TurnCompletionStatus::Interrupted))
+        }
+        "failed" | "error" | "errored" => {
+            Some(ParsedTurnStatus::Terminal(TurnCompletionStatus::Failed))
+        }
+        "inprogress"
+        | "running"
+        | "streaming"
+        | "active"
+        | "paused"
+        | "awaitingapproval"
+        | "waitingonapproval"
+        | "awaitinguserinput"
+        | "waitingonuserinput" => Some(ParsedTurnStatus::Active),
+        _ => None,
     }
 }
 
@@ -1649,6 +1682,48 @@ fn join_string_array(items: Option<&Vec<Value>>) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn map_turn_result_keeps_non_terminal_status_aliases_active() {
+        for status in [
+            "inProgress",
+            "in_progress",
+            "running",
+            "streaming",
+            "active",
+            "paused",
+            "waitingOnApproval",
+            "waitingOnUserInput",
+        ] {
+            let mut mapper = TurnEventMapper::default();
+            let events = mapper.map_turn_result(&json!({
+                "turn": {
+                    "status": status
+                }
+            }));
+
+            assert!(
+                matches!(events.as_slice(), [EngineEvent::TurnStarted { .. }]),
+                "expected `{status}` to keep the turn active, got {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn map_notification_ignores_non_terminal_turn_completed_statuses() {
+        let mut mapper = TurnEventMapper::default();
+
+        let events = mapper.map_notification(
+            "turn/completed",
+            &json!({
+                "turn": {
+                    "status": "in_progress"
+                }
+            }),
+        );
+
+        assert!(events.is_empty());
+    }
 
     #[test]
     fn map_server_request_dynamic_tool_call_uses_call_id() {

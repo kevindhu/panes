@@ -119,6 +119,7 @@ pub enum EngineEvent {
     TurnCompleted {
         token_usage: Option<TokenUsage>,
         status: TurnCompletionStatus,
+        diagnostics: Option<TurnCompletionDiagnostics>,
     },
     TextDelta {
         content: String,
@@ -182,6 +183,20 @@ pub enum TurnCompletionStatus {
     Completed,
     Interrupted,
     Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnCompletionSource {
+    Engine,
+    ReconciledStreamLost,
+    ReconciledTimeout,
+    TimeoutFallback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnCompletionDiagnostics {
+    pub source: TurnCompletionSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

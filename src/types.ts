@@ -278,6 +278,9 @@ export interface NoticeBlock {
   level: "info" | "warning" | "error";
   title: string;
   message: string;
+  details?: string[];
+  status?: string;
+  source?: TurnCompletionSource;
 }
 
 export interface ActionBlock {
@@ -1136,6 +1139,17 @@ export interface TurnCompletedEvent {
   type: "TurnCompleted";
   token_usage?: StreamTokenUsage | null;
   status?: TurnCompletionStatus;
+  diagnostics?: TurnCompletionDiagnostics | null;
+}
+
+export type TurnCompletionSource =
+  | "engine"
+  | "reconciled_stream_lost"
+  | "reconciled_timeout"
+  | "timeout_fallback";
+
+export interface TurnCompletionDiagnostics {
+  source: TurnCompletionSource;
 }
 
 export interface TextDeltaEvent {
@@ -1293,4 +1307,34 @@ export interface ContextUsage {
   windowWeeklyPercent: number | null;
   windowFiveHourResetsAt: string | null;
   windowWeeklyResetsAt: string | null;
+}
+
+export interface RefreshThreadUsageLimitsDiagnostics {
+  threadId: string;
+  engineId: string;
+  modelId: string;
+  threadStatus: string;
+  messageCount: number;
+  lastActivityAt: string;
+  engineThreadId: string | null;
+  threadReadAttempted: boolean;
+  threadReadSucceeded: boolean;
+  accountReadAttempted: boolean;
+  accountReadSucceeded: boolean;
+  currentTokens: number | null;
+  maxContextTokens: number | null;
+  contextWindowPercent: number | null;
+  fiveHourPercent: number | null;
+  weeklyPercent: number | null;
+  fiveHourResetsAt: number | null;
+  weeklyResetsAt: number | null;
+  threadReadError: string | null;
+  accountReadError: string | null;
+  fatalError: string | null;
+}
+
+export interface RefreshThreadUsageLimitsResult {
+  refreshed: boolean;
+  missingContext: boolean;
+  diagnostics: RefreshThreadUsageLimitsDiagnostics;
 }

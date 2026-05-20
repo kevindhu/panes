@@ -125,6 +125,7 @@ import type {
   Message,
   OpenCodeRemoteSession,
   OpenCodeRuntimeCatalog,
+  RefreshThreadUsageLimitsResult,
   Thread,
   TrustLevel,
 } from "../../types";
@@ -1832,6 +1833,50 @@ function formatUsagePercent(percent: number | null): string {
   return `${Math.max(0, Math.min(100, Math.round(percent)))}%`;
 }
 
+function formatUsageRefreshDiagnosticValue(value: unknown): string {
+  if (value === null || value === undefined) {
+    return "null";
+  }
+  if (typeof value === "string") {
+    return value.length > 0 ? value : '""';
+  }
+  return String(value);
+}
+
+function formatUsageRefreshDiagnostics(
+  result: RefreshThreadUsageLimitsResult,
+): string {
+  const { diagnostics } = result;
+  return [
+    "Context usage refresh did not return thread context metrics.",
+    "Send this entire message back for diagnosis.",
+    "",
+    `refreshed=${formatUsageRefreshDiagnosticValue(result.refreshed)}`,
+    `missingContext=${formatUsageRefreshDiagnosticValue(result.missingContext)}`,
+    `threadId=${formatUsageRefreshDiagnosticValue(diagnostics.threadId)}`,
+    `engineId=${formatUsageRefreshDiagnosticValue(diagnostics.engineId)}`,
+    `modelId=${formatUsageRefreshDiagnosticValue(diagnostics.modelId)}`,
+    `threadStatus=${formatUsageRefreshDiagnosticValue(diagnostics.threadStatus)}`,
+    `messageCount=${formatUsageRefreshDiagnosticValue(diagnostics.messageCount)}`,
+    `lastActivityAt=${formatUsageRefreshDiagnosticValue(diagnostics.lastActivityAt)}`,
+    `engineThreadId=${formatUsageRefreshDiagnosticValue(diagnostics.engineThreadId)}`,
+    `threadReadAttempted=${formatUsageRefreshDiagnosticValue(diagnostics.threadReadAttempted)}`,
+    `threadReadSucceeded=${formatUsageRefreshDiagnosticValue(diagnostics.threadReadSucceeded)}`,
+    `accountReadAttempted=${formatUsageRefreshDiagnosticValue(diagnostics.accountReadAttempted)}`,
+    `accountReadSucceeded=${formatUsageRefreshDiagnosticValue(diagnostics.accountReadSucceeded)}`,
+    `currentTokens=${formatUsageRefreshDiagnosticValue(diagnostics.currentTokens)}`,
+    `maxContextTokens=${formatUsageRefreshDiagnosticValue(diagnostics.maxContextTokens)}`,
+    `contextWindowPercent=${formatUsageRefreshDiagnosticValue(diagnostics.contextWindowPercent)}`,
+    `fiveHourPercent=${formatUsageRefreshDiagnosticValue(diagnostics.fiveHourPercent)}`,
+    `weeklyPercent=${formatUsageRefreshDiagnosticValue(diagnostics.weeklyPercent)}`,
+    `fiveHourResetsAt=${formatUsageRefreshDiagnosticValue(diagnostics.fiveHourResetsAt)}`,
+    `weeklyResetsAt=${formatUsageRefreshDiagnosticValue(diagnostics.weeklyResetsAt)}`,
+    `threadReadError=${formatUsageRefreshDiagnosticValue(diagnostics.threadReadError)}`,
+    `accountReadError=${formatUsageRefreshDiagnosticValue(diagnostics.accountReadError)}`,
+    `fatalError=${formatUsageRefreshDiagnosticValue(diagnostics.fatalError)}`,
+  ].join("\n");
+}
+
 function usagePercentToWidth(percent: number | null): string {
   if (typeof percent !== "number" || !Number.isFinite(percent)) {
     return "0%";
@@ -2175,13 +2220,16 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
     setUsageRefreshInFlight(true);
     try {
-      await ipc.refreshThreadUsageLimits(threadId);
+      const result = await ipc.refreshThreadUsageLimits(threadId);
+      if (result.missingContext || result.diagnostics.fatalError) {
+        toast.error(formatUsageRefreshDiagnostics(result), 0);
+      }
     } catch (refreshError) {
       toast.error(String(refreshError));
     } finally {
       setUsageRefreshInFlight(false);
     }
-  }, [activeThread?.engineId, t, threadId, usageRefreshInFlight]);
+  }, [activeThread?.engineId, threadId, usageRefreshInFlight]);
 
   useEffect(() => {
     selectedEngineIdRef.current = selectedEngineId;

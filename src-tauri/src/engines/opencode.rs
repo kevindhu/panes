@@ -544,6 +544,7 @@ async fn emit_turn_completed(
         .send(EngineEvent::TurnCompleted {
             token_usage,
             status,
+            diagnostics: None,
         })
         .await
         .ok();
