@@ -36,6 +36,7 @@ import { toast } from "../../stores/toastStore";
 import { canUseNativeCodexHistoryTools } from "../../lib/codexThreadCapabilities";
 import { ipc } from "../../lib/ipc";
 import { formatRelativeTime } from "../../lib/formatters";
+import { activateThreadContext } from "../../lib/threadActivation";
 import {
   emitTerminalAcceleratedRenderingChanged,
   getTerminalAcceleratedRenderingPreferenceVersion,
@@ -121,7 +122,6 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   const setActiveView = useUiStore((state) => state.setActiveView);
   const openWorkspaceSettings = useUiStore((state) => state.openWorkspaceSettings);
   const openCommandPalette = useUiStore((state) => state.openCommandPalette);
-  const bindChatThread = useChatStore((s) => s.setActiveThread);
   const boundChatThreadId = useChatStore((s) => s.threadId);
   const boundChatStatus = useChatStore((s) => s.status);
   const boundChatStreaming = useChatStore((s) => s.streaming);
@@ -284,16 +284,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   async function onSelectThread(thread: Thread) {
     closeThreadContextMenu();
     if (activeView !== "chat") setActiveView("chat");
-    if (thread.workspaceId !== activeWorkspaceId) {
-      await setActiveWorkspace(thread.workspaceId);
-    }
-    if (thread.repoId) {
-      setActiveRepo(thread.repoId);
-    } else {
-      setActiveRepo(null, { remember: false });
-    }
-    setActiveThread(thread.id);
-    await bindChatThread(thread.id);
+    await activateThreadContext(thread);
   }
 
   async function onSelectProject(wsId: string) {
@@ -322,7 +313,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
     await removeWorkspace(project.id);
     if (wasActive) {
       setActiveThread(null);
-      await bindChatThread(null);
+      await activateThreadContext(null);
     }
   }
 
@@ -387,7 +378,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
     await removeThread(thread.id);
     if (wasActive) {
       setActiveThread(null);
-      await bindChatThread(null);
+      await activateThreadContext(null);
     }
   }
 

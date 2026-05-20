@@ -441,7 +441,8 @@
       "planImplementationThreadUnavailable": "A thread original de planejamento não está mais disponível. Reabra a thread e tente novamente.",
       "invalidOutputSchema": "O schema de saída deve ser um objeto ou booleano JSON Schema válido: {{error}}",
       "invalidCustomApprovalPolicy": "A política de aprovação estruturada deve ser um objeto JSON.",
-      "invalidCustomApprovalPolicyWithError": "A política de aprovação estruturada contém JSON inválido: {{error}}"
+      "invalidCustomApprovalPolicyWithError": "A política de aprovação estruturada contém JSON inválido: {{error}}",
+      "newChatRequiredForEngineSwitch": "Inicie um novo chat para mudar de {{currentEngine}} para {{nextEngine}}."
     }
   },
   "messageBlocks": {

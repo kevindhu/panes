@@ -63,6 +63,7 @@ import {
 import { ipc } from "../../lib/ipc";
 import { resolvePreferredOnboardingChatSelection } from "../../lib/onboarding";
 import { recordPerfMetric } from "../../lib/perfTelemetry";
+import { activateThreadContext } from "../../lib/threadActivation";
 import { isMacDesktop, usesCustomWindowFrame } from "../../lib/windowActions";
 import { MessageBlocks, shouldShowClaudeUnsupportedApproval } from "./MessageBlocks";
 import { resolveEngineCapabilities } from "./engineCapabilities";
@@ -80,6 +81,7 @@ import {
 } from "./planModePrompt";
 import { buildComposerRuntimeSnapshot } from "./composerRuntime";
 import { resolveReasoningEffortForModel } from "./reasoningEffort";
+import { resolveChatSubmitTarget } from "./threadContinuation";
 import { ToolInputQuestionnaire } from "./ToolInputQuestionnaire";
 import {
   buildPermissionsApprovalResponse,
@@ -1966,6 +1968,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   );
   const {
     activeThread,
+    startupRestorePending,
     createThread,
     forkCodexThread,
     rollbackCodexThread,
@@ -1982,6 +1985,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   } = useThreadStore(
     useShallow((state) => ({
       activeThread: state.threads.find((thread) => thread.id === state.activeThreadId) ?? null,
+      startupRestorePending: state.startupRestorePending,
       createThread: state.createThread,
       forkCodexThread: state.forkCodexThread,
       rollbackCodexThread: state.rollbackCodexThread,
@@ -3894,6 +3898,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       activeThread &&
       activeThread.workspaceId === activeWorkspaceId;
 
+    if (!activeThreadInCurrentWorkspace && startupRestorePending && activeThread) {
+      return;
+    }
+
     const targetThreadId = activeThreadInCurrentWorkspace ? activeThread.id : null;
     if (targetThreadId === threadId) {
       return;
@@ -3910,6 +3918,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     activeWorkspaceId,
     activeThread?.id,
     activeThread?.workspaceId,
+    startupRestorePending,
     threadId,
     bindChatThread,
     setActiveThreadInStore,
@@ -4788,29 +4797,39 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     const submitReasoningEffort = composerRuntime.reasoningEffort;
     const submitPlanMode = submitEngineId === "opencode" ? false : planMode;
 
-    const activeScopeRepoId = activeRepo?.id ?? null;
-    const activeThreadInScope = activeThread
-      ? activeThread.workspaceId === activeWorkspaceId &&
-        activeThread.repoId === activeScopeRepoId
-      : false;
-    const activeThreadModelMatch = activeThread
-      ? submitEngineId === "codex" ||
-        activeThread.modelId === submitModelId ||
-        readThreadLastModelId(activeThread) === submitModelId
-      : false;
-    const activeThreadEngineMatch = activeThread
-      ? activeThread.engineId === submitEngineId
-      : false;
+    const submitTarget = resolveChatSubmitTarget({
+      activeThread,
+      boundThreadId: threadId,
+      threads: useThreadStore.getState().threads,
+      activeWorkspaceId,
+      startupRestorePending,
+      selectedEngineId: submitEngineId,
+    });
 
-    let targetThreadId =
-      threadId &&
-      activeThreadInScope &&
-      activeThreadEngineMatch &&
-      activeThreadModelMatch
-        ? threadId
+    if (submitTarget.kind === "block_engine_switch") {
+      const currentEngineName =
+        engines.find((engine) => engine.id === submitTarget.thread.engineId)?.name ??
+        submitTarget.thread.engineId;
+      const nextEngineName = selectedEngine?.name ?? submitEngineId;
+      toast.warning(
+        t("panel.toasts.newChatRequiredForEngineSwitch", {
+          currentEngine: currentEngineName,
+          nextEngine: nextEngineName,
+        }),
+      );
+      return;
+    }
+
+    const activeScopeRepoId = activeRepo?.id ?? null;
+    const continuingVisibleThread = submitTarget.kind === "continue";
+    let currentThread: Thread | null =
+      continuingVisibleThread
+        ? useThreadStore
+            .getState()
+            .threads.find((thread) => thread.id === submitTarget.thread.id) ?? submitTarget.thread
         : null;
 
-    if (!targetThreadId) {
+    if (!currentThread) {
       const createdThreadId = await createThread({
         workspaceId: activeWorkspaceId,
         repoId: activeScopeRepoId,
@@ -4828,12 +4847,25 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       if (!createdThreadId) {
         return;
       }
-      targetThreadId = createdThreadId;
-      manualThreadBindTargetRef.current = createdThreadId;
+      currentThread =
+        useThreadStore.getState().threads.find((thread) => thread.id === createdThreadId) ?? null;
+      if (!currentThread) {
+        return;
+      }
+    }
+
+    const requiresThreadReconciliation =
+      !continuingVisibleThread ||
+      startupRestorePending ||
+      currentThread.workspaceId !== activeWorkspaceId ||
+      threadId !== currentThread.id;
+
+    if (requiresThreadReconciliation) {
+      manualThreadBindTargetRef.current = currentThread.id;
       try {
-        await bindChatThread(createdThreadId);
+        await activateThreadContext(currentThread);
       } finally {
-        if (manualThreadBindTargetRef.current === createdThreadId) {
+        if (manualThreadBindTargetRef.current === currentThread.id) {
           manualThreadBindTargetRef.current = null;
         }
       }
@@ -4841,13 +4873,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
     const inputItems = await resolveCodexInputItems(text, submitEngineId);
 
-    const currentThread =
-      useThreadStore.getState().threads.find((thread) => thread.id === targetThreadId) ??
-      activeThread;
-
-    if (!currentThread) {
-      return;
-    }
+    const currentThreadId = currentThread.id;
+    currentThread =
+      useThreadStore.getState().threads.find((thread) => thread.id === currentThreadId) ??
+      currentThread;
 
     const submission = await sendPreparedTurn({
       text,

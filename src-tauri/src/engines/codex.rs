@@ -1087,25 +1087,69 @@ impl CodexEngine {
 
     pub async fn read_usage_limits_snapshot(
         &self,
+        engine_thread_id: Option<&str>,
     ) -> anyhow::Result<Option<super::UsageLimitsSnapshot>> {
         let transport = self.ensure_ready_transport().await?;
-        let snapshot = request_with_fallback(
+        let mut mapper = TurnEventMapper::default();
+        let mut last_error: Option<anyhow::Error> = None;
+
+        if let Some(engine_thread_id) = engine_thread_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let params = serde_json::json!({
+              "threadId": engine_thread_id,
+              "includeTurns": false,
+            });
+
+            match request_with_fallback(
+                transport.as_ref(),
+                THREAD_READ_METHODS,
+                params,
+                DEFAULT_TIMEOUT,
+            )
+            .await
+            .context("failed to read codex thread usage snapshot")
+            {
+                Ok(snapshot) => {
+                    mapper.merge_usage_snapshot_payload(&snapshot);
+                }
+                Err(error) => {
+                    log::debug!(
+                        "failed to read codex thread usage snapshot for {engine_thread_id}: {error}"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        match request_with_fallback(
             transport.as_ref(),
             ACCOUNT_RATE_LIMITS_READ_METHODS,
             serde_json::Value::Null,
             Duration::from_secs(5),
         )
         .await
-        .context("failed to read codex account rate limits")?;
+        .context("failed to read codex account rate limits")
+        {
+            Ok(snapshot) => {
+                mapper.merge_usage_snapshot_payload(&snapshot);
+            }
+            Err(error) => {
+                log::debug!("failed to read codex account rate limits: {error}");
+                last_error = Some(error);
+            }
+        }
 
-        let mut mapper = TurnEventMapper::default();
-        let Some(super::EngineEvent::UsageLimitsUpdated { usage }) =
-            mapper.map_rate_limits_snapshot(&snapshot)
-        else {
-            return Ok(None);
-        };
+        if let Some(usage) = mapper.latest_usage_limits_snapshot() {
+            return Ok(Some(usage));
+        }
 
-        Ok(Some(usage))
+        if let Some(error) = last_error {
+            return Err(error);
+        }
+
+        Ok(None)
     }
 
     pub async fn list_skills(&self, cwd: &str) -> anyhow::Result<Vec<CodexSkillDto>> {

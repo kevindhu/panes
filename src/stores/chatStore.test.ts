@@ -390,6 +390,55 @@ describe("chatStore send", () => {
     vi.useRealTimers();
   });
 
+  it("preserves last-known context usage when a refresh only returns account windows", async () => {
+    vi.useFakeTimers();
+
+    let streamHandler: ((event: StreamEvent) => void) | null = null;
+    mockListenThreadEvents.mockImplementationOnce(async (_threadId, onEvent) => {
+      streamHandler = onEvent;
+      return () => {};
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    expect(streamHandler).not.toBeNull();
+
+    streamHandler!({
+      type: "UsageLimitsUpdated",
+      usage: {
+        current_tokens: 30000,
+        max_context_tokens: 200000,
+        context_window_percent: 45,
+        five_hour_percent: 17,
+        weekly_percent: 42,
+      },
+    });
+
+    await vi.advanceTimersByTimeAsync(20);
+
+    streamHandler!({
+      type: "UsageLimitsUpdated",
+      usage: {
+        five_hour_percent: 25,
+        weekly_percent: 50,
+      },
+    });
+
+    await vi.advanceTimersByTimeAsync(20);
+
+    expect(useChatStore.getState().usageLimits).toEqual({
+      currentTokens: 30000,
+      maxContextTokens: 200000,
+      contextPercent: 90,
+      windowFiveHourPercent: 75,
+      windowWeeklyPercent: 50,
+      windowFiveHourResetsAt: null,
+      windowWeeklyResetsAt: null,
+    });
+
+    vi.useRealTimers();
+  });
+
   it("preserves stdin action output chunks from streamed events", async () => {
     vi.useFakeTimers();
 

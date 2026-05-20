@@ -441,7 +441,8 @@
       "planImplementationThreadUnavailable": "The original planning thread is no longer available. Reopen the thread and try again.",
       "invalidOutputSchema": "Output schema must be valid JSON Schema object or boolean: {{error}}",
       "invalidCustomApprovalPolicy": "Structured approval policy must be a JSON object.",
-      "invalidCustomApprovalPolicyWithError": "Structured approval policy is invalid JSON: {{error}}"
+      "invalidCustomApprovalPolicyWithError": "Structured approval policy is invalid JSON: {{error}}",
+      "newChatRequiredForEngineSwitch": "Start a new chat to switch from {{currentEngine}} to {{nextEngine}}."
     }
   },
   "messageBlocks": {

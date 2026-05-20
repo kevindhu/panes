@@ -1245,6 +1245,29 @@ function mapUsageLimitsFromEvent(event: Extract<StreamEvent, { type: "UsageLimit
   };
 }
 
+function mergeUsageLimits(
+  previous: ContextUsage | null,
+  next: ContextUsage | null,
+): ContextUsage | null {
+  if (!next) {
+    return previous;
+  }
+
+  if (!previous) {
+    return next;
+  }
+
+  return {
+    currentTokens: next.currentTokens ?? previous.currentTokens,
+    maxContextTokens: next.maxContextTokens ?? previous.maxContextTokens,
+    contextPercent: next.contextPercent ?? previous.contextPercent,
+    windowFiveHourPercent: next.windowFiveHourPercent ?? previous.windowFiveHourPercent,
+    windowWeeklyPercent: next.windowWeeklyPercent ?? previous.windowWeeklyPercent,
+    windowFiveHourResetsAt: next.windowFiveHourResetsAt ?? previous.windowFiveHourResetsAt,
+    windowWeeklyResetsAt: next.windowWeeklyResetsAt ?? previous.windowWeeklyResetsAt,
+  };
+}
+
 function resolveAssistantTargetFromEvent(
   threadId: string,
   event: StreamEvent,
@@ -1732,7 +1755,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
             let hydrationRecalcRequired = false;
             for (const queuedEvent of batch) {
               if (queuedEvent.type === "UsageLimitsUpdated") {
-                nextUsageLimits = mapUsageLimitsFromEvent(queuedEvent);
+                nextUsageLimits = mergeUsageLimits(
+                  nextUsageLimits,
+                  mapUsageLimitsFromEvent(queuedEvent),
+                );
                 continue;
               }
               const previousLength = nextMessages.length;

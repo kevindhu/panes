@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { ThreeColumnLayout } from "./components/layout/ThreeColumnLayout";
 import { CommandPalette } from "./components/shared/CommandPalette";
 import { OnboardingWizard } from "./components/onboarding/OnboardingWizard";
@@ -31,6 +31,7 @@ import { CustomWindowFrame } from "./components/shared/CustomWindowFrame";
 import { useCustomWindowFrameState } from "./lib/customWindowFrame";
 import { runEditMenuAction } from "./lib/nativeEditActions";
 import { createAndActivateWorkspaceThread } from "./lib/newThreadActions";
+import { restoreStartupThreadContext } from "./lib/threadActivation";
 import {
   cycleWorkspaceTerminalLayout,
   isWorkspaceSurfaceVisible,
@@ -117,6 +118,8 @@ function resolveChatNotificationBody(
 export function App() {
   const loadWorkspaces = useWorkspaceStore((s) => s.loadWorkspaces);
   const workspaces = useWorkspaceStore((s) => s.workspaces);
+  const workspaceLoading = useWorkspaceStore((s) => s.loading);
+  const reposLoading = useWorkspaceStore((s) => s.reposLoading);
   const loadEngines = useEngineStore((s) => s.load);
   const applyEngineRuntimeUpdate = useEngineStore((s) => s.applyRuntimeUpdate);
   const loadKeepAwake = useKeepAwakeStore((s) => s.load);
@@ -128,11 +131,16 @@ export function App() {
   const refreshThreads = useThreadStore((s) => s.refreshThreads);
   const refreshArchivedThreads = useThreadStore((s) => s.refreshArchivedThreads);
   const applyThreadUpdateLocal = useThreadStore((s) => s.applyThreadUpdateLocal);
+  const threads = useThreadStore((s) => s.threads);
+  const activeThreadId = useThreadStore((s) => s.activeThreadId);
+  const threadLoading = useThreadStore((s) => s.loading);
+  const setStartupRestorePending = useThreadStore((s) => s.setStartupRestorePending);
   const commandPaletteOpen = useUiStore((s) => s.commandPaletteOpen);
   const closeCommandPalette = useUiStore((s) => s.closeCommandPalette);
   const checkForUpdate = useUpdateStore((s) => s.checkForUpdate);
   const customWindowFrame = usesCustomWindowFrame();
   const customWindowFrameState = useCustomWindowFrameState();
+  const startupRestoreAttemptedRef = useRef(false);
 
   useEffect(() => {
     void loadWorkspaces();
@@ -144,6 +152,43 @@ export function App() {
   useEffect(() => {
     void refreshAllThreads(workspaces.map((workspace) => workspace.id));
   }, [workspaces, refreshAllThreads]);
+
+  useEffect(() => {
+    if (startupRestoreAttemptedRef.current) {
+      return;
+    }
+
+    if (workspaceLoading || reposLoading || threadLoading) {
+      return;
+    }
+
+    startupRestoreAttemptedRef.current = true;
+
+    let cancelled = false;
+    void restoreStartupThreadContext({
+      activeThreadId,
+      threads,
+      workspaceLoading,
+      reposLoading,
+      threadLoading,
+    }).then(() => {
+      if (cancelled) {
+        return;
+      }
+      setStartupRestorePending(false);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeThreadId,
+    reposLoading,
+    setStartupRestorePending,
+    threadLoading,
+    threads,
+    workspaceLoading,
+  ]);
 
   useEffect(() => {
     const hasSessionTimer = keepAwakeSessionTimer != null;

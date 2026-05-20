@@ -1,9 +1,9 @@
 import { t } from "../i18n";
-import { useChatStore } from "../stores/chatStore";
 import { useTerminalStore } from "../stores/terminalStore";
 import { useThreadStore } from "../stores/threadStore";
 import { useUiStore } from "../stores/uiStore";
 import { useWorkspaceStore } from "../stores/workspaceStore";
+import { activateThreadContext } from "./threadActivation";
 import { resolveNewThreadTargetLayoutMode } from "./newThreadLayout";
 import {
   applyWorkspaceLayoutMode,
@@ -46,6 +46,8 @@ export async function createAndActivateWorkspaceThread(
     return null;
   }
 
-  await useChatStore.getState().setActiveThread(threadId);
+  const createdThread =
+    useThreadStore.getState().threads.find((thread) => thread.id === threadId) ?? null;
+  await activateThreadContext(createdThread);
   return threadId;
 }

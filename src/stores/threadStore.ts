@@ -36,6 +36,7 @@ interface ThreadState {
   threadsByWorkspace: Record<string, Thread[]>;
   archivedThreadsByWorkspace: Record<string, Thread[]>;
   activeThreadId: string | null;
+  startupRestorePending: boolean;
   loading: boolean;
   error?: string;
   createThread: (input: CreateThreadInput) => Promise<string | null>;
@@ -70,6 +71,7 @@ interface ThreadState {
     modelId: string,
   ) => Promise<Thread | null>;
   setActiveThread: (threadId: string | null) => void;
+  setStartupRestorePending: (pending: boolean) => void;
   applyThreadUpdateLocal: (thread: Thread) => boolean;
   setThreadReasoningEffortLocal: (threadId: string, reasoningEffort: string | null) => void;
   setThreadLastModelLocal: (threadId: string, modelId: string | null) => void;
@@ -175,6 +177,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
   threadsByWorkspace: {},
   archivedThreadsByWorkspace: {},
   activeThreadId: null,
+  startupRestorePending: true,
   loading: false,
   createThread: async ({
     workspaceId,
@@ -678,6 +681,9 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       localStorage.removeItem(LAST_THREAD_KEY);
     }
     set({ activeThreadId: threadId });
+  },
+  setStartupRestorePending: (pending) => {
+    set({ startupRestorePending: pending });
   },
   applyThreadUpdateLocal: (updatedThread) => {
     let applied = false;

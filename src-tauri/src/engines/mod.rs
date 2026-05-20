@@ -585,7 +585,11 @@ impl EngineManager {
         thread: &ThreadDto,
     ) -> anyhow::Result<Option<UsageLimitsSnapshot>> {
         match thread.engine_id.as_str() {
-            "codex" => self.codex.read_usage_limits_snapshot().await,
+            "codex" => {
+                self.codex
+                    .read_usage_limits_snapshot(thread.engine_thread_id.as_deref())
+                    .await
+            }
             "claude" | "opencode" => Ok(None),
             _ => anyhow::bail!("unsupported engine_id {}", thread.engine_id),
         }

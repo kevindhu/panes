@@ -30,6 +30,30 @@ pub struct ApprovalRequest {
 }
 
 impl TurnEventMapper {
+    pub fn latest_usage_limits_snapshot(&self) -> Option<UsageLimitsSnapshot> {
+        if has_usage_limit_metrics(&self.latest_usage_limits) {
+            Some(self.latest_usage_limits.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn merge_usage_snapshot_payload(&mut self, payload: &Value) -> Option<UsageLimitsSnapshot> {
+        let mut changed = false;
+
+        if let Some(context_update) = extract_context_usage_limits(payload) {
+            changed |= merge_context_usage_snapshot(&mut self.latest_usage_limits, &context_update);
+        }
+
+        changed |= merge_rate_limits_snapshot(&mut self.latest_usage_limits, payload);
+
+        if changed {
+            Some(self.latest_usage_limits.clone())
+        } else {
+            None
+        }
+    }
+
     pub fn map_notification(&mut self, method: &str, params: &Value) -> Vec<EngineEvent> {
         let method_key = method_signature(method);
 
@@ -43,10 +67,7 @@ impl TurnEventMapper {
                     extract_token_usage(params).or_else(|| self.latest_token_usage.clone());
                 let status = extract_turn_completion_status(params);
                 if let Some(context_update) = extract_context_usage_limits(params) {
-                    self.latest_usage_limits.current_tokens = context_update.current_tokens;
-                    self.latest_usage_limits.max_context_tokens = context_update.max_context_tokens;
-                    self.latest_usage_limits.context_window_percent =
-                        context_update.context_window_percent;
+                    merge_context_usage_snapshot(&mut self.latest_usage_limits, &context_update);
                     events.push(EngineEvent::UsageLimitsUpdated {
                         usage: self.latest_usage_limits.clone(),
                     });
@@ -124,10 +145,7 @@ impl TurnEventMapper {
             "threadtokenusageupdated" => {
                 self.latest_token_usage = extract_token_usage(params);
                 if let Some(context_update) = extract_context_usage_limits(params) {
-                    self.latest_usage_limits.current_tokens = context_update.current_tokens;
-                    self.latest_usage_limits.max_context_tokens = context_update.max_context_tokens;
-                    self.latest_usage_limits.context_window_percent =
-                        context_update.context_window_percent;
+                    merge_context_usage_snapshot(&mut self.latest_usage_limits, &context_update);
                     vec![EngineEvent::UsageLimitsUpdated {
                         usage: self.latest_usage_limits.clone(),
                     }]
@@ -298,9 +316,7 @@ impl TurnEventMapper {
         }
 
         if let Some(context_update) = extract_context_usage_limits(result) {
-            self.latest_usage_limits.current_tokens = context_update.current_tokens;
-            self.latest_usage_limits.max_context_tokens = context_update.max_context_tokens;
-            self.latest_usage_limits.context_window_percent = context_update.context_window_percent;
+            merge_context_usage_snapshot(&mut self.latest_usage_limits, &context_update);
             out.push(EngineEvent::UsageLimitsUpdated {
                 usage: self.latest_usage_limits.clone(),
             });
@@ -1286,6 +1302,40 @@ fn extract_context_usage_limits(value: &Value) -> Option<UsageLimitsSnapshot> {
         context_window_percent,
         ..UsageLimitsSnapshot::default()
     })
+}
+
+fn has_usage_limit_metrics(snapshot: &UsageLimitsSnapshot) -> bool {
+    snapshot.current_tokens.is_some()
+        || snapshot.max_context_tokens.is_some()
+        || snapshot.context_window_percent.is_some()
+        || snapshot.five_hour_percent.is_some()
+        || snapshot.weekly_percent.is_some()
+        || snapshot.five_hour_resets_at.is_some()
+        || snapshot.weekly_resets_at.is_some()
+}
+
+fn merge_context_usage_snapshot(
+    target: &mut UsageLimitsSnapshot,
+    context_update: &UsageLimitsSnapshot,
+) -> bool {
+    let mut changed = false;
+
+    if target.current_tokens != context_update.current_tokens {
+        target.current_tokens = context_update.current_tokens;
+        changed = true;
+    }
+
+    if target.max_context_tokens != context_update.max_context_tokens {
+        target.max_context_tokens = context_update.max_context_tokens;
+        changed = true;
+    }
+
+    if target.context_window_percent != context_update.context_window_percent {
+        target.context_window_percent = context_update.context_window_percent;
+        changed = true;
+    }
+
+    changed
 }
 
 fn merge_rate_limits_snapshot(target: &mut UsageLimitsSnapshot, payload: &Value) -> bool {
@@ -2347,5 +2397,56 @@ mod tests {
             }
             _ => panic!("expected usage limits update"),
         }
+    }
+
+    #[test]
+    fn merge_usage_snapshot_payload_combines_thread_context_and_account_windows() {
+        let mut mapper = TurnEventMapper::default();
+        let thread_payload = json!({
+            "threadId": "thr_123",
+            "tokenUsage": {
+                "last": {
+                    "totalTokens": 30000
+                },
+                "total": {
+                    "totalTokens": 90000
+                },
+                "modelContextWindow": 200000
+            }
+        });
+        let account_payload = json!({
+            "rateLimits": {
+                "primary": {
+                    "usedPercent": 17,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1735689600
+                },
+                "secondary": {
+                    "usedPercent": 42,
+                    "windowDurationMins": 10080,
+                    "resetsAt": 1736294400000i64
+                }
+            }
+        });
+
+        let thread_usage = mapper
+            .merge_usage_snapshot_payload(&thread_payload)
+            .expect("expected thread usage snapshot");
+        assert_eq!(thread_usage.current_tokens, Some(30000));
+        assert_eq!(thread_usage.max_context_tokens, Some(200000));
+        assert_eq!(thread_usage.context_window_percent, Some(90));
+        assert_eq!(thread_usage.five_hour_percent, None);
+        assert_eq!(thread_usage.weekly_percent, None);
+
+        let merged_usage = mapper
+            .merge_usage_snapshot_payload(&account_payload)
+            .expect("expected merged usage snapshot");
+        assert_eq!(merged_usage.current_tokens, Some(30000));
+        assert_eq!(merged_usage.max_context_tokens, Some(200000));
+        assert_eq!(merged_usage.context_window_percent, Some(90));
+        assert_eq!(merged_usage.five_hour_percent, Some(17));
+        assert_eq!(merged_usage.weekly_percent, Some(42));
+        assert_eq!(merged_usage.five_hour_resets_at, Some(1735689600 * 1000));
+        assert_eq!(merged_usage.weekly_resets_at, Some(1736294400000));
     }
 }

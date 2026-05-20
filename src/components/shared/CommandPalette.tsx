@@ -71,6 +71,7 @@ import { useFileStore } from "../../stores/fileStore";
 import { useHarnessStore } from "../../stores/harnessStore";
 import { canToggleKeepAwake, useKeepAwakeStore } from "../../stores/keepAwakeStore";
 import { toast } from "../../stores/toastStore";
+import { activateThreadContext } from "../../lib/threadActivation";
 import type { FileTreeEntry, GitBranch, GitStash, GitStatus, HarnessInfo, Repo, SearchResult, Thread, Workspace } from "../../types";
 
 const FILE_SEARCH_RESULT_LIMIT = 80;
@@ -1916,13 +1917,7 @@ export function CommandPalette({ open, onClose }: Props) {
         threadId: targetThread.id,
         messageId: result.messageId,
       });
-      if (targetThread.repoId) {
-        setActiveRepo(targetThread.repoId);
-      } else {
-        setActiveRepo(null, { remember: false });
-      }
-      setActiveThread(targetThread.id);
-      await bindChatThread(targetThread.id);
+      await activateThreadContext(targetThread);
       useUiStore.getState().setActiveView("chat");
       onClose();
     },
