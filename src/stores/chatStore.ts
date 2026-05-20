@@ -73,6 +73,7 @@ let activeThreadBindSeq = 0;
 const STREAM_EVENT_BATCH_WINDOW_MS = 16;
 const STREAM_EVENT_QUEUE_FLUSH_THRESHOLD = 500;
 const CONTEXT_USAGE_CACHE_METADATA_KEY = "contextUsageCache";
+let lastKnownCodexAccountUsageWindows: ContextUsage | null = null;
 
 /**
  * Background listeners for threads that are still streaming when the user switches away.
@@ -174,6 +175,28 @@ function contextUsageFromThreadMetadata(
   };
 }
 
+function accountUsageWindowsFromUsageLimits(usage: ContextUsage | null): ContextUsage | null {
+  if (
+    !usage ||
+    (usage.windowFiveHourPercent === null &&
+      usage.windowWeeklyPercent === null &&
+      usage.windowFiveHourResetsAt === null &&
+      usage.windowWeeklyResetsAt === null)
+  ) {
+    return null;
+  }
+
+  return {
+    currentTokens: null,
+    maxContextTokens: null,
+    contextPercent: null,
+    windowFiveHourPercent: usage.windowFiveHourPercent,
+    windowWeeklyPercent: usage.windowWeeklyPercent,
+    windowFiveHourResetsAt: usage.windowFiveHourResetsAt,
+    windowWeeklyResetsAt: usage.windowWeeklyResetsAt,
+  };
+}
+
 function mergeContextUsageCacheIntoThread(thread: Thread, usage: ContextUsage): Thread {
   const currentCache =
     thread.engineMetadata?.[CONTEXT_USAGE_CACHE_METADATA_KEY] &&
@@ -222,6 +245,10 @@ function syncThreadContextUsageCache(threadId: string, usage: ContextUsage | nul
   if (updatedThread !== thread) {
     threadStore.applyThreadUpdateLocal(updatedThread);
   }
+}
+
+export function resetUsageLimitCachesForTests(): void {
+  lastKnownCodexAccountUsageWindows = null;
 }
 
 function isThreadTurnActive(status: ThreadStatus): boolean {
@@ -2132,6 +2159,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
           const currentState = useChatStore.getState();
           if (currentState.threadId === threadId) {
             syncThreadContextUsageCache(threadId, currentState.usageLimits);
+            const thread = useThreadStore
+              .getState()
+              .threads.find((candidate) => candidate.id === threadId);
+            if (thread?.engineId === "codex") {
+              lastKnownCodexAccountUsageWindows =
+                accountUsageWindowsFromUsageLimits(currentState.usageLimits) ??
+                lastKnownCodexAccountUsageWindows;
+            }
           }
         }
 
@@ -2237,7 +2272,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
         error: undefined,
         streaming: isThreadStatusStreaming(threadStatus),
         status: threadStatus,
-        usageLimits: contextUsageFromThreadMetadata(activeThread?.engineMetadata),
+        usageLimits:
+          activeThread?.engineId === "codex"
+            ? mergeUsageLimits(
+                contextUsageFromThreadMetadata(activeThread?.engineMetadata),
+                lastKnownCodexAccountUsageWindows,
+              )
+            : null,
       });
     } catch (error) {
       if (bindSeq !== activeThreadBindSeq) {

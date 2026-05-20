@@ -22,7 +22,7 @@ vi.mock("../lib/perfTelemetry", () => ({
   recordPerfMetric: mockRecordPerfMetric,
 }));
 
-import { useChatStore } from "./chatStore";
+import { resetUsageLimitCachesForTests, useChatStore } from "./chatStore";
 import { useThreadStore } from "./threadStore";
 
 function deferred<T>() {
@@ -38,6 +38,7 @@ function deferred<T>() {
 describe("chatStore send", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetUsageLimitCachesForTests();
     mockIpc.getThreadMessagesWindow.mockResolvedValue({
       messages: [],
       nextCursor: null,
@@ -601,6 +602,98 @@ describe("chatStore send", () => {
       windowWeeklyPercent: 50,
       windowFiveHourResetsAt: null,
       windowWeeklyResetsAt: null,
+    });
+
+    vi.useRealTimers();
+  });
+
+  it("preserves last-known account windows when binding another Codex thread", async () => {
+    vi.useFakeTimers();
+
+    const thread1 = {
+      id: "thread-1",
+      workspaceId: "workspace-1",
+      repoId: null,
+      engineId: "codex" as const,
+      modelId: "gpt-5.3-codex",
+      engineThreadId: "engine-thread-1",
+      engineMetadata: {
+        codexSyncRequired: false,
+      },
+      title: "Thread 1",
+      status: "completed" as const,
+      messageCount: 4,
+      totalTokens: 0,
+      createdAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+    };
+    const thread2 = {
+      id: "thread-2",
+      workspaceId: "workspace-1",
+      repoId: null,
+      engineId: "codex" as const,
+      modelId: "gpt-5.3-codex",
+      engineThreadId: "engine-thread-2",
+      engineMetadata: {
+        codexSyncRequired: false,
+        contextUsageCache: {
+          currentTokens: 40000,
+          maxContextTokens: 200000,
+          contextWindowPercent: 84,
+        },
+      },
+      title: "Thread 2",
+      status: "completed" as const,
+      messageCount: 3,
+      totalTokens: 0,
+      createdAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+    };
+
+    useThreadStore.setState({
+      threads: [thread1, thread2],
+      threadsByWorkspace: {
+        "workspace-1": [thread1, thread2],
+      },
+      archivedThreadsByWorkspace: {},
+      activeThreadId: "thread-1",
+      loading: false,
+      error: undefined,
+    });
+
+    let streamHandler: ((event: StreamEvent) => void) | null = null;
+    mockListenThreadEvents
+      .mockImplementationOnce(async (_threadId, onEvent) => {
+        streamHandler = onEvent;
+        return () => {};
+      })
+      .mockImplementationOnce(async () => () => {});
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    expect(streamHandler).not.toBeNull();
+    streamHandler!({
+      type: "UsageLimitsUpdated",
+      usage: {
+        five_hour_percent: 17,
+        weekly_percent: 42,
+        five_hour_resets_at: 1735689600,
+        weekly_resets_at: 1736294400000,
+      },
+    });
+
+    await vi.advanceTimersByTimeAsync(20);
+
+    await useChatStore.getState().setActiveThread("thread-2");
+
+    expect(useChatStore.getState().usageLimits).toEqual({
+      currentTokens: 40000,
+      maxContextTokens: 200000,
+      contextPercent: 85,
+      windowFiveHourPercent: 83,
+      windowWeeklyPercent: 58,
+      windowFiveHourResetsAt: "2025-01-01T00:00:00.000Z",
+      windowWeeklyResetsAt: "2025-01-08T00:00:00.000Z",
     });
 
     vi.useRealTimers();
