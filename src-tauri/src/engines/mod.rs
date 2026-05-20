@@ -362,9 +362,15 @@ pub struct ImportedThreadMessage {
 pub struct UsageLimitsReadDiagnostics {
     pub thread_read_attempted: bool,
     pub thread_read_succeeded: bool,
+    pub latest_turn_read_attempted: bool,
+    pub latest_turn_read_succeeded: bool,
+    pub latest_turn_source: Option<String>,
+    pub latest_turn_id: Option<String>,
+    pub latest_turn_had_token_usage: bool,
     pub account_read_attempted: bool,
     pub account_read_succeeded: bool,
     pub thread_read_error: Option<String>,
+    pub latest_turn_read_error: Option<String>,
     pub account_read_error: Option<String>,
     pub fatal_error: Option<String>,
 }

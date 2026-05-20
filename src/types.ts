@@ -1319,6 +1319,13 @@ export interface RefreshThreadUsageLimitsDiagnostics {
   engineThreadId: string | null;
   threadReadAttempted: boolean;
   threadReadSucceeded: boolean;
+  latestTurnReadAttempted: boolean;
+  latestTurnReadSucceeded: boolean;
+  latestTurnSource: string | null;
+  latestTurnId: string | null;
+  latestTurnHadTokenUsage: boolean;
+  cachedContextAvailable: boolean;
+  cachedContextUsed: boolean;
   accountReadAttempted: boolean;
   accountReadSucceeded: boolean;
   currentTokens: number | null;
@@ -1329,6 +1336,7 @@ export interface RefreshThreadUsageLimitsDiagnostics {
   fiveHourResetsAt: number | null;
   weeklyResetsAt: number | null;
   threadReadError: string | null;
+  latestTurnReadError: string | null;
   accountReadError: string | null;
   fatalError: string | null;
 }

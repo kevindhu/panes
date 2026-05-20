@@ -1096,44 +1096,15 @@ impl CodexEngine {
 
     pub async fn read_usage_limits_snapshot(
         &self,
-        engine_thread_id: Option<&str>,
+        _engine_thread_id: Option<&str>,
     ) -> anyhow::Result<super::UsageLimitsReadResult> {
         let transport = self.ensure_ready_transport().await?;
         let mut mapper = TurnEventMapper::default();
         let mut diagnostics = super::UsageLimitsReadDiagnostics::default();
 
-        if let Some(engine_thread_id) = engine_thread_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            diagnostics.thread_read_attempted = true;
-            let params = serde_json::json!({
-              "threadId": engine_thread_id,
-              "includeTurns": false,
-            });
-
-            match request_with_fallback(
-                transport.as_ref(),
-                THREAD_READ_METHODS,
-                params,
-                DEFAULT_TIMEOUT,
-            )
-            .await
-            .context("failed to read codex thread usage snapshot")
-            {
-                Ok(snapshot) => {
-                    diagnostics.thread_read_succeeded = true;
-                    mapper.merge_usage_snapshot_payload(&snapshot);
-                }
-                Err(error) => {
-                    log::debug!(
-                        "failed to read codex thread usage snapshot for {engine_thread_id}: {error}"
-                    );
-                    diagnostics.thread_read_error = Some(format!("{error:#}"));
-                }
-            }
-        }
-
+        // Upstream Codex restores thread-scoped context usage via `thread/resume` replay, not
+        // `thread/read`. Refresh only reads account windows here; callers merge persisted thread
+        // context from local metadata/cache.
         diagnostics.account_read_attempted = true;
         match request_with_fallback(
             transport.as_ref(),

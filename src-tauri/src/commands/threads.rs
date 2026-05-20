@@ -26,6 +26,7 @@ use crate::{
 
 const MAX_THREAD_TITLE_CHARS: usize = 120;
 const BRANCH_PROFILE_LOG_FILE_NAME: &str = "codex-branch-profile.log";
+const CONTEXT_USAGE_CACHE_METADATA_KEY: &str = "contextUsageCache";
 
 fn branch_profile_log_path() -> PathBuf {
     crate::runtime_env::app_data_dir()
@@ -92,6 +93,13 @@ pub struct RefreshThreadUsageLimitsDiagnosticsDto {
     pub engine_thread_id: Option<String>,
     pub thread_read_attempted: bool,
     pub thread_read_succeeded: bool,
+    pub latest_turn_read_attempted: bool,
+    pub latest_turn_read_succeeded: bool,
+    pub latest_turn_source: Option<String>,
+    pub latest_turn_id: Option<String>,
+    pub latest_turn_had_token_usage: bool,
+    pub cached_context_available: bool,
+    pub cached_context_used: bool,
     pub account_read_attempted: bool,
     pub account_read_succeeded: bool,
     pub current_tokens: Option<u64>,
@@ -102,6 +110,7 @@ pub struct RefreshThreadUsageLimitsDiagnosticsDto {
     pub five_hour_resets_at: Option<i64>,
     pub weekly_resets_at: Option<i64>,
     pub thread_read_error: Option<String>,
+    pub latest_turn_read_error: Option<String>,
     pub account_read_error: Option<String>,
     pub fatal_error: Option<String>,
 }
@@ -122,6 +131,82 @@ fn usage_snapshot_missing_context(usage: Option<&crate::engines::UsageLimitsSnap
     usage.current_tokens.is_none()
         && usage.max_context_tokens.is_none()
         && usage.context_window_percent.is_none()
+}
+
+fn usage_snapshot_has_context_metrics(usage: &crate::engines::UsageLimitsSnapshot) -> bool {
+    usage.current_tokens.is_some()
+        || usage.max_context_tokens.is_some()
+        || usage.context_window_percent.is_some()
+}
+
+fn cached_context_usage_from_metadata(
+    metadata: Option<&Value>,
+) -> Option<crate::engines::UsageLimitsSnapshot> {
+    let cache = metadata
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(CONTEXT_USAGE_CACHE_METADATA_KEY))
+        .and_then(Value::as_object)?;
+
+    let current_tokens = cache.get("currentTokens").and_then(Value::as_u64);
+    let max_context_tokens = cache.get("maxContextTokens").and_then(Value::as_u64);
+    let context_window_percent = cache
+        .get("contextWindowPercent")
+        .and_then(Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok());
+
+    if current_tokens.is_none()
+        && max_context_tokens.is_none()
+        && context_window_percent.is_none()
+    {
+        return None;
+    }
+
+    Some(crate::engines::UsageLimitsSnapshot {
+        current_tokens,
+        max_context_tokens,
+        context_window_percent,
+        ..crate::engines::UsageLimitsSnapshot::default()
+    })
+}
+
+fn merge_cached_context_usage(
+    usage: Option<crate::engines::UsageLimitsSnapshot>,
+    cached: &crate::engines::UsageLimitsSnapshot,
+) -> crate::engines::UsageLimitsSnapshot {
+    let mut merged = usage.unwrap_or_default();
+    if merged.current_tokens.is_none() {
+        merged.current_tokens = cached.current_tokens;
+    }
+    if merged.max_context_tokens.is_none() {
+        merged.max_context_tokens = cached.max_context_tokens;
+    }
+    if merged.context_window_percent.is_none() {
+        merged.context_window_percent = cached.context_window_percent;
+    }
+    merged
+}
+
+fn merge_context_usage_cache_into_metadata(
+    mut metadata: Option<Value>,
+    usage: &crate::engines::UsageLimitsSnapshot,
+) -> Value {
+    let mut metadata = metadata.take().unwrap_or_else(|| json!({}));
+    if !metadata.is_object() {
+        metadata = json!({});
+    }
+
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert(
+            CONTEXT_USAGE_CACHE_METADATA_KEY.to_string(),
+            json!({
+                "currentTokens": usage.current_tokens,
+                "maxContextTokens": usage.max_context_tokens,
+                "contextWindowPercent": usage.context_window_percent,
+            }),
+        );
+    }
+
+    metadata
 }
 
 #[tauri::command]
@@ -1303,7 +1388,34 @@ pub async fn refresh_thread_usage_limits(
         },
     };
 
-    let refreshed = if let Some(usage) = read_result.usage.clone() {
+    let cached_context = cached_context_usage_from_metadata(thread.engine_metadata.as_ref());
+    let cached_context_available = cached_context.is_some();
+    let should_apply_cached_context =
+        usage_snapshot_missing_context(read_result.usage.as_ref()) && cached_context.is_some();
+    let effective_usage = if let Some(cached_context) = cached_context.as_ref() {
+        if should_apply_cached_context {
+            Some(merge_cached_context_usage(read_result.usage.clone(), cached_context))
+        } else {
+            read_result.usage.clone()
+        }
+    } else {
+        read_result.usage.clone()
+    };
+
+    if let Some(usage) = effective_usage.as_ref().filter(|usage| usage_snapshot_has_context_metrics(usage))
+    {
+        if let Err(error) = run_db(state.db.clone(), {
+            let thread_id = thread_id.clone();
+            let metadata = merge_context_usage_cache_into_metadata(thread.engine_metadata.clone(), usage);
+            move |db| db::threads::update_engine_metadata(db, &thread_id, &metadata)
+        })
+        .await
+        {
+            log::warn!("failed to persist context usage cache during refresh: {error}");
+        }
+    }
+
+    let refreshed = if let Some(usage) = effective_usage.clone() {
         let stream_event_topic = format!("stream-event-{thread_id}");
         let _ = app.emit(
             &stream_event_topic,
@@ -1317,7 +1429,7 @@ pub async fn refresh_thread_usage_limits(
         false
     };
 
-    let usage = read_result.usage.as_ref();
+    let usage = effective_usage.as_ref();
     Ok(RefreshThreadUsageLimitsResultDto {
         refreshed,
         missing_context: usage_snapshot_missing_context(usage),
@@ -1331,6 +1443,13 @@ pub async fn refresh_thread_usage_limits(
             engine_thread_id: thread.engine_thread_id.clone(),
             thread_read_attempted: read_result.diagnostics.thread_read_attempted,
             thread_read_succeeded: read_result.diagnostics.thread_read_succeeded,
+            latest_turn_read_attempted: read_result.diagnostics.latest_turn_read_attempted,
+            latest_turn_read_succeeded: read_result.diagnostics.latest_turn_read_succeeded,
+            latest_turn_source: read_result.diagnostics.latest_turn_source.clone(),
+            latest_turn_id: read_result.diagnostics.latest_turn_id.clone(),
+            latest_turn_had_token_usage: read_result.diagnostics.latest_turn_had_token_usage,
+            cached_context_available,
+            cached_context_used: should_apply_cached_context,
             account_read_attempted: read_result.diagnostics.account_read_attempted,
             account_read_succeeded: read_result.diagnostics.account_read_succeeded,
             current_tokens: usage.and_then(|value| value.current_tokens),
@@ -1341,6 +1460,7 @@ pub async fn refresh_thread_usage_limits(
             five_hour_resets_at: usage.and_then(|value| value.five_hour_resets_at),
             weekly_resets_at: usage.and_then(|value| value.weekly_resets_at),
             thread_read_error: read_result.diagnostics.thread_read_error.clone(),
+            latest_turn_read_error: read_result.diagnostics.latest_turn_read_error.clone(),
             account_read_error: read_result.diagnostics.account_read_error.clone(),
             fatal_error: read_result.diagnostics.fatal_error.clone(),
         },
@@ -4549,5 +4669,45 @@ mod tests {
         .expect_err("expected non-opencode thread to be rejected");
 
         assert!(error.contains("OpenCode thread config is only available for OpenCode threads"));
+    }
+
+    #[test]
+    fn cached_context_usage_reads_from_engine_metadata() {
+        let cached = cached_context_usage_from_metadata(Some(&json!({
+            CONTEXT_USAGE_CACHE_METADATA_KEY: {
+                "currentTokens": 42000,
+                "maxContextTokens": 200000,
+                "contextWindowPercent": 84,
+            }
+        })))
+        .expect("expected cached context usage to deserialize");
+
+        assert_eq!(cached.current_tokens, Some(42000));
+        assert_eq!(cached.max_context_tokens, Some(200000));
+        assert_eq!(cached.context_window_percent, Some(84));
+    }
+
+    #[test]
+    fn merge_cached_context_usage_only_fills_missing_context_fields() {
+        let cached = crate::engines::UsageLimitsSnapshot {
+            current_tokens: Some(42000),
+            max_context_tokens: Some(200000),
+            context_window_percent: Some(84),
+            ..crate::engines::UsageLimitsSnapshot::default()
+        };
+        let usage = crate::engines::UsageLimitsSnapshot {
+            current_tokens: None,
+            max_context_tokens: Some(160000),
+            context_window_percent: None,
+            five_hour_percent: Some(11),
+            ..crate::engines::UsageLimitsSnapshot::default()
+        };
+
+        let merged = merge_cached_context_usage(Some(usage), &cached);
+
+        assert_eq!(merged.current_tokens, Some(42000));
+        assert_eq!(merged.max_context_tokens, Some(160000));
+        assert_eq!(merged.context_window_percent, Some(84));
+        assert_eq!(merged.five_hour_percent, Some(11));
     }
 }

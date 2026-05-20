@@ -446,6 +446,117 @@ describe("chatStore send", () => {
     vi.useRealTimers();
   });
 
+  it("hydrates cached context usage from thread metadata when binding an old Codex thread", async () => {
+    const thread = {
+      id: "thread-1",
+      workspaceId: "workspace-1",
+      repoId: null,
+      engineId: "codex" as const,
+      modelId: "gpt-5.3-codex",
+      engineThreadId: "engine-thread-1",
+      engineMetadata: {
+        codexSyncRequired: false,
+        contextUsageCache: {
+          currentTokens: 30000,
+          maxContextTokens: 200000,
+          contextWindowPercent: 90,
+        },
+      },
+      title: "Thread 1",
+      status: "completed" as const,
+      messageCount: 4,
+      totalTokens: 0,
+      createdAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+    };
+
+    useThreadStore.setState({
+      threads: [thread],
+      threadsByWorkspace: {
+        "workspace-1": [thread],
+      },
+      archivedThreadsByWorkspace: {},
+      activeThreadId: "thread-1",
+      loading: false,
+      error: undefined,
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    expect(useChatStore.getState().usageLimits).toEqual({
+      currentTokens: 30000,
+      maxContextTokens: 200000,
+      contextPercent: 90,
+      windowFiveHourPercent: null,
+      windowWeeklyPercent: null,
+      windowFiveHourResetsAt: null,
+      windowWeeklyResetsAt: null,
+    });
+  });
+
+  it("updates the in-memory thread cache when streamed context usage arrives", async () => {
+    vi.useFakeTimers();
+
+    const thread = {
+      id: "thread-1",
+      workspaceId: "workspace-1",
+      repoId: null,
+      engineId: "codex" as const,
+      modelId: "gpt-5.3-codex",
+      engineThreadId: "engine-thread-1",
+      engineMetadata: {
+        codexSyncRequired: false,
+      },
+      title: "Thread 1",
+      status: "completed" as const,
+      messageCount: 4,
+      totalTokens: 0,
+      createdAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+    };
+
+    useThreadStore.setState({
+      threads: [thread],
+      threadsByWorkspace: {
+        "workspace-1": [thread],
+      },
+      archivedThreadsByWorkspace: {},
+      activeThreadId: "thread-1",
+      loading: false,
+      error: undefined,
+    });
+
+    let streamHandler: ((event: StreamEvent) => void) | null = null;
+    mockListenThreadEvents.mockImplementationOnce(async (_threadId, onEvent) => {
+      streamHandler = onEvent;
+      return () => {};
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    expect(streamHandler).not.toBeNull();
+    streamHandler!({
+      type: "UsageLimitsUpdated",
+      usage: {
+        current_tokens: 30000,
+        max_context_tokens: 200000,
+        context_window_percent: 90,
+      },
+    });
+
+    await vi.advanceTimersByTimeAsync(20);
+
+    expect(useThreadStore.getState().threads[0]?.engineMetadata).toMatchObject({
+      contextUsageCache: {
+        currentTokens: 30000,
+        maxContextTokens: 200000,
+        contextWindowPercent: 90,
+      },
+    });
+
+    vi.useRealTimers();
+  });
+
   it("preserves last-known context usage when a refresh only returns account windows", async () => {
     vi.useFakeTimers();
 

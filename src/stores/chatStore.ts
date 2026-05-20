@@ -19,6 +19,7 @@ import type {
   SteerBlock,
   StreamTokenUsage,
   StreamEvent,
+  Thread,
   TurnCompletionSource,
   ThreadStatus
 } from "../types";
@@ -71,6 +72,7 @@ interface ChatState {
 let activeThreadBindSeq = 0;
 const STREAM_EVENT_BATCH_WINDOW_MS = 16;
 const STREAM_EVENT_QUEUE_FLUSH_THRESHOLD = 500;
+const CONTEXT_USAGE_CACHE_METADATA_KEY = "contextUsageCache";
 
 /**
  * Background listeners for threads that are still streaming when the user switches away.
@@ -116,6 +118,110 @@ const inflightActionOutputHydration = new Map<string, Promise<void>>();
 
 function isCodexThreadSyncRequired(metadata: Record<string, unknown> | undefined): boolean {
   return metadata?.codexSyncRequired === true;
+}
+
+function normalizeContextUsageCacheInteger(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+  return Math.max(0, Math.round(value));
+}
+
+function normalizeContextUsageCachePercent(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function hasContextUsageMetrics(usage: ContextUsage | null | undefined): usage is ContextUsage {
+  return Boolean(
+    usage &&
+      (usage.currentTokens !== null ||
+        usage.maxContextTokens !== null ||
+        usage.contextPercent !== null),
+  );
+}
+
+function contextUsageFromThreadMetadata(
+  metadata: Record<string, unknown> | undefined,
+): ContextUsage | null {
+  const cache = metadata?.[CONTEXT_USAGE_CACHE_METADATA_KEY];
+  if (!cache || typeof cache !== "object" || Array.isArray(cache)) {
+    return null;
+  }
+
+  const cacheRecord = cache as Record<string, unknown>;
+  const currentTokens = normalizeContextUsageCacheInteger(cacheRecord.currentTokens);
+  const maxContextTokens = normalizeContextUsageCacheInteger(cacheRecord.maxContextTokens);
+  let contextPercent = calculateContextPercentRemaining(currentTokens, maxContextTokens);
+  if (contextPercent === null) {
+    contextPercent = normalizeContextUsageCachePercent(cacheRecord.contextWindowPercent);
+  }
+
+  if (currentTokens === null && maxContextTokens === null && contextPercent === null) {
+    return null;
+  }
+
+  return {
+    currentTokens,
+    maxContextTokens,
+    contextPercent,
+    windowFiveHourPercent: null,
+    windowWeeklyPercent: null,
+    windowFiveHourResetsAt: null,
+    windowWeeklyResetsAt: null,
+  };
+}
+
+function mergeContextUsageCacheIntoThread(thread: Thread, usage: ContextUsage): Thread {
+  const currentCache =
+    thread.engineMetadata?.[CONTEXT_USAGE_CACHE_METADATA_KEY] &&
+    typeof thread.engineMetadata[CONTEXT_USAGE_CACHE_METADATA_KEY] === "object" &&
+    !Array.isArray(thread.engineMetadata[CONTEXT_USAGE_CACHE_METADATA_KEY])
+      ? (thread.engineMetadata[CONTEXT_USAGE_CACHE_METADATA_KEY] as Record<string, unknown>)
+      : null;
+
+  const nextCache = {
+    currentTokens: usage.currentTokens,
+    maxContextTokens: usage.maxContextTokens,
+    contextWindowPercent: usage.contextPercent,
+  };
+
+  if (
+    normalizeContextUsageCacheInteger(currentCache?.currentTokens) === nextCache.currentTokens &&
+    normalizeContextUsageCacheInteger(currentCache?.maxContextTokens) ===
+      nextCache.maxContextTokens &&
+    normalizeContextUsageCachePercent(currentCache?.contextWindowPercent) ===
+      nextCache.contextWindowPercent
+  ) {
+    return thread;
+  }
+
+  const metadata = { ...(thread.engineMetadata ?? {}) };
+  metadata[CONTEXT_USAGE_CACHE_METADATA_KEY] = nextCache;
+
+  return {
+    ...thread,
+    engineMetadata: metadata,
+  };
+}
+
+function syncThreadContextUsageCache(threadId: string, usage: ContextUsage | null): void {
+  if (!hasContextUsageMetrics(usage)) {
+    return;
+  }
+
+  const threadStore = useThreadStore.getState();
+  const thread = threadStore.threads.find((candidate) => candidate.id === threadId);
+  if (!thread) {
+    return;
+  }
+
+  const updatedThread = mergeContextUsageCacheIntoThread(thread, usage);
+  if (updatedThread !== thread) {
+    threadStore.applyThreadUpdateLocal(updatedThread);
+  }
 }
 
 function isThreadTurnActive(status: ThreadStatus): boolean {
@@ -1960,6 +2066,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
         streamFlushInProgress = true;
         const batch = queuedStreamEvents.splice(0, queuedStreamEvents.length);
+        const usageUpdateSeen = batch.some((event) => event.type === "UsageLimitsUpdated");
         const flushStartedAt = performance.now();
         try {
           set((state) => {
@@ -2020,6 +2127,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
         } finally {
           streamFlushInProgress = false;
         }
+
+        if (usageUpdateSeen) {
+          const currentState = useChatStore.getState();
+          if (currentState.threadId === threadId) {
+            syncThreadContextUsageCache(threadId, currentState.usageLimits);
+          }
+        }
+
         recordPerfMetric("chat.stream.flush.ms", performance.now() - flushStartedAt, {
           threadId,
           batchSize: batch.length,
@@ -2122,7 +2237,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         error: undefined,
         streaming: isThreadStatusStreaming(threadStatus),
         status: threadStatus,
-        usageLimits: null,
+        usageLimits: contextUsageFromThreadMetadata(activeThread?.engineMetadata),
       });
     } catch (error) {
       if (bindSeq !== activeThreadBindSeq) {

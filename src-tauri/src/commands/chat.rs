@@ -8,7 +8,7 @@ use std::{
 use arboard::{Clipboard, ImageData};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
-use serde_json::{value::RawValue, Value};
+use serde_json::{json, value::RawValue, Value};
 use tauri::{Emitter, State};
 use tokio::fs as tokio_fs;
 use tokio::sync::{mpsc, oneshot};
@@ -54,6 +54,7 @@ const IMAGE_ATTACHMENT_EXTENSIONS: &[&str] = &[
 const MESSAGE_WINDOW_DEFAULT_LIMIT: usize = 120;
 const MESSAGE_WINDOW_MAX_LIMIT: usize = 400;
 const MAX_CHAT_NOTIFICATION_PREVIEW_CHARS: usize = 240;
+const CONTEXT_USAGE_CACHE_METADATA_KEY: &str = "contextUsageCache";
 
 fn value_to_raw(value: &Value) -> Box<RawValue> {
     serde_json::value::to_raw_value(value).unwrap_or_else(|_| empty_raw_value())
@@ -61,6 +62,35 @@ fn value_to_raw(value: &Value) -> Box<RawValue> {
 
 fn empty_raw_value() -> Box<RawValue> {
     RawValue::from_string("null".to_string()).expect("\"null\" is a valid JSON literal")
+}
+
+fn usage_snapshot_has_context_metrics(usage: &crate::engines::UsageLimitsSnapshot) -> bool {
+    usage.current_tokens.is_some()
+        || usage.max_context_tokens.is_some()
+        || usage.context_window_percent.is_some()
+}
+
+fn merge_context_usage_cache_into_metadata(
+    mut metadata: Option<Value>,
+    usage: &crate::engines::UsageLimitsSnapshot,
+) -> Value {
+    let mut metadata = metadata.take().unwrap_or_else(|| json!({}));
+    if !metadata.is_object() {
+        metadata = json!({});
+    }
+
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert(
+            CONTEXT_USAGE_CACHE_METADATA_KEY.to_string(),
+            json!({
+                "currentTokens": usage.current_tokens,
+                "maxContextTokens": usage.max_context_tokens,
+                "contextWindowPercent": usage.context_window_percent,
+            }),
+        );
+    }
+
+    metadata
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3116,6 +3146,27 @@ async fn process_stream_event(
             .await
             {
                 log::warn!("failed to persist approval: {error}");
+            }
+        }
+        EngineEvent::UsageLimitsUpdated { usage } => {
+            if usage_snapshot_has_context_metrics(usage) {
+                if let Err(error) = run_db(state.db.clone(), {
+                    let thread_id = thread.id.clone();
+                    let usage = usage.clone();
+                    move |db| {
+                        let current_thread = db::threads::get_thread(db, &thread_id)?
+                            .ok_or_else(|| anyhow::anyhow!("thread not found: {thread_id}"))?;
+                        let metadata = merge_context_usage_cache_into_metadata(
+                            current_thread.engine_metadata,
+                            &usage,
+                        );
+                        db::threads::update_engine_metadata(db, &thread_id, &metadata)
+                    }
+                })
+                .await
+                {
+                    log::warn!("failed to persist context usage cache: {error}");
+                }
             }
         }
         _ => {}
