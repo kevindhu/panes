@@ -1247,6 +1247,7 @@ export interface NoticeEvent {
   level: "info" | "warning" | "error";
   title: string;
   message: string;
+  details?: string[];
 }
 
 export type StreamEvent =

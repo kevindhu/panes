@@ -31,7 +31,7 @@ use git::watcher::GitWatcherManager;
 #[cfg(target_os = "macos")]
 use locale::native_strings;
 use locale::resolve_app_locale;
-use models::{EngineRuntimeUpdatedDto, ThreadDto, ThreadStatusDto};
+use models::{EngineRuntimeUpdatedDto, RuntimeToastDto, ThreadDto, ThreadStatusDto};
 use power::KeepAwakeManager;
 use state::{AppState, TurnManager};
 #[cfg(target_os = "macos")]
@@ -509,6 +509,40 @@ async fn handle_codex_runtime_event(
                 );
             }
         }
+        CodexRuntimeEvent::ThreadCompacted { engine_thread_id } => {
+            if let Some(updated_thread) = apply_codex_runtime_thread_update(
+                state,
+                &engine_thread_id,
+                None,
+                None,
+                &[],
+                None,
+                Some(true),
+                Some("thread_compacted"),
+            )
+            .await
+            {
+                let _ = app.emit(
+                    "thread-updated",
+                    ThreadUpdatedEvent {
+                        thread_id: updated_thread.id.clone(),
+                        workspace_id: updated_thread.workspace_id.clone(),
+                        thread: Some(updated_thread),
+                    },
+                );
+                let _ = app.emit(
+                    "engine-runtime-updated",
+                    EngineRuntimeUpdatedDto {
+                        engine_id: "codex".to_string(),
+                        protocol_diagnostics: None,
+                        toast: Some(RuntimeToastDto {
+                            variant: "info".to_string(),
+                            message: "Context compacted".to_string(),
+                        }),
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -607,33 +641,24 @@ async fn resolve_codex_runtime_approval(
                 }
             }
 
-            // Conditionally advance the thread status.
-            if has_local_turn {
-                tx.execute(
-                    "UPDATE threads
-                     SET status = ?1, last_activity_at = datetime('now')
-                     WHERE id = ?2
-                       AND status = ?3",
-                    rusqlite::params![
-                        ThreadStatusDto::Streaming.as_str(),
-                        thread_id,
-                        ThreadStatusDto::AwaitingApproval.as_str()
-                    ],
-                )
-                .context("failed to conditionally update thread status")?;
-            }
+            let next_thread_status = if has_local_turn {
+                ThreadStatusDto::Streaming
+            } else {
+                db::threads::derive_thread_status_for_recovery(&tx, &thread_id)?
+            };
+            tx.execute(
+                "UPDATE threads
+                 SET status = ?1, last_activity_at = datetime('now')
+                 WHERE id = ?2
+                   AND status != ?1",
+                rusqlite::params![next_thread_status.as_str(), &thread_id],
+            )
+            .context("failed to update thread status after runtime approval resolution")?;
 
             tx.commit()
                 .context("failed to commit approval resolution transaction")?;
 
-            // Read the updated thread after the transaction has committed (non-atomic read is fine).
-            let updated_thread = if has_local_turn {
-                db::threads::get_thread(db, &thread_id)?
-            } else {
-                None
-            };
-
-            Ok(updated_thread)
+            db::threads::get_thread(db, &thread_id)
         }
     })
     .await

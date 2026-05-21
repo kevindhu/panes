@@ -511,6 +511,10 @@
       "customPayloadHint": "Esta solicitação aceita um formulário estruturado abaixo. O JSON avançado continua disponível para casos extremos.",
       "sendPayload": "Enviar payload"
     },
+    "contextCompaction": {
+      "summary": "Resumo",
+      "prompt": "Prompt compactado"
+    },
     "toolInput": {
       "answerInComposer": "Responda isso na caixa de chat abaixo.",
       "questionCounter": "{{current}} / {{total}}",

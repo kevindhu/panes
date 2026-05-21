@@ -170,6 +170,8 @@ pub enum EngineEvent {
         level: String,
         title: String,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<Vec<String>>,
     },
     Error {
         message: String,

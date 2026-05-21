@@ -11,6 +11,8 @@ use super::{
 
 pub const APPROVAL_DETAIL_SERVER_METHOD_KEY: &str = "_serverMethod";
 pub const APPROVAL_DETAIL_RAW_REQUEST_ID_KEY: &str = "_rawRequestId";
+const CONTEXT_COMPACTION_SUMMARY_DETAIL_PREFIX: &str = "summary::";
+const CONTEXT_COMPACTION_PROMPT_DETAIL_PREFIX: &str = "prompt::";
 
 #[derive(Default)]
 pub struct TurnEventMapper {
@@ -180,6 +182,7 @@ impl TurnEventMapper {
                 message:
                     "Codex compacted the active thread context to keep the conversation moving."
                         .to_string(),
+                details: extract_context_compaction_notice_details(params),
             }],
             "warning" => vec![map_simple_notice(
                 "codex_warning",
@@ -874,21 +877,16 @@ fn normalize_plan_step_status_for_display(status: &str) -> String {
 fn parse_turn_status(status: &str) -> Option<ParsedTurnStatus> {
     match method_signature(status).as_str() {
         "completed" => Some(ParsedTurnStatus::Terminal(TurnCompletionStatus::Completed)),
-        "interrupted" | "cancelled" | "canceled" => {
-            Some(ParsedTurnStatus::Terminal(TurnCompletionStatus::Interrupted))
-        }
+        "interrupted" | "cancelled" | "canceled" => Some(ParsedTurnStatus::Terminal(
+            TurnCompletionStatus::Interrupted,
+        )),
         "failed" | "error" | "errored" => {
             Some(ParsedTurnStatus::Terminal(TurnCompletionStatus::Failed))
         }
-        "inprogress"
-        | "running"
-        | "streaming"
-        | "active"
-        | "paused"
-        | "awaitingapproval"
-        | "waitingonapproval"
-        | "awaitinguserinput"
-        | "waitingonuserinput" => Some(ParsedTurnStatus::Active),
+        "inprogress" | "running" | "streaming" | "active" | "paused" | "awaitingapproval"
+        | "waitingonapproval" | "awaitinguserinput" | "waitingonuserinput" => {
+            Some(ParsedTurnStatus::Active)
+        }
         _ => None,
     }
 }
@@ -912,6 +910,7 @@ fn map_deprecation_notice(params: &Value) -> Option<EngineEvent> {
         level: "warning".to_string(),
         title: "Deprecation notice".to_string(),
         message,
+        details: None,
     })
 }
 
@@ -921,6 +920,7 @@ fn map_simple_notice(kind: &str, level: &str, title: &str, message: String) -> E
         level: level.to_string(),
         title: title.to_string(),
         message,
+        details: None,
     }
 }
 
@@ -1112,7 +1112,59 @@ fn map_hook_notification(method_key: &str, params: &Value) -> Option<EngineEvent
         level: level.to_string(),
         title: title.to_string(),
         message: message_lines.join("\n"),
+        details: None,
     })
+}
+
+fn extract_context_compaction_notice_details(params: &Value) -> Option<Vec<String>> {
+    let mut details = Vec::new();
+
+    for (prefix, path) in [
+        (
+            CONTEXT_COMPACTION_SUMMARY_DETAIL_PREFIX,
+            ["summary"].as_slice(),
+        ),
+        (
+            CONTEXT_COMPACTION_SUMMARY_DETAIL_PREFIX,
+            ["contextCompaction", "summary"].as_slice(),
+        ),
+        (
+            CONTEXT_COMPACTION_SUMMARY_DETAIL_PREFIX,
+            ["context_compaction", "summary"].as_slice(),
+        ),
+        (
+            CONTEXT_COMPACTION_SUMMARY_DETAIL_PREFIX,
+            ["context", "summary"].as_slice(),
+        ),
+        (
+            CONTEXT_COMPACTION_PROMPT_DETAIL_PREFIX,
+            ["message"].as_slice(),
+        ),
+        (
+            CONTEXT_COMPACTION_PROMPT_DETAIL_PREFIX,
+            ["contextCompaction", "message"].as_slice(),
+        ),
+        (
+            CONTEXT_COMPACTION_PROMPT_DETAIL_PREFIX,
+            ["context_compaction", "message"].as_slice(),
+        ),
+        (
+            CONTEXT_COMPACTION_PROMPT_DETAIL_PREFIX,
+            ["context", "message"].as_slice(),
+        ),
+    ] {
+        if let Some(value) = extract_nested_string(params, path) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                let encoded = format!("{prefix}{trimmed}");
+                if !details.iter().any(|existing| existing == &encoded) {
+                    details.push(encoded);
+                }
+            }
+        }
+    }
+
+    (!details.is_empty()).then_some(details)
 }
 
 fn summarize_permissions_request(params: &Value) -> String {
@@ -2141,13 +2193,48 @@ mod tests {
                 level,
                 title,
                 message,
+                details,
             } => {
                 assert_eq!(kind, "context_compacted");
                 assert_eq!(level, "info");
                 assert_eq!(title, "Context compacted");
                 assert!(message.contains("compacted"));
+                assert!(details.is_none());
             }
             other => panic!("expected notice event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_notification_emits_context_compacted_notice_details() {
+        let mut mapper = TurnEventMapper::default();
+
+        let events = mapper.map_notification(
+            "contextCompacted",
+            &json!({
+                "contextCompaction": {
+                    "summary": "Kept the repo goal and recent edits.",
+                    "message": "Continue from the persisted thread summary."
+                }
+            }),
+        );
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            EngineEvent::Notice {
+                kind,
+                details: Some(details),
+                ..
+            } => {
+                assert_eq!(kind, "context_compacted");
+                assert!(details
+                    .iter()
+                    .any(|detail| { detail == "summary::Kept the repo goal and recent edits." }));
+                assert!(details.iter().any(|detail| {
+                    detail == "prompt::Continue from the persisted thread summary."
+                }));
+            }
+            other => panic!("expected compaction notice details, got {other:?}"),
         }
     }
 
@@ -2170,6 +2257,7 @@ mod tests {
                 level,
                 title,
                 message,
+                ..
             } => {
                 assert_eq!(kind, "deprecation_notice");
                 assert_eq!(level, "warning");
@@ -2216,6 +2304,7 @@ mod tests {
                 level,
                 title,
                 message,
+                ..
             } => {
                 assert_eq!(kind, "hook_completed_hook_123");
                 assert_eq!(level, "info");

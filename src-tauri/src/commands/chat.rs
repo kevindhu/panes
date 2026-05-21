@@ -278,7 +278,26 @@ fn turn_status_notice_level(status: &TurnCompletionStatus) -> &'static str {
     }
 }
 
-fn turn_status_notice_title(status: &TurnCompletionStatus) -> &'static str {
+fn turn_status_notice_has_pending_approval_conflict(stats: &TurnBlockStats) -> bool {
+    stats.approvals_pending > 0
+}
+
+fn turn_status_notice_level_with_stats(
+    status: &TurnCompletionStatus,
+    stats: &TurnBlockStats,
+) -> &'static str {
+    if turn_status_notice_has_pending_approval_conflict(stats) {
+        "warning"
+    } else {
+        turn_status_notice_level(status)
+    }
+}
+
+fn turn_status_notice_title(status: &TurnCompletionStatus, stats: &TurnBlockStats) -> &'static str {
+    if turn_status_notice_has_pending_approval_conflict(stats) {
+        return "Approval still pending";
+    }
+
     match status {
         TurnCompletionStatus::Completed => "Turn completed",
         TurnCompletionStatus::Interrupted => "Turn interrupted",
@@ -289,7 +308,12 @@ fn turn_status_notice_title(status: &TurnCompletionStatus) -> &'static str {
 fn turn_status_notice_message(
     status: &TurnCompletionStatus,
     source: Option<&TurnCompletionSource>,
+    stats: &TurnBlockStats,
 ) -> String {
+    if turn_status_notice_has_pending_approval_conflict(stats) {
+        return "A terminal result was recorded, but Panes still has unresolved approvals. The turn may have ended early or the approval protocol may be out of sync.".to_string();
+    }
+
     match (status, source) {
         (TurnCompletionStatus::Completed, Some(TurnCompletionSource::Engine)) => {
             "Codex reported a normal terminal completion.".to_string()
@@ -351,6 +375,12 @@ fn build_turn_status_notice_block(
             "Approvals: {} pending, {} answered",
             stats.approvals_pending, stats.approvals_answered
         ));
+        if turn_status_notice_has_pending_approval_conflict(&stats) {
+            details.push(format!(
+                "Protocol warning: terminal result arrived while {} approval(s) were still pending.",
+                stats.approvals_pending
+            ));
+        }
     }
 
     if stats.diff_blocks > 0 {
@@ -363,25 +393,31 @@ fn build_turn_status_notice_block(
 
     ContentBlock::Notice {
         kind: "turn_status".to_string(),
-        level: turn_status_notice_level(status).to_string(),
-        title: turn_status_notice_title(status).to_string(),
-        message: turn_status_notice_message(status, source),
+        level: turn_status_notice_level_with_stats(status, &stats).to_string(),
+        title: turn_status_notice_title(status, &stats).to_string(),
+        message: turn_status_notice_message(status, source, &stats),
         details: (!details.is_empty()).then_some(details),
         status: Some(
-            match status {
-                TurnCompletionStatus::Completed => "completed",
-                TurnCompletionStatus::Interrupted => "interrupted",
-                TurnCompletionStatus::Failed => "failed",
+            if turn_status_notice_has_pending_approval_conflict(&stats) {
+                "awaiting_approval"
+            } else {
+                match status {
+                    TurnCompletionStatus::Completed => "completed",
+                    TurnCompletionStatus::Interrupted => "interrupted",
+                    TurnCompletionStatus::Failed => "failed",
+                }
             }
             .to_string(),
         ),
-        source: source.map(|value| match value {
-            TurnCompletionSource::Engine => "engine",
-            TurnCompletionSource::ReconciledStreamLost => "reconciled_stream_lost",
-            TurnCompletionSource::ReconciledTimeout => "reconciled_timeout",
-            TurnCompletionSource::TimeoutFallback => "timeout_fallback",
-        }
-        .to_string()),
+        source: source.map(|value| {
+            match value {
+                TurnCompletionSource::Engine => "engine",
+                TurnCompletionSource::ReconciledStreamLost => "reconciled_stream_lost",
+                TurnCompletionSource::ReconciledTimeout => "reconciled_timeout",
+                TurnCompletionSource::TimeoutFallback => "timeout_fallback",
+            }
+            .to_string()
+        }),
     }
 }
 
@@ -1616,6 +1652,7 @@ async fn respond_to_approval_inner(
     })
     .await?
     .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+    let has_local_turn = state.turns.get(&thread_id).await.is_some();
     let normalized_response =
         normalize_approval_response_for_engine(thread.engine_id.as_str(), response)?;
     let approval_route =
@@ -1638,6 +1675,7 @@ async fn respond_to_approval_inner(
         let thread_id = thread_id.clone();
         let decision = decision.to_string();
         let normalized_response = normalized_response.clone();
+        let has_local_turn = has_local_turn;
         move |db| {
             db::actions::answer_approval_with_response(
                 db,
@@ -1654,7 +1692,13 @@ async fn respond_to_approval_inner(
                     Some(&normalized_response),
                 );
             }
-            db::threads::update_thread_status(db, &thread_id, ThreadStatusDto::Streaming)?;
+            let next_thread_status = if has_local_turn {
+                ThreadStatusDto::Streaming
+            } else {
+                let conn = db.connect()?;
+                db::threads::derive_thread_status_for_recovery(&conn, &thread_id)?
+            };
+            db::threads::update_thread_status(db, &thread_id, next_thread_status)?;
             Ok(())
         }
     })
@@ -3483,8 +3527,16 @@ fn chat_notification_preview(blocks: &[ContentBlock]) -> Option<String> {
                     return Some(preview);
                 }
             }
-            ContentBlock::Notice { kind, message, title, .. } => {
-                if kind == "turn_status" {
+            ContentBlock::Notice {
+                kind,
+                message,
+                title,
+                ..
+            } => {
+                if kind == "turn_status"
+                    || kind == "context_compacted"
+                    || kind.starts_with("codex_context_compaction_")
+                {
                     continue;
                 }
                 if let Some(preview) = normalize_chat_notification_preview(message) {
@@ -3567,20 +3619,21 @@ fn apply_event_to_blocks(
             diagnostics,
         } => {
             progress.force_persist = true;
-            match status {
-                TurnCompletionStatus::Completed => {
-                    progress.message_status = Some(MessageStatusDto::Completed);
-                    progress.thread_status = Some(ThreadStatusDto::Completed);
+            let has_pending_approvals = collect_turn_block_stats(blocks).approvals_pending > 0;
+            progress.message_status = Some(match status {
+                TurnCompletionStatus::Completed => MessageStatusDto::Completed,
+                TurnCompletionStatus::Interrupted => MessageStatusDto::Interrupted,
+                TurnCompletionStatus::Failed => MessageStatusDto::Error,
+            });
+            progress.thread_status = Some(if has_pending_approvals {
+                ThreadStatusDto::AwaitingApproval
+            } else {
+                match status {
+                    TurnCompletionStatus::Completed => ThreadStatusDto::Completed,
+                    TurnCompletionStatus::Interrupted => ThreadStatusDto::Idle,
+                    TurnCompletionStatus::Failed => ThreadStatusDto::Error,
                 }
-                TurnCompletionStatus::Interrupted => {
-                    progress.message_status = Some(MessageStatusDto::Interrupted);
-                    progress.thread_status = Some(ThreadStatusDto::Idle);
-                }
-                TurnCompletionStatus::Failed => {
-                    progress.message_status = Some(MessageStatusDto::Error);
-                    progress.thread_status = Some(ThreadStatusDto::Error);
-                }
-            }
+            });
             progress.token_usage = token_usage
                 .as_ref()
                 .map(|usage| (usage.input, usage.output));
@@ -3774,13 +3827,14 @@ fn apply_event_to_blocks(
             level,
             title,
             message,
+            details,
         } => {
             let block = ContentBlock::Notice {
                 kind: kind.to_string(),
                 level: level.to_string(),
                 title: title.to_string(),
                 message: message.to_string(),
-                details: None,
+                details: details.as_ref().filter(|items| !items.is_empty()).cloned(),
                 status: None,
                 source: None,
             };
@@ -5312,6 +5366,7 @@ mod tests {
                 level: "warning".to_string(),
                 title: "Deprecation notice".to_string(),
                 message: "Use the newer API.".to_string(),
+                details: None,
             },
             1000,
         );
@@ -5326,6 +5381,7 @@ mod tests {
                 level: "warning".to_string(),
                 title: "Deprecation notice".to_string(),
                 message: "Use the newer permissions API.".to_string(),
+                details: None,
             },
             1000,
         );
@@ -5334,6 +5390,42 @@ mod tests {
         assert!(matches!(
             &blocks[0],
             ContentBlock::Notice { message, .. } if message == "Use the newer permissions API."
+        ));
+    }
+
+    #[test]
+    fn generic_notice_blocks_preserve_details() {
+        let mut blocks = Vec::new();
+        let mut action_index = HashMap::new();
+        let mut approval_index = HashMap::new();
+
+        let progress = apply_event_to_blocks(
+            &mut blocks,
+            &mut action_index,
+            &mut approval_index,
+            &EngineEvent::Notice {
+                kind: "context_compacted".to_string(),
+                level: "info".to_string(),
+                title: "Context compacted".to_string(),
+                message: "Codex compacted the active thread context.".to_string(),
+                details: Some(vec![
+                    "summary::Kept the repo goal and recent edits.".to_string(),
+                    "prompt::Continue from the persisted thread summary.".to_string(),
+                ]),
+            },
+            1000,
+        );
+
+        assert!(progress.blocks_changed);
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::Notice {
+                kind,
+                details: Some(details),
+                ..
+            } if kind == "context_compacted"
+                && details.iter().any(|detail| detail.starts_with("summary::"))
+                && details.iter().any(|detail| detail.starts_with("prompt::"))
         ));
     }
 
@@ -5395,6 +5487,68 @@ mod tests {
                 && source == "engine"
                 && details.iter().any(|detail| detail == "Completion source: explicit engine terminal event")
                 && details.iter().any(|detail| detail == "Token usage: 12 input, 34 output")
+        ));
+    }
+
+    #[test]
+    fn turn_completed_with_pending_approval_keeps_thread_awaiting_approval() {
+        let mut blocks = vec![ContentBlock::Approval {
+            approval_id: "approval-1".to_string(),
+            action_type: "command".to_string(),
+            summary: "Run command".to_string(),
+            details: empty_raw_value(),
+            status: "pending".to_string(),
+            decision: None,
+        }];
+        let mut action_index = HashMap::new();
+        let mut approval_index = HashMap::new();
+        rebuild_block_indexes(&blocks, &mut action_index, &mut approval_index);
+
+        let progress = apply_event_to_blocks(
+            &mut blocks,
+            &mut action_index,
+            &mut approval_index,
+            &EngineEvent::TurnCompleted {
+                token_usage: Some(crate::engines::TokenUsage {
+                    input: 12,
+                    output: 34,
+                    reasoning: None,
+                    cache_read: None,
+                    cache_write: None,
+                    cost_usd: None,
+                }),
+                status: TurnCompletionStatus::Completed,
+                diagnostics: Some(crate::engines::TurnCompletionDiagnostics {
+                    source: TurnCompletionSource::Engine,
+                }),
+            },
+            1000,
+        );
+
+        assert_eq!(progress.message_status, Some(MessageStatusDto::Completed));
+        assert_eq!(
+            progress.thread_status,
+            Some(ThreadStatusDto::AwaitingApproval)
+        );
+        assert!(matches!(
+            &blocks[1],
+            ContentBlock::Notice {
+                kind,
+                level,
+                title,
+                message,
+                details: Some(details),
+                status: Some(status),
+                source: Some(source),
+            }
+            if kind == "turn_status"
+                && level == "warning"
+                && title == "Approval still pending"
+                && message.contains("unresolved approvals")
+                && status == "awaiting_approval"
+                && source == "engine"
+                && details.iter().any(|detail| detail == "Approvals: 1 pending, 0 answered")
+                && details.iter().any(|detail| detail.contains("Protocol warning"))
         ));
     }
 

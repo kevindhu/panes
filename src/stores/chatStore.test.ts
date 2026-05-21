@@ -12,6 +12,12 @@ const mockIpc = vi.hoisted(() => ({
 
 const mockListenThreadEvents = vi.hoisted(() => vi.fn());
 const mockRecordPerfMetric = vi.hoisted(() => vi.fn());
+const mockToast = vi.hoisted(() => ({
+  info: vi.fn(),
+  success: vi.fn(),
+  warning: vi.fn(),
+  error: vi.fn(),
+}));
 
 vi.mock("../lib/ipc", () => ({
   ipc: mockIpc,
@@ -20,6 +26,10 @@ vi.mock("../lib/ipc", () => ({
 
 vi.mock("../lib/perfTelemetry", () => ({
   recordPerfMetric: mockRecordPerfMetric,
+}));
+
+vi.mock("./toastStore", () => ({
+  toast: mockToast,
 }));
 
 import { resetUsageLimitCachesForTests, useChatStore } from "./chatStore";
@@ -1143,6 +1153,77 @@ describe("chatStore send", () => {
     ]);
   });
 
+  it("restores completed runtime state after answering the last pending approval on a terminal message", async () => {
+    mockIpc.respondApproval.mockResolvedValueOnce(undefined);
+    useChatStore.setState({
+      threadId: "thread-1",
+      messages: [
+        {
+          id: "assistant-terminal-approval",
+          threadId: "thread-1",
+          role: "assistant",
+          status: "completed",
+          schemaVersion: 1,
+          blocks: [
+            {
+              type: "approval",
+              approvalId: "approval-terminal",
+              actionType: "command",
+              summary: "Run command",
+              details: {},
+              status: "pending",
+            },
+            {
+              type: "notice",
+              kind: "turn_status",
+              level: "warning",
+              title: "Approval still pending",
+              message:
+                "A terminal result was recorded, but Panes still has unresolved approvals. The turn may have ended early or the approval protocol may be out of sync.",
+              status: "awaiting_approval",
+              source: "engine",
+              details: [
+                "Completion source: explicit engine terminal event",
+                "Approvals: 1 pending, 0 answered",
+              ],
+            },
+          ],
+          createdAt: new Date().toISOString(),
+          hydration: "full",
+          hasDeferredContent: false,
+        },
+      ],
+      olderCursor: null,
+      hasOlderMessages: false,
+      loadingOlderMessages: false,
+      olderLoadBlockedUntil: 0,
+      status: "awaiting_approval",
+      streaming: true,
+      usageLimits: null,
+      error: undefined,
+      unlisten: undefined,
+    });
+
+    await useChatStore
+      .getState()
+      .respondApproval("approval-terminal", { decision: "accept" } as ApprovalResponse);
+
+    expect(useChatStore.getState()).toMatchObject({
+      status: "completed",
+      streaming: false,
+    });
+    expect(useChatStore.getState().messages[0]?.blocks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "approval",
+          approvalId: "approval-terminal",
+          status: "answered",
+          decision: "accept",
+        }),
+      ]),
+    );
+  });
+
   it("stores only the latest MCP progress message on the matching action block", async () => {
     vi.useFakeTimers();
 
@@ -1604,6 +1685,141 @@ describe("chatStore send", () => {
     });
 
     vi.useRealTimers();
+  });
+
+  it("keeps the thread awaiting approval when TurnCompleted arrives before a pending approval is cleared", async () => {
+    vi.useFakeTimers();
+
+    let streamHandler: ((event: StreamEvent) => void) | null = null;
+    mockListenThreadEvents.mockImplementationOnce(async (_threadId, onEvent) => {
+      streamHandler = onEvent;
+      return () => {};
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    streamHandler!({
+      type: "ApprovalRequested",
+      approval_id: "approval-runtime-3",
+      action_type: "command",
+      summary: "Run command",
+      details: {},
+    });
+    streamHandler!({
+      type: "TurnCompleted",
+      status: "completed",
+      diagnostics: {
+        source: "engine",
+      },
+    });
+
+    await vi.advanceTimersByTimeAsync(20);
+
+    const state = useChatStore.getState();
+    expect(state).toMatchObject({
+      status: "awaiting_approval",
+      streaming: true,
+    });
+    const assistant = state.messages[state.messages.length - 1];
+    expect(assistant?.role).toBe("assistant");
+    expect(assistant?.status).toBe("completed");
+    expect(assistant?.blocks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "notice",
+          kind: "turn_status",
+          title: "Approval still pending",
+          status: "awaiting_approval",
+          source: "engine",
+        }),
+      ]),
+    );
+
+    vi.useRealTimers();
+  });
+
+  it("shows a toast and preserves details for live context compaction notices", async () => {
+    vi.useFakeTimers();
+
+    let streamHandler: ((event: StreamEvent) => void) | null = null;
+    mockListenThreadEvents.mockImplementationOnce(async (_threadId, onEvent) => {
+      streamHandler = onEvent;
+      return () => {};
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    streamHandler!({
+      type: "Notice",
+      kind: "context_compacted",
+      level: "info",
+      title: "Context compacted",
+      message: "Codex compacted the active thread context to keep the conversation moving.",
+      details: [
+        "summary::Kept the repo goal and recent edits.",
+        "prompt::Continue from the persisted thread summary.",
+      ],
+    });
+
+    await vi.advanceTimersByTimeAsync(20);
+
+    expect(mockToast.info).toHaveBeenCalledWith("Context compacted");
+    expect(useChatStore.getState().messages.at(-1)?.blocks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "notice",
+          kind: "context_compacted",
+          details: [
+            "summary::Kept the repo goal and recent edits.",
+            "prompt::Continue from the persisted thread summary.",
+          ],
+        }),
+      ]),
+    );
+
+    vi.useRealTimers();
+  });
+
+  it("blocks send when pending approvals still exist even if the thread is not marked streaming", async () => {
+    useChatStore.setState({
+      threadId: "thread-1",
+      messages: [
+        {
+          id: "assistant-1",
+          threadId: "thread-1",
+          role: "assistant",
+          status: "completed",
+          schemaVersion: 1,
+          blocks: [
+            {
+              type: "approval",
+              approvalId: "approval-1",
+              actionType: "command",
+              summary: "Run command",
+              details: {},
+              status: "pending",
+            },
+          ],
+          createdAt: new Date().toISOString(),
+          hydration: "full",
+          hasDeferredContent: false,
+        },
+      ],
+      olderCursor: null,
+      hasOlderMessages: false,
+      loadingOlderMessages: false,
+      olderLoadBlockedUntil: 0,
+      status: "completed",
+      streaming: false,
+      usageLimits: null,
+      error: undefined,
+      unlisten: undefined,
+    });
+
+    await expect(useChatStore.getState().send("keep going")).resolves.toBe(false);
+    expect(useChatStore.getState().error).toBe(
+      "Resolve the pending approval before starting a new turn.",
+    );
   });
 
   it("syncs dirty Codex thread metadata before binding the message window", async () => {

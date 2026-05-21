@@ -200,6 +200,9 @@ pub enum CodexRuntimeEvent {
     ThreadUnarchived {
         engine_thread_id: String,
     },
+    ThreadCompacted {
+        engine_thread_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -2567,6 +2570,21 @@ impl CodexEngine {
                                         });
                                 }
                             }
+                            "thread/compacted" | "contextcompacted" => {
+                                if let Some(engine_thread_id) =
+                                    extract_any_string(&params, &["threadId", "thread_id"])
+                                {
+                                    let has_active_turn = {
+                                        let state = state.lock().await;
+                                        state.active_turn_ids.contains_key(&engine_thread_id)
+                                    };
+                                    if !has_active_turn {
+                                        let _ = runtime_events.send(
+                                            CodexRuntimeEvent::ThreadCompacted { engine_thread_id },
+                                        );
+                                    }
+                                }
+                            }
                             "configwarning" => {
                                 if let Some(diagnostics) =
                                     update_protocol_diagnostics_with_config_warning(
@@ -4716,13 +4734,19 @@ fn extract_imported_messages_from_turns(turns: &[serde_json::Value]) -> Vec<Impo
                     }));
                 }
                 "contextCompaction" => {
-                    assistant_blocks.push(serde_json::json!({
+                    let mut notice = serde_json::json!({
                         "type": "notice",
                         "kind": format!("codex_context_compaction_{}", imported_item_id(&item)),
                         "level": "info",
                         "title": "Context compacted",
                         "message": "Codex compacted the thread context.",
-                    }));
+                    });
+                    if let Some(details) = imported_context_compaction_notice_details(&item) {
+                        notice["details"] = serde_json::Value::Array(
+                            details.into_iter().map(serde_json::Value::String).collect(),
+                        );
+                    }
+                    assistant_blocks.push(notice);
                 }
                 "enteredReviewMode" | "exitedReviewMode" => {
                     let review = extract_any_string(&item, &["review"]).unwrap_or_default();
@@ -5095,6 +5119,37 @@ fn extract_any_string(value: &serde_json::Value, keys: &[&str]) -> Option<String
         }
     }
     None
+}
+
+fn extract_context_compaction_notice_details(value: &serde_json::Value) -> Option<Vec<String>> {
+    let mut details = Vec::new();
+
+    for (prefix, path) in [
+        ("summary::", ["summary"].as_slice()),
+        ("summary::", ["contextCompaction", "summary"].as_slice()),
+        ("summary::", ["context_compaction", "summary"].as_slice()),
+        ("summary::", ["context", "summary"].as_slice()),
+        ("prompt::", ["message"].as_slice()),
+        ("prompt::", ["contextCompaction", "message"].as_slice()),
+        ("prompt::", ["context_compaction", "message"].as_slice()),
+        ("prompt::", ["context", "message"].as_slice()),
+    ] {
+        if let Some(text) = extract_nested_string(value, path) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                let encoded = format!("{prefix}{trimmed}");
+                if !details.iter().any(|existing| existing == &encoded) {
+                    details.push(encoded);
+                }
+            }
+        }
+    }
+
+    (!details.is_empty()).then_some(details)
+}
+
+fn imported_context_compaction_notice_details(item: &serde_json::Value) -> Option<Vec<String>> {
+    extract_context_compaction_notice_details(item)
 }
 
 fn extract_any_u64(value: &serde_json::Value, keys: &[&str]) -> Option<u64> {
@@ -6736,6 +6791,7 @@ fn is_known_codex_notification_method(normalized_method: &str) -> bool {
             | "turn/plan/updated"
             | "thread/started"
             | "thread/compacted"
+            | "contextcompacted"
             | "thread/status/changed"
             | "thread/name/updated"
             | "thread/archived"
@@ -7981,6 +8037,9 @@ mod tests {
             "thread/started"
         )));
         assert!(is_known_codex_notification_method(&normalize_method(
+            "contextCompacted"
+        )));
+        assert!(is_known_codex_notification_method(&normalize_method(
             "thread/archived"
         )));
         assert!(is_known_codex_notification_method(&normalize_method(
@@ -8007,6 +8066,24 @@ mod tests {
         assert!(is_known_codex_notification_method(&normalize_method(
             "windowsSandbox/setupCompleted"
         )));
+    }
+
+    #[test]
+    fn context_compaction_details_extract_summary_and_message() {
+        let details = extract_context_compaction_notice_details(&json!({
+            "contextCompaction": {
+                "summary": "Kept the repo goal and recent edits.",
+                "message": "Continue from the persisted thread summary."
+            }
+        }))
+        .expect("details should be extracted");
+
+        assert!(details
+            .iter()
+            .any(|detail| { detail == "summary::Kept the repo goal and recent edits." }));
+        assert!(details
+            .iter()
+            .any(|detail| { detail == "prompt::Continue from the persisted thread summary." }));
     }
 
     #[test]

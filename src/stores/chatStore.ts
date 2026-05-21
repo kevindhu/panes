@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { ipc, listenThreadEvents } from "../lib/ipc";
 import { recordPerfMetric } from "../lib/perfTelemetry";
 import { useThreadStore } from "./threadStore";
+import { toast } from "./toastStore";
 import type {
   ApprovalResponse,
   ActionBlock,
@@ -259,6 +260,7 @@ function applyRuntimeStateFromEvent(
   status: ThreadStatus,
   streaming: boolean,
   event: StreamEvent,
+  messages: Message[],
 ): Pick<ChatState, "status" | "streaming"> {
   if (event.type === "UsageLimitsUpdated") {
     return { status, streaming };
@@ -269,7 +271,7 @@ function applyRuntimeStateFromEvent(
   }
 
   if (event.type === "ApprovalResolved") {
-    return { status: "streaming", streaming: true };
+    return deriveRuntimeStateFromMessages(messages) ?? { status: "streaming", streaming: true };
   }
 
   if (event.type === "Error" && !event.recoverable) {
@@ -277,6 +279,10 @@ function applyRuntimeStateFromEvent(
   }
 
   if (event.type === "TurnCompleted") {
+    if (messagesHavePendingApprovals(messages)) {
+      return { status: "awaiting_approval", streaming: true };
+    }
+
     const completionStatus = String(event.status ?? "completed");
     if (completionStatus === "failed") {
       return { status: "error", streaming: false };
@@ -366,6 +372,25 @@ function recordPendingTurnLatencyMetrics(threadId: string, event: StreamEvent) {
   if (event.type === "TextDelta" && String(event.content ?? "").length > 0) {
     recordPendingTurnMetric(threadId, "firstTextRecorded", "chat.turn.first_text.ms");
   }
+}
+
+function normalizeNoticeDetails(details: unknown): string[] | undefined {
+  if (!Array.isArray(details)) {
+    return undefined;
+  }
+
+  const normalized = details
+    .filter((detail): detail is string => typeof detail === "string")
+    .map((detail) => detail.trim())
+    .filter((detail) => detail.length > 0);
+
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function isContextCompactionNoticeEvent(
+  event: StreamEvent,
+): event is Extract<StreamEvent, { type: "Notice" }> {
+  return event.type === "Notice" && String(event.kind ?? "") === "context_compacted";
 }
 
 function enqueueStreamEvent(queue: StreamEvent[], event: StreamEvent) {
@@ -1073,6 +1098,13 @@ interface TurnBlockStats {
   errorBlocks: number;
 }
 
+function messagesHavePendingApprovals(messages: Message[]): boolean {
+  return messages.some((message) =>
+    message.role === "assistant" &&
+    (message.blocks ?? []).some((block) => block.type === "approval" && block.status === "pending"),
+  );
+}
+
 function collectTurnBlockStats(blocks: ContentBlock[]): TurnBlockStats {
   const stats: TurnBlockStats = {
     actionsTotal: 0,
@@ -1123,6 +1155,36 @@ function collectTurnBlockStats(blocks: ContentBlock[]): TurnBlockStats {
   return stats;
 }
 
+function deriveRuntimeStateFromMessages(
+  messages: Message[],
+): Pick<ChatState, "status" | "streaming"> | null {
+  if (messagesHavePendingApprovals(messages)) {
+    return { status: "awaiting_approval", streaming: true };
+  }
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "assistant") {
+      continue;
+    }
+
+    if (message.status === "error") {
+      return { status: "error", streaming: false };
+    }
+    if (message.status === "completed") {
+      return { status: "completed", streaming: false };
+    }
+    if (message.status === "interrupted") {
+      return { status: "idle", streaming: false };
+    }
+    if (message.status === "streaming") {
+      return { status: "streaming", streaming: true };
+    }
+  }
+
+  return null;
+}
+
 function describeTurnCompletionSource(source?: TurnCompletionSource | null): string | null {
   switch (source) {
     case "engine":
@@ -1136,6 +1198,14 @@ function describeTurnCompletionSource(source?: TurnCompletionSource | null): str
     default:
       return null;
   }
+}
+
+function turnStatusNoticeHasPendingApprovalConflict(
+  state: TurnStatusState,
+  stats: TurnBlockStats,
+  source?: TurnCompletionSource | null,
+): boolean {
+  return state !== "streaming" && stats.approvalsPending > 0 && Boolean(source);
 }
 
 function turnStatusNoticeLevel(state: TurnStatusState): NoticeBlock["level"] {
@@ -1166,7 +1236,12 @@ function turnStatusNoticeTitle(state: TurnStatusState): string {
 function turnStatusNoticeMessage(
   state: TurnStatusState,
   source?: TurnCompletionSource | null,
+  hasPendingApprovalConflict = false,
 ): string {
+  if (hasPendingApprovalConflict) {
+    return "A terminal result was recorded, but Panes still has unresolved approvals. The turn may have ended early or the approval protocol may be out of sync.";
+  }
+
   switch (state) {
     case "completed":
       if (source === "engine") {
@@ -1205,6 +1280,11 @@ function buildTurnStatusNotice(
   const stats = collectTurnBlockStats(blocks);
   const details: string[] = [];
   const sourceLabel = describeTurnCompletionSource(source);
+  const hasPendingApprovalConflict = turnStatusNoticeHasPendingApprovalConflict(
+    state,
+    stats,
+    source,
+  );
 
   if (sourceLabel) {
     details.push(`Completion source: ${sourceLabel}`);
@@ -1224,6 +1304,11 @@ function buildTurnStatusNotice(
     details.push(
       `Approvals: ${stats.approvalsPending} pending, ${stats.approvalsAnswered} answered`,
     );
+    if (hasPendingApprovalConflict) {
+      details.push(
+        `Protocol warning: terminal result arrived while ${stats.approvalsPending} approval(s) were still pending.`,
+      );
+    }
   }
 
   if (stats.diffBlocks > 0) {
@@ -1241,11 +1326,11 @@ function buildTurnStatusNotice(
   return {
     type: "notice",
     kind: "turn_status",
-    level: turnStatusNoticeLevel(state),
-    title: turnStatusNoticeTitle(state),
-    message: turnStatusNoticeMessage(state, source),
+    level: hasPendingApprovalConflict ? "warning" : turnStatusNoticeLevel(state),
+    title: hasPendingApprovalConflict ? "Approval still pending" : turnStatusNoticeTitle(state),
+    message: turnStatusNoticeMessage(state, source, hasPendingApprovalConflict),
     details: details.length > 0 ? details : undefined,
-    status: state,
+    status: hasPendingApprovalConflict ? "awaiting_approval" : state,
     source: source ?? undefined,
   };
 }
@@ -1896,7 +1981,7 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
           : "info",
       title: String(event.title ?? "Notice"),
       message: String(event.message ?? ""),
-      details: undefined,
+      details: normalizeNoticeDetails(event.details),
       status: undefined,
       source: undefined,
     });
@@ -1912,12 +1997,14 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
 
   if (event.type === "TurnCompleted") {
     const status = String(event.status ?? "completed");
-    const nextState =
+    const terminalState =
       status === "failed"
         ? "failed"
         : status === "interrupted"
           ? "interrupted"
           : "completed";
+    const blockStats = collectTurnBlockStats(assistant.blocks ?? []);
+    const nextState = blockStats.approvalsPending > 0 ? "awaiting_approval" : terminalState;
     assistant.blocks = upsertNoticeBlock(
       assistant.blocks ?? [],
       buildTurnStatusNotice(assistant.blocks ?? [], {
@@ -2123,6 +2210,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 nextStatus,
                 nextStreaming,
                 queuedEvent,
+                nextMessages,
               );
               nextStatus = nextRuntimeState.status;
               nextStreaming = nextRuntimeState.streaming;
@@ -2193,6 +2281,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const unlistenStream = await listenThreadEvents(threadId, (event) => {
         if (bindSeq !== activeThreadBindSeq) {
           return;
+        }
+        if (isContextCompactionNoticeEvent(event)) {
+          toast.info(String(event.title ?? "Context compacted").trim() || "Context compacted");
         }
         const pendingTurnMeta = pendingTurnMetaByThread.get(threadId);
         if (
@@ -2373,6 +2464,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set({ error: "A turn is already in progress for this thread." });
       return false;
     }
+    if (messagesHavePendingApprovals(state.messages)) {
+      set({ error: "Resolve the pending approval before starting a new turn." });
+      return false;
+    }
 
     const threadId = options?.threadIdOverride ?? state.threadId;
     if (!threadId) {
@@ -2533,20 +2628,35 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const responseData = typeof response === "object" && response !== null && !Array.isArray(response)
       ? response as Record<string, unknown>
       : undefined;
-    const previousMessages = get().messages;
+    const previousState = {
+      messages: get().messages,
+      status: get().status,
+      streaming: get().streaming,
+    };
     set((state) => {
       const nextMessages = resolveApprovalInMessages(state.messages, approvalId, decision, responseData);
       if (nextMessages === state.messages) {
         return state;
       }
-      return { ...state, messages: nextMessages };
+      const nextRuntimeState = deriveRuntimeStateFromMessages(nextMessages);
+      return {
+        ...state,
+        messages: nextMessages,
+        status: nextRuntimeState?.status ?? state.status,
+        streaming: nextRuntimeState?.streaming ?? state.streaming,
+      };
     });
 
     try {
       await ipc.respondApproval(threadId, approvalId, response);
     } catch (error) {
       // Roll back the optimistic update on failure
-      set({ messages: previousMessages, error: String(error) });
+      set({
+        messages: previousState.messages,
+        status: previousState.status,
+        streaming: previousState.streaming,
+        error: String(error),
+      });
     }
   },
   hydrateActionOutput: async (messageId, actionId) => {

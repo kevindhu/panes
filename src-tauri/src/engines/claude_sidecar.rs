@@ -1367,6 +1367,7 @@ impl Engine for ClaudeSidecarEngine {
                                                     level: "info".to_string(),
                                                     title: "Claude stop reason".to_string(),
                                                     message: stop_reason.clone(),
+                                                    details: None,
                                                 })
                                                 .await
                                                 .ok();
@@ -1406,6 +1407,7 @@ impl Engine for ClaudeSidecarEngine {
                                             level,
                                             title,
                                             message,
+                                            details: None,
                                         })
                                         .await
                                         .ok();
@@ -1473,6 +1475,7 @@ impl Engine for ClaudeSidecarEngine {
                                     level: "warning".to_string(),
                                     title: "Claude event lag".to_string(),
                                     message: message.clone(),
+                                    details: None,
                                 })
                                 .await
                                 .ok();

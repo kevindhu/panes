@@ -154,9 +154,7 @@ fn cached_context_usage_from_metadata(
         .and_then(Value::as_u64)
         .and_then(|value| u8::try_from(value).ok());
 
-    if current_tokens.is_none()
-        && max_context_tokens.is_none()
-        && context_window_percent.is_none()
+    if current_tokens.is_none() && max_context_tokens.is_none() && context_window_percent.is_none()
     {
         return None;
     }
@@ -1394,7 +1392,10 @@ pub async fn refresh_thread_usage_limits(
         usage_snapshot_missing_context(read_result.usage.as_ref()) && cached_context.is_some();
     let effective_usage = if let Some(cached_context) = cached_context.as_ref() {
         if should_apply_cached_context {
-            Some(merge_cached_context_usage(read_result.usage.clone(), cached_context))
+            Some(merge_cached_context_usage(
+                read_result.usage.clone(),
+                cached_context,
+            ))
         } else {
             read_result.usage.clone()
         }
@@ -1402,11 +1403,14 @@ pub async fn refresh_thread_usage_limits(
         read_result.usage.clone()
     };
 
-    if let Some(usage) = effective_usage.as_ref().filter(|usage| usage_snapshot_has_context_metrics(usage))
+    if let Some(usage) = effective_usage
+        .as_ref()
+        .filter(|usage| usage_snapshot_has_context_metrics(usage))
     {
         if let Err(error) = run_db(state.db.clone(), {
             let thread_id = thread_id.clone();
-            let metadata = merge_context_usage_cache_into_metadata(thread.engine_metadata.clone(), usage);
+            let metadata =
+                merge_context_usage_cache_into_metadata(thread.engine_metadata.clone(), usage);
             move |db| db::threads::update_engine_metadata(db, &thread_id, &metadata)
         })
         .await

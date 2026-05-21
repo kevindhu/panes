@@ -366,7 +366,7 @@ pub fn reconcile_runtime_state(db: &Database) -> anyhow::Result<RuntimeRecoveryR
     })
 }
 
-fn derive_thread_status_for_recovery(
+pub(crate) fn derive_thread_status_for_recovery(
     conn: &rusqlite::Connection,
     thread_id: &str,
 ) -> anyhow::Result<ThreadStatusDto> {

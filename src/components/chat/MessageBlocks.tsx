@@ -86,6 +86,9 @@ interface Props {
   onLoadActionOutput?: (actionId: string) => Promise<void>;
 }
 
+const CONTEXT_COMPACTION_SUMMARY_DETAIL_PREFIX = "summary::";
+const CONTEXT_COMPACTION_PROMPT_DETAIL_PREFIX = "prompt::";
+
 function isBlockLike(value: unknown): value is { type: string } {
   return typeof value === "object" && value !== null && "type" in value;
 }
@@ -722,6 +725,13 @@ function NoticeBlockView({ block }: { block: NoticeBlock }) {
     return <TurnStatusNoticeView block={block} />;
   }
 
+  if (
+    block.kind === "context_compacted" ||
+    block.kind.startsWith("codex_context_compaction_")
+  ) {
+    return <ContextCompactionNoticeView block={block} />;
+  }
+
   return (
     <div className="msg-notice-block msg-notice-block--info">
       <Info size={14} style={{ flexShrink: 0, color: "var(--info)", marginTop: 1 }} />
@@ -730,6 +740,85 @@ function NoticeBlockView({ block }: { block: NoticeBlock }) {
           {block.title}
         </div>
         <div>{block.message}</div>
+      </div>
+    </div>
+  );
+}
+
+function ContextCompactionNoticeView({ block }: { block: NoticeBlock }) {
+  const { t } = useTranslation("chat");
+  const [expanded, setExpanded] = useState(false);
+  const details = (block.details ?? []).filter((detail) => detail.trim().length > 0);
+  const toggleExpanded = useCallback(() => setExpanded((value) => !value), []);
+
+  const renderDetail = (detail: string, index: number) => {
+    let label: string | null = null;
+    let content = detail;
+
+    if (detail.startsWith(CONTEXT_COMPACTION_SUMMARY_DETAIL_PREFIX)) {
+      label = t("messageBlocks.contextCompaction.summary");
+      content = detail.slice(CONTEXT_COMPACTION_SUMMARY_DETAIL_PREFIX.length);
+    } else if (detail.startsWith(CONTEXT_COMPACTION_PROMPT_DETAIL_PREFIX)) {
+      label = t("messageBlocks.contextCompaction.prompt");
+      content = detail.slice(CONTEXT_COMPACTION_PROMPT_DETAIL_PREFIX.length);
+    }
+
+    return (
+      <div
+        key={`${detail}:${index}`}
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: 2,
+        }}
+      >
+        {label && (
+          <div style={{ fontSize: 10.5, fontWeight: 600, color: "var(--text-3)" }}>
+            {label}
+          </div>
+        )}
+        <div
+          style={{
+            fontSize: 11.5,
+            color: "var(--text-2)",
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+            fontFamily: '"JetBrains Mono", monospace',
+          }}
+        >
+          <LinkifiedPlainText text={content} />
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="msg-notice-block msg-notice-block--info">
+      <Layers size={14} style={{ flexShrink: 0, color: "var(--info)", marginTop: 1 }} />
+      <div style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 6 }}>
+        <div style={{ fontSize: 11, fontWeight: 600, color: "var(--info)" }}>
+          {block.title}
+        </div>
+        <div>{block.message}</div>
+        {details.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <button
+              type="button"
+              className="acard-toggle"
+              onClick={toggleExpanded}
+              style={{ alignSelf: "flex-start" }}
+            >
+              {expanded
+                ? t("messageBlocks.approval.hideDetails")
+                : t("messageBlocks.approval.showDetails")}
+            </button>
+            {expanded && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {details.map(renderDetail)}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

@@ -511,6 +511,10 @@
       "customPayloadHint": "This request supports a structured response form below. Advanced JSON is still available for edge cases.",
       "sendPayload": "Send payload"
     },
+    "contextCompaction": {
+      "summary": "Summary",
+      "prompt": "Compacted prompt"
+    },
     "toolInput": {
       "answerInComposer": "Answer this in the chat box below.",
       "questionCounter": "{{current}} / {{total}}",
