@@ -349,6 +349,8 @@ function eventHasVisibleAssistantContent(event: StreamEvent): boolean {
       return String(event.content ?? "").length > 0;
     case "ThinkingDelta":
       return String(event.content ?? "").length > 0;
+    case "TurnSnapshotRecovered":
+      return Array.isArray(event.blocks) && event.blocks.length > 0;
     case "ActionStarted":
     case "ActionOutputDelta":
     case "ActionCompleted":
@@ -1189,6 +1191,8 @@ function describeTurnCompletionSource(source?: TurnCompletionSource | null): str
   switch (source) {
     case "engine":
       return "explicit engine terminal event";
+    case "recovered_snapshot":
+      return "recovered from Codex thread history";
     case "reconciled_stream_lost":
       return "reconciled from thread history after live stream loss";
     case "reconciled_timeout":
@@ -1246,6 +1250,9 @@ function turnStatusNoticeMessage(
     case "completed":
       if (source === "engine") {
         return "Codex reported a normal terminal completion.";
+      }
+      if (source === "recovered_snapshot") {
+        return "Panes recovered the completed turn from Codex thread history.";
       }
       if (source === "reconciled_timeout") {
         return "Panes recovered the completed turn from thread history after the live completion timed out.";
@@ -1387,6 +1394,43 @@ function terminalizeUnresolvedTurnBlocks(
     terminalizeUnresolvedActionBlocks(blocks, state, source),
     state,
   );
+}
+
+function assistantMessageHasMeaningfulContent(message: Message | undefined): boolean {
+  return Boolean(
+    message?.role === "assistant" &&
+      (message.blocks ?? []).some((block) => {
+        if (block.type === "text") return Boolean(block.content?.trim());
+        if (block.type === "action" || block.type === "diff" || block.type === "code" || block.type === "approval") {
+          return true;
+        }
+        return false;
+      }),
+  );
+}
+
+function cancelActiveAssistantMessage(messages: Message[]): Message[] {
+  const last = messages[messages.length - 1];
+  if (last?.role !== "assistant") {
+    return messages;
+  }
+
+  if (!assistantMessageHasMeaningfulContent(last)) {
+    return messages.slice(0, -1);
+  }
+
+  if (last.status !== "streaming") {
+    return messages;
+  }
+
+  return [
+    ...messages.slice(0, -1),
+    {
+      ...last,
+      status: "interrupted",
+      blocks: terminalizeUnresolvedTurnBlocks(last.blocks, "interrupted") ?? last.blocks,
+    },
+  ];
 }
 
 function formatTurnActionStats(stats: TurnBlockStats): string | null {
@@ -2002,6 +2046,10 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
 
   if (event.type === "TurnStarted" && typeof event.client_turn_id === "string") {
     assistant.clientTurnId = event.client_turn_id;
+  }
+
+  if (event.type === "TurnSnapshotRecovered") {
+    assistant.blocks = normalizeBlocks(Array.isArray(event.blocks) ? event.blocks : []) ?? [];
   }
 
   // Stamp durationMs on the last thinking block when a non-thinking event arrives
@@ -2875,22 +2923,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return;
     }
 
+    pendingTurnMetaByThread.delete(threadId);
+    set((state) => ({
+      status: "idle",
+      streaming: false,
+      messages: cancelActiveAssistantMessage(state.messages),
+    }));
+
     try {
       await ipc.cancelTurn(threadId);
-      pendingTurnMetaByThread.delete(threadId);
-      // Remove the trailing assistant message if it has no meaningful content
-      // (e.g. only thinking blocks with no text, or completely empty)
-      const messages = get().messages;
-      const last = messages[messages.length - 1];
-      const lastHasContent = last?.role === "assistant" && (last.blocks ?? []).some((b) => {
-        if (b.type === "text") return Boolean(b.content?.trim());
-        if (b.type === "action" || b.type === "diff" || b.type === "code" || b.type === "approval") return true;
-        return false;
-      });
-      const nextMessages = last?.role === "assistant" && !lastHasContent
-        ? messages.slice(0, -1)
-        : messages;
-      set({ status: "idle", streaming: false, messages: nextMessages });
     } catch (error) {
       set({ error: String(error) });
     }

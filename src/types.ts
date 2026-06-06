@@ -1147,6 +1147,7 @@ export interface TurnCompletedEvent {
 
 export type TurnCompletionSource =
   | "engine"
+  | "recovered_snapshot"
   | "reconciled_stream_lost"
   | "reconciled_timeout"
   | "timeout_fallback";
@@ -1158,6 +1159,11 @@ export interface TurnCompletionDiagnostics {
 export interface TextDeltaEvent {
   type: "TextDelta";
   content: string;
+}
+
+export interface TurnSnapshotRecoveredEvent {
+  type: "TurnSnapshotRecovered";
+  blocks: ContentBlock[];
 }
 
 export interface ThinkingDeltaEvent {
@@ -1256,6 +1262,7 @@ export interface NoticeEvent {
 export type StreamEvent =
   | TurnStartedEvent
   | TurnCompletedEvent
+  | TurnSnapshotRecoveredEvent
   | TextDeltaEvent
   | ThinkingDeltaEvent
   | ActionStartedEvent

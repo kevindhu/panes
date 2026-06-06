@@ -220,10 +220,11 @@ pub struct CodexReviewStarted {
     pub review_thread_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct ReconciledTurnCompletion {
     status: TurnCompletionStatus,
     error_message: Option<String>,
+    assistant_blocks: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2016,28 +2017,44 @@ impl CodexEngine {
         Ok(extract_turns_from_thread_read_response(&result))
     }
 
-    async fn reconcile_turn_completion_via_thread_read(
+    async fn reconcile_turn_completion_via_history(
         &self,
         engine_thread_id: &str,
         expected_turn_id: Option<&str>,
     ) -> anyhow::Result<Option<ReconciledTurnCompletion>> {
         let transport = self.ensure_ready_transport().await?;
-        let params = serde_json::json!({
-          "threadId": engine_thread_id,
-          "includeTurns": true,
-        });
-
-        let result = request_with_fallback(
+        let turns = match fetch_paginated_data(
             transport.as_ref(),
-            THREAD_READ_METHODS,
-            params,
-            DEFAULT_TIMEOUT,
+            THREAD_TURNS_LIST_METHODS,
+            |cursor| {
+                serde_json::json!({
+                  "threadId": engine_thread_id,
+                  "cursor": cursor,
+                  "limit": 100,
+                  "sortDirection": "asc",
+                })
+            },
         )
         .await
-        .context("failed to read codex thread turns for reconciliation")?;
+        {
+            Ok(turns) => turns,
+            Err(error) if is_method_not_supported_error(&error.to_string()) => {
+                log::debug!(
+                    "codex thread/turns/list unsupported during reconciliation, falling back to thread/read includeTurns"
+                );
+                self.list_thread_import_messages_via_thread_read(
+                    transport.as_ref(),
+                    engine_thread_id,
+                )
+                .await?
+            }
+            Err(error) => {
+                return Err(error).context("failed to list codex thread turns for reconciliation");
+            }
+        };
 
-        Ok(extract_reconciled_turn_completion(
-            &result,
+        Ok(extract_reconciled_turn_completion_from_turns(
+            &turns,
             expected_turn_id,
         ))
     }
@@ -2061,7 +2078,7 @@ impl CodexEngine {
         };
 
         match self
-            .reconcile_turn_completion_via_thread_read(engine_thread_id, Some(expected_turn_id))
+            .reconcile_turn_completion_via_history(engine_thread_id, Some(expected_turn_id))
             .await
         {
             Ok(Some(reconciled)) => {
@@ -4440,11 +4457,19 @@ fn extract_turn_id(value: &serde_json::Value) -> Option<String> {
     None
 }
 
+#[cfg(test)]
 fn extract_reconciled_turn_completion(
     value: &serde_json::Value,
     expected_turn_id: Option<&str>,
 ) -> Option<ReconciledTurnCompletion> {
     let turns = extract_thread_turns(value)?;
+    extract_reconciled_turn_completion_from_turns(turns, expected_turn_id)
+}
+
+fn extract_reconciled_turn_completion_from_turns(
+    turns: &[serde_json::Value],
+    expected_turn_id: Option<&str>,
+) -> Option<ReconciledTurnCompletion> {
     let expected_turn_id = expected_turn_id
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
@@ -4456,6 +4481,20 @@ fn extract_reconciled_turn_completion(
     Some(ReconciledTurnCompletion {
         status,
         error_message: extract_nested_string(selected, &["error", "message"]),
+        assistant_blocks: extract_recovered_assistant_blocks_from_turn(selected),
+    })
+}
+
+fn extract_recovered_assistant_blocks_from_turn(
+    turn: &serde_json::Value,
+) -> Option<Vec<serde_json::Value>> {
+    let messages = extract_imported_messages_from_turns(std::slice::from_ref(turn));
+    messages.into_iter().rev().find_map(|message| {
+        if message.role != "assistant" {
+            return None;
+        }
+        let blocks = message.blocks.as_array()?.clone();
+        (!blocks.is_empty()).then_some(blocks)
     })
 }
 
@@ -4464,6 +4503,7 @@ fn build_reconciled_turn_completion_events(
     mode: TurnCompletionRecoveryMode,
 ) -> Vec<EngineEvent> {
     let mut events = Vec::new();
+    let recovered_blocks = reconciled.assistant_blocks.clone();
 
     if let Some(message) = reconciled.error_message {
         events.push(EngineEvent::Error {
@@ -4472,12 +4512,17 @@ fn build_reconciled_turn_completion_events(
         });
     }
 
-    let source = match mode {
-        TurnCompletionRecoveryMode::StreamLost => TurnCompletionSource::ReconciledStreamLost,
-        TurnCompletionRecoveryMode::CompletionTimeout => TurnCompletionSource::ReconciledTimeout,
+    let source = match (mode, recovered_blocks.as_ref()) {
+        (TurnCompletionRecoveryMode::StreamLost, Some(blocks)) if !blocks.is_empty() => {
+            TurnCompletionSource::RecoveredSnapshot
+        }
+        (TurnCompletionRecoveryMode::StreamLost, _) => TurnCompletionSource::ReconciledStreamLost,
+        (TurnCompletionRecoveryMode::CompletionTimeout, _) => {
+            TurnCompletionSource::ReconciledTimeout
+        }
     };
 
-    let status = if matches!(mode, TurnCompletionRecoveryMode::StreamLost)
+    let status = if source == TurnCompletionSource::ReconciledStreamLost
         && reconciled.status == TurnCompletionStatus::Completed
     {
         events.push(EngineEvent::Error {
@@ -4491,6 +4536,10 @@ fn build_reconciled_turn_completion_events(
         reconciled.status
     };
 
+    if let Some(blocks) = recovered_blocks.filter(|blocks| !blocks.is_empty()) {
+        events.push(EngineEvent::TurnSnapshotRecovered { blocks });
+    }
+
     events.push(EngineEvent::TurnCompleted {
         token_usage: None,
         status,
@@ -4500,6 +4549,7 @@ fn build_reconciled_turn_completion_events(
     events
 }
 
+#[cfg(test)]
 fn extract_thread_turns<'a>(value: &'a serde_json::Value) -> Option<&'a Vec<serde_json::Value>> {
     if let Some(turns) = value.get("turns").and_then(serde_json::Value::as_array) {
         return Some(turns);
@@ -7365,6 +7415,10 @@ mod tests {
             ReconciledTurnCompletion {
                 status: TurnCompletionStatus::Failed,
                 error_message: Some("permission denied".to_string()),
+                assistant_blocks: Some(vec![serde_json::json!({
+                    "type": "error",
+                    "message": "permission denied",
+                })]),
             }
         );
     }
@@ -7405,11 +7459,54 @@ mod tests {
     }
 
     #[test]
+    fn extract_reconciled_turn_completion_recovers_blocks_from_turn_items() {
+        let reconciled = extract_reconciled_turn_completion(
+            &json!({
+                "thread": {
+                    "turns": [
+                        {
+                            "id": "turn-active",
+                            "status": "completed",
+                            "items": [
+                                {
+                                    "id": "item-1",
+                                    "type": "commandExecution",
+                                    "status": "completed",
+                                    "command": "pnpm test",
+                                    "aggregatedOutput": "ok",
+                                    "durationMs": 25
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }),
+            Some("turn-active"),
+        )
+        .expect("expected terminal turn");
+
+        assert_eq!(reconciled.status, TurnCompletionStatus::Completed);
+        let blocks = reconciled
+            .assistant_blocks
+            .expect("expected recovered assistant blocks");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].get("type").and_then(serde_json::Value::as_str),
+            Some("action")
+        );
+        assert_eq!(
+            blocks[0].get("status").and_then(serde_json::Value::as_str),
+            Some("done")
+        );
+    }
+
+    #[test]
     fn build_reconciled_turn_completion_events_marks_lost_completed_turn_failed() {
         let events = build_reconciled_turn_completion_events(
             ReconciledTurnCompletion {
                 status: TurnCompletionStatus::Completed,
                 error_message: None,
+                assistant_blocks: None,
             },
             TurnCompletionRecoveryMode::StreamLost,
         );
@@ -7443,11 +7540,67 @@ mod tests {
     }
 
     #[test]
+    fn build_reconciled_turn_completion_events_uses_recovered_snapshot_when_available() {
+        let events = build_reconciled_turn_completion_events(
+            ReconciledTurnCompletion {
+                status: TurnCompletionStatus::Completed,
+                error_message: None,
+                assistant_blocks: Some(vec![serde_json::json!({
+                    "type": "action",
+                    "actionId": "codex-import-item-1",
+                    "engineActionId": "item-1",
+                    "actionType": "command",
+                    "summary": "Run `pnpm test`",
+                    "details": { "id": "item-1" },
+                    "outputChunks": [],
+                    "status": "done",
+                    "result": {
+                        "success": true,
+                        "output": "ok",
+                        "error": null,
+                        "diff": null,
+                        "durationMs": 10
+                    }
+                })]),
+            },
+            TurnCompletionRecoveryMode::StreamLost,
+        );
+
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            EngineEvent::TurnSnapshotRecovered { blocks } => {
+                assert_eq!(blocks.len(), 1);
+                assert_eq!(
+                    blocks[0].get("status").and_then(serde_json::Value::as_str),
+                    Some("done")
+                );
+            }
+            other => panic!("expected recovered snapshot event, got {other:?}"),
+        }
+        match &events[1] {
+            EngineEvent::TurnCompleted {
+                status,
+                token_usage,
+                diagnostics,
+            } => {
+                assert_eq!(*status, TurnCompletionStatus::Completed);
+                assert!(token_usage.is_none());
+                assert_eq!(
+                    diagnostics.as_ref().map(|value| &value.source),
+                    Some(&TurnCompletionSource::RecoveredSnapshot)
+                );
+            }
+            other => panic!("expected turn completed event, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn build_reconciled_turn_completion_events_keeps_timeout_completion_status() {
         let events = build_reconciled_turn_completion_events(
             ReconciledTurnCompletion {
                 status: TurnCompletionStatus::Completed,
                 error_message: Some("remote failure".to_string()),
+                assistant_blocks: None,
             },
             TurnCompletionRecoveryMode::CompletionTimeout,
         );

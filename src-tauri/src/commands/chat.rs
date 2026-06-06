@@ -5,8 +5,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::Context;
 use arboard::{Clipboard, ImageData};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, value::RawValue, Value};
 use tauri::{Emitter, State};
@@ -261,6 +263,9 @@ fn collect_turn_block_stats(blocks: &[ContentBlock]) -> TurnBlockStats {
 fn describe_turn_completion_source(source: Option<&TurnCompletionSource>) -> Option<&'static str> {
     match source {
         Some(TurnCompletionSource::Engine) => Some("explicit engine terminal event"),
+        Some(TurnCompletionSource::RecoveredSnapshot) => {
+            Some("recovered from Codex thread history")
+        }
         Some(TurnCompletionSource::ReconciledStreamLost) => {
             Some("reconciled from thread history after live stream loss")
         }
@@ -319,6 +324,9 @@ fn turn_status_notice_message(
     match (status, source) {
         (TurnCompletionStatus::Completed, Some(TurnCompletionSource::Engine)) => {
             "Codex reported a normal terminal completion.".to_string()
+        }
+        (TurnCompletionStatus::Completed, Some(TurnCompletionSource::RecoveredSnapshot)) => {
+            "Panes recovered the completed turn from Codex thread history.".to_string()
         }
         (TurnCompletionStatus::Completed, Some(TurnCompletionSource::ReconciledTimeout)) => {
             "Panes recovered the completed turn from thread history after the live completion timed out."
@@ -415,6 +423,7 @@ fn build_turn_status_notice_block(
         source: source.map(|value| {
             match value {
                 TurnCompletionSource::Engine => "engine",
+                TurnCompletionSource::RecoveredSnapshot => "recovered_snapshot",
                 TurnCompletionSource::ReconciledStreamLost => "reconciled_stream_lost",
                 TurnCompletionSource::ReconciledTimeout => "reconciled_timeout",
                 TurnCompletionSource::TimeoutFallback => "timeout_fallback",
@@ -510,6 +519,67 @@ fn terminalize_unresolved_turn_blocks(
     let action_changed = terminalize_unresolved_action_blocks(blocks, status, source);
     let approval_changed = terminalize_pending_approval_blocks(blocks);
     action_changed || approval_changed
+}
+
+fn terminalize_unresolved_turn_blocks_json(
+    blocks: &mut Value,
+    status: &TurnCompletionStatus,
+    source: Option<&TurnCompletionSource>,
+) -> bool {
+    let Some(items) = blocks.as_array_mut() else {
+        return false;
+    };
+
+    let error = unresolved_action_terminal_error(status, source);
+    let mut changed = false;
+
+    for item in items {
+        let Some(object) = item.as_object_mut() else {
+            continue;
+        };
+
+        match object.get("type").and_then(Value::as_str) {
+            Some("action") => {
+                let is_unresolved = object
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|status| status == "running" || status == "pending");
+                if is_unresolved {
+                    object.insert("status".to_string(), json!("error"));
+                    if !object.contains_key("result")
+                        || object.get("result").is_some_and(Value::is_null)
+                    {
+                        object.insert(
+                            "result".to_string(),
+                            json!({
+                                "success": false,
+                                "output": null,
+                                "error": error,
+                                "diff": null,
+                                "durationMs": 0
+                            }),
+                        );
+                    }
+                    changed = true;
+                }
+            }
+            Some("approval") => {
+                let is_pending = object.get("status").and_then(Value::as_str) == Some("pending");
+                if is_pending {
+                    object.insert("status".to_string(), json!("answered"));
+                    if !object.contains_key("decision")
+                        || object.get("decision").is_some_and(Value::is_null)
+                    {
+                        object.insert("decision".to_string(), json!("cancel"));
+                    }
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    changed
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1697,23 +1767,114 @@ fn attachment_modality_label(modality: &str) -> &'static str {
 }
 
 #[tauri::command]
-pub async fn cancel_turn(state: State<'_, AppState>, thread_id: String) -> Result<(), String> {
+pub async fn cancel_turn(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> Result<(), String> {
     state.turns.cancel(&thread_id).await;
 
     let db = state.db.clone();
-    if let Some(thread) = run_db(db.clone(), {
+    let thread = run_db(db.clone(), {
         let thread_id = thread_id.clone();
         move |db| db::threads::get_thread(db, &thread_id)
     })
-    .await?
-    {
+    .await?;
+
+    if let Some(thread) = thread.as_ref() {
+        let cancel_snapshot = run_db(db.clone(), {
+            let thread_id = thread_id.clone();
+            move |db| persist_cancelled_turn_snapshot(db, &thread_id)
+        })
+        .await?;
+
+        if let Some(message_id) = cancel_snapshot.assistant_message_id.as_deref() {
+            resolve_pending_approvals_for_terminal_message(state.inner(), message_id).await;
+        }
+
+        let latest_thread = cancel_snapshot.thread.or_else(|| Some(thread.clone()));
+        let (thread_updated_event, _) = build_final_thread_event(latest_thread, thread);
+        let _ = app.emit("thread-updated", thread_updated_event);
+
         state
             .engines
-            .interrupt(&thread)
+            .interrupt(thread)
             .await
             .map_err(err_to_string)?;
     }
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct CancelledTurnSnapshot {
+    thread: Option<ThreadDto>,
+    assistant_message_id: Option<String>,
+}
+
+fn persist_cancelled_turn_snapshot(
+    db: &crate::db::Database,
+    thread_id: &str,
+) -> anyhow::Result<CancelledTurnSnapshot> {
+    let latest_streaming_assistant: Option<(String, Option<String>)> = {
+        let conn = db.connect()?;
+        conn.query_row(
+            "SELECT id, blocks_json
+             FROM messages
+             WHERE thread_id = ?1
+               AND role = 'assistant'
+               AND status = 'streaming'
+             ORDER BY created_at DESC, rowid DESC
+             LIMIT 1",
+            params![thread_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .context("failed to load latest streaming assistant message for cancellation")?
+    };
+
+    let mut assistant_message_id: Option<String> = None;
+    if let Some((message_id, blocks_json)) = latest_streaming_assistant {
+        db::actions::resolve_pending_approvals_for_message(db, &message_id, Some("cancel"))?;
+
+        let mut updated_blocks = None;
+        if let Some(blocks_json) = blocks_json.as_deref() {
+            match serde_json::from_str::<Value>(blocks_json) {
+                Ok(mut blocks) => {
+                    terminalize_unresolved_turn_blocks_json(
+                        &mut blocks,
+                        &TurnCompletionStatus::Interrupted,
+                        None,
+                    );
+                    updated_blocks = Some(blocks.to_string());
+                }
+                Err(error) => {
+                    log::warn!("failed to parse streaming assistant blocks during cancel: {error}");
+                }
+            }
+        }
+
+        if let Some(blocks_json) = updated_blocks {
+            db::messages::update_assistant_blocks_json(
+                db,
+                &message_id,
+                &blocks_json,
+                MessageStatusDto::Interrupted,
+                None,
+            )?;
+        } else {
+            db::messages::update_assistant_status(db, &message_id, MessageStatusDto::Interrupted)?;
+        }
+
+        assistant_message_id = Some(message_id);
+    }
+
+    db::threads::update_thread_status(db, thread_id, ThreadStatusDto::Idle)?;
+    let thread = db::threads::get_thread(db, thread_id)?;
+
+    Ok(CancelledTurnSnapshot {
+        thread,
+        assistant_message_id,
+    })
 }
 
 #[tauri::command]
@@ -3815,6 +3976,24 @@ fn apply_event_to_blocks(
         EngineEvent::TurnStarted { .. } => {
             progress.thread_status = Some(ThreadStatusDto::Streaming);
         }
+        EngineEvent::TurnSnapshotRecovered { blocks: recovered } => {
+            let mut next_blocks = Vec::with_capacity(recovered.len());
+            for block in recovered {
+                match serde_json::from_value::<ContentBlock>(block.clone()) {
+                    Ok(block) => next_blocks.push(block),
+                    Err(error) => {
+                        log::warn!("failed to decode recovered turn block: {error}");
+                    }
+                }
+            }
+
+            if !next_blocks.is_empty() {
+                *blocks = next_blocks;
+                rebuild_block_indexes(blocks, action_index, approval_index);
+                progress.blocks_changed = true;
+                progress.force_persist = true;
+            }
+        }
         EngineEvent::TurnCompleted {
             token_usage,
             status,
@@ -5035,6 +5214,106 @@ mod tests {
         assert_eq!(event.workspace_id, fallback_thread.workspace_id);
         assert!(event.thread.is_none());
         assert!(final_thread.is_none());
+    }
+
+    #[test]
+    fn persist_cancelled_turn_snapshot_marks_streaming_turn_interrupted_and_thread_idle() {
+        let state = test_app_state();
+        let thread = test_thread(&state, "codex", "gpt-5.5-codex");
+        db::threads::update_thread_status(&state.db, &thread.id, ThreadStatusDto::Streaming)
+            .expect("failed to set thread streaming");
+        let assistant_message = db::messages::insert_assistant_placeholder(
+            &state.db,
+            &thread.id,
+            Some(thread.engine_id.as_str()),
+            Some(thread.model_id.as_str()),
+            None,
+        )
+        .expect("failed to insert assistant placeholder");
+        let approval_id = "approval-cancel";
+        db::actions::insert_approval(
+            &state.db,
+            approval_id,
+            &thread.id,
+            &assistant_message.id,
+            &crate::engines::events::ActionType::Command,
+            "Run command",
+            &json!({}),
+        )
+        .expect("failed to insert approval");
+        let blocks = json!([
+            {
+                "type": "action",
+                "actionId": "action-running",
+                "engineActionId": "item-running",
+                "actionType": "command",
+                "summary": "pnpm test",
+                "details": {},
+                "outputChunks": [],
+                "outputDeferred": false,
+                "outputDeferredLoaded": true,
+                "status": "running"
+            },
+            {
+                "type": "approval",
+                "approvalId": approval_id,
+                "actionType": "command",
+                "summary": "Run command",
+                "details": {},
+                "status": "pending"
+            }
+        ]);
+        db::messages::update_assistant_blocks_json(
+            &state.db,
+            &assistant_message.id,
+            &blocks.to_string(),
+            MessageStatusDto::Streaming,
+            None,
+        )
+        .expect("failed to store streaming blocks");
+
+        let snapshot = persist_cancelled_turn_snapshot(&state.db, &thread.id)
+            .expect("failed to persist cancelled turn snapshot");
+
+        assert_eq!(
+            snapshot.assistant_message_id.as_deref(),
+            Some(assistant_message.id.as_str())
+        );
+        assert_eq!(
+            snapshot.thread.as_ref().map(|thread| &thread.status),
+            Some(&ThreadStatusDto::Idle)
+        );
+        let messages = db::messages::get_thread_messages(&state.db, &thread.id)
+            .expect("failed to load messages");
+        let assistant = messages
+            .iter()
+            .find(|message| message.id == assistant_message.id)
+            .expect("assistant message should exist");
+        assert_eq!(assistant.status, MessageStatusDto::Interrupted);
+        let blocks = assistant
+            .blocks
+            .as_ref()
+            .and_then(Value::as_array)
+            .expect("assistant blocks should be an array");
+        assert_eq!(
+            blocks[0].get("status").and_then(Value::as_str),
+            Some("error")
+        );
+        assert_eq!(
+            blocks[0]
+                .get("result")
+                .and_then(|value| value.get("error"))
+                .and_then(Value::as_str),
+            Some("The turn was interrupted before this action reported completion.")
+        );
+        assert_eq!(
+            blocks[1].get("status").and_then(Value::as_str),
+            Some("answered")
+        );
+        assert_eq!(
+            blocks[1].get("decision").and_then(Value::as_str),
+            Some("cancel")
+        );
     }
 
     #[test]

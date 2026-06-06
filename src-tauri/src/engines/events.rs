@@ -121,6 +121,9 @@ pub enum EngineEvent {
         status: TurnCompletionStatus,
         diagnostics: Option<TurnCompletionDiagnostics>,
     },
+    TurnSnapshotRecovered {
+        blocks: Vec<serde_json::Value>,
+    },
     TextDelta {
         content: String,
     },
@@ -191,6 +194,7 @@ pub enum TurnCompletionStatus {
 #[serde(rename_all = "snake_case")]
 pub enum TurnCompletionSource {
     Engine,
+    RecoveredSnapshot,
     ReconciledStreamLost,
     ReconciledTimeout,
     TimeoutFallback,

@@ -4,6 +4,7 @@ import type { ApprovalResponse, Message, StreamEvent } from "../types";
 const mockIpc = vi.hoisted(() => ({
   sendMessage: vi.fn(),
   steerMessage: vi.fn(),
+  cancelTurn: vi.fn(),
   getThreadMessagesWindow: vi.fn(),
   getActionOutput: vi.fn(),
   respondApproval: vi.fn(),
@@ -58,6 +59,7 @@ describe("chatStore send", () => {
       outputChunks: [],
       truncated: false,
     });
+    mockIpc.cancelTurn.mockResolvedValue(undefined);
     mockIpc.steerMessage.mockResolvedValue(undefined);
     mockIpc.syncThreadFromEngine.mockResolvedValue({
       id: "thread-1",
@@ -138,6 +140,73 @@ describe("chatStore send", () => {
     expect(state.streaming).toBe(false);
     expect(state.status).toBe("error");
     expect(state.messages).toEqual([]);
+  });
+
+  it("immediately clears streaming state and terminalizes retained assistant blocks on cancel", async () => {
+    const pendingCancel = deferred<void>();
+    mockIpc.cancelTurn.mockReturnValueOnce(pendingCancel.promise);
+    useChatStore.setState({
+      threadId: "thread-1",
+      status: "streaming",
+      streaming: true,
+      messages: [
+        {
+          id: "user-1",
+          threadId: "thread-1",
+          role: "user",
+          content: "run tests",
+          blocks: [{ type: "text", content: "run tests" }],
+          status: "completed",
+          schemaVersion: 1,
+          createdAt: new Date().toISOString(),
+        },
+        {
+          id: "assistant-1",
+          threadId: "thread-1",
+          role: "assistant",
+          status: "streaming",
+          schemaVersion: 1,
+          createdAt: new Date().toISOString(),
+          blocks: [
+            {
+              type: "action",
+              actionId: "action-running",
+              engineActionId: "item-running",
+              actionType: "command",
+              summary: "pnpm test",
+              details: {},
+              outputChunks: [],
+              outputDeferred: false,
+              outputDeferredLoaded: true,
+              status: "running",
+            },
+          ],
+        },
+      ],
+    });
+
+    const cancelPromise = useChatStore.getState().cancel();
+    const state = useChatStore.getState();
+    const assistant = state.messages[state.messages.length - 1];
+
+    expect(state.status).toBe("idle");
+    expect(state.streaming).toBe(false);
+    expect(assistant).toMatchObject({
+      role: "assistant",
+      status: "interrupted",
+    });
+    expect(assistant?.blocks?.[0]).toMatchObject({
+      type: "action",
+      status: "error",
+      result: {
+        success: false,
+        error: "The turn was interrupted before this action reported completion.",
+        durationMs: 0,
+      },
+    });
+
+    pendingCancel.resolve();
+    await expect(cancelPromise).resolves.toBeUndefined();
   });
 
   it("reloads the current thread when forceReload is requested", async () => {
@@ -494,6 +563,89 @@ describe("chatStore send", () => {
           source: "reconciled_stream_lost",
           details: expect.arrayContaining([
             "Actions: 2 total, 1 done, 1 error, 0 running, 0 pending",
+          ]),
+        }),
+      ]),
+    );
+
+    vi.useRealTimers();
+  });
+
+  it("uses recovered turn snapshots before terminal completion stats are stored", async () => {
+    vi.useFakeTimers();
+
+    let streamHandler: ((event: StreamEvent) => void) | null = null;
+    mockListenThreadEvents.mockImplementationOnce(async (_threadId, onEvent) => {
+      streamHandler = onEvent;
+      return () => {};
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    streamHandler!({
+      type: "ActionStarted",
+      action_id: "action-live",
+      engine_action_id: "item-1",
+      action_type: "command",
+      summary: "pnpm test",
+      details: {},
+    });
+    streamHandler!({
+      type: "TurnSnapshotRecovered",
+      blocks: [
+        {
+          type: "action",
+          actionId: "codex-import-item-1",
+          engineActionId: "item-1",
+          actionType: "command",
+          summary: "Run `pnpm test`",
+          details: {},
+          outputChunks: [],
+          status: "done",
+          result: {
+            success: true,
+            output: "ok",
+            durationMs: 25,
+          },
+        },
+      ],
+    });
+    streamHandler!({
+      type: "TurnCompleted",
+      status: "completed",
+      diagnostics: {
+        source: "recovered_snapshot",
+      },
+    });
+
+    await vi.advanceTimersByTimeAsync(20);
+
+    const assistant = useChatStore
+      .getState()
+      .messages.find((message) => message.role === "assistant" && message.blocks?.length);
+    const actionBlocks = assistant?.blocks?.filter((block) => block.type === "action") ?? [];
+    expect(actionBlocks).toHaveLength(1);
+    expect(actionBlocks[0]).toMatchObject({
+      actionId: "codex-import-item-1",
+      status: "done",
+      result: {
+        success: true,
+        output: "ok",
+        durationMs: 25,
+      },
+    });
+    expect(assistant?.blocks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "notice",
+          kind: "turn_status",
+          level: "info",
+          title: "Turn completed",
+          status: "completed",
+          source: "recovered_snapshot",
+          details: expect.arrayContaining([
+            "Completion source: recovered from Codex thread history",
+            "Actions: 1 total, 1 done, 0 error, 0 running, 0 pending",
           ]),
         }),
       ]),
