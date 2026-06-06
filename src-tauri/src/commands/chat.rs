@@ -159,6 +159,8 @@ enum ContentBlock {
         status: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         source: Option<String>,
+        #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
 
     #[serde(rename = "error")]
@@ -344,6 +346,7 @@ fn build_turn_status_notice_block(
     status: &TurnCompletionStatus,
     token_usage: Option<&crate::engines::TokenUsage>,
     source: Option<&TurnCompletionSource>,
+    duration_ms: Option<u64>,
 ) -> ContentBlock {
     let stats = collect_turn_block_stats(blocks);
     let mut details = Vec::new();
@@ -418,7 +421,95 @@ fn build_turn_status_notice_block(
             }
             .to_string()
         }),
+        duration_ms,
     }
+}
+
+fn unresolved_action_terminal_error(
+    status: &TurnCompletionStatus,
+    source: Option<&TurnCompletionSource>,
+) -> &'static str {
+    if matches!(source, Some(TurnCompletionSource::ReconciledStreamLost)) {
+        return "Panes lost the live Codex stream before this action reported completion.";
+    }
+    if matches!(source, Some(TurnCompletionSource::ReconciledTimeout)) {
+        return "Panes recovered the turn completion before this action reported completion.";
+    }
+
+    match status {
+        TurnCompletionStatus::Completed => {
+            "The turn completed before this action reported completion."
+        }
+        TurnCompletionStatus::Interrupted => {
+            "The turn was interrupted before this action reported completion."
+        }
+        TurnCompletionStatus::Failed => "The turn failed before this action reported completion.",
+    }
+}
+
+fn terminalize_unresolved_action_blocks(
+    blocks: &mut [ContentBlock],
+    status: &TurnCompletionStatus,
+    source: Option<&TurnCompletionSource>,
+) -> bool {
+    let error = unresolved_action_terminal_error(status, source);
+    let mut changed = false;
+
+    for block in blocks {
+        if let ContentBlock::Action {
+            status: block_status,
+            result,
+            ..
+        } = block
+        {
+            if block_status == "running" || block_status == "pending" {
+                *block_status = "error".to_string();
+                if result.is_none() {
+                    *result = Some(ActionBlockResult {
+                        success: false,
+                        output: None,
+                        error: Some(error.to_string()),
+                        diff: None,
+                        duration_ms: 0,
+                    });
+                }
+                changed = true;
+            }
+        }
+    }
+
+    changed
+}
+
+fn terminalize_pending_approval_blocks(blocks: &mut [ContentBlock]) -> bool {
+    let mut changed = false;
+
+    for block in blocks {
+        if let ContentBlock::Approval {
+            status, decision, ..
+        } = block
+        {
+            if status == "pending" {
+                *status = "answered".to_string();
+                if decision.is_none() {
+                    *decision = Some("cancel".to_string());
+                }
+                changed = true;
+            }
+        }
+    }
+
+    changed
+}
+
+fn terminalize_unresolved_turn_blocks(
+    blocks: &mut [ContentBlock],
+    status: &TurnCompletionStatus,
+    source: Option<&TurnCompletionSource>,
+) -> bool {
+    let action_changed = terminalize_unresolved_action_blocks(blocks, status, source);
+    let approval_changed = terminalize_pending_approval_blocks(blocks);
+    action_changed || approval_changed
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1945,6 +2036,7 @@ async fn run_turn(
     cancellation: CancellationToken,
 ) {
     let max_output_chars = state.config.debug.max_action_output_chars;
+    let turn_started_at = Instant::now();
     let (event_tx, mut event_rx) = mpsc::channel::<EngineEvent>(ENGINE_EVENT_QUEUE_CAPACITY);
 
     let engines = state.engines.clone();
@@ -1996,6 +2088,7 @@ async fn run_turn(
         &mut action_index,
         &mut approval_index,
         max_output_chars,
+        turn_started_at,
     )
     .await;
     let initial_force_persist = apply_stream_progress(
@@ -2048,6 +2141,7 @@ async fn run_turn(
                             &mut action_index,
                             &mut approval_index,
                             max_output_chars,
+                            turn_started_at,
                         )
                         .await;
                         let force_persist = apply_stream_progress(
@@ -2112,6 +2206,7 @@ async fn run_turn(
                                 &mut action_index,
                                 &mut approval_index,
                                 max_output_chars,
+                                turn_started_at,
                             )
                             .await;
                             let force_persist = apply_stream_progress(
@@ -2161,6 +2256,7 @@ async fn run_turn(
                             &mut action_index,
                             &mut approval_index,
                             max_output_chars,
+                            turn_started_at,
                         )
                         .await;
                         let force_persist = apply_stream_progress(
@@ -2211,6 +2307,7 @@ async fn run_turn(
                     &mut action_index,
                     &mut approval_index,
                     max_output_chars,
+                    turn_started_at,
                 )
                 .await;
                 let force_persist = apply_stream_progress(
@@ -2260,6 +2357,7 @@ async fn run_turn(
             &mut action_index,
             &mut approval_index,
             max_output_chars,
+            turn_started_at,
         )
         .await;
         let force_persist = apply_stream_progress(
@@ -2309,6 +2407,11 @@ async fn run_turn(
                 thread_status = ThreadStatusDto::Error;
                 thread_status_dirty = true;
             }
+            if terminalize_unresolved_turn_blocks(&mut blocks, &TurnCompletionStatus::Failed, None)
+            {
+                blocks_dirty = true;
+            }
+            resolve_pending_approvals_for_terminal_message(&state, &assistant_message_id).await;
             let _ = app.emit(
                 &stream_event_topic,
                 EngineEvent::Error {
@@ -2330,6 +2433,11 @@ async fn run_turn(
                 thread_status = ThreadStatusDto::Error;
                 thread_status_dirty = true;
             }
+            if terminalize_unresolved_turn_blocks(&mut blocks, &TurnCompletionStatus::Failed, None)
+            {
+                blocks_dirty = true;
+            }
+            resolve_pending_approvals_for_terminal_message(&state, &assistant_message_id).await;
         }
     }
 
@@ -2338,6 +2446,11 @@ async fn run_turn(
         message_state_dirty = true;
         thread_status = ThreadStatusDto::Idle;
         thread_status_dirty = true;
+        if terminalize_unresolved_turn_blocks(&mut blocks, &TurnCompletionStatus::Interrupted, None)
+        {
+            blocks_dirty = true;
+        }
+        resolve_pending_approvals_for_terminal_message(&state, &assistant_message_id).await;
     }
 
     flush_stream_state(
@@ -2425,6 +2538,7 @@ async fn run_codex_review_turn(
     cancellation: CancellationToken,
 ) {
     let max_output_chars = state.config.debug.max_action_output_chars;
+    let turn_started_at = Instant::now();
     let (event_tx, mut event_rx) = mpsc::channel::<EngineEvent>(ENGINE_EVENT_QUEUE_CAPACITY);
     let (started_tx, started_rx) = oneshot::channel();
 
@@ -2544,6 +2658,7 @@ async fn run_codex_review_turn(
         &mut action_index,
         &mut approval_index,
         max_output_chars,
+        turn_started_at,
     )
     .await;
     let initial_force_persist = apply_stream_progress(
@@ -2600,6 +2715,7 @@ async fn run_codex_review_turn(
                             &mut action_index,
                             &mut approval_index,
                             max_output_chars,
+                            turn_started_at,
                         )
                         .await;
                         let force_persist = apply_stream_progress(
@@ -2664,6 +2780,7 @@ async fn run_codex_review_turn(
                                 &mut action_index,
                                 &mut approval_index,
                                 max_output_chars,
+                                turn_started_at,
                             )
                             .await;
                             let force_persist = apply_stream_progress(
@@ -2713,6 +2830,7 @@ async fn run_codex_review_turn(
                             &mut action_index,
                             &mut approval_index,
                             max_output_chars,
+                            turn_started_at,
                         )
                         .await;
                         let force_persist = apply_stream_progress(
@@ -2763,6 +2881,7 @@ async fn run_codex_review_turn(
                     &mut action_index,
                     &mut approval_index,
                     max_output_chars,
+                    turn_started_at,
                 )
                 .await;
                 let force_persist = apply_stream_progress(
@@ -2812,6 +2931,7 @@ async fn run_codex_review_turn(
             &mut action_index,
             &mut approval_index,
             max_output_chars,
+            turn_started_at,
         )
         .await;
         let force_persist = apply_stream_progress(
@@ -2861,6 +2981,11 @@ async fn run_codex_review_turn(
                 thread_status = ThreadStatusDto::Error;
                 thread_status_dirty = true;
             }
+            if terminalize_unresolved_turn_blocks(&mut blocks, &TurnCompletionStatus::Failed, None)
+            {
+                blocks_dirty = true;
+            }
+            resolve_pending_approvals_for_terminal_message(&state, &assistant_message_id).await;
             let _ = app.emit(
                 &stream_event_topic,
                 EngineEvent::Error {
@@ -2882,6 +3007,11 @@ async fn run_codex_review_turn(
                 thread_status = ThreadStatusDto::Error;
                 thread_status_dirty = true;
             }
+            if terminalize_unresolved_turn_blocks(&mut blocks, &TurnCompletionStatus::Failed, None)
+            {
+                blocks_dirty = true;
+            }
+            resolve_pending_approvals_for_terminal_message(&state, &assistant_message_id).await;
         }
     }
 
@@ -2890,6 +3020,11 @@ async fn run_codex_review_turn(
         message_state_dirty = true;
         thread_status = ThreadStatusDto::Idle;
         thread_status_dirty = true;
+        if terminalize_unresolved_turn_blocks(&mut blocks, &TurnCompletionStatus::Interrupted, None)
+        {
+            blocks_dirty = true;
+        }
+        resolve_pending_approvals_for_terminal_message(&state, &assistant_message_id).await;
     }
 
     flush_stream_state(
@@ -3066,6 +3201,58 @@ fn try_coalesce_stream_events(
     }
 }
 
+fn elapsed_duration_ms(started_at: Instant) -> u64 {
+    let elapsed_ms = started_at.elapsed().as_millis();
+    elapsed_ms.min(u128::from(u64::MAX)) as u64
+}
+
+fn emit_stream_event_with_duration(
+    app: &tauri::AppHandle,
+    stream_event_topic: &str,
+    event: &EngineEvent,
+    turn_duration_ms: Option<u64>,
+) {
+    if let Some(duration_ms) = turn_duration_ms {
+        if matches!(event, EngineEvent::TurnCompleted { .. }) {
+            match serde_json::to_value(event) {
+                Ok(mut value) => {
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("duration_ms".to_string(), json!(duration_ms));
+                    }
+                    let _ = app.emit(stream_event_topic, value);
+                }
+                Err(error) => {
+                    log::warn!("failed to serialize turn completion event with duration: {error}");
+                    let _ = app.emit(stream_event_topic, event);
+                }
+            }
+            return;
+        }
+    }
+
+    let _ = app.emit(stream_event_topic, event);
+}
+
+async fn resolve_pending_approvals_for_terminal_message(
+    state: &AppState,
+    assistant_message_id: &str,
+) {
+    if let Err(error) = run_db(state.db.clone(), {
+        let assistant_message_id = assistant_message_id.to_string();
+        move |db| {
+            db::actions::resolve_pending_approvals_for_message(
+                db,
+                &assistant_message_id,
+                Some("cancel"),
+            )
+        }
+    })
+    .await
+    {
+        log::warn!("failed to resolve pending approvals for terminal message: {error}");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_stream_event(
     app: &tauri::AppHandle,
@@ -3079,6 +3266,7 @@ async fn process_stream_event(
     action_index: &mut HashMap<String, usize>,
     approval_index: &mut HashMap<String, usize>,
     max_output_chars: usize,
+    turn_started_at: Instant,
 ) -> EventProgress {
     let mut normalized_event = event.clone();
     match &mut normalized_event {
@@ -3094,7 +3282,13 @@ async fn process_stream_event(
         _ => {}
     }
 
-    let _ = app.emit(stream_event_topic, &normalized_event);
+    let turn_duration_ms = if matches!(&normalized_event, EngineEvent::TurnCompleted { .. }) {
+        Some(elapsed_duration_ms(turn_started_at))
+    } else {
+        None
+    };
+
+    emit_stream_event_with_duration(app, stream_event_topic, &normalized_event, turn_duration_ms);
     if matches!(&normalized_event, EngineEvent::ApprovalRequested { .. }) {
         let _ = app.emit(approval_event_topic, &normalized_event);
     }
@@ -3216,13 +3410,20 @@ async fn process_stream_event(
         _ => {}
     }
 
-    apply_event_to_blocks(
+    let progress = apply_event_to_blocks(
         blocks,
         action_index,
         approval_index,
         &normalized_event,
         max_output_chars,
-    )
+        turn_duration_ms,
+    );
+
+    if matches!(&normalized_event, EngineEvent::TurnCompleted { .. }) {
+        resolve_pending_approvals_for_terminal_message(state, assistant_message_id).await;
+    }
+
+    progress
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3606,6 +3807,7 @@ fn apply_event_to_blocks(
     approval_index: &mut HashMap<String, usize>,
     event: &EngineEvent,
     max_output_chars: usize,
+    turn_duration_ms: Option<u64>,
 ) -> EventProgress {
     let mut progress = EventProgress::default();
 
@@ -3619,6 +3821,8 @@ fn apply_event_to_blocks(
             diagnostics,
         } => {
             progress.force_persist = true;
+            let source = diagnostics.as_ref().map(|value| &value.source);
+            progress.blocks_changed |= terminalize_unresolved_turn_blocks(blocks, status, source);
             let has_pending_approvals = collect_turn_block_stats(blocks).approvals_pending > 0;
             progress.message_status = Some(match status {
                 TurnCompletionStatus::Completed => MessageStatusDto::Completed,
@@ -3641,7 +3845,8 @@ fn apply_event_to_blocks(
                 blocks,
                 status,
                 token_usage.as_ref(),
-                diagnostics.as_ref().map(|value| &value.source),
+                source,
+                turn_duration_ms,
             );
             progress.blocks_changed |= upsert_notice_block(
                 blocks,
@@ -3811,6 +4016,7 @@ fn apply_event_to_blocks(
                 details: None,
                 status: None,
                 source: None,
+                duration_ms: None,
             };
             progress.blocks_changed = upsert_notice_block(
                 blocks,
@@ -3837,6 +4043,7 @@ fn apply_event_to_blocks(
                 details: details.as_ref().filter(|items| !items.is_empty()).cloned(),
                 status: None,
                 source: None,
+                duration_ms: None,
             };
             progress.blocks_changed =
                 upsert_notice_block(blocks, action_index, approval_index, kind, block);
@@ -5241,6 +5448,7 @@ mod tests {
                 details: serde_json::json!({}),
             },
             1000,
+            None,
         );
         assert!(started.blocks_changed);
 
@@ -5254,6 +5462,7 @@ mod tests {
                 reason: "highRiskCyberActivity".to_string(),
             },
             1000,
+            None,
         );
         assert!(rerouted.blocks_changed);
         assert_eq!(rerouted.turn_model_id.as_deref(), Some("gpt-5.3-codex"));
@@ -5267,6 +5476,7 @@ mod tests {
                 message: "Fetching results".to_string(),
             },
             1000,
+            None,
         );
         assert!(progress.blocks_changed);
 
@@ -5329,6 +5539,7 @@ mod tests {
                 scope: crate::engines::DiffScope::Turn,
             },
             1000,
+            None,
         );
 
         assert!(progress.blocks_changed);
@@ -5369,6 +5580,7 @@ mod tests {
                 details: None,
             },
             1000,
+            None,
         );
         assert!(first.blocks_changed);
 
@@ -5384,6 +5596,7 @@ mod tests {
                 details: None,
             },
             1000,
+            None,
         );
         assert!(second.blocks_changed);
         assert_eq!(blocks.len(), 1);
@@ -5414,6 +5627,7 @@ mod tests {
                 ]),
             },
             1000,
+            None,
         );
 
         assert!(progress.blocks_changed);
@@ -5464,6 +5678,7 @@ mod tests {
                 }),
             },
             1000,
+            Some(123_456),
         );
 
         assert!(progress.blocks_changed);
@@ -5478,6 +5693,7 @@ mod tests {
                 details: Some(details),
                 status: Some(status),
                 source: Some(source),
+                duration_ms: Some(duration_ms),
             }
             if kind == "turn_status"
                 && level == "info"
@@ -5485,13 +5701,78 @@ mod tests {
                 && message == "Codex reported a normal terminal completion."
                 && status == "completed"
                 && source == "engine"
+                && *duration_ms == 123_456
                 && details.iter().any(|detail| detail == "Completion source: explicit engine terminal event")
                 && details.iter().any(|detail| detail == "Token usage: 12 input, 34 output")
         ));
     }
 
     #[test]
-    fn turn_completed_with_pending_approval_keeps_thread_awaiting_approval() {
+    fn turn_completed_terminalizes_unresolved_action_blocks_before_stats() {
+        let mut blocks = vec![ContentBlock::Action {
+            action_id: "action-1".to_string(),
+            engine_action_id: Some("item-1".to_string()),
+            action_type: "command".to_string(),
+            summary: "Run tests".to_string(),
+            details: empty_raw_value(),
+            output_chunks: Vec::new(),
+            status: "running".to_string(),
+            result: None,
+        }];
+        let mut action_index = HashMap::new();
+        let mut approval_index = HashMap::new();
+        rebuild_block_indexes(&blocks, &mut action_index, &mut approval_index);
+
+        let progress = apply_event_to_blocks(
+            &mut blocks,
+            &mut action_index,
+            &mut approval_index,
+            &EngineEvent::TurnCompleted {
+                token_usage: None,
+                status: TurnCompletionStatus::Interrupted,
+                diagnostics: Some(crate::engines::TurnCompletionDiagnostics {
+                    source: TurnCompletionSource::ReconciledStreamLost,
+                }),
+            },
+            1000,
+            None,
+        );
+
+        assert!(progress.blocks_changed);
+        assert_eq!(blocks.len(), 2);
+        match &blocks[0] {
+            ContentBlock::Action { status, result, .. } => {
+                assert_eq!(status, "error");
+                let result = result.as_ref().expect("expected synthetic action result");
+                assert!(!result.success);
+                assert_eq!(
+                    result.error.as_deref(),
+                    Some(
+                        "Panes lost the live Codex stream before this action reported completion."
+                    )
+                );
+                assert_eq!(result.duration_ms, 0);
+            }
+            other => panic!("expected action block, got {other:?}"),
+        }
+        assert!(matches!(
+            &blocks[1],
+            ContentBlock::Notice {
+                kind,
+                details: Some(details),
+                status: Some(status),
+                source: Some(source),
+                ..
+            }
+            if kind == "turn_status"
+                && status == "interrupted"
+                && source == "reconciled_stream_lost"
+                && details.iter().any(|detail| detail == "Actions: 1 total, 0 done, 1 error, 0 running, 0 pending")
+        ));
+    }
+
+    #[test]
+    fn turn_completed_with_pending_approval_resolves_approval_before_stats() {
         let mut blocks = vec![ContentBlock::Approval {
             approval_id: "approval-1".to_string(),
             action_type: "command".to_string(),
@@ -5523,13 +5804,19 @@ mod tests {
                 }),
             },
             1000,
+            Some(42_000),
         );
 
         assert_eq!(progress.message_status, Some(MessageStatusDto::Completed));
-        assert_eq!(
-            progress.thread_status,
-            Some(ThreadStatusDto::AwaitingApproval)
-        );
+        assert_eq!(progress.thread_status, Some(ThreadStatusDto::Completed));
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::Approval {
+                status,
+                decision: Some(decision),
+                ..
+            } if status == "answered" && decision == "cancel"
+        ));
         assert!(matches!(
             &blocks[1],
             ContentBlock::Notice {
@@ -5540,15 +5827,17 @@ mod tests {
                 details: Some(details),
                 status: Some(status),
                 source: Some(source),
+                duration_ms: Some(duration_ms),
             }
             if kind == "turn_status"
-                && level == "warning"
-                && title == "Approval still pending"
-                && message.contains("unresolved approvals")
-                && status == "awaiting_approval"
+                && level == "info"
+                && title == "Turn completed"
+                && message == "Codex reported a normal terminal completion."
+                && status == "completed"
                 && source == "engine"
-                && details.iter().any(|detail| detail == "Approvals: 1 pending, 0 answered")
-                && details.iter().any(|detail| detail.contains("Protocol warning"))
+                && *duration_ms == 42_000
+                && details.iter().any(|detail| detail == "Approvals: 0 pending, 1 answered")
+                && !details.iter().any(|detail| detail.contains("Protocol warning"))
         ));
     }
 

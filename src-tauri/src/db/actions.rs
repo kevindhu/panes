@@ -120,6 +120,26 @@ pub fn resolve_approval(db: &Database, approval_id: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+pub fn resolve_pending_approvals_for_message(
+    db: &Database,
+    message_id: &str,
+    decision: Option<&str>,
+) -> anyhow::Result<usize> {
+    let conn = db.connect()?;
+    let changed = conn
+        .execute(
+            "UPDATE approvals
+     SET status = 'answered',
+         decision = COALESCE(decision, ?1),
+         answered_at = COALESCE(answered_at, datetime('now'))
+     WHERE message_id = ?2
+       AND status = 'pending'",
+            params![decision, message_id],
+        )
+        .context("failed to resolve pending approvals for terminal message")?;
+    Ok(changed)
+}
+
 pub fn find_approval_message_id(
     db: &Database,
     approval_id: &str,

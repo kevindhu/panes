@@ -74,6 +74,28 @@ function createUserMessage(): Message {
   };
 }
 
+function createAssistantMessage(): Message {
+  return {
+    id: "assistant-1",
+    threadId: "thread-1",
+    role: "assistant",
+    blocks: [
+      {
+        type: "notice",
+        kind: "turn_status",
+        level: "info",
+        title: "Turn completed",
+        message: "The turn reached a terminal completion.",
+        status: "completed",
+        durationMs: 123000,
+      },
+    ],
+    status: "completed",
+    schemaVersion: 1,
+    createdAt: "2026-05-19T12:00:01.000Z",
+  };
+}
+
 describe("MessageRowView editing attachments", () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -209,5 +231,37 @@ describe("MessageRowView editing attachments", () => {
 
     expect(onPasteEditAttachments).toHaveBeenCalledTimes(1);
     expect(onPasteEditAttachments).toHaveBeenCalledWith([file]);
+  });
+
+  it("shows task duration at the bottom of completed assistant messages", async () => {
+    await act(async () => {
+      root.render(
+        <MessageRowView
+          message={createAssistantMessage()}
+          index={0}
+          isHighlighted={false}
+          assistantLabel=""
+          assistantEngineId="codex"
+          canEditUserMessages
+          editingMessageId={null}
+          editingMode={null}
+          editingDraftText=""
+          editingDraftAttachments={[]}
+          editingRollbackTurns={null}
+          editingBusy={false}
+          onStartEdit={vi.fn()}
+          onStartRollback={vi.fn()}
+          onChangeEditText={vi.fn()}
+          onRemoveEditAttachment={vi.fn()}
+          onPasteEditAttachments={vi.fn()}
+          onCancelEdit={vi.fn()}
+          onSubmitEdit={vi.fn(async () => undefined)}
+          onApproval={vi.fn()}
+          onLoadActionOutput={vi.fn(async () => undefined)}
+        />,
+      );
+    });
+
+    expect(container.textContent).toContain("Task took 2m 3s.");
   });
 });

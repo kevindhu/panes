@@ -605,6 +605,31 @@ function humanizeTurnStatusSource(source?: string): string | null {
   }
 }
 
+function formatTaskDuration(durationMs?: number): string | null {
+  if (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs < 0) {
+    return null;
+  }
+
+  if (durationMs < 1000) {
+    return `${Math.max(0, Math.round(durationMs))}ms`;
+  }
+
+  const totalSeconds = Math.max(1, Math.round(durationMs / 1000));
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`;
+  }
+
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (totalMinutes < 60) {
+    return seconds > 0 ? `${totalMinutes}m ${seconds}s` : `${totalMinutes}m`;
+  }
+
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+}
+
 function TurnStatusNoticeView({ block }: { block: NoticeBlock }) {
   const { t } = useTranslation("chat");
   const [expanded, setExpanded] = useState(() => block.level !== "info");
@@ -619,6 +644,7 @@ function TurnStatusNoticeView({ block }: { block: NoticeBlock }) {
   const status = String(block.status ?? "");
   const sourceLabel = humanizeTurnStatusSource(block.source);
   const details = Array.isArray(block.details) ? block.details : [];
+  const durationLabel = formatTaskDuration(block.durationMs);
 
   let Icon = Info;
   let accent = "var(--info)";
@@ -713,6 +739,17 @@ function TurnStatusNoticeView({ block }: { block: NoticeBlock }) {
                 ))}
               </div>
             )}
+          </div>
+        )}
+        {durationLabel && (
+          <div
+            style={{
+              color: "var(--text-3)",
+              fontSize: 11,
+              fontFamily: '"JetBrains Mono", monospace',
+            }}
+          >
+            Task took {durationLabel}.
           </div>
         )}
       </div>

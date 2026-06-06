@@ -281,6 +281,7 @@ export interface NoticeBlock {
   details?: string[];
   status?: string;
   source?: TurnCompletionSource;
+  durationMs?: number;
 }
 
 export interface ActionBlock {
@@ -1140,6 +1141,8 @@ export interface TurnCompletedEvent {
   token_usage?: StreamTokenUsage | null;
   status?: TurnCompletionStatus;
   diagnostics?: TurnCompletionDiagnostics | null;
+  duration_ms?: number | null;
+  durationMs?: number | null;
 }
 
 export type TurnCompletionSource =

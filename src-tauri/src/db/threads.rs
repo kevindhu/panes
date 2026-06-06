@@ -373,9 +373,11 @@ pub(crate) fn derive_thread_status_for_recovery(
     let has_pending_approval = conn
         .query_row(
             "SELECT 1
-       FROM approvals
-       WHERE thread_id = ?1
-         AND status = 'pending'
+       FROM approvals a
+       JOIN messages m ON m.id = a.message_id
+       WHERE a.thread_id = ?1
+         AND a.status = 'pending'
+         AND m.status = 'streaming'
        LIMIT 1",
             params![thread_id],
             |_| Ok(()),
@@ -443,7 +445,10 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use crate::db::{messages, workspaces, ConnectionPool, SQLITE_POOL_MAX_IDLE};
+    use crate::{
+        db::{actions, messages, workspaces, ConnectionPool, SQLITE_POOL_MAX_IDLE},
+        engines::events::ActionType,
+    };
 
     use super::*;
 
@@ -548,6 +553,52 @@ mod tests {
         assert_eq!(refreshed.message_count, 2);
         assert_eq!(refreshed.total_tokens, 34);
         assert!(!refreshed.last_activity_at.is_empty());
+    }
+
+    #[test]
+    fn recovery_ignores_pending_approvals_on_terminal_assistant_messages() {
+        let db = test_db();
+        let thread = test_thread(&db, "Approval recovery");
+        let assistant = messages::insert_assistant_placeholder(
+            &db,
+            &thread.id,
+            Some("codex"),
+            Some("gpt-5.3-codex"),
+            Some("low"),
+        )
+        .unwrap();
+        actions::insert_approval(
+            &db,
+            "approval-terminal",
+            &thread.id,
+            &assistant.id,
+            &ActionType::Command,
+            "Run command",
+            &json!({}),
+        )
+        .unwrap();
+
+        let conn = db.connect().unwrap();
+        assert_eq!(
+            derive_thread_status_for_recovery(&conn, &thread.id).unwrap(),
+            ThreadStatusDto::AwaitingApproval
+        );
+        drop(conn);
+
+        messages::complete_assistant_message(
+            &db,
+            &assistant.id,
+            crate::models::MessageStatusDto::Completed,
+            None,
+            Some("gpt-5.3-codex"),
+        )
+        .unwrap();
+
+        let conn = db.connect().unwrap();
+        assert_eq!(
+            derive_thread_status_for_recovery(&conn, &thread.id).unwrap(),
+            ThreadStatusDto::Completed
+        );
     }
 
     #[test]

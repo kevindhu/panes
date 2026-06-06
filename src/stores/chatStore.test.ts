@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ApprovalResponse, StreamEvent } from "../types";
+import type { ApprovalResponse, Message, StreamEvent } from "../types";
 
 const mockIpc = vi.hoisted(() => ({
   sendMessage: vi.fn(),
@@ -385,6 +385,7 @@ describe("chatStore send", () => {
     streamHandler!({
       type: "TurnCompleted",
       status: "completed",
+      duration_ms: 123456,
       token_usage: {
         input: 12,
         output: 34,
@@ -409,6 +410,7 @@ describe("chatStore send", () => {
         message: "Codex reported a normal terminal completion.",
         status: "completed",
         source: "engine",
+        durationMs: 123456,
         details: expect.arrayContaining([
           "Completion source: explicit engine terminal event",
           "Token usage: 12 input, 34 output",
@@ -417,6 +419,216 @@ describe("chatStore send", () => {
     ]);
 
     vi.useRealTimers();
+  });
+
+  it("terminalizes unresolved action blocks before turn completion stats are stored", async () => {
+    vi.useFakeTimers();
+
+    let streamHandler: ((event: StreamEvent) => void) | null = null;
+    mockListenThreadEvents.mockImplementationOnce(async (_threadId, onEvent) => {
+      streamHandler = onEvent;
+      return () => {};
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    streamHandler!({
+      type: "ActionStarted",
+      action_id: "action-done",
+      engine_action_id: "item-done",
+      action_type: "command",
+      summary: "pnpm test",
+      details: {},
+    });
+    streamHandler!({
+      type: "ActionStarted",
+      action_id: "action-lost",
+      engine_action_id: "item-lost",
+      action_type: "command",
+      summary: "pnpm lint",
+      details: {},
+    });
+    streamHandler!({
+      type: "ActionCompleted",
+      action_id: "action-done",
+      result: {
+        success: true,
+        durationMs: 25,
+      },
+    });
+    streamHandler!({
+      type: "TurnCompleted",
+      status: "interrupted",
+      diagnostics: {
+        source: "reconciled_stream_lost",
+      },
+    });
+
+    await vi.advanceTimersByTimeAsync(20);
+
+    const assistant = useChatStore
+      .getState()
+      .messages.find((message) => message.role === "assistant" && message.blocks?.length);
+    const actionBlocks = assistant?.blocks?.filter((block) => block.type === "action") ?? [];
+    expect(actionBlocks).toHaveLength(2);
+    expect(actionBlocks[0]).toMatchObject({
+      actionId: "action-done",
+      status: "done",
+    });
+    expect(actionBlocks[1]).toMatchObject({
+      actionId: "action-lost",
+      status: "error",
+      result: {
+        success: false,
+        error: "Panes lost the live Codex stream before this action reported completion.",
+        durationMs: 0,
+      },
+    });
+    expect(assistant?.blocks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "notice",
+          kind: "turn_status",
+          title: "Turn interrupted",
+          status: "interrupted",
+          source: "reconciled_stream_lost",
+          details: expect.arrayContaining([
+            "Actions: 2 total, 1 done, 1 error, 0 running, 0 pending",
+          ]),
+        }),
+      ]),
+    );
+
+    vi.useRealTimers();
+  });
+
+  it("normalizes stale running action blocks when terminal messages are loaded", async () => {
+    const staleMessage: Message = {
+      id: "assistant-stale",
+      threadId: "thread-1",
+      role: "assistant",
+      status: "interrupted",
+      schemaVersion: 1,
+      createdAt: "2026-06-05T12:00:00.000Z",
+      blocks: [
+        {
+          type: "action",
+          actionId: "action-stale",
+          engineActionId: "item-stale",
+          actionType: "command",
+          summary: "pnpm test",
+          details: {},
+          outputChunks: [],
+          outputDeferred: false,
+          outputDeferredLoaded: true,
+          status: "running",
+        },
+        {
+          type: "notice",
+          kind: "turn_status",
+          level: "warning",
+          title: "Turn interrupted",
+          message: "The turn ended before a normal completion.",
+          status: "interrupted",
+          source: "reconciled_stream_lost",
+          details: [
+            "Completion source: reconciled from thread history after live stream loss",
+            "Actions: 1 total, 0 done, 0 error, 1 running, 0 pending",
+          ],
+        },
+      ],
+    };
+
+    mockIpc.getThreadMessagesWindow.mockResolvedValueOnce({
+      messages: [staleMessage],
+      nextCursor: null,
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    const assistant = useChatStore.getState().messages[0];
+    expect(assistant.blocks?.[0]).toMatchObject({
+      type: "action",
+      actionId: "action-stale",
+      status: "error",
+      result: {
+        success: false,
+        error: "Panes lost the live Codex stream before this action reported completion.",
+        durationMs: 0,
+      },
+    });
+    expect(assistant.blocks?.[1]).toMatchObject({
+      type: "notice",
+      kind: "turn_status",
+      details: [
+        "Completion source: reconciled from thread history after live stream loss",
+        "Actions: 1 total, 0 done, 1 error, 0 running, 0 pending",
+      ],
+    });
+  });
+
+  it("normalizes stale pending approval blocks when terminal messages are loaded", async () => {
+    const staleMessage: Message = {
+      id: "assistant-stale-approval",
+      threadId: "thread-1",
+      role: "assistant",
+      status: "completed",
+      schemaVersion: 1,
+      createdAt: "2026-06-05T12:00:00.000Z",
+      blocks: [
+        {
+          type: "approval",
+          approvalId: "approval-stale",
+          actionType: "command",
+          summary: "Run command",
+          details: {},
+          status: "pending",
+        },
+        {
+          type: "notice",
+          kind: "turn_status",
+          level: "warning",
+          title: "Approval still pending",
+          message:
+            "A terminal result was recorded, but Panes still has unresolved approvals. The turn may have ended early or the approval protocol may be out of sync.",
+          status: "awaiting_approval",
+          source: "engine",
+          details: [
+            "Completion source: explicit engine terminal event",
+            "Approvals: 1 pending, 0 answered",
+            "Protocol warning: terminal result arrived while 1 approval(s) were still pending.",
+          ],
+        },
+      ],
+    };
+
+    mockIpc.getThreadMessagesWindow.mockResolvedValueOnce({
+      messages: [staleMessage],
+      nextCursor: null,
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    const assistant = useChatStore.getState().messages[0];
+    expect(assistant.blocks?.[0]).toMatchObject({
+      type: "approval",
+      approvalId: "approval-stale",
+      status: "answered",
+      decision: "cancel",
+    });
+    expect(assistant.blocks?.[1]).toMatchObject({
+      type: "notice",
+      kind: "turn_status",
+      level: "info",
+      title: "Turn completed",
+      message: "Codex reported a normal terminal completion.",
+      status: "completed",
+      source: "engine",
+      details: [
+        "Completion source: explicit engine terminal event",
+        "Approvals: 0 pending, 1 answered",
+      ],
+    });
   });
 
   it("derives context usage from current context tokens instead of cumulative totals", async () => {
@@ -858,7 +1070,7 @@ describe("chatStore send", () => {
           id: "assistant-approval",
           threadId: "thread-1",
           role: "assistant",
-          status: "completed",
+          status: "streaming",
           schemaVersion: 1,
           blocks: [
             {
@@ -1687,7 +1899,7 @@ describe("chatStore send", () => {
     vi.useRealTimers();
   });
 
-  it("keeps the thread awaiting approval when TurnCompleted arrives before a pending approval is cleared", async () => {
+  it("resolves pending approvals when TurnCompleted arrives before approval resolution", async () => {
     vi.useFakeTimers();
 
     let streamHandler: ((event: StreamEvent) => void) | null = null;
@@ -1717,8 +1929,8 @@ describe("chatStore send", () => {
 
     const state = useChatStore.getState();
     expect(state).toMatchObject({
-      status: "awaiting_approval",
-      streaming: true,
+      status: "completed",
+      streaming: false,
     });
     const assistant = state.messages[state.messages.length - 1];
     expect(assistant?.role).toBe("assistant");
@@ -1726,11 +1938,23 @@ describe("chatStore send", () => {
     expect(assistant?.blocks).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
+          type: "approval",
+          approvalId: "approval-runtime-3",
+          status: "answered",
+          decision: "cancel",
+        }),
+      ]),
+    );
+    expect(assistant?.blocks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
           type: "notice",
           kind: "turn_status",
-          title: "Approval still pending",
-          status: "awaiting_approval",
+          level: "info",
+          title: "Turn completed",
+          status: "completed",
           source: "engine",
+          details: expect.arrayContaining(["Approvals: 0 pending, 1 answered"]),
         }),
       ]),
     );
