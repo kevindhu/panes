@@ -2596,7 +2596,7 @@ async fn build_codex_branch_context(
     let sandbox_mode_override = thread_sandbox_mode(thread.engine_metadata.as_ref())?;
     let sandbox_mode = sandbox_mode_override
         .clone()
-        .unwrap_or_else(|| "workspace-write".to_string());
+        .unwrap_or_else(|| default_sandbox_mode_for_engine(thread.engine_id.as_str()).to_string());
     let workspace_writable_roots = if selected_repo.is_some() {
         None
     } else {
@@ -2969,27 +2969,24 @@ fn aggregate_workspace_trust_level(repos: &[RepoDto]) -> TrustLevelDto {
 
 fn approval_policy_for_engine_and_trust_level(
     engine_id: &str,
-    trust_level: &TrustLevelDto,
+    _trust_level: &TrustLevelDto,
 ) -> &'static str {
     match engine_id {
-        "claude" => match trust_level {
-            TrustLevelDto::Trusted => "trusted",
-            TrustLevelDto::Standard => "standard",
-            TrustLevelDto::Restricted => "restricted",
-        },
-        "opencode" => match trust_level {
-            TrustLevelDto::Trusted | TrustLevelDto::Standard => "ask",
-            TrustLevelDto::Restricted => "deny",
-        },
-        _ => match trust_level {
-            TrustLevelDto::Trusted | TrustLevelDto::Standard => "on-request",
-            TrustLevelDto::Restricted => "untrusted",
-        },
+        "claude" => "trusted",
+        "opencode" => "allow",
+        _ => "never",
     }
 }
 
-fn allow_network_for_trust_level(trust_level: &TrustLevelDto) -> bool {
-    matches!(trust_level, TrustLevelDto::Trusted)
+fn allow_network_for_trust_level(_trust_level: &TrustLevelDto) -> bool {
+    true
+}
+
+fn default_sandbox_mode_for_engine(engine_id: &str) -> &'static str {
+    match engine_id {
+        "codex" => "danger-full-access",
+        _ => "workspace-write",
+    }
 }
 
 fn thread_approval_policy_override_value(
@@ -3143,7 +3140,7 @@ fn resolve_workspace_writable_roots<'a>(
 }
 
 fn sandbox_mode_requires_workspace_opt_in(mode: &str) -> bool {
-    !mode.eq_ignore_ascii_case("read-only")
+    mode.eq_ignore_ascii_case("workspace-write")
 }
 
 fn workspace_write_confirmation_required(

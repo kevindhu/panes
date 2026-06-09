@@ -971,11 +971,9 @@ pub async fn send_message(
     let sandbox_mode_override = thread_sandbox_mode(thread.engine_metadata.as_ref())?;
     let supports_panes_sandbox = thread.engine_id != "opencode";
     let sandbox_mode = if supports_panes_sandbox {
-        Some(
-            sandbox_mode_override
-                .clone()
-                .unwrap_or_else(|| "workspace-write".to_string()),
-        )
+        Some(sandbox_mode_override.clone().unwrap_or_else(|| {
+            default_sandbox_mode_for_engine(thread.engine_id.as_str()).to_string()
+        }))
     } else {
         if sandbox_mode_override.is_some() {
             log::warn!(
@@ -4602,28 +4600,24 @@ fn aggregate_workspace_trust_level(repos: &[RepoDto]) -> TrustLevelDto {
 
 fn approval_policy_for_engine_and_trust_level(
     engine_id: &str,
-    trust_level: &TrustLevelDto,
+    _trust_level: &TrustLevelDto,
 ) -> &'static str {
     match engine_id {
-        "claude" => match trust_level {
-            TrustLevelDto::Trusted => "trusted",
-            TrustLevelDto::Standard => "standard",
-            TrustLevelDto::Restricted => "restricted",
-        },
-        "opencode" => match trust_level {
-            TrustLevelDto::Trusted | TrustLevelDto::Standard => "ask",
-            TrustLevelDto::Restricted => "deny",
-        },
-        _ => match trust_level {
-            TrustLevelDto::Trusted => "on-request",
-            TrustLevelDto::Standard => "on-request",
-            TrustLevelDto::Restricted => "untrusted",
-        },
+        "claude" => "trusted",
+        "opencode" => "allow",
+        _ => "never",
     }
 }
 
-fn allow_network_for_trust_level(trust_level: &TrustLevelDto) -> bool {
-    matches!(trust_level, TrustLevelDto::Trusted)
+fn allow_network_for_trust_level(_trust_level: &TrustLevelDto) -> bool {
+    true
+}
+
+fn default_sandbox_mode_for_engine(engine_id: &str) -> &'static str {
+    match engine_id {
+        "codex" => "danger-full-access",
+        _ => "workspace-write",
+    }
 }
 
 fn thread_approval_policy_override_value(
@@ -4776,7 +4770,7 @@ fn resolve_workspace_writable_roots<'a>(
 }
 
 fn sandbox_mode_requires_workspace_opt_in(mode: &str) -> bool {
-    !mode.eq_ignore_ascii_case("read-only")
+    mode.eq_ignore_ascii_case("workspace-write")
 }
 
 fn workspace_write_confirmation_required(
@@ -5551,7 +5545,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_workspace_threads_ignore_stale_confirmation_requirements() {
+    fn non_workspace_write_modes_ignore_workspace_confirmation_requirements() {
         let resolution = WorkspaceWritableRootsResolution {
             roots: vec![
                 String::from("/workspace/repo-a"),
@@ -5565,6 +5559,11 @@ mod tests {
             "read-only",
             true,
         ));
+        assert!(!workspace_write_confirmation_required(
+            Some(&resolution),
+            "danger-full-access",
+            true,
+        ));
         assert!(workspace_write_confirmation_required(
             Some(&resolution),
             "workspace-write",
@@ -5573,34 +5572,46 @@ mod tests {
     }
 
     #[test]
-    fn claude_defaults_follow_trust_level_directly() {
+    fn permission_defaults_use_max_privilege_modes() {
         assert_eq!(
             approval_policy_for_engine_and_trust_level("claude", &TrustLevelDto::Trusted),
             "trusted"
         );
         assert_eq!(
             approval_policy_for_engine_and_trust_level("claude", &TrustLevelDto::Standard),
-            "standard"
+            "trusted"
         );
         assert_eq!(
             approval_policy_for_engine_and_trust_level("claude", &TrustLevelDto::Restricted),
-            "restricted"
+            "trusted"
+        );
+        assert_eq!(
+            approval_policy_for_engine_and_trust_level("codex", &TrustLevelDto::Trusted),
+            "never"
+        );
+        assert_eq!(
+            approval_policy_for_engine_and_trust_level("codex", &TrustLevelDto::Standard),
+            "never"
+        );
+        assert_eq!(
+            approval_policy_for_engine_and_trust_level("codex", &TrustLevelDto::Restricted),
+            "never"
         );
     }
 
     #[test]
-    fn opencode_defaults_use_permission_modes_not_codex_sandbox_policies() {
+    fn opencode_defaults_allow_tools_without_permission_prompts() {
         assert_eq!(
             approval_policy_for_engine_and_trust_level("opencode", &TrustLevelDto::Trusted),
-            "ask"
+            "allow"
         );
         assert_eq!(
             approval_policy_for_engine_and_trust_level("opencode", &TrustLevelDto::Standard),
-            "ask"
+            "allow"
         );
         assert_eq!(
             approval_policy_for_engine_and_trust_level("opencode", &TrustLevelDto::Restricted),
-            "deny"
+            "allow"
         );
     }
 

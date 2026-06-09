@@ -45,7 +45,7 @@ vi.mock("../../stores/toastStore", () => ({
   },
 }));
 
-import { MessageRowView } from "./ChatPanel";
+import { MessageRowView, shouldVirtualizeMessages } from "./ChatPanel";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -263,5 +263,12 @@ describe("MessageRowView editing attachments", () => {
     });
 
     expect(container.textContent).toContain("Task took 2m 3s.");
+  });
+});
+
+describe("shouldVirtualizeMessages", () => {
+  it("keeps long transcripts fully mounted", () => {
+    expect(shouldVirtualizeMessages(114, false)).toBe(false);
+    expect(shouldVirtualizeMessages(80, true)).toBe(false);
   });
 });

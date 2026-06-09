@@ -1772,18 +1772,18 @@ function ApprovalCard({
 function renderSingleBlock(
   block: ContentBlock,
   index: number,
-  safeBlocks: ContentBlock[],
+  sourceBlocks: ContentBlock[],
   status: MessageStatus | undefined,
   engineId: string | undefined,
   onApproval: (approvalId: string, response: ApprovalResponse) => void,
   onLoadActionOutput: ((actionId: string) => Promise<void>) | undefined,
 ) {
-  const blockKey = getMessageBlockKey(block, index, safeBlocks);
+  const blockKey = getMessageBlockKey(block, index, sourceBlocks);
 
   /* ── Text ── */
   if (block.type === "text") {
     const textContent = String(block.content ?? "");
-    const isLastBlock = index === safeBlocks.length - 1;
+    const isLastBlock = index === sourceBlocks.length - 1;
     const isStreamingText = status === "streaming" && isLastBlock;
 
     if (isStreamingText) {
@@ -1905,7 +1905,7 @@ function renderSingleBlock(
 
   /* ── Thinking ── */
   if (block.type === "thinking") {
-    const isLastBlock = index === safeBlocks.length - 1;
+    const isLastBlock = index === sourceBlocks.length - 1;
     const thinkingActive = status === "streaming" && isLastBlock;
     return (
       <div key={blockKey} >
@@ -2041,7 +2041,7 @@ function MessageBlocksView({ blocks = [], status, engineId, onApproval, onLoadAc
         return renderSingleBlock(
           segment.block,
           segment.index,
-          renderedBlocks,
+          safeBlocks,
           status,
           engineId,
           onApproval,

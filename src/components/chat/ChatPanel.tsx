@@ -130,10 +130,44 @@ import type {
   TrustLevel,
 } from "../../types";
 
-const MESSAGE_VIRTUALIZATION_THRESHOLD = 40;
 const MESSAGE_ESTIMATED_ROW_HEIGHT = 220;
 const MESSAGE_ROW_GAP = 12;
 const MESSAGE_OVERSCAN_PX = 700;
+
+export function shouldVirtualizeMessages(messageCount: number, streaming: boolean): boolean {
+  // Chat rows can contain very large, dynamic markdown blocks. Keeping the
+  // transcript mounted is more important than risking a bad virtual window.
+  void messageCount;
+  void streaming;
+  return false;
+}
+
+function selectionEndpointInsideElement(
+  element: HTMLElement,
+  node: Node | null,
+): boolean {
+  if (!node) {
+    return false;
+  }
+  const endpoint = node instanceof Element ? node : node.parentElement;
+  return endpoint ? element.contains(endpoint) : false;
+}
+
+export function hasActiveTextSelectionInsideElement(element: HTMLElement | null): boolean {
+  if (!element) {
+    return false;
+  }
+
+  const selection = window.getSelection?.();
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+    return false;
+  }
+
+  return (
+    selectionEndpointInsideElement(element, selection.anchorNode) ||
+    selectionEndpointInsideElement(element, selection.focusNode)
+  );
+}
 const LazyTerminalPanel = lazy(() =>
   import("../terminal/TerminalPanel").then((module) => ({
     default: module.TerminalPanel,
@@ -2079,7 +2113,8 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const layoutVersionRafRef = useRef<number | null>(null);
   const threadExecutionPolicyRequestIdsRef = useRef<Record<string, number>>({});
   const [listLayoutVersion, setListLayoutVersion] = useState(0);
-  const [viewportScrollTop, setViewportScrollTop] = useState(0);
+  const viewportScrollTopRef = useRef(0);
+  const [nearTopLoadRequest, setNearTopLoadRequest] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(0);
   const [autoScrollLocked, setAutoScrollLocked] = useState(false);
   const [hasExplicitComposerRuntime, setHasExplicitComposerRuntime] = useState(false);
@@ -3513,10 +3548,20 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
     let rafId = 0;
     const updateScroll = () => {
-      setViewportScrollTop(viewport.scrollTop);
+      const scrollTop = viewport.scrollTop;
+      viewportScrollTopRef.current = scrollTop;
       const nearBottom =
-        viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 120;
-      setAutoScrollLocked(!nearBottom);
+        scrollTop + viewport.clientHeight >= viewport.scrollHeight - 120;
+      setAutoScrollLocked((current) => {
+        const next = !nearBottom;
+        return current === next ? current : next;
+      });
+      if (
+        scrollTop <= 80 &&
+        !hasActiveTextSelectionInsideElement(viewport)
+      ) {
+        setNearTopLoadRequest((request) => request + 1);
+      }
     };
     const updateHeight = () => {
       setViewportHeight(viewport.clientHeight);
@@ -4034,6 +4079,9 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   useEffect(() => {
     const viewport = viewportRef.current;
     if (!viewport) return;
+    if (hasActiveTextSelectionInsideElement(viewport)) {
+      return;
+    }
     if (!autoScrollLocked) {
       scrollViewportToBottom("smooth");
     }
@@ -4047,7 +4095,11 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     if (performance.now() - threadActivatedAtRef.current < 700) {
       return;
     }
-    if (viewportScrollTop > 80 || prependLoadInFlightRef.current) {
+    if (
+      viewportScrollTopRef.current > 80 ||
+      prependLoadInFlightRef.current ||
+      hasActiveTextSelectionInsideElement(viewport)
+    ) {
       return;
     }
 
@@ -4074,8 +4126,8 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     hasOlderMessages,
     loadOlderMessages,
     loadingOlderMessages,
+    nearTopLoadRequest,
     threadId,
-    viewportScrollTop,
   ]);
 
   useEffect(() => {
@@ -5366,8 +5418,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     [scheduleListLayoutVersionBump],
   );
 
-  const virtualizationEnabled =
-    messages.length >= MESSAGE_VIRTUALIZATION_THRESHOLD;
+  const virtualizationEnabled = shouldVirtualizeMessages(messages.length, streaming);
 
   useEffect(() => {
     recordPerfMetric("chat.render.commit.ms", performance.now() - renderStartedAtRef.current, {

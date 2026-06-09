@@ -936,6 +936,172 @@ function hasRenderableAssistantContent(message: Message): boolean {
   });
 }
 
+function resolveActiveStreamingMessageIds(messages: Message[], threadId: string): Set<string> {
+  const activeMessageIds = new Set<string>();
+  const pendingTurnMeta = pendingTurnMetaByThread.get(threadId);
+  if (pendingTurnMeta?.assistantMessageId) {
+    activeMessageIds.add(pendingTurnMeta.assistantMessageId);
+  }
+
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    const isPendingAssistant =
+      message.role === "assistant" &&
+      (message.status === "streaming" ||
+        (pendingTurnMeta?.clientTurnId != null &&
+          message.clientTurnId === pendingTurnMeta.clientTurnId));
+    if (!isPendingAssistant) {
+      continue;
+    }
+
+    activeMessageIds.add(message.id);
+    const previous = messages[index - 1];
+    if (previous?.role === "user") {
+      activeMessageIds.add(previous.id);
+    }
+  }
+
+  return activeMessageIds;
+}
+
+function shouldPreferCurrentStreamingMessage(current: Message, loaded: Message): boolean {
+  if (current.role !== "assistant" || current.status !== "streaming") {
+    return false;
+  }
+
+  if (hasRenderableAssistantContent(current)) {
+    return true;
+  }
+
+  return !hasRenderableAssistantContent(loaded);
+}
+
+function hasPersistedUserForCurrentOptimisticUser(
+  currentMessage: Message,
+  currentMessageIndex: number,
+  currentMessages: Message[],
+  mergedMessages: Message[],
+): boolean {
+  if (currentMessage.role !== "user") {
+    return false;
+  }
+
+  const nextMessage = currentMessages[currentMessageIndex + 1];
+  if (nextMessage?.role !== "assistant" || !nextMessage.clientTurnId) {
+    return false;
+  }
+
+  const loadedAssistantIndex = mergedMessages.findIndex(
+    (message) =>
+      message.role === "assistant" &&
+      message.clientTurnId === nextMessage.clientTurnId,
+  );
+  return loadedAssistantIndex > 0 && mergedMessages[loadedAssistantIndex - 1]?.role === "user";
+}
+
+function mergeLoadedMessagesWithActiveStreamingMessages(
+  loadedMessages: Message[],
+  currentMessages: Message[],
+  threadId: string,
+): Message[] {
+  if (currentMessages.length === 0) {
+    return loadedMessages;
+  }
+
+  const activeMessageIds = resolveActiveStreamingMessageIds(currentMessages, threadId);
+  if (activeMessageIds.size === 0) {
+    return loadedMessages;
+  }
+
+  const mergedMessages = [...loadedMessages];
+  const loadedIndexById = new Map<string, number>();
+  const loadedAssistantIndexByClientTurnId = new Map<string, number>();
+  for (let index = 0; index < mergedMessages.length; index += 1) {
+    const message = mergedMessages[index];
+    loadedIndexById.set(message.id, index);
+    if (message.role === "assistant" && message.clientTurnId) {
+      loadedAssistantIndexByClientTurnId.set(message.clientTurnId, index);
+    }
+  }
+
+  for (const currentMessage of currentMessages) {
+    const loadedIndex = loadedIndexById.get(currentMessage.id);
+    if (loadedIndex !== undefined) {
+      const loadedMessage = mergedMessages[loadedIndex];
+      if (shouldPreferCurrentStreamingMessage(currentMessage, loadedMessage)) {
+        mergedMessages[loadedIndex] = currentMessage;
+      }
+      continue;
+    }
+
+    if (currentMessage.role !== "assistant" || !currentMessage.clientTurnId) {
+      continue;
+    }
+
+    const loadedAssistantIndex = loadedAssistantIndexByClientTurnId.get(
+      currentMessage.clientTurnId,
+    );
+    if (loadedAssistantIndex === undefined) {
+      continue;
+    }
+
+    const loadedAssistant = mergedMessages[loadedAssistantIndex];
+    if (shouldPreferCurrentStreamingMessage(currentMessage, loadedAssistant)) {
+      loadedIndexById.delete(loadedAssistant.id);
+      mergedMessages[loadedAssistantIndex] = currentMessage;
+      loadedIndexById.set(currentMessage.id, loadedAssistantIndex);
+      loadedAssistantIndexByClientTurnId.set(
+        currentMessage.clientTurnId,
+        loadedAssistantIndex,
+      );
+    }
+  }
+
+  const emittedIds = new Set(mergedMessages.map((message) => message.id));
+  const emittedAssistantClientTurnIds = new Set(
+    mergedMessages
+      .filter(
+        (message): message is Message & { clientTurnId: string } =>
+          message.role === "assistant" && Boolean(message.clientTurnId),
+      )
+      .map((message) => message.clientTurnId),
+  );
+
+  for (let index = 0; index < currentMessages.length; index += 1) {
+    const currentMessage = currentMessages[index];
+    if (!activeMessageIds.has(currentMessage.id) || emittedIds.has(currentMessage.id)) {
+      continue;
+    }
+
+    if (
+      hasPersistedUserForCurrentOptimisticUser(
+        currentMessage,
+        index,
+        currentMessages,
+        mergedMessages,
+      )
+    ) {
+      continue;
+    }
+
+    if (
+      currentMessage.role === "assistant" &&
+      currentMessage.clientTurnId &&
+      emittedAssistantClientTurnIds.has(currentMessage.clientTurnId)
+    ) {
+      continue;
+    }
+
+    mergedMessages.push(currentMessage);
+    emittedIds.add(currentMessage.id);
+    if (currentMessage.role === "assistant" && currentMessage.clientTurnId) {
+      emittedAssistantClientTurnIds.add(currentMessage.clientTurnId);
+    }
+  }
+
+  return mergedMessages;
+}
+
 function resolveAssistantMessageIndex(
   messages: Message[],
   target: AssistantMessageTarget,
@@ -2668,7 +2834,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
         if (currentState.unlisten) {
           unlisten();
         }
+        const mergedMessages = applyHydrationWindow(
+          mergeLoadedMessagesWithActiveStreamingMessages(
+            messages,
+            currentState.messages,
+            threadId,
+          ),
+        );
         set({
+          messages: mergedMessages,
           olderCursor,
           hasOlderMessages: olderCursor !== null,
           loadingOlderMessages: false,

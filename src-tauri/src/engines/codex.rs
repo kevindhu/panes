@@ -400,7 +400,7 @@ impl Engine for CodexEngine {
         let approval_policy = sandbox
             .approval_policy
             .clone()
-            .unwrap_or_else(|| serde_json::Value::String("on-request".to_string()));
+            .unwrap_or_else(default_codex_approval_policy);
         let mut force_external_sandbox = self.resolve_external_sandbox_mode().await;
         let mut sandbox_mode = sandbox_mode_from_policy(&sandbox, force_external_sandbox);
         let mut sandbox_policy = sandbox_policy_to_json(&sandbox, force_external_sandbox);
@@ -1180,7 +1180,7 @@ impl CodexEngine {
         let approval_policy = sandbox
             .approval_policy
             .clone()
-            .unwrap_or_else(|| serde_json::Value::String("on-request".to_string()));
+            .unwrap_or_else(default_codex_approval_policy);
         let force_external_sandbox = self.resolve_external_sandbox_mode().await;
         let sandbox_mode = sandbox_mode_from_policy(&sandbox, force_external_sandbox);
         let sandbox_policy = sandbox_policy_to_json(&sandbox, force_external_sandbox);
@@ -4148,6 +4148,10 @@ fn insert_optional_string(
     }
 }
 
+fn default_codex_approval_policy() -> serde_json::Value {
+    serde_json::Value::String("never".to_string())
+}
+
 fn sandbox_mode_from_policy(sandbox: &SandboxPolicy, force_external_sandbox: bool) -> String {
     // `thread/start` only accepts sandbox mode enums. When local workspace sandboxing is broken
     // (common in macOS app contexts), use danger-full-access and enforce external sandboxing on
@@ -4158,7 +4162,7 @@ fn sandbox_mode_from_policy(sandbox: &SandboxPolicy, force_external_sandbox: boo
         sandbox
             .sandbox_mode
             .clone()
-            .unwrap_or_else(|| "workspace-write".to_string())
+            .unwrap_or_else(|| "danger-full-access".to_string())
     }
 }
 
@@ -4172,7 +4176,11 @@ fn sandbox_policy_to_json(
           "networkAccess": if sandbox.allow_network { "enabled" } else { "restricted" },
         })
     } else {
-        match sandbox.sandbox_mode.as_deref().unwrap_or("workspace-write") {
+        match sandbox
+            .sandbox_mode
+            .as_deref()
+            .unwrap_or("danger-full-access")
+        {
             "read-only" => serde_json::json!({
               "type": "readOnly",
               "access": {
@@ -7028,6 +7036,43 @@ mod tests {
             })
         );
         assert!(payload.get("readOnlyAccess").is_none());
+    }
+
+    #[test]
+    fn codex_policy_defaults_to_full_access_without_approval_prompts() {
+        let sandbox = SandboxPolicy {
+            writable_roots: vec!["/tmp/workspace".to_string()],
+            allow_network: false,
+            approval_policy: None,
+            permission_profile: None,
+            approvals_reviewer: None,
+            reasoning_effort: None,
+            sandbox_mode: None,
+            service_tier: None,
+            personality: None,
+            output_schema: None,
+            opencode_agent: None,
+        };
+
+        assert_eq!(
+            sandbox_mode_from_policy(&sandbox, false),
+            "danger-full-access"
+        );
+        assert_eq!(
+            sandbox_policy_to_json(&sandbox, false),
+            json!({ "type": "dangerFullAccess" })
+        );
+
+        let params = build_thread_start_params(
+            "gpt-5.4",
+            "/tmp/workspace",
+            &default_codex_approval_policy(),
+            &sandbox_mode_from_policy(&sandbox, false),
+            &sandbox,
+        );
+
+        assert_eq!(params.get("approvalPolicy"), Some(&json!("never")));
+        assert_eq!(params.get("sandbox"), Some(&json!("danger-full-access")));
     }
 
     #[test]

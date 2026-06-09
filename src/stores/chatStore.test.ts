@@ -2022,6 +2022,164 @@ describe("chatStore send", () => {
     expect(existingUnlisten).not.toHaveBeenCalled();
   });
 
+  it("merges late loaded history into an active optimistic turn", async () => {
+    const existingUnlisten = vi.fn();
+    const lateUnlisten = vi.fn();
+    mockIpc.getThreadMessagesWindow.mockResolvedValueOnce({
+      messages: [
+        {
+          id: "history-user",
+          threadId: "thread-1",
+          role: "user",
+          status: "completed",
+          schemaVersion: 1,
+          blocks: [{ type: "text", content: "previous question" }],
+          createdAt: "2026-05-19T12:00:00.000Z",
+          hydration: "full",
+          hasDeferredContent: false,
+        },
+        {
+          id: "history-assistant",
+          threadId: "thread-1",
+          role: "assistant",
+          status: "completed",
+          schemaVersion: 1,
+          blocks: [{ type: "text", content: "previous answer" }],
+          createdAt: "2026-05-19T12:00:01.000Z",
+          hydration: "full",
+          hasDeferredContent: false,
+        },
+      ],
+      nextCursor: null,
+    });
+    mockListenThreadEvents.mockImplementationOnce(async () => {
+      useChatStore.setState({
+        threadId: "thread-1",
+        messages: [
+          {
+            id: "optimistic-user",
+            threadId: "thread-1",
+            role: "user",
+            status: "completed",
+            schemaVersion: 1,
+            blocks: [{ type: "text", content: "hello" }],
+            createdAt: "2026-05-19T12:00:02.000Z",
+            hydration: "full",
+            hasDeferredContent: false,
+          },
+          {
+            id: "optimistic-assistant",
+            threadId: "thread-1",
+            role: "assistant",
+            status: "streaming",
+            schemaVersion: 1,
+            blocks: [],
+            createdAt: "2026-05-19T12:00:03.000Z",
+            hydration: "full",
+            hasDeferredContent: false,
+          },
+        ],
+        status: "streaming",
+        streaming: true,
+        unlisten: existingUnlisten,
+      });
+      return lateUnlisten;
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    const state = useChatStore.getState();
+    expect(state.messages.map((message) => message.id)).toEqual([
+      "history-user",
+      "history-assistant",
+      "optimistic-user",
+      "optimistic-assistant",
+    ]);
+    expect(state.streaming).toBe(true);
+    expect(lateUnlisten).toHaveBeenCalledTimes(1);
+    expect(existingUnlisten).not.toHaveBeenCalled();
+  });
+
+  it("keeps streamed content when a late bind includes the same active assistant", async () => {
+    const existingUnlisten = vi.fn();
+    const lateUnlisten = vi.fn();
+    mockIpc.getThreadMessagesWindow.mockResolvedValueOnce({
+      messages: [
+        {
+          id: "persisted-user",
+          threadId: "thread-1",
+          role: "user",
+          status: "completed",
+          schemaVersion: 1,
+          blocks: [{ type: "text", content: "hello" }],
+          createdAt: "2026-05-19T12:00:00.000Z",
+          hydration: "full",
+          hasDeferredContent: false,
+        },
+        {
+          id: "persisted-assistant",
+          threadId: "thread-1",
+          role: "assistant",
+          clientTurnId: "turn-1",
+          status: "streaming",
+          schemaVersion: 1,
+          blocks: [],
+          createdAt: "2026-05-19T12:00:01.000Z",
+          hydration: "full",
+          hasDeferredContent: false,
+        },
+      ],
+      nextCursor: null,
+    });
+    mockListenThreadEvents.mockImplementationOnce(async () => {
+      useChatStore.setState({
+        threadId: "thread-1",
+        messages: [
+          {
+            id: "optimistic-user",
+            threadId: "thread-1",
+            role: "user",
+            status: "completed",
+            schemaVersion: 1,
+            blocks: [{ type: "text", content: "hello" }],
+            createdAt: "2026-05-19T12:00:00.500Z",
+            hydration: "full",
+            hasDeferredContent: false,
+          },
+          {
+            id: "optimistic-assistant",
+            threadId: "thread-1",
+            role: "assistant",
+            clientTurnId: "turn-1",
+            status: "streaming",
+            schemaVersion: 1,
+            blocks: [{ type: "text", content: "streamed content" }],
+            createdAt: "2026-05-19T12:00:01.500Z",
+            hydration: "full",
+            hasDeferredContent: false,
+          },
+        ],
+        status: "streaming",
+        streaming: true,
+        unlisten: existingUnlisten,
+      });
+      return lateUnlisten;
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    const state = useChatStore.getState();
+    expect(state.messages.map((message) => message.id)).toEqual([
+      "persisted-user",
+      "optimistic-assistant",
+    ]);
+    expect(state.messages[1]?.blocks).toEqual([
+      { type: "text", content: "streamed content" },
+    ]);
+    expect(lateUnlisten).toHaveBeenCalledTimes(1);
+    expect(existingUnlisten).not.toHaveBeenCalled();
+  });
+
   it("marks the thread as awaiting approval while a streamed approval is pending", async () => {
     vi.useFakeTimers();
 
