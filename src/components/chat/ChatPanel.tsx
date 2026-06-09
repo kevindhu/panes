@@ -1973,10 +1973,12 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   renderStartedAtRef.current = performance.now();
 
   const [input, setInput] = useState("");
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const inputHistoryRef = useRef<string[]>([]);
   const inputHistCursorRef = useRef(-1);
   const inputLiveDraftRef = useRef("");
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
+  const currentAttachmentsRef = useRef<ChatAttachment[]>([]);
   const [isFileDropOver, setIsFileDropOver] = useState(false);
   const [planMode, setPlanMode] = useState(false);
   const [slashMenuOpen, setSlashMenuOpen] = useState(false);
@@ -2136,7 +2138,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const syncTerminalSessions = useTerminalStore((s) => s.syncSessions);
   const viewportRef = useRef<HTMLDivElement>(null);
   const chatSectionRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLTextAreaElement>(null);
   const titleInputRef = useRef<HTMLInputElement>(null);
   const effortSyncKeyRef = useRef<string | null>(null);
   const manuallyOverrodeThreadSelectionRef = useRef(false);
@@ -2690,6 +2691,36 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     }
   }, []);
 
+  useEffect(() => {
+    currentAttachmentsRef.current = attachments;
+  }, [attachments]);
+
+  const clearAcceptedComposerSubmission = useCallback(
+    (submittedText: string) => {
+      recordSubmittedInput(submittedText);
+      inputHistCursorRef.current = -1;
+      inputLiveDraftRef.current = "";
+      currentAttachmentsRef.current = [];
+      setInput("");
+      setAttachments([]);
+    },
+    [recordSubmittedInput],
+  );
+
+  const restoreAcceptedComposerSubmission = useCallback(
+    (draft: { text: string; attachments: ChatAttachment[] }) => {
+      currentAttachmentsRef.current = draft.attachments;
+      setInput(draft.text);
+      setAttachments(draft.attachments);
+    },
+    [],
+  );
+
+  const canRestoreAcceptedComposerSubmission = useCallback(() => {
+    const currentInput = inputRef.current?.value ?? "";
+    return currentInput.length === 0 && currentAttachmentsRef.current.length === 0;
+  }, []);
+
   const restoreComposerFromEditDraft = useCallback(
     (draft: { text: string; attachments: ChatAttachment[]; planMode: boolean }) => {
       setInput(draft.text);
@@ -2714,6 +2745,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       outputSchemaText: string;
       customApprovalPolicyText: string;
       openCodeAgent: string;
+      onAccepted?: () => void;
     }): Promise<"sent" | "prompted" | "failed"> => {
       if (
         options.thread.repoId === null &&
@@ -2782,6 +2814,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         attachments: options.attachments.length > 0 ? options.attachments : undefined,
         inputItems: options.inputItems,
         planMode: options.planMode,
+        onAccepted: options.onAccepted,
       });
       if (!sent) {
         return "failed";
@@ -4974,18 +5007,26 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       }
 
       const inputItems = await resolveCodexInputItems(text, "codex");
+      let accepted = false;
       const steered = await steer(text, {
         threadIdOverride: activeThreadId,
         attachments: currentAttachments.length > 0 ? currentAttachments : undefined,
         inputItems,
         planMode,
+        onAccepted: () => {
+          accepted = true;
+          clearAcceptedComposerSubmission(text);
+        },
       });
       if (steered) {
-        recordSubmittedInput(text);
-        inputHistCursorRef.current = -1;
-        inputLiveDraftRef.current = "";
-        setInput("");
-        setAttachments([]);
+        if (!accepted) {
+          clearAcceptedComposerSubmission(text);
+        }
+      } else if (accepted && canRestoreAcceptedComposerSubmission()) {
+        restoreAcceptedComposerSubmission({
+          text,
+          attachments: currentAttachments,
+        });
       }
       return;
     }
@@ -5080,6 +5121,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       useThreadStore.getState().threads.find((thread) => thread.id === currentThreadId) ??
       currentThread;
 
+    let accepted = false;
     const submission = await sendPreparedTurn({
       text,
       attachments: currentAttachments,
@@ -5094,13 +5136,20 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       outputSchemaText,
       customApprovalPolicyText,
       openCodeAgent: selectedOpenCodeAgentRef.current,
+      onAccepted: () => {
+        accepted = true;
+        clearAcceptedComposerSubmission(text);
+      },
     });
     if (submission === "sent") {
-      recordSubmittedInput(text);
-      inputHistCursorRef.current = -1;
-      inputLiveDraftRef.current = "";
-      setInput("");
-      setAttachments([]);
+      if (!accepted) {
+        clearAcceptedComposerSubmission(text);
+      }
+    } else if (submission === "failed" && accepted && canRestoreAcceptedComposerSubmission()) {
+      restoreAcceptedComposerSubmission({
+        text,
+        attachments: currentAttachments,
+      });
     }
   }
 
@@ -5109,6 +5158,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     if (!prompt) return;
     setWorkspaceOptInPrompt(null);
 
+    let accepted = false;
     try {
       await ipc.confirmWorkspaceThread(prompt.threadId, prompt.threadPaths);
 
@@ -5144,21 +5194,40 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         attachments: prompt.attachments.length > 0 ? prompt.attachments : undefined,
         inputItems: prompt.inputItems ?? undefined,
         planMode: promptPlanMode,
+        onAccepted: () => {
+          accepted = true;
+          clearAcceptedComposerSubmission(prompt.text);
+        },
       });
       if (!sent) {
-        setInput(prompt.text);
-        setAttachments(prompt.attachments);
+        if (accepted && canRestoreAcceptedComposerSubmission()) {
+          restoreAcceptedComposerSubmission({
+            text: prompt.text,
+            attachments: prompt.attachments,
+          });
+        } else if (!accepted) {
+          setInput(prompt.text);
+          setAttachments(prompt.attachments);
+        }
         return;
       }
 
       pendingPlanImplementationThreadIdRef.current = promptPlanMode ? prompt.threadId : null;
-      setInput("");
-      setAttachments([]);
+      if (!accepted) {
+        clearAcceptedComposerSubmission(prompt.text);
+      }
 
       await refreshThreads(prompt.workspaceId);
     } catch {
-      setInput(prompt.text);
-      setAttachments(prompt.attachments);
+      if (accepted && canRestoreAcceptedComposerSubmission()) {
+        restoreAcceptedComposerSubmission({
+          text: prompt.text,
+          attachments: prompt.attachments,
+        });
+      } else if (!accepted) {
+        setInput(prompt.text);
+        setAttachments(prompt.attachments);
+      }
     }
   }
 

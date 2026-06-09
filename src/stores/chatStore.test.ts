@@ -131,6 +131,22 @@ describe("chatStore send", () => {
     await expect(sendPromise).resolves.toBe(true);
   });
 
+  it("notifies when a submitted turn is accepted into local chat state", async () => {
+    const pendingRequest = deferred<string>();
+    const onAccepted = vi.fn();
+    mockIpc.sendMessage.mockReturnValueOnce(pendingRequest.promise);
+
+    const sendPromise = useChatStore.getState().send("hello", {
+      onAccepted,
+    });
+
+    expect(onAccepted).toHaveBeenCalledTimes(1);
+    expect(useChatStore.getState().messages).toHaveLength(2);
+
+    pendingRequest.resolve("assistant-message-id");
+    await expect(sendPromise).resolves.toBe(true);
+  });
+
   it("removes the optimistic turn if the turn request fails", async () => {
     mockIpc.sendMessage.mockRejectedValueOnce(new Error("send failed"));
 
@@ -1743,6 +1759,47 @@ describe("chatStore send", () => {
       }),
     ]);
     expect(useChatStore.getState().error).toContain("steer failed");
+  });
+
+  it("notifies when a steer is accepted into local chat state", async () => {
+    useChatStore.setState({
+      threadId: "thread-1",
+      messages: [
+        {
+          id: "assistant-1",
+          threadId: "thread-1",
+          role: "assistant",
+          status: "streaming",
+          schemaVersion: 1,
+          blocks: [],
+          createdAt: new Date().toISOString(),
+          hydration: "full",
+          hasDeferredContent: false,
+        },
+      ],
+      olderCursor: null,
+      hasOlderMessages: false,
+      loadingOlderMessages: false,
+      olderLoadBlockedUntil: 0,
+      status: "streaming",
+      streaming: true,
+      usageLimits: null,
+      error: undefined,
+      unlisten: undefined,
+    });
+    const pendingRequest = deferred<void>();
+    const onAccepted = vi.fn();
+    mockIpc.steerMessage.mockReturnValueOnce(pendingRequest.promise);
+
+    const steerPromise = useChatStore.getState().steer("follow up", {
+      onAccepted,
+    });
+
+    expect(onAccepted).toHaveBeenCalledTimes(1);
+    expect(useChatStore.getState().messages[0].blocks).toHaveLength(1);
+
+    pendingRequest.resolve();
+    await expect(steerPromise).resolves.toBe(true);
   });
 
   it("folds persisted steer messages into the preceding completed assistant when binding", async () => {

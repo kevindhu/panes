@@ -54,6 +54,7 @@ interface ChatState {
       attachments?: ChatAttachment[];
       inputItems?: ChatInputItem[];
       planMode?: boolean;
+      onAccepted?: () => void;
     },
   ) => Promise<boolean>;
   steer: (
@@ -63,6 +64,7 @@ interface ChatState {
       attachments?: ChatAttachment[];
       inputItems?: ChatInputItem[];
       planMode?: boolean;
+      onAccepted?: () => void;
     },
   ) => Promise<boolean>;
   cancel: () => Promise<void>;
@@ -75,6 +77,17 @@ const STREAM_EVENT_BATCH_WINDOW_MS = 16;
 const STREAM_EVENT_QUEUE_FLUSH_THRESHOLD = 500;
 const CONTEXT_USAGE_CACHE_METADATA_KEY = "contextUsageCache";
 let lastKnownCodexAccountUsageWindows: ContextUsage | null = null;
+
+function notifyTurnAccepted(onAccepted: (() => void) | undefined) {
+  if (!onAccepted) {
+    return;
+  }
+  try {
+    onAccepted();
+  } catch (error) {
+    console.warn("Accepted turn callback failed", error);
+  }
+}
 
 /**
  * Background listeners for threads that are still streaming when the user switches away.
@@ -3013,6 +3026,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       streaming: true,
       error: undefined
     }));
+    notifyTurnAccepted(options?.onAccepted);
     schedulePendingTurnShellMetric(threadId, clientTurnId);
 
     try {
@@ -3073,6 +3087,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       ),
       error: undefined,
     }));
+    notifyTurnAccepted(options?.onAccepted);
 
     try {
       await ipc.steerMessage(

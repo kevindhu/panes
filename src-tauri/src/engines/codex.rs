@@ -77,6 +77,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const TURN_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const HEALTH_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(12);
 const LOGIN_SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const STREAM_LOST_RECOVERY_RETRY_DELAYS_SECS: &[u64] = &[2, 5, 10, 20, 30, 45, 60];
 const TRANSPORT_RESTART_MAX_ATTEMPTS: usize = 3;
 const TRANSPORT_RESTART_BASE_BACKOFF: Duration = Duration::from_millis(250);
 const TRANSPORT_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(2);
@@ -225,6 +226,8 @@ struct ReconciledTurnCompletion {
     status: TurnCompletionStatus,
     error_message: Option<String>,
     assistant_blocks: Option<Vec<serde_json::Value>>,
+    completed_at: Option<i64>,
+    duration_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2082,6 +2085,16 @@ impl CodexEngine {
             .await
         {
             Ok(Some(reconciled)) => {
+                let reconciled = self
+                    .wait_for_verified_reconciled_turn_completion(
+                        engine_thread_id,
+                        expected_turn_id,
+                        event_tx,
+                        reason,
+                        mode,
+                        reconciled,
+                    )
+                    .await;
                 log::warn!(
                     "reconciled codex turn completion for thread {engine_thread_id} after {reason}: status={:?}",
                     reconciled.status
@@ -2100,6 +2113,81 @@ impl CodexEngine {
                 false
             }
         }
+    }
+
+    async fn wait_for_verified_reconciled_turn_completion(
+        &self,
+        engine_thread_id: &str,
+        expected_turn_id: &str,
+        event_tx: &mpsc::Sender<EngineEvent>,
+        reason: &str,
+        mode: TurnCompletionRecoveryMode,
+        mut reconciled: ReconciledTurnCompletion,
+    ) -> ReconciledTurnCompletion {
+        if !is_provisional_stream_lost_interrupted_recovery(&reconciled, mode) {
+            return reconciled;
+        }
+
+        if let Some(blocks) = reconciled
+            .assistant_blocks
+            .as_ref()
+            .filter(|blocks| !blocks.is_empty())
+            .cloned()
+        {
+            event_tx
+                .send(EngineEvent::TurnSnapshotRecovered { blocks })
+                .await
+                .ok();
+            event_tx
+                .send(EngineEvent::Notice {
+                    kind: "codex_turn_recovery".to_string(),
+                    level: "info".to_string(),
+                    title: "Reconnecting to Codex".to_string(),
+                    message:
+                        "Panes lost the live Codex stream and is verifying the final turn state."
+                            .to_string(),
+                    details: Some(vec![format!("Recovery reason: {reason}")]),
+                })
+                .await
+                .ok();
+        }
+
+        for delay_secs in STREAM_LOST_RECOVERY_RETRY_DELAYS_SECS {
+            tokio::time::sleep(Duration::from_secs(*delay_secs)).await;
+
+            match self
+                .reconcile_turn_completion_via_history(engine_thread_id, Some(expected_turn_id))
+                .await
+            {
+                Ok(Some(next)) => {
+                    if is_provisional_stream_lost_interrupted_recovery(&next, mode) {
+                        reconciled = next;
+                        continue;
+                    }
+
+                    log::warn!(
+                        "verified codex turn completion for thread {engine_thread_id} after provisional stream-loss recovery: status={:?}",
+                        next.status
+                    );
+                    return next;
+                }
+                Ok(None) => {
+                    log::debug!(
+                        "codex turn completion still unavailable for thread {engine_thread_id} during stream-loss recovery retry"
+                    );
+                }
+                Err(error) => {
+                    log::warn!(
+                        "failed codex stream-loss recovery retry for thread {engine_thread_id}: {error}"
+                    );
+                }
+            }
+        }
+
+        log::warn!(
+            "codex turn completion for thread {engine_thread_id} stayed provisional after stream-loss recovery retries"
+        );
+        reconciled
     }
 
     pub async fn set_thread_name(
@@ -4490,6 +4578,8 @@ fn extract_reconciled_turn_completion_from_turns(
         status,
         error_message: extract_nested_string(selected, &["error", "message"]),
         assistant_blocks: extract_recovered_assistant_blocks_from_turn(selected),
+        completed_at: extract_any_i64(selected, &["completedAt", "completed_at"]),
+        duration_ms: extract_any_i64(selected, &["durationMs", "duration_ms"]),
     })
 }
 
@@ -4512,20 +4602,21 @@ fn build_reconciled_turn_completion_events(
 ) -> Vec<EngineEvent> {
     let mut events = Vec::new();
     let recovered_blocks = reconciled.assistant_blocks.clone();
+    let error_message = reconciled.error_message.clone();
+    let mut synthetic_error_message = None;
+    let provisional_interrupted =
+        is_provisional_stream_lost_interrupted_recovery(&reconciled, mode);
 
-    if let Some(message) = reconciled.error_message {
-        events.push(EngineEvent::Error {
-            message,
-            recoverable: true,
-        });
-    }
-
-    let source = match (mode, recovered_blocks.as_ref()) {
-        (TurnCompletionRecoveryMode::StreamLost, Some(blocks)) if !blocks.is_empty() => {
+    let source = match (mode, &reconciled.status, recovered_blocks.as_ref()) {
+        (TurnCompletionRecoveryMode::StreamLost, TurnCompletionStatus::Completed, Some(blocks))
+            if !blocks.is_empty() =>
+        {
             TurnCompletionSource::RecoveredSnapshot
         }
-        (TurnCompletionRecoveryMode::StreamLost, _) => TurnCompletionSource::ReconciledStreamLost,
-        (TurnCompletionRecoveryMode::CompletionTimeout, _) => {
+        (TurnCompletionRecoveryMode::StreamLost, _, _) => {
+            TurnCompletionSource::ReconciledStreamLost
+        }
+        (TurnCompletionRecoveryMode::CompletionTimeout, _, _) => {
             TurnCompletionSource::ReconciledTimeout
         }
     };
@@ -4533,12 +4624,16 @@ fn build_reconciled_turn_completion_events(
     let status = if source == TurnCompletionSource::ReconciledStreamLost
         && reconciled.status == TurnCompletionStatus::Completed
     {
-        events.push(EngineEvent::Error {
-            message:
-                "Codex finished after Panes lost the live event stream, so the transcript may be incomplete."
-                    .to_string(),
-            recoverable: true,
-        });
+        synthetic_error_message = Some(
+            "Codex finished after Panes lost the live event stream, so the transcript may be incomplete."
+                .to_string(),
+        );
+        TurnCompletionStatus::Failed
+    } else if provisional_interrupted {
+        synthetic_error_message = Some(
+            "Panes lost the live Codex stream and could not verify Codex's final turn state."
+                .to_string(),
+        );
         TurnCompletionStatus::Failed
     } else {
         reconciled.status
@@ -4548,6 +4643,20 @@ fn build_reconciled_turn_completion_events(
         events.push(EngineEvent::TurnSnapshotRecovered { blocks });
     }
 
+    if let Some(message) = error_message {
+        events.push(EngineEvent::Error {
+            message,
+            recoverable: true,
+        });
+    }
+
+    if let Some(message) = synthetic_error_message {
+        events.push(EngineEvent::Error {
+            message,
+            recoverable: true,
+        });
+    }
+
     events.push(EngineEvent::TurnCompleted {
         token_usage: None,
         status,
@@ -4555,6 +4664,21 @@ fn build_reconciled_turn_completion_events(
     });
 
     events
+}
+
+fn is_provisional_stream_lost_interrupted_recovery(
+    reconciled: &ReconciledTurnCompletion,
+    mode: TurnCompletionRecoveryMode,
+) -> bool {
+    mode == TurnCompletionRecoveryMode::StreamLost
+        && reconciled.status == TurnCompletionStatus::Interrupted
+        && reconciled.error_message.is_none()
+        && reconciled.completed_at.is_none()
+        && reconciled.duration_ms.is_none()
+        && reconciled
+            .assistant_blocks
+            .as_ref()
+            .is_some_and(|blocks| !blocks.is_empty())
 }
 
 #[cfg(test)]
@@ -7464,6 +7588,8 @@ mod tests {
                     "type": "error",
                     "message": "permission denied",
                 })]),
+                completed_at: None,
+                duration_ms: None,
             }
         );
     }
@@ -7546,12 +7672,42 @@ mod tests {
     }
 
     #[test]
+    fn extract_reconciled_turn_completion_preserves_interruption_metadata() {
+        let reconciled = extract_reconciled_turn_completion(
+            &json!({
+                "thread": {
+                    "turns": [
+                        {
+                            "id": "turn-active",
+                            "status": "interrupted",
+                            "completedAt": 1_780_000_000,
+                            "durationMs": 42_000
+                        }
+                    ]
+                }
+            }),
+            Some("turn-active"),
+        )
+        .expect("expected interrupted turn");
+
+        assert_eq!(reconciled.status, TurnCompletionStatus::Interrupted);
+        assert_eq!(reconciled.completed_at, Some(1_780_000_000));
+        assert_eq!(reconciled.duration_ms, Some(42_000));
+        assert!(!is_provisional_stream_lost_interrupted_recovery(
+            &reconciled,
+            TurnCompletionRecoveryMode::StreamLost
+        ));
+    }
+
+    #[test]
     fn build_reconciled_turn_completion_events_marks_lost_completed_turn_failed() {
         let events = build_reconciled_turn_completion_events(
             ReconciledTurnCompletion {
                 status: TurnCompletionStatus::Completed,
                 error_message: None,
                 assistant_blocks: None,
+                completed_at: Some(1_780_000_000),
+                duration_ms: Some(42_000),
             },
             TurnCompletionRecoveryMode::StreamLost,
         );
@@ -7607,6 +7763,8 @@ mod tests {
                         "durationMs": 10
                     }
                 })]),
+                completed_at: Some(1_780_000_000),
+                duration_ms: Some(42_000),
             },
             TurnCompletionRecoveryMode::StreamLost,
         );
@@ -7640,12 +7798,66 @@ mod tests {
     }
 
     #[test]
+    fn build_reconciled_turn_completion_events_does_not_trust_provisional_interrupted_snapshot() {
+        let events = build_reconciled_turn_completion_events(
+            ReconciledTurnCompletion {
+                status: TurnCompletionStatus::Interrupted,
+                error_message: None,
+                assistant_blocks: Some(vec![serde_json::json!({
+                    "type": "text",
+                    "content": "partial response"
+                })]),
+                completed_at: None,
+                duration_ms: None,
+            },
+            TurnCompletionRecoveryMode::StreamLost,
+        );
+
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[0],
+            EngineEvent::TurnSnapshotRecovered { blocks }
+                if blocks
+                    .first()
+                    .and_then(|block| block.get("content"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("partial response")
+        ));
+        match &events[1] {
+            EngineEvent::Error {
+                message,
+                recoverable,
+            } => {
+                assert!(message.contains("could not verify"));
+                assert!(*recoverable);
+            }
+            other => panic!("expected warning error event, got {other:?}"),
+        }
+        match &events[2] {
+            EngineEvent::TurnCompleted {
+                status,
+                diagnostics,
+                ..
+            } => {
+                assert_eq!(*status, TurnCompletionStatus::Failed);
+                assert_eq!(
+                    diagnostics.as_ref().map(|value| &value.source),
+                    Some(&TurnCompletionSource::ReconciledStreamLost)
+                );
+            }
+            other => panic!("expected turn completed event, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn build_reconciled_turn_completion_events_keeps_timeout_completion_status() {
         let events = build_reconciled_turn_completion_events(
             ReconciledTurnCompletion {
                 status: TurnCompletionStatus::Completed,
                 error_message: Some("remote failure".to_string()),
                 assistant_blocks: None,
+                completed_at: Some(1_780_000_000),
+                duration_ms: Some(42_000),
             },
             TurnCompletionRecoveryMode::CompletionTimeout,
         );
