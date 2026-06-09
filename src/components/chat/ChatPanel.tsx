@@ -154,19 +154,55 @@ function selectionEndpointInsideElement(
 }
 
 export function hasActiveTextSelectionInsideElement(element: HTMLElement | null): boolean {
+  return getActiveTextSelectionRangeInsideElement(element) !== null;
+}
+
+export function getActiveTextSelectionRangeInsideElement(
+  element: HTMLElement | null,
+): Range | null {
   if (!element) {
-    return false;
+    return null;
   }
 
   const selection = window.getSelection?.();
   if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+    return null;
+  }
+
+  for (let index = 0; index < selection.rangeCount; index += 1) {
+    const range = selection.getRangeAt(index);
+    try {
+      if (range.intersectsNode(element)) {
+        return range.cloneRange();
+      }
+    } catch {
+      // Fall back to endpoint checks below if the browser rejects intersectsNode.
+    }
+  }
+
+  const endpointInside =
+    selectionEndpointInsideElement(element, selection.anchorNode) ||
+    selectionEndpointInsideElement(element, selection.focusNode);
+  return endpointInside ? selection.getRangeAt(0).cloneRange() : null;
+}
+
+function rangeIsConnected(range: Range): boolean {
+  return range.startContainer.isConnected && range.endContainer.isConnected;
+}
+
+export function restoreTextSelectionRange(range: Range | null): boolean {
+  if (!range || !rangeIsConnected(range)) {
     return false;
   }
 
-  return (
-    selectionEndpointInsideElement(element, selection.anchorNode) ||
-    selectionEndpointInsideElement(element, selection.focusNode)
-  );
+  const selection = window.getSelection?.();
+  if (!selection) {
+    return false;
+  }
+
+  selection.removeAllRanges();
+  selection.addRange(range);
+  return true;
 }
 const LazyTerminalPanel = lazy(() =>
   import("../terminal/TerminalPanel").then((module) => ({
@@ -2109,6 +2145,9 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const prependLoadInFlightRef = useRef(false);
   const threadActivatedAtRef = useRef(0);
   const initialScrollThreadRef = useRef<string | null>(null);
+  const preservedSelectionRangeRef = useRef<Range | null>(null);
+  const preservedSelectionUntilRef = useRef(0);
+  const selectionRestoreRafRef = useRef<number | null>(null);
   const messageHeightsRef = useRef<Map<string, number>>(new Map());
   const layoutVersionRafRef = useRef<number | null>(null);
   const threadExecutionPolicyRequestIdsRef = useRef<Record<string, number>>({});
@@ -3547,20 +3586,56 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     }
 
     let rafId = 0;
+    const preserveSelectionRange = () => {
+      const range = getActiveTextSelectionRangeInsideElement(viewport);
+      if (!range) {
+        return false;
+      }
+
+      preservedSelectionRangeRef.current = range;
+      preservedSelectionUntilRef.current = performance.now() + 1500;
+      return true;
+    };
+    const scheduleSelectionRestore = () => {
+      if (
+        !preservedSelectionRangeRef.current ||
+        performance.now() > preservedSelectionUntilRef.current ||
+        selectionRestoreRafRef.current !== null
+      ) {
+        return;
+      }
+
+      selectionRestoreRafRef.current = window.requestAnimationFrame(() => {
+        selectionRestoreRafRef.current = null;
+        if (performance.now() > preservedSelectionUntilRef.current) {
+          preservedSelectionRangeRef.current = null;
+          return;
+        }
+        if (!restoreTextSelectionRange(preservedSelectionRangeRef.current)) {
+          preservedSelectionRangeRef.current = null;
+        }
+      });
+    };
     const updateScroll = () => {
+      const selectionActive = preserveSelectionRange();
       const scrollTop = viewport.scrollTop;
       viewportScrollTopRef.current = scrollTop;
       const nearBottom =
         scrollTop + viewport.clientHeight >= viewport.scrollHeight - 120;
-      setAutoScrollLocked((current) => {
-        const next = !nearBottom;
-        return current === next ? current : next;
-      });
+      if (!selectionActive) {
+        setAutoScrollLocked((current) => {
+          const next = !nearBottom;
+          return current === next ? current : next;
+        });
+      }
       if (
         scrollTop <= 80 &&
-        !hasActiveTextSelectionInsideElement(viewport)
+        !selectionActive
       ) {
         setNearTopLoadRequest((request) => request + 1);
+      }
+      if (selectionActive) {
+        scheduleSelectionRestore();
       }
     };
     const updateHeight = () => {
@@ -3579,8 +3654,17 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         updateScroll();
       });
     };
+    const onWheel = (event: WheelEvent) => {
+      if (event.buttons !== 0) {
+        return;
+      }
+      if (preserveSelectionRange()) {
+        scheduleSelectionRestore();
+      }
+    };
 
     viewport.addEventListener("scroll", onScroll, { passive: true });
+    viewport.addEventListener("wheel", onWheel, { passive: true });
 
     let resizeObserver: ResizeObserver | null = null;
     if (typeof ResizeObserver !== "undefined") {
@@ -3592,8 +3676,13 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
     return () => {
       viewport.removeEventListener("scroll", onScroll);
+      viewport.removeEventListener("wheel", onWheel);
       if (rafId !== 0) {
         window.cancelAnimationFrame(rafId);
+      }
+      if (selectionRestoreRafRef.current !== null) {
+        window.cancelAnimationFrame(selectionRestoreRafRef.current);
+        selectionRestoreRafRef.current = null;
       }
       if (resizeObserver) {
         resizeObserver.disconnect();
@@ -5471,6 +5560,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
     const { offsets, rowCount } = virtualizedLayout;
 
+    const viewportScrollTop = viewportScrollTopRef.current;
     const visibleStart = Math.max(0, viewportScrollTop - MESSAGE_OVERSCAN_PX);
     const visibleEnd =
       viewportScrollTop + viewportHeight + MESSAGE_OVERSCAN_PX;
@@ -5514,7 +5604,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   }, [
     virtualizedLayout,
     viewportHeight,
-    viewportScrollTop,
   ]);
 
   const visibleMessages = useMemo(() => {

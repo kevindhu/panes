@@ -45,7 +45,13 @@ vi.mock("../../stores/toastStore", () => ({
   },
 }));
 
-import { MessageRowView, shouldVirtualizeMessages } from "./ChatPanel";
+import {
+  MessageRowView,
+  getActiveTextSelectionRangeInsideElement,
+  hasActiveTextSelectionInsideElement,
+  restoreTextSelectionRange,
+  shouldVirtualizeMessages,
+} from "./ChatPanel";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -270,5 +276,94 @@ describe("shouldVirtualizeMessages", () => {
   it("keeps long transcripts fully mounted", () => {
     expect(shouldVirtualizeMessages(114, false)).toBe(false);
     expect(shouldVirtualizeMessages(80, true)).toBe(false);
+  });
+});
+
+describe("hasActiveTextSelectionInsideElement", () => {
+  afterEach(() => {
+    window.getSelection()?.removeAllRanges();
+  });
+
+  it("detects non-collapsed selections anchored inside the chat viewport", () => {
+    const viewport = document.createElement("div");
+    const paragraph = document.createElement("p");
+    paragraph.textContent = "selected chat text";
+    viewport.appendChild(paragraph);
+    document.body.appendChild(viewport);
+
+    const range = document.createRange();
+    range.setStart(paragraph.firstChild!, 0);
+    range.setEnd(paragraph.firstChild!, 8);
+
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+
+    expect(hasActiveTextSelectionInsideElement(viewport)).toBe(true);
+    expect(getActiveTextSelectionRangeInsideElement(viewport)?.toString()).toBe(
+      "selected",
+    );
+
+    selection?.removeAllRanges();
+    document.body.removeChild(viewport);
+  });
+
+  it("restores a preserved selection range after the current selection changes", () => {
+    const viewport = document.createElement("div");
+    const paragraph = document.createElement("p");
+    paragraph.textContent = "selected chat text";
+    viewport.appendChild(paragraph);
+    document.body.appendChild(viewport);
+
+    const originalRange = document.createRange();
+    originalRange.setStart(paragraph.firstChild!, 0);
+    originalRange.setEnd(paragraph.firstChild!, 8);
+
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(originalRange);
+    const preservedRange = getActiveTextSelectionRangeInsideElement(viewport);
+
+    const changedRange = document.createRange();
+    changedRange.setStart(paragraph.firstChild!, 0);
+    changedRange.setEnd(paragraph.firstChild!, paragraph.textContent!.length);
+    selection?.removeAllRanges();
+    selection?.addRange(changedRange);
+
+    expect(selection?.toString()).toBe("selected chat text");
+    expect(restoreTextSelectionRange(preservedRange)).toBe(true);
+    expect(selection?.toString()).toBe("selected");
+
+    selection?.removeAllRanges();
+    document.body.removeChild(viewport);
+  });
+
+  it("ignores collapsed and outside selections", () => {
+    const viewport = document.createElement("div");
+    const outside = document.createElement("p");
+    viewport.textContent = "chat";
+    outside.textContent = "outside";
+    document.body.appendChild(viewport);
+    document.body.appendChild(outside);
+
+    const selection = window.getSelection();
+    const collapsedRange = document.createRange();
+    collapsedRange.setStart(viewport.firstChild!, 1);
+    collapsedRange.collapse(true);
+    selection?.removeAllRanges();
+    selection?.addRange(collapsedRange);
+
+    expect(hasActiveTextSelectionInsideElement(viewport)).toBe(false);
+
+    const outsideRange = document.createRange();
+    outsideRange.setStart(outside.firstChild!, 0);
+    outsideRange.setEnd(outside.firstChild!, 4);
+    selection?.removeAllRanges();
+    selection?.addRange(outsideRange);
+
+    expect(hasActiveTextSelectionInsideElement(viewport)).toBe(false);
+
+    document.body.removeChild(viewport);
+    document.body.removeChild(outside);
   });
 });
