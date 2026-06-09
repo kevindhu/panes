@@ -77,6 +77,7 @@ import {
 } from "./messageEditBranching";
 import {
   getPlanImplementationCodingMessage,
+  shouldClearPendingPlanImplementationPrompt,
   shouldPromptToImplementPlan,
 } from "./planModePrompt";
 import { buildComposerRuntimeSnapshot } from "./composerRuntime";
@@ -3188,7 +3189,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     const armedThreadId = pendingPlanImplementationThreadIdRef.current;
     if (
       shouldPromptToImplementPlan({
-        wasStreaming,
         streaming,
         status,
         activeThreadId: threadId,
@@ -3229,7 +3229,12 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       return;
     }
 
-    if (wasStreaming && !streaming && armedThreadId === threadId && status !== "completed") {
+    if (
+      wasStreaming &&
+      !streaming &&
+      armedThreadId === threadId &&
+      shouldClearPendingPlanImplementationPrompt(status)
+    ) {
       pendingPlanImplementationThreadIdRef.current = null;
     }
   }, [

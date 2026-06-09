@@ -71,11 +71,6 @@ body {
   overflow-x: hidden;
 }
 
-body.locale-fading > *:not(nav) {
-  opacity: 0;
-  transition: opacity 0.15s ease;
-}
-
 a { text-decoration: none; color: inherit; }
 button { font: inherit; background: none; border: none; cursor: pointer; color: inherit; }
 img { display: block; max-width: 100%; }
@@ -186,35 +181,6 @@ button:focus-visible {
   display: flex;
   align-items: center;
   gap: 12px;
-}
-
-.lang-switcher {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  padding: 3px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.03);
-}
-
-.lang-switcher-btn {
-  padding: 4px 8px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.03em;
-  color: var(--text-3);
-  transition: background 0.2s, color 0.2s;
-}
-
-.lang-switcher-btn:hover {
-  color: var(--text-1);
-}
-
-.lang-switcher-btn.is-active {
-  background: var(--accent-dim);
-  color: var(--accent);
 }
 
 .btn-download {

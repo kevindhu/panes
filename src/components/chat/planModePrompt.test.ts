@@ -4,6 +4,7 @@ import {
   getPlanImplementationCodingMessage,
   latestAssistantMessage,
   messageHasStructuredPlan,
+  shouldClearPendingPlanImplementationPrompt,
   shouldPromptToImplementPlan,
 } from "./planModePrompt";
 
@@ -129,7 +130,6 @@ describe("planModePrompt", () => {
 
     expect(
       shouldPromptToImplementPlan({
-        wasStreaming: true,
         streaming: false,
         status: "completed",
         activeThreadId: "thread-1",
@@ -166,7 +166,6 @@ describe("planModePrompt", () => {
 
     expect(
       shouldPromptToImplementPlan({
-        wasStreaming: true,
         streaming: false,
         status: "completed",
         activeThreadId: "thread-1",
@@ -184,7 +183,6 @@ describe("planModePrompt", () => {
 
     expect(
       shouldPromptToImplementPlan({
-        wasStreaming: true,
         streaming: false,
         status: "completed",
         activeThreadId: "thread-1",
@@ -196,7 +194,6 @@ describe("planModePrompt", () => {
 
     expect(
       shouldPromptToImplementPlan({
-        wasStreaming: true,
         streaming: false,
         status: "completed",
         activeThreadId: "thread-1",
@@ -208,7 +205,6 @@ describe("planModePrompt", () => {
 
     expect(
       shouldPromptToImplementPlan({
-        wasStreaming: true,
         streaming: false,
         status: "error",
         activeThreadId: "thread-1",
@@ -246,7 +242,6 @@ describe("planModePrompt", () => {
 
     expect(
       shouldPromptToImplementPlan({
-        wasStreaming: true,
         streaming: false,
         status: "completed",
         activeThreadId: "thread-1",
@@ -267,6 +262,40 @@ describe("planModePrompt", () => {
           planAssistant,
           trailingAssistant,
         ],
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps the implementation prompt armed while a plan turn waits for user input", () => {
+    expect(shouldClearPendingPlanImplementationPrompt("awaiting_approval")).toBe(false);
+    expect(shouldClearPendingPlanImplementationPrompt("streaming")).toBe(false);
+    expect(shouldClearPendingPlanImplementationPrompt("completed")).toBe(false);
+    expect(shouldClearPendingPlanImplementationPrompt("idle")).toBe(true);
+    expect(shouldClearPendingPlanImplementationPrompt("error")).toBe(true);
+  });
+
+  it("prompts after a user-input pause even without a fresh streaming transition", () => {
+    const latestAssistant = buildAssistantMessage(
+      [
+        "# Remove Legacy Locale Support",
+        "",
+        "## Summary",
+        "Make the app English-only.",
+        "",
+        "## Key Changes",
+        "- Remove legacy locale resources.",
+        "- Remove language switching.",
+      ].join("\n"),
+    );
+
+    expect(
+      shouldPromptToImplementPlan({
+        streaming: false,
+        status: "completed",
+        activeThreadId: "thread-1",
+        armedThreadId: "thread-1",
+        engineId: "codex",
+        messages: [latestAssistant],
       }),
     ).toBe(true);
   });

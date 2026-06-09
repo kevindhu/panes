@@ -5,10 +5,6 @@
 <h1 align="center">Panes</h1>
 
 <p align="center">
-  <strong>English</strong> &bull; <a href="./README.pt-BR.md">Português (Brasil)</a>
-</p>
-
-<p align="center">
   <strong>The local-first cockpit for AI-assisted coding.</strong>
 </p>
 
@@ -220,13 +216,13 @@ Generated build artifacts can grow quickly during Tauri/Rust development. `pnpm 
 | Windows: `%LOCALAPPDATA%\Panes\workspaces.db` | SQLite database |
 | Windows: `%LOCALAPPDATA%\Panes\logs` | App log directory |
 
-### Localization
+### User-facing copy
 
-User-facing frontend copy is localized with `i18next`/`react-i18next`. Treat i18n as part of the implementation of every new feature, not as cleanup work after the UI is already built.
+User-facing frontend copy is managed with `i18next`/`react-i18next`. Treat resource updates as part of the implementation of every new feature, not as cleanup work after the UI is already built.
 
 - Do not ship new visible UI strings hardcoded in components, dialogs, menus, toasts, or empty states
-- Add or update translation keys in both `src/i18n/resources/en/` and `src/i18n/resources/pt-BR/`
-- Reuse the existing namespace structure whenever possible and keep keys aligned across locales
+- Add or update English resource keys in `src/i18n/resources/en/`
+- Reuse the existing namespace structure whenever possible
 - Keep the i18n resource test passing when copy changes
 
 ## Architecture
@@ -254,7 +250,7 @@ The app currently exposes Codex and Claude as chat engines. Codex talks to `code
 
 Contributions are welcome. Use the pull request flow described in [CONTRIBUTING.md](./CONTRIBUTING.md).
 
-All external changes should go through a reviewed pull request. If the change adds or edits user-facing copy, update both locale resource sets as part of the same change.
+All external changes should go through a reviewed pull request. If the change adds or edits user-facing copy, update the English resource files as part of the same change.
 
 ## License
 

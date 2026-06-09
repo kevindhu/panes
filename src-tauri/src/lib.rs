@@ -30,7 +30,6 @@ use git::repo::FileTreeCache;
 use git::watcher::GitWatcherManager;
 #[cfg(target_os = "macos")]
 use locale::native_strings;
-use locale::resolve_app_locale;
 use models::{EngineRuntimeUpdatedDto, RuntimeToastDto, ThreadDto, ThreadStatusDto};
 use power::KeepAwakeManager;
 use state::{AppState, TurnManager};
@@ -64,7 +63,6 @@ pub fn run() {
         }
     }
     let app_config = AppConfig::load_or_create().expect("failed to load config");
-    let app_locale = resolve_app_locale(app_config.general.locale.as_deref());
     let keep_awake = Arc::new(KeepAwakeManager::new());
     if let Err(error) = keep_awake.reclaim_stale_helpers() {
         log::warn!("failed to reclaim stale keep awake helper: {error}");
@@ -101,7 +99,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(app_state)
-        .menu(move |handle| build_app_menu(handle, app_locale))
+        .menu(build_app_menu)
         .setup(|app| {
             let main_window_config = app
                 .config()
@@ -177,8 +175,6 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::app::get_app_locale,
-            commands::app::set_app_locale,
             commands::power::get_keep_awake_state,
             commands::power::set_keep_awake_enabled,
             commands::power::get_power_settings,
@@ -892,16 +888,15 @@ where
         .map_err(|error| error.to_string())
 }
 
-fn build_app_menu(handle: &tauri::AppHandle, locale: &str) -> tauri::Result<Menu<tauri::Wry>> {
+fn build_app_menu(handle: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
-        let _ = locale;
         return Menu::with_items(handle, &[]);
     }
 
     #[cfg(target_os = "macos")]
     {
-        let strings = native_strings(locale);
+        let strings = native_strings();
 
         let app_menu = SubmenuBuilder::new(handle, strings.app_menu)
             .about(Some(AboutMetadata {

@@ -23,7 +23,7 @@ List any checks you intentionally skipped.
 ## Localization
 
 - [ ] No new user-facing copy
-- [ ] Updated both `src/i18n/resources/en/` and `src/i18n/resources/pt-BR/`
+- [ ] Updated English resources under `src/i18n/resources/en/`
 
 ## Notes for review
 

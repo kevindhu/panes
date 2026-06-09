@@ -6,13 +6,6 @@ import workspaceEn from "./resources/en/workspace.json";
 import setupEn from "./resources/en/setup.json";
 import gitEn from "./resources/en/git.json";
 import nativeEn from "./resources/en/native.json";
-import commonPtBr from "./resources/pt-BR/common.json";
-import appPtBr from "./resources/pt-BR/app.json";
-import chatPtBr from "./resources/pt-BR/chat.json";
-import workspacePtBr from "./resources/pt-BR/workspace.json";
-import setupPtBr from "./resources/pt-BR/setup.json";
-import gitPtBr from "./resources/pt-BR/git.json";
-import nativePtBr from "./resources/pt-BR/native.json";
 
 function flattenKeys(value: unknown, prefix = ""): string[] {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -42,7 +35,7 @@ function readNestedString(
 }
 
 describe("i18n resources", () => {
-  it("keeps pt-BR keys aligned with en", () => {
+  it("keeps English namespace resources valid", () => {
     const enKeys = [
       ...flattenKeys(commonEn, "common"),
       ...flattenKeys(appEn, "app"),
@@ -52,23 +45,12 @@ describe("i18n resources", () => {
       ...flattenKeys(gitEn, "git"),
       ...flattenKeys(nativeEn, "native"),
     ].sort();
-    const ptBrKeys = [
-      ...flattenKeys(commonPtBr, "common"),
-      ...flattenKeys(appPtBr, "app"),
-      ...flattenKeys(chatPtBr, "chat"),
-      ...flattenKeys(workspacePtBr, "workspace"),
-      ...flattenKeys(setupPtBr, "setup"),
-      ...flattenKeys(gitPtBr, "git"),
-      ...flattenKeys(nativePtBr, "native"),
-    ].sort();
 
-    expect(ptBrKeys).toEqual(enKeys);
+    expect(enKeys.length).toBeGreaterThan(0);
   });
 
   it("defines fallback thread titles used by the chat panel", () => {
     expect(readNestedString(chatEn, "panel.workspaceChatTitle")).toBeTruthy();
     expect(readNestedString(chatEn, "panel.repoChatTitle")).toBeTruthy();
-    expect(readNestedString(chatPtBr, "panel.workspaceChatTitle")).toBeTruthy();
-    expect(readNestedString(chatPtBr, "panel.repoChatTitle")).toBeTruthy();
   });
 });

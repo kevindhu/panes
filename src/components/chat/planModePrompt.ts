@@ -35,6 +35,10 @@ export function messageHasStructuredPlan(message: Message | null | undefined): b
   return genericListMatches.length >= 2;
 }
 
+export function shouldClearPendingPlanImplementationPrompt(status: ThreadStatus): boolean {
+  return status === "error" || status === "idle";
+}
+
 export function latestAssistantMessage(messages: Message[]): Message | undefined {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
@@ -73,7 +77,6 @@ function messageHasExitPlanModeAttempt(message: Message | null | undefined): boo
 }
 
 export function shouldPromptToImplementPlan({
-  wasStreaming,
   streaming,
   status,
   activeThreadId,
@@ -81,7 +84,6 @@ export function shouldPromptToImplementPlan({
   engineId,
   messages,
 }: {
-  wasStreaming: boolean;
   streaming: boolean;
   status: ThreadStatus;
   activeThreadId: string | null;
@@ -89,7 +91,7 @@ export function shouldPromptToImplementPlan({
   engineId?: string | null;
   messages: Message[];
 }): boolean {
-  if (!wasStreaming || streaming) {
+  if (streaming) {
     return false;
   }
 

@@ -44,7 +44,7 @@ cargo check
 - Send changes through a branch in your fork and open a pull request against `master`.
 - Keep one PR focused on one problem.
 - Update docs when behavior, setup, or workflow changes.
-- If you add or change user-facing copy, update both locale resource sets under `src/i18n/resources/en/` and `src/i18n/resources/pt-BR/`.
+- If you add or change user-facing copy, update the English resource files under `src/i18n/resources/en/`.
 - Reuse the existing IPC/store patterns instead of introducing ad hoc flows.
 - Prefer active runtime paths over legacy or placeholder code paths.
 
@@ -67,7 +67,7 @@ cargo check
 
 - Unrelated refactors bundled with a bug fix
 - Missing screenshots for UI changes
-- New strings without i18n updates
+- New strings without resource updates
 - PRs that do not say which checks were run
 - Changes that bypass existing shared primitives without a strong reason
 

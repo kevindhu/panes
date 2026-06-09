@@ -25,8 +25,6 @@ pub struct GeneralConfig {
     pub default_engine: String,
     pub default_model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub locale: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_accelerated_rendering: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_notifications: Option<bool>,
@@ -71,7 +69,6 @@ impl Default for GeneralConfig {
             theme: "dark".to_string(),
             default_engine: "codex".to_string(),
             default_model: "gpt-5.4".to_string(),
-            locale: None,
             terminal_accelerated_rendering: None,
             chat_notifications: None,
             terminal_notifications: None,
@@ -302,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_locale_field_uses_none() {
+    fn missing_optional_general_fields_use_defaults() {
         let raw = r#"
 [general]
 theme = "dark"
@@ -321,7 +318,6 @@ max_action_output_chars = 20000
 
         let config = toml::from_str::<AppConfig>(raw).expect("config should deserialize");
 
-        assert_eq!(config.general.locale, None);
         assert!(!config.power.keep_awake_enabled);
         assert_eq!(config.general.terminal_accelerated_rendering, None);
         assert_eq!(config.general.terminal_notifications, None);
@@ -337,7 +333,6 @@ max_action_output_chars = 20000
     fn default_config_omits_optional_general_fields_from_toml() {
         let raw = toml::to_string_pretty(&AppConfig::default()).expect("config should serialize");
 
-        assert!(!raw.contains("locale"));
         assert!(raw.contains("[power]"));
         assert!(raw.contains("keep_awake_enabled = false"));
         assert!(!raw.contains("terminal_accelerated_rendering"));
@@ -348,16 +343,16 @@ max_action_output_chars = 20000
     fn save_overwrites_existing_config() {
         with_temp_app_data_env(|| {
             let mut config = AppConfig::default();
-            config.general.locale = Some("en".to_string());
+            config.general.default_model = "gpt-5.3".to_string();
             config.save().expect("initial config save should succeed");
 
             let mut updated = AppConfig::load_or_create().expect("config should reload");
-            updated.general.locale = Some("pt-BR".to_string());
+            updated.general.default_model = "gpt-5.4".to_string();
             updated.power.keep_awake_enabled = true;
             updated.save().expect("updated config save should succeed");
 
             let saved = AppConfig::load_or_create().expect("config should reload after overwrite");
-            assert_eq!(saved.general.locale.as_deref(), Some("pt-BR"));
+            assert_eq!(saved.general.default_model, "gpt-5.4");
             assert!(saved.power.keep_awake_enabled);
         });
     }
@@ -383,9 +378,34 @@ max_action_output_chars = 20000
 
         let config = toml::from_str::<AppConfig>(raw).expect("legacy config should deserialize");
 
-        assert_eq!(config.general.locale, None);
         assert_eq!(config.general.terminal_accelerated_rendering, None);
         assert_eq!(config.general.terminal_notifications, None);
+    }
+
+    #[test]
+    fn legacy_locale_field_is_ignored() {
+        let raw = r#"
+[general]
+theme = "dark"
+default_engine = "codex"
+default_model = "gpt-5.4"
+locale = "en"
+
+[ui]
+sidebar_width = 260
+git_panel_width = 380
+font_size = 13
+
+[debug]
+persist_engine_event_logs = false
+max_action_output_chars = 20000
+"#;
+
+        let config = toml::from_str::<AppConfig>(raw).expect("legacy config should deserialize");
+        let serialized = toml::to_string_pretty(&config).expect("config should serialize");
+
+        assert_eq!(config.general.default_model, "gpt-5.4");
+        assert!(!serialized.contains("locale"));
     }
 
     #[test]

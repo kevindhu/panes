@@ -15,12 +15,6 @@
     "resolveFailed": "Could not find {{reference}} in this workspace.",
     "shiftClickHint": "Shift-click to open in the editor"
   },
-  "language": {
-    "label": "Language",
-    "changed": "Language updated. Native menu labels update after restart.",
-    "english": "English",
-    "portugueseBrazil": "Português (Brasil)"
-  },
   "labels": {
     "settings": "Settings"
   }

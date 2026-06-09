@@ -164,7 +164,6 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 vi.mock("../../lib/ipc", () => ({
   ipc: {
     getTerminalAcceleratedRendering: mockGetTerminalAcceleratedRendering,
-    setAppLocale: vi.fn(async (locale: string) => locale),
   },
 }));
 

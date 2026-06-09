@@ -22,7 +22,6 @@ import {
   RefreshCw,
   PillBottle,
   BellRing,
-  Globe,
 } from "lucide-react";
 import { useChatStore } from "../../stores/chatStore";
 import { useThreadStore } from "../../stores/threadStore";
@@ -41,11 +40,6 @@ import {
   emitTerminalAcceleratedRenderingChanged,
   getTerminalAcceleratedRenderingPreferenceVersion,
 } from "../../lib/terminalRenderingSettings";
-import {
-  normalizeAppLocale,
-  SUPPORTED_APP_LOCALES,
-  type AppLocale,
-} from "../../lib/locale";
 import { handleDragMouseDown, handleDragDoubleClick } from "../../lib/windowDrag";
 import { createAndActivateWorkspaceThread } from "../../lib/newThreadActions";
 import { getActionMenuPosition } from "../git/actionMenuPosition";
@@ -171,7 +165,6 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   const settingsTriggerRef = useRef<HTMLButtonElement>(null);
   const threadContextMenuRef = useRef<HTMLDivElement>(null);
   const previousSyncedActiveWorkspaceIdRef = useRef<string | null>(activeWorkspaceId);
-  const activeLocale = normalizeAppLocale(i18n.language);
 
   const closeSettingsMenu = useCallback(() => setSettingsMenuOpen(false), []);
   const closeThreadContextMenu = useCallback(() => setThreadContextMenu(null), []);
@@ -388,18 +381,6 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
 
   async function onRestoreThread(thread: Thread) {
     await restoreThread(thread.id);
-  }
-
-  async function onLocaleSelect(locale: AppLocale) {
-    if (locale === activeLocale) return;
-
-    try {
-      const savedLocale = await ipc.setAppLocale(locale);
-      await i18n.changeLanguage(savedLocale);
-      toast.info(t("common:language.changed"));
-    } catch {
-      toast.error(t("app:sidebar.languageFailed"));
-    }
   }
 
   async function onToggleTerminalAcceleratedRendering() {
@@ -969,46 +950,6 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                 <span className="ws-toggle-thumb" />
               </label>
             </div>
-            <div className="git-action-menu-item" style={{ justifyContent: "space-between", cursor: "default" }}>
-              <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <Globe size={14} style={{ opacity: 0.5, flexShrink: 0 }} />
-                {t("common:language.label")}
-              </span>
-              <span
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  background: "rgba(31, 35, 40, 0.06)",
-                  borderRadius: 6,
-                  padding: 2,
-                  gap: 2,
-                }}
-              >
-                {SUPPORTED_APP_LOCALES.map((locale) => (
-                  <button
-                    key={locale}
-                    type="button"
-                    onClick={() => { void onLocaleSelect(locale); }}
-                    style={{
-                      fontSize: 11,
-                      lineHeight: 1,
-                      padding: "3px 8px",
-                      borderRadius: 4,
-                      border: "none",
-                      cursor: "pointer",
-                      background: activeLocale === locale ? "var(--accent)" : "transparent",
-                      color: activeLocale === locale ? "#fff" : "var(--text-3)",
-                      fontWeight: activeLocale === locale ? 500 : 400,
-                      boxShadow: "none",
-                      transition: "background 0.15s, color 0.15s, box-shadow 0.15s",
-                    }}
-                  >
-                    {locale === "en" ? "EN-US" : "PT-BR"}
-                  </button>
-                ))}
-              </span>
-            </div>
-
             <div className="git-action-menu-divider" />
             <div
               style={{
