@@ -19,6 +19,7 @@ import type {
 } from "../../workers/markdownParser.types";
 
 const MARKDOWN_WORKER_THRESHOLD_CHARS = 1000;
+const STREAMING_MARKDOWN_INLINE_LIMIT_CHARS = 6000;
 const MARKDOWN_CACHE_LIMIT = 280;
 const MARKDOWN_CACHE_MAX_BYTES = 8 * 1024 * 1024;
 
@@ -236,6 +237,8 @@ export default function MarkdownContent({
   const hasStreamedRef = useRef(streaming);
 
   const workerEligible = content.length >= MARKDOWN_WORKER_THRESHOLD_CHARS;
+  const deferStreamingMarkdown =
+    streaming && content.length >= STREAMING_MARKDOWN_INLINE_LIMIT_CHARS;
   const cacheKey = useMemo(() => computeCacheKey(content), [content]);
   const hasStreamed = hasStreamedRef.current || streaming;
   const cachedHtml = useMemo(() => peekCachedMarkdownHtml(cacheKey), [cacheKey]);
@@ -251,11 +254,14 @@ export default function MarkdownContent({
     if (cachedHtml !== null) {
       return cachedHtml;
     }
+    if (deferStreamingMarkdown) {
+      return null;
+    }
     if (showWorkerPlaceholder) {
       return null;
     }
     return renderMarkdownToHtml(content);
-  }, [cachedHtml, content, showWorkerPlaceholder]);
+  }, [cachedHtml, content, deferStreamingMarkdown, showWorkerPlaceholder]);
 
   useEffect(() => {
     if (!streaming) {

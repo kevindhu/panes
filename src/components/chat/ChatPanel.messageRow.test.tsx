@@ -47,6 +47,9 @@ vi.mock("../../stores/toastStore", () => ({
 
 import {
   MessageRowView,
+  areMessageRowsMeasured,
+  buildVirtualizedMessageLayout,
+  computeVirtualMessageWindow,
   getActiveTextSelectionRangeInsideElement,
   hasActiveTextSelectionInsideElement,
   restoreTextSelectionRange,
@@ -273,9 +276,99 @@ describe("MessageRowView editing attachments", () => {
 });
 
 describe("shouldVirtualizeMessages", () => {
-  it("keeps long transcripts fully mounted", () => {
-    expect(shouldVirtualizeMessages(114, false)).toBe(false);
-    expect(shouldVirtualizeMessages(80, true)).toBe(false);
+  const readyLargeTranscript = {
+    messageCount: 120,
+    streaming: false,
+    allRowsMeasured: true,
+    editing: false,
+    loadingOlderMessages: false,
+  };
+
+  it("virtualizes only large completed transcripts with exact row measurements", () => {
+    expect(shouldVirtualizeMessages({ ...readyLargeTranscript, messageCount: 119 })).toBe(false);
+    expect(shouldVirtualizeMessages(readyLargeTranscript)).toBe(true);
+    expect(shouldVirtualizeMessages({ ...readyLargeTranscript, streaming: true })).toBe(false);
+    expect(shouldVirtualizeMessages({ ...readyLargeTranscript, allRowsMeasured: false })).toBe(false);
+  });
+
+  it("does not virtualize while editing or older-message loading can move DOM nodes", () => {
+    expect(shouldVirtualizeMessages({ ...readyLargeTranscript, editing: true })).toBe(false);
+    expect(shouldVirtualizeMessages({ ...readyLargeTranscript, loadingOlderMessages: true })).toBe(false);
+  });
+});
+
+describe("virtualized message layout", () => {
+  it("refuses to build a layout until every row has a real measured height", () => {
+    const messages = Array.from({ length: 120 }, (_, index) => ({ id: `message-${index}` }));
+    const measuredHeights = new Map<string, number>();
+    for (let index = 0; index < messages.length - 1; index += 1) {
+      measuredHeights.set(messages[index].id, 120);
+    }
+
+    expect(areMessageRowsMeasured(messages, measuredHeights)).toBe(false);
+    expect(buildVirtualizedMessageLayout(messages, measuredHeights)).toBeNull();
+
+    measuredHeights.set(messages[messages.length - 1].id, 120);
+
+    expect(areMessageRowsMeasured(messages, measuredHeights)).toBe(true);
+    expect(buildVirtualizedMessageLayout(messages, measuredHeights)).not.toBeNull();
+  });
+
+  it("keeps the actual tall row mounted when the viewport is inside it", () => {
+    const messages = Array.from({ length: 130 }, (_, index) => ({ id: `message-${index}` }));
+    const measuredHeights = new Map<string, number>();
+    for (const message of messages) {
+      measuredHeights.set(message.id, 96);
+    }
+    measuredHeights.set("message-64", 5200);
+
+    const layout = buildVirtualizedMessageLayout(messages, measuredHeights);
+    expect(layout).not.toBeNull();
+
+    const tallRowTop = layout!.offsets[64];
+    const window = computeVirtualMessageWindow(layout!, tallRowTop + 2600, 700, 700);
+
+    expect(window.startIndex).toBeLessThanOrEqual(64);
+    expect(window.endIndexExclusive).toBeGreaterThan(64);
+  });
+
+  it("preserves the hidden gap below the last rendered row in the bottom spacer", () => {
+    const messages = [{ id: "a" }, { id: "b" }, { id: "c" }];
+    const layout = buildVirtualizedMessageLayout(
+      messages,
+      new Map([
+        ["a", 100],
+        ["b", 100],
+        ["c", 100],
+      ]),
+    );
+
+    expect(layout).not.toBeNull();
+
+    const window = computeVirtualMessageWindow(layout!, 113, 1, 0);
+
+    expect(window.startIndex).toBe(1);
+    expect(window.endIndexExclusive).toBe(2);
+    expect(window.topSpacerHeight).toBe(112);
+    expect(window.bottomSpacerHeight).toBe(112);
+  });
+
+  it("renders the full measured range while text selection is active", () => {
+    const messages = Array.from({ length: 120 }, (_, index) => ({ id: `message-${index}` }));
+    const measuredHeights = new Map<string, number>();
+    for (const message of messages) {
+      measuredHeights.set(message.id, 100);
+    }
+
+    const layout = buildVirtualizedMessageLayout(messages, measuredHeights);
+    expect(layout).not.toBeNull();
+
+    const window = computeVirtualMessageWindow(layout!, 3000, 700, 700, true);
+
+    expect(window.startIndex).toBe(0);
+    expect(window.endIndexExclusive).toBe(messages.length);
+    expect(window.topSpacerHeight).toBe(0);
+    expect(window.bottomSpacerHeight).toBe(0);
   });
 });
 

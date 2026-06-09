@@ -1,5 +1,6 @@
 import {
   FormEvent,
+  Fragment,
   Suspense,
   lazy,
   memo,
@@ -131,16 +132,153 @@ import type {
   TrustLevel,
 } from "../../types";
 
-const MESSAGE_ESTIMATED_ROW_HEIGHT = 220;
+const MESSAGE_MIN_ROW_HEIGHT = 56;
 const MESSAGE_ROW_GAP = 12;
 const MESSAGE_OVERSCAN_PX = 700;
+const MESSAGE_VIRTUALIZATION_THRESHOLD = 120;
 
-export function shouldVirtualizeMessages(messageCount: number, streaming: boolean): boolean {
-  // Chat rows can contain very large, dynamic markdown blocks. Keeping the
-  // transcript mounted is more important than risking a bad virtual window.
-  void messageCount;
-  void streaming;
-  return false;
+interface MessageVirtualizationOptions {
+  messageCount: number;
+  streaming: boolean;
+  allRowsMeasured: boolean;
+  editing: boolean;
+  loadingOlderMessages: boolean;
+}
+
+interface VirtualizedMessageLayout {
+  offsets: number[];
+  rowCount: number;
+  totalHeight: number;
+}
+
+interface VirtualMessageWindow {
+  startIndex: number;
+  endIndexExclusive: number;
+  topSpacerHeight: number;
+  bottomSpacerHeight: number;
+}
+
+export function shouldVirtualizeMessages({
+  messageCount,
+  streaming,
+  allRowsMeasured,
+  editing,
+  loadingOlderMessages,
+}: MessageVirtualizationOptions): boolean {
+  return (
+    messageCount >= MESSAGE_VIRTUALIZATION_THRESHOLD &&
+    !streaming &&
+    allRowsMeasured &&
+    !editing &&
+    !loadingOlderMessages
+  );
+}
+
+export function areMessageRowsMeasured(
+  messages: Array<{ id: string }>,
+  measuredHeights: ReadonlyMap<string, number>,
+): boolean {
+  if (messages.length === 0) {
+    return false;
+  }
+
+  return messages.every((message) => {
+    const height = measuredHeights.get(message.id);
+    return height !== undefined && Number.isFinite(height) && height > 0;
+  });
+}
+
+export function buildVirtualizedMessageLayout(
+  messages: Array<{ id: string }>,
+  measuredHeights: ReadonlyMap<string, number>,
+): VirtualizedMessageLayout | null {
+  if (!areMessageRowsMeasured(messages, measuredHeights)) {
+    return null;
+  }
+
+  const rowCount = messages.length;
+  const offsets = new Array<number>(rowCount + 1);
+  offsets[0] = 0;
+
+  for (let index = 0; index < rowCount; index += 1) {
+    const measuredHeight = measuredHeights.get(messages[index].id);
+    if (measuredHeight === undefined) {
+      return null;
+    }
+
+    const rowHeight = Math.max(MESSAGE_MIN_ROW_HEIGHT, Math.ceil(measuredHeight));
+    offsets[index + 1] =
+      offsets[index] + rowHeight + (index < rowCount - 1 ? MESSAGE_ROW_GAP : 0);
+  }
+
+  return {
+    offsets,
+    rowCount,
+    totalHeight: offsets[rowCount],
+  };
+}
+
+export function computeVirtualMessageWindow(
+  layout: VirtualizedMessageLayout,
+  viewportScrollTop: number,
+  viewportHeight: number,
+  overscanPx = MESSAGE_OVERSCAN_PX,
+  renderFullRange = false,
+): VirtualMessageWindow {
+  const { offsets, rowCount, totalHeight } = layout;
+  if (renderFullRange) {
+    return {
+      startIndex: 0,
+      endIndexExclusive: rowCount,
+      topSpacerHeight: 0,
+      bottomSpacerHeight: 0,
+    };
+  }
+
+  const visibleStart = Math.max(0, viewportScrollTop - overscanPx);
+  const visibleEnd =
+    Math.max(0, viewportScrollTop) + Math.max(0, viewportHeight) + overscanPx;
+
+  let lo = 0;
+  let hi = rowCount;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (offsets[mid + 1] < visibleStart) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  const startIndex = lo;
+
+  lo = startIndex;
+  hi = rowCount;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (offsets[mid] <= visibleEnd) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  let endIndexExclusive = lo;
+
+  if (endIndexExclusive <= startIndex) {
+    endIndexExclusive = Math.min(rowCount, startIndex + 1);
+  }
+
+  const hiddenRowsBelow = endIndexExclusive < rowCount;
+  const gapAfterLastVisibleRow = hiddenRowsBelow ? MESSAGE_ROW_GAP : 0;
+
+  return {
+    startIndex,
+    endIndexExclusive,
+    topSpacerHeight: offsets[startIndex],
+    bottomSpacerHeight: Math.max(
+      0,
+      totalHeight - offsets[endIndexExclusive] + gapAfterLastVisibleRow,
+    ),
+  };
 }
 
 function selectionEndpointInsideElement(
@@ -218,7 +356,8 @@ const LazyEditorWithExplorer = lazy(() =>
 
 interface MeasuredMessageRowProps {
   messageId: string;
-  onHeightChange: (messageId: string, height: number) => void;
+  threadId: string | null;
+  onHeightChange: (threadId: string | null, messageId: string, height: number) => void;
   children: ReactNode;
 }
 
@@ -308,7 +447,12 @@ export function buildPermissionApprovalResponseForEngine(
   );
 }
 
-function MeasuredMessageRow({ messageId, onHeightChange, children }: MeasuredMessageRowProps) {
+function MeasuredMessageRow({
+  messageId,
+  threadId,
+  onHeightChange,
+  children,
+}: MeasuredMessageRowProps) {
   const rowRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -318,7 +462,7 @@ function MeasuredMessageRow({ messageId, onHeightChange, children }: MeasuredMes
     }
 
     const publishHeight = () => {
-      onHeightChange(messageId, element.getBoundingClientRect().height);
+      onHeightChange(threadId, messageId, element.getBoundingClientRect().height);
     };
 
     publishHeight();
@@ -330,7 +474,7 @@ function MeasuredMessageRow({ messageId, onHeightChange, children }: MeasuredMes
     const observer = new ResizeObserver(() => publishHeight());
     observer.observe(element);
     return () => observer.disconnect();
-  }, [messageId, onHeightChange]);
+  }, [messageId, onHeightChange, threadId]);
 
   return <div ref={rowRef}>{children}</div>;
 }
@@ -1225,16 +1369,18 @@ function formatResetTime(
   return t("status.daysHoursShort", { days: diffDays, hours: diffHr % 24 });
 }
 
-function estimateMessageOffset(
+function getMeasuredMessageOffset(
   messages: Message[],
   index: number,
   measuredHeights: Map<string, number>,
-): number {
+): number | null {
   let offset = 0;
   for (let current = 0; current < index; current += 1) {
     const currentMessageId = messages[current].id;
-    const rowHeight =
-      measuredHeights.get(currentMessageId) ?? MESSAGE_ESTIMATED_ROW_HEIGHT;
+    const rowHeight = measuredHeights.get(currentMessageId);
+    if (rowHeight === undefined) {
+      return null;
+    }
     offset += rowHeight + MESSAGE_ROW_GAP;
   }
   return offset;
@@ -2150,13 +2296,19 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const preservedSelectionRangeRef = useRef<Range | null>(null);
   const preservedSelectionUntilRef = useRef(0);
   const selectionRestoreRafRef = useRef<number | null>(null);
+  const selectionVirtualizationPauseTimeoutRef = useRef<number | null>(null);
   const messageHeightsRef = useRef<Map<string, number>>(new Map());
+  const messageHeightsThreadIdRef = useRef<string | null>(null);
   const layoutVersionRafRef = useRef<number | null>(null);
   const threadExecutionPolicyRequestIdsRef = useRef<Record<string, number>>({});
   const [listLayoutVersion, setListLayoutVersion] = useState(0);
+  const scrollVersionRafRef = useRef<number | null>(null);
+  const virtualWindowUpdatesEnabledRef = useRef(false);
+  const [scrollVersion, setScrollVersion] = useState(0);
   const viewportScrollTopRef = useRef(0);
   const [nearTopLoadRequest, setNearTopLoadRequest] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(0);
+  const [selectionVirtualizationPaused, setSelectionVirtualizationPaused] = useState(false);
   const [autoScrollLocked, setAutoScrollLocked] = useState(false);
   const [hasExplicitComposerRuntime, setHasExplicitComposerRuntime] = useState(false);
   const [workspaceOptInPrompt, setWorkspaceOptInPrompt] = useState<{
@@ -2189,6 +2341,11 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     customApprovalPolicyText: string;
     openCodeAgent: string;
   } | null>(null);
+
+  if (messageHeightsThreadIdRef.current !== threadId) {
+    messageHeightsRef.current.clear();
+    messageHeightsThreadIdRef.current = threadId;
+  }
 
   const trustLevelOptions = useMemo(() => getTrustLevelOptions(t), [t]);
   const codexThreadApprovalPolicyOptions = useMemo(
@@ -3549,6 +3706,59 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     });
   }, []);
 
+  const scheduleVirtualWindowUpdate = useCallback(() => {
+    if (!virtualWindowUpdatesEnabledRef.current) {
+      return;
+    }
+    if (scrollVersionRafRef.current !== null) {
+      return;
+    }
+    scrollVersionRafRef.current = window.requestAnimationFrame(() => {
+      scrollVersionRafRef.current = null;
+      setScrollVersion((version) => version + 1);
+    });
+  }, []);
+
+  const scheduleSelectionVirtualizationPauseCheck = useCallback((delayMs = 250) => {
+    if (selectionVirtualizationPauseTimeoutRef.current !== null) {
+      window.clearTimeout(selectionVirtualizationPauseTimeoutRef.current);
+    }
+
+    const checkSelection = () => {
+      selectionVirtualizationPauseTimeoutRef.current = null;
+      const viewport = viewportRef.current;
+      const selectionActive = hasActiveTextSelectionInsideElement(viewport);
+      const preservedSelectionActive =
+        preservedSelectionRangeRef.current !== null &&
+        performance.now() <= preservedSelectionUntilRef.current;
+
+      if (selectionActive || preservedSelectionActive) {
+        setSelectionVirtualizationPaused(true);
+        selectionVirtualizationPauseTimeoutRef.current = window.setTimeout(
+          checkSelection,
+          250,
+        );
+        return;
+      }
+
+      preservedSelectionRangeRef.current = null;
+      setSelectionVirtualizationPaused(false);
+    };
+
+    selectionVirtualizationPauseTimeoutRef.current = window.setTimeout(
+      checkSelection,
+      delayMs,
+    );
+  }, []);
+
+  const pauseVirtualizationForSelection = useCallback(
+    (delayMs = 1500) => {
+      setSelectionVirtualizationPaused(true);
+      scheduleSelectionVirtualizationPauseCheck(delayMs);
+    },
+    [scheduleSelectionVirtualizationPauseCheck],
+  );
+
   useEffect(() => {
     if (activeWorkspaceId) {
       void syncTerminalSessions(activeWorkspaceId);
@@ -3632,6 +3842,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
       preservedSelectionRangeRef.current = range;
       preservedSelectionUntilRef.current = performance.now() + 1500;
+      pauseVirtualizationForSelection();
       return true;
     };
     const scheduleSelectionRestore = () => {
@@ -3675,6 +3886,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       if (selectionActive) {
         scheduleSelectionRestore();
       }
+      scheduleVirtualWindowUpdate();
     };
     const updateHeight = () => {
       setViewportHeight(viewport.clientHeight);
@@ -3700,9 +3912,13 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         scheduleSelectionRestore();
       }
     };
+    const onSelectStart = () => {
+      pauseVirtualizationForSelection();
+    };
 
     viewport.addEventListener("scroll", onScroll, { passive: true });
     viewport.addEventListener("wheel", onWheel, { passive: true });
+    viewport.addEventListener("selectstart", onSelectStart);
 
     let resizeObserver: ResizeObserver | null = null;
     if (typeof ResizeObserver !== "undefined") {
@@ -3715,8 +3931,13 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     return () => {
       viewport.removeEventListener("scroll", onScroll);
       viewport.removeEventListener("wheel", onWheel);
+      viewport.removeEventListener("selectstart", onSelectStart);
       if (rafId !== 0) {
         window.cancelAnimationFrame(rafId);
+      }
+      if (scrollVersionRafRef.current !== null) {
+        window.cancelAnimationFrame(scrollVersionRafRef.current);
+        scrollVersionRafRef.current = null;
       }
       if (selectionRestoreRafRef.current !== null) {
         window.cancelAnimationFrame(selectionRestoreRafRef.current);
@@ -3728,12 +3949,21 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         window.removeEventListener("resize", updateHeight);
       }
     };
-  }, []);
+  }, [pauseVirtualizationForSelection, scheduleVirtualWindowUpdate]);
 
   useEffect(() => {
-    messageHeightsRef.current.clear();
-    scheduleListLayoutVersionBump();
-  }, [activeThread?.id, scheduleListLayoutVersionBump]);
+    const onSelectionChange = () => {
+      if (hasActiveTextSelectionInsideElement(viewportRef.current)) {
+        setSelectionVirtualizationPaused(true);
+      }
+      scheduleSelectionVirtualizationPauseCheck(120);
+    };
+
+    document.addEventListener("selectionchange", onSelectionChange);
+    return () => {
+      document.removeEventListener("selectionchange", onSelectionChange);
+    };
+  }, [scheduleSelectionVirtualizationPauseCheck]);
 
   useEffect(() => {
     const existingIds = new Set(messages.map((message) => message.id));
@@ -4284,20 +4514,21 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     }
 
     const targetMessageId = messages[targetIndex].id;
-    const targetHeight =
-      messageHeightsRef.current.get(targetMessageId) ??
-      MESSAGE_ESTIMATED_ROW_HEIGHT;
-    const targetTopOffset = estimateMessageOffset(
+    const targetHeight = messageHeightsRef.current.get(targetMessageId);
+    const targetTopOffset = getMeasuredMessageOffset(
       messages,
       targetIndex,
       messageHeightsRef.current,
     );
-    const centeredTop = Math.max(
-      0,
-      targetTopOffset - Math.max((viewport.clientHeight - targetHeight) / 2, 0),
-    );
 
-    viewport.scrollTo({ top: centeredTop, behavior: "smooth" });
+    if (targetTopOffset !== null && targetHeight !== undefined) {
+      const centeredTop = Math.max(
+        0,
+        targetTopOffset - Math.max((viewport.clientHeight - targetHeight) / 2, 0),
+      );
+      viewport.scrollTo({ top: centeredTop, behavior: "smooth" });
+    }
+
     window.setTimeout(() => {
       const targetElement = viewport.querySelector<HTMLElement>(
         `[data-message-id="${targetMessageId}"]`,
@@ -4337,6 +4568,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       if (layoutVersionRafRef.current !== null) {
         window.cancelAnimationFrame(layoutVersionRafRef.current);
         layoutVersionRafRef.current = null;
+      }
+      if (selectionVirtualizationPauseTimeoutRef.current !== null) {
+        window.clearTimeout(selectionVirtualizationPauseTimeoutRef.current);
+        selectionVirtualizationPauseTimeoutRef.current = null;
       }
     };
   }, []);
@@ -5565,8 +5800,12 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   }
 
   const onMessageRowHeightChange = useCallback(
-    (messageId: string, height: number) => {
-      const normalizedHeight = Math.max(56, Math.ceil(height));
+    (rowThreadId: string | null, messageId: string, height: number) => {
+      if (rowThreadId !== messageHeightsThreadIdRef.current) {
+        return;
+      }
+
+      const normalizedHeight = Math.max(MESSAGE_MIN_ROW_HEIGHT, Math.ceil(height));
       const previousHeight = messageHeightsRef.current.get(messageId);
       if (
         previousHeight !== undefined &&
@@ -5581,16 +5820,34 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     [scheduleListLayoutVersionBump],
   );
 
-  const virtualizationEnabled = shouldVirtualizeMessages(messages.length, streaming);
+  const virtualizationCandidate =
+    messages.length >= MESSAGE_VIRTUALIZATION_THRESHOLD && !streaming;
+  const virtualizedLayout = useMemo(() => {
+    if (!virtualizationCandidate) {
+      return null;
+    }
+
+    return buildVirtualizedMessageLayout(messages, messageHeightsRef.current);
+  }, [messages, virtualizationCandidate, listLayoutVersion]);
+  const virtualizationEnabled = shouldVirtualizeMessages({
+    messageCount: messages.length,
+    streaming,
+    allRowsMeasured: virtualizedLayout !== null,
+    editing: editingMessageId !== null,
+    loadingOlderMessages,
+  });
+  virtualWindowUpdatesEnabledRef.current = virtualizationEnabled;
+  const shouldMeasureMessageRows = virtualizationCandidate;
 
   useEffect(() => {
     recordPerfMetric("chat.render.commit.ms", performance.now() - renderStartedAtRef.current, {
       threadId,
       messageCount: messages.length,
       virtualized: virtualizationEnabled,
+      selectionPinned: selectionVirtualizationPaused,
       streaming,
     });
-  }, [messages.length, streaming, threadId, virtualizationEnabled]);
+  }, [messages.length, selectionVirtualizationPaused, streaming, threadId, virtualizationEnabled]);
 
   const handleApproval = useCallback(
     (approvalId: string, response: ApprovalResponse) => {
@@ -5604,79 +5861,23 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     [hydrateActionOutput],
   );
 
-  const virtualizedLayout = useMemo(() => {
-    if (!virtualizationEnabled || messages.length === 0) {
-      return null;
-    }
-
-    const rowCount = messages.length;
-    const offsets = new Array<number>(rowCount + 1);
-    offsets[0] = 0;
-
-    for (let index = 0; index < rowCount; index += 1) {
-      const messageId = messages[index].id;
-      const measuredHeight = messageHeightsRef.current.get(messageId);
-      const rowHeight = measuredHeight ?? MESSAGE_ESTIMATED_ROW_HEIGHT;
-      offsets[index + 1] =
-        offsets[index] + rowHeight + (index < rowCount - 1 ? MESSAGE_ROW_GAP : 0);
-    }
-
-    return {
-      offsets,
-      rowCount,
-    };
-  }, [messages, virtualizationEnabled, listLayoutVersion]);
-
   const virtualWindow = useMemo(() => {
-    if (!virtualizedLayout) {
+    if (!virtualizationEnabled || !virtualizedLayout) {
       return null;
     }
 
-    const { offsets, rowCount } = virtualizedLayout;
-
-    const viewportScrollTop = viewportScrollTopRef.current;
-    const visibleStart = Math.max(0, viewportScrollTop - MESSAGE_OVERSCAN_PX);
-    const visibleEnd =
-      viewportScrollTop + viewportHeight + MESSAGE_OVERSCAN_PX;
-
-    // Binary search: find first row whose bottom edge (offsets[i+1]) >= visibleStart
-    let lo = 0;
-    let hi = rowCount;
-    while (lo < hi) {
-      const mid = (lo + hi) >>> 1;
-      if (offsets[mid + 1] < visibleStart) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
-    }
-    const startIndex = lo;
-
-    // Binary search: find first row whose top edge (offsets[i]) > visibleEnd
-    lo = startIndex;
-    hi = rowCount;
-    while (lo < hi) {
-      const mid = (lo + hi) >>> 1;
-      if (offsets[mid] <= visibleEnd) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
-    }
-    let endIndexExclusive = lo;
-
-    if (endIndexExclusive <= startIndex) {
-      endIndexExclusive = Math.min(rowCount, startIndex + 1);
-    }
-
-    return {
-      startIndex,
-      endIndexExclusive,
-      topSpacerHeight: offsets[startIndex],
-      bottomSpacerHeight: offsets[rowCount] - offsets[endIndexExclusive],
-    };
+    return computeVirtualMessageWindow(
+      virtualizedLayout,
+      viewportScrollTopRef.current,
+      viewportHeight,
+      MESSAGE_OVERSCAN_PX,
+      selectionVirtualizationPaused,
+    );
   }, [
+    selectionVirtualizationPaused,
+    virtualizationEnabled,
     virtualizedLayout,
+    scrollVersion,
     viewportHeight,
   ]);
 
@@ -6185,10 +6386,13 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         ) : virtualizationEnabled && virtualWindow ? (
           <div style={{ display: "flex", flexDirection: "column" }}>
             {virtualWindow.topSpacerHeight > 0 && (
-              <div style={{ height: virtualWindow.topSpacerHeight }} />
+              <div key="top-spacer" style={{ height: virtualWindow.topSpacerHeight }} />
             )}
 
-            <div style={{ display: "flex", flexDirection: "column", gap: MESSAGE_ROW_GAP }}>
+            <div
+              key="message-window"
+              style={{ display: "flex", flexDirection: "column", gap: MESSAGE_ROW_GAP }}
+            >
               {visibleMessages.map((message, relativeIndex) => {
                   const absoluteIndex = virtualWindow.startIndex + relativeIndex;
                   const assistantIdentity = assistantIdentityByMessageId.get(message.id);
@@ -6196,6 +6400,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                     <MeasuredMessageRow
                       key={message.id}
                       messageId={message.id}
+                      threadId={threadId}
                       onHeightChange={onMessageRowHeightChange}
                     >
                       <MessageRow
@@ -6227,16 +6432,15 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
             </div>
 
             {virtualWindow.bottomSpacerHeight > 0 && (
-              <div style={{ height: virtualWindow.bottomSpacerHeight }} />
+              <div key="bottom-spacer" style={{ height: virtualWindow.bottomSpacerHeight }} />
             )}
           </div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: MESSAGE_ROW_GAP }}>
             {visibleMessages.map((message, index) => {
               const assistantIdentity = assistantIdentityByMessageId.get(message.id);
-              return (
+              const row = (
                 <MessageRow
-                  key={message.id}
                   message={message}
                   index={index}
                   isHighlighted={message.id === highlightedMessageId}
@@ -6259,6 +6463,21 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                   onApproval={handleApproval}
                   onLoadActionOutput={handleLoadActionOutput}
                 />
+              );
+
+              if (!shouldMeasureMessageRows) {
+                return <Fragment key={message.id}>{row}</Fragment>;
+              }
+
+              return (
+                <MeasuredMessageRow
+                  key={message.id}
+                  messageId={message.id}
+                  threadId={threadId}
+                  onHeightChange={onMessageRowHeightChange}
+                >
+                  {row}
+                </MeasuredMessageRow>
               );
             })}
           </div>
