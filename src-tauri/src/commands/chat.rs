@@ -596,6 +596,7 @@ struct ThreadUpdatedEvent {
 struct ChatTurnFinishedEvent {
     thread_id: String,
     workspace_id: String,
+    repo_id: Option<String>,
     engine_id: String,
     thread_title: String,
     status: String,
@@ -3919,9 +3920,19 @@ fn emit_chat_turn_finished(
     status: &MessageStatusDto,
     blocks: &[ContentBlock],
 ) {
-    let event = ChatTurnFinishedEvent {
+    let event = build_chat_turn_finished_event(thread, status, blocks);
+    let _ = app.emit("chat-turn-finished", event);
+}
+
+fn build_chat_turn_finished_event(
+    thread: &ThreadDto,
+    status: &MessageStatusDto,
+    blocks: &[ContentBlock],
+) -> ChatTurnFinishedEvent {
+    ChatTurnFinishedEvent {
         thread_id: thread.id.clone(),
         workspace_id: thread.workspace_id.clone(),
+        repo_id: thread.repo_id.clone(),
         engine_id: thread.engine_id.clone(),
         thread_title: thread.title.clone(),
         status: match status {
@@ -3932,8 +3943,7 @@ fn emit_chat_turn_finished(
         }
         .to_string(),
         preview: chat_notification_preview(blocks),
-    };
-    let _ = app.emit("chat-turn-finished", event);
+    }
 }
 
 fn build_final_thread_event(
@@ -5208,6 +5218,20 @@ mod tests {
         assert_eq!(event.workspace_id, fallback_thread.workspace_id);
         assert!(event.thread.is_none());
         assert!(final_thread.is_none());
+    }
+
+    #[test]
+    fn build_chat_turn_finished_event_includes_repo_id() {
+        let state = test_app_state();
+        let mut thread = test_thread(&state, "codex", "gpt-5.5-codex");
+        thread.repo_id = Some("repo-1".to_string());
+        let event =
+            build_chat_turn_finished_event(&thread, &MessageStatusDto::Completed, &[]);
+
+        assert_eq!(event.thread_id, thread.id);
+        assert_eq!(event.workspace_id, thread.workspace_id);
+        assert_eq!(event.repo_id.as_deref(), Some("repo-1"));
+        assert_eq!(event.status, "completed");
     }
 
     #[test]

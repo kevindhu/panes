@@ -3579,6 +3579,27 @@ button, input, textarea, select {
   background: rgba(9, 105, 218, 0.12);
 }
 
+.sb-rail-notification-badge {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: var(--accent);
+  color: white;
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  box-shadow: 0 0 0 2px var(--sidebar-bg);
+  pointer-events: none;
+}
+
 .sb-rail-divider {
   width: 18px;
   height: 1px;
@@ -3828,6 +3849,23 @@ button, input, textarea, select {
   font-variant-numeric: tabular-nums;
 }
 
+.sb-project-notification-badge {
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 99px;
+  background: var(--accent);
+  color: white;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.14);
+}
+
 .sb-project-archive {
   display: flex;
   align-items: center;
@@ -3842,7 +3880,8 @@ button, input, textarea, select {
   flex-shrink: 0;
 }
 
-.sb-project:hover .sb-project-count {
+.sb-project:hover .sb-project-count,
+.sb-project:hover .sb-project-notification-badge {
   visibility: hidden;
 }
 
@@ -3897,6 +3936,11 @@ button, input, textarea, select {
   background: rgba(9, 105, 218, 0.06);
 }
 
+.sb-thread-notified:not(.sb-thread-active) .sb-thread-title-label {
+  color: var(--text-1);
+  font-weight: 500;
+}
+
 .sb-thread-active::before {
   content: none;
   transform: translateY(-50%);
@@ -3949,6 +3993,15 @@ button, input, textarea, select {
 
 .sb-thread-running-indicator span:nth-child(3) {
   animation-delay: 0.3s;
+}
+
+.sb-thread-notification-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.14);
+  flex-shrink: 0;
 }
 
 .sb-thread-trailing {

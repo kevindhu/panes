@@ -162,6 +162,10 @@ const terminalNotificationState = vi.hoisted(() => ({
   openModal: vi.fn(),
 }));
 
+const threadNotificationState = vi.hoisted(() => ({
+  notificationsByThreadId: {} as Record<string, { workspaceId: string }>,
+}));
+
 function applySelector<TState, TResult>(
   state: TState,
   selector?: ((state: TState) => TResult) | undefined,
@@ -245,6 +249,19 @@ vi.mock("../../stores/terminalNotificationSettingsStore", () => ({
   ) => applySelector(terminalNotificationState, selector),
 }));
 
+vi.mock("../../stores/threadNotificationStore", () => ({
+  useThreadNotificationStore: (
+    selector?: (state: typeof threadNotificationState) => unknown,
+  ) => applySelector(threadNotificationState, selector),
+  countWorkspaceThreadNotifications: (
+    notificationsByThreadId: Record<string, { workspaceId: string }>,
+    workspaceId: string,
+  ) =>
+    Object.values(notificationsByThreadId).filter(
+      (notification) => notification.workspaceId === workspaceId,
+    ).length,
+}));
+
 vi.mock("../workspace/WorkspaceMoreMenu", () => ({
   WorkspaceMoreMenu: () => null,
 }));
@@ -276,6 +293,7 @@ describe("Sidebar thread context menu", () => {
     chatState.threadId = "claude-1";
     chatState.status = "completed";
     chatState.streaming = false;
+    threadNotificationState.notificationsByThreadId = {};
     uiState.sidebarPinned = true;
     uiState.activeView = "harnesses";
     container = document.createElement("div");
@@ -407,6 +425,20 @@ describe("Sidebar thread context menu", () => {
     });
 
     expect(workspaceState.reorderWorkspaces).not.toHaveBeenCalled();
+  });
+
+  it("shows unread completion badges on thread and workspace rows", async () => {
+    threadNotificationState.notificationsByThreadId = {
+      [codexThread.id]: {
+        workspaceId: codexThread.workspaceId,
+      },
+    };
+
+    await renderSidebar();
+
+    const row = findThreadRow("Codex conversation");
+    expect(row?.querySelector(".sb-thread-notification-dot")).not.toBeNull();
+    expect(container.querySelector(".sb-project-notification-badge")?.textContent).toBe("1");
   });
 
   async function renderSidebar() {

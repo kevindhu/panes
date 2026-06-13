@@ -8,6 +8,7 @@ import { TerminalNotificationSettingsModal } from "./components/shared/TerminalN
 import { t } from "./i18n";
 import { useUpdateStore } from "./stores/updateStore";
 import {
+  type ChatTurnFinishedEvent,
   ipc,
   listenChatTurnFinished,
   listenEngineRuntimeUpdated,
@@ -24,6 +25,8 @@ import { useTerminalStore, collectSessionIds } from "./stores/terminalStore";
 import { useFileStore } from "./stores/fileStore";
 import { useKeepAwakeStore } from "./stores/keepAwakeStore";
 import { useTerminalNotificationSettingsStore } from "./stores/terminalNotificationSettingsStore";
+import { useThreadNotificationStore } from "./stores/threadNotificationStore";
+import { useWorkspacePaneStore } from "./stores/workspacePaneStore";
 import { toast } from "./stores/toastStore";
 import type { ChatEngineId, RuntimeToast, Thread } from "./types";
 import { getActiveEditorView, openSearchPanel } from "./components/editor/CodeMirrorEditor";
@@ -31,6 +34,7 @@ import { CustomWindowFrame } from "./components/shared/CustomWindowFrame";
 import { useCustomWindowFrameState } from "./lib/customWindowFrame";
 import { runEditMenuAction } from "./lib/nativeEditActions";
 import { createAndActivateWorkspaceThread } from "./lib/newThreadActions";
+import { isThreadActivityVisible } from "./lib/threadActivityVisibility";
 import { restoreStartupThreadContext } from "./lib/threadActivation";
 import {
   cycleWorkspaceTerminalLayout,
@@ -115,9 +119,51 @@ function resolveChatNotificationBody(
   return t("app:notificationSettings.chatNotificationFallbackComplete");
 }
 
+function isChatTurnVisible(
+  event: Pick<ChatTurnFinishedEvent, "threadId" | "workspaceId" | "repoId">,
+): boolean {
+  const workspaceState = useWorkspaceStore.getState();
+  const uiState = useUiStore.getState();
+  return isThreadActivityVisible({
+    windowFocused: document.hasFocus(),
+    activeView: uiState.activeView,
+    activeWorkspaceId: workspaceState.activeWorkspaceId,
+    activeRepoId: workspaceState.activeRepoId,
+    activeThreadId: useChatStore.getState().threadId,
+    activityWorkspaceId: event.workspaceId,
+    activityRepoId: event.repoId,
+    activityThreadId: event.threadId,
+    chatSurfaceVisible: isWorkspaceSurfaceVisible(event.workspaceId, "chat"),
+  });
+}
+
+function clearVisibleThreadNotification(): void {
+  const threadId = useChatStore.getState().threadId;
+  if (!threadId) {
+    return;
+  }
+
+  const thread = useThreadStore.getState().threads.find((item) => item.id === threadId);
+  if (!thread) {
+    return;
+  }
+
+  if (
+    isChatTurnVisible({
+      threadId: thread.id,
+      workspaceId: thread.workspaceId,
+      repoId: thread.repoId,
+    })
+  ) {
+    useThreadNotificationStore.getState().clearThreadNotification(thread.id);
+  }
+}
+
 export function App() {
   const loadWorkspaces = useWorkspaceStore((s) => s.loadWorkspaces);
   const workspaces = useWorkspaceStore((s) => s.workspaces);
+  const activeWorkspaceId = useWorkspaceStore((s) => s.activeWorkspaceId);
+  const activeRepoId = useWorkspaceStore((s) => s.activeRepoId);
   const workspaceLoading = useWorkspaceStore((s) => s.loading);
   const reposLoading = useWorkspaceStore((s) => s.reposLoading);
   const loadEngines = useEngineStore((s) => s.load);
@@ -134,10 +180,17 @@ export function App() {
   const threads = useThreadStore((s) => s.threads);
   const activeThreadId = useThreadStore((s) => s.activeThreadId);
   const threadLoading = useThreadStore((s) => s.loading);
+  const startupRestorePending = useThreadStore((s) => s.startupRestorePending);
   const setStartupRestorePending = useThreadStore((s) => s.setStartupRestorePending);
   const commandPaletteOpen = useUiStore((s) => s.commandPaletteOpen);
+  const activeView = useUiStore((s) => s.activeView);
   const closeCommandPalette = useUiStore((s) => s.closeCommandPalette);
   const checkForUpdate = useUpdateStore((s) => s.checkForUpdate);
+  const visibleChatThreadId = useChatStore((s) => s.threadId);
+  const activeWorkspacePaneLayout = useWorkspacePaneStore((state) =>
+    activeWorkspaceId ? state.workspaces[activeWorkspaceId] ?? null : null,
+  );
+  const pruneThreadNotifications = useThreadNotificationStore((s) => s.pruneThreadNotifications);
   const customWindowFrame = usesCustomWindowFrame();
   const customWindowFrameState = useCustomWindowFrameState();
   const startupRestoreAttemptedRef = useRef(false);
@@ -152,6 +205,34 @@ export function App() {
   useEffect(() => {
     void refreshAllThreads(workspaces.map((workspace) => workspace.id));
   }, [workspaces, refreshAllThreads]);
+
+  useEffect(() => {
+    if (startupRestorePending || workspaceLoading || threadLoading) {
+      return;
+    }
+    pruneThreadNotifications(threads.map((thread) => thread.id));
+  }, [
+    pruneThreadNotifications,
+    startupRestorePending,
+    threadLoading,
+    threads,
+    workspaceLoading,
+  ]);
+
+  useEffect(() => {
+    clearVisibleThreadNotification();
+    window.addEventListener("focus", clearVisibleThreadNotification);
+    return () => {
+      window.removeEventListener("focus", clearVisibleThreadNotification);
+    };
+  }, [
+    activeRepoId,
+    activeView,
+    activeWorkspaceId,
+    activeWorkspacePaneLayout,
+    threads,
+    visibleChatThreadId,
+  ]);
 
   useEffect(() => {
     if (startupRestoreAttemptedRef.current) {
@@ -250,19 +331,21 @@ export function App() {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void listenChatTurnFinished(async (event) => {
-      const notificationStore = useTerminalNotificationSettingsStore.getState();
-      const settings = notificationStore.settings ?? await notificationStore.load();
-      if (!settings?.chatEnabled || event.status === "interrupted") {
+      if (event.status === "interrupted") {
         return;
       }
 
-      const activeWorkspaceId = useWorkspaceStore.getState().activeWorkspaceId;
-      const activeThreadId = useThreadStore.getState().activeThreadId;
-      if (
-        document.hasFocus()
-        && activeWorkspaceId === event.workspaceId
-        && activeThreadId === event.threadId
-      ) {
+      const visible = isChatTurnVisible(event);
+      const threadNotifications = useThreadNotificationStore.getState();
+      if (visible) {
+        threadNotifications.clearThreadNotification(event.threadId);
+      } else {
+        threadNotifications.markThreadFinished(event);
+      }
+
+      const notificationStore = useTerminalNotificationSettingsStore.getState();
+      const settings = notificationStore.settings ?? await notificationStore.load();
+      if (!settings?.chatEnabled || visible) {
         return;
       }
 

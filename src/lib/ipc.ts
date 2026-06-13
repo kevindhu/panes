@@ -686,6 +686,7 @@ export interface ThreadUpdatedEvent {
 export interface ChatTurnFinishedEvent {
   threadId: string;
   workspaceId: string;
+  repoId: string | null;
   engineId: ChatEngineId;
   threadTitle: string;
   status: "completed" | "interrupted" | "error";

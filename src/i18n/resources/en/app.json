@@ -40,6 +40,8 @@
     "workspaceFallback": "Workspace",
     "noThreads": "No threads",
     "untitledThread": "Untitled thread",
+    "unreadThreadNotification": "Unread thread completion",
+    "unreadThreadNotifications": "{{count}} unread thread completions",
     "archiveThread": "Archive thread",
     "showMore": "Show {{count}} more",
     "archived": "Archived",

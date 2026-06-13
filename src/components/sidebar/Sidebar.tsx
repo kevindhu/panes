@@ -31,6 +31,10 @@ import { useOnboardingStore } from "../../stores/onboardingStore";
 import { useUpdateStore } from "../../stores/updateStore";
 import { canToggleKeepAwake, useKeepAwakeStore } from "../../stores/keepAwakeStore";
 import { useTerminalNotificationSettingsStore } from "../../stores/terminalNotificationSettingsStore";
+import {
+  countWorkspaceThreadNotifications,
+  useThreadNotificationStore,
+} from "../../stores/threadNotificationStore";
 import { toast } from "../../stores/toastStore";
 import { canUseNativeCodexHistoryTools } from "../../lib/codexThreadCapabilities";
 import { ipc } from "../../lib/ipc";
@@ -154,6 +158,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   const terminalNotificationUpdatingTerminalEnabled = useTerminalNotificationSettingsStore((s) => s.updatingTerminalEnabled);
   const toggleTerminalNotifications = useTerminalNotificationSettingsStore((s) => s.toggle);
   const openTerminalNotificationSettings = useTerminalNotificationSettingsStore((s) => s.openModal);
+  const threadNotificationsByThreadId = useThreadNotificationStore((s) => s.notificationsByThreadId);
   const hasUpdate = updateStatus === "available" && !updateSnoozed;
   const keepAwakeAvailable = canToggleKeepAwake(keepAwakeState);
 
@@ -824,6 +829,10 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
             const constrainExpandedThreads = isShowingAll && hasMore;
             const isDraggingProject =
               workspaceDragState?.dragging && workspaceDragState.workspaceId === project.workspace.id;
+            const workspaceNotificationCount = countWorkspaceThreadNotifications(
+              threadNotificationsByThreadId,
+              project.workspace.id,
+            );
 
             return (
               <div
@@ -871,7 +880,19 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                   <span className="sb-project-name">{projectName}</span>
 
                   <span className="sb-project-trailing">
-                    {project.threads.length > 0 && (
+                    {workspaceNotificationCount > 0 ? (
+                      <span
+                        className="sb-project-notification-badge"
+                        title={t("app:sidebar.unreadThreadNotifications", {
+                          count: workspaceNotificationCount,
+                        })}
+                        aria-label={t("app:sidebar.unreadThreadNotifications", {
+                          count: workspaceNotificationCount,
+                        })}
+                      >
+                        {workspaceNotificationCount > 9 ? "9+" : workspaceNotificationCount}
+                      </span>
+                    ) : project.threads.length > 0 && (
                       <span className="sb-project-count">
                         {project.threads.length}
                       </span>
@@ -897,12 +918,13 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                           const isActive = thread.id === activeThreadId;
                           const isRunning = isThreadRunning(thread);
                           const threadLabel = getThreadLabel(thread);
+                          const hasNotification = thread.id in threadNotificationsByThreadId;
                           return (
                             <div
                               key={thread.id}
                               role="button"
                               tabIndex={0}
-                              className={`sb-thread sb-thread-animate ${isActive ? "sb-thread-active" : ""}`}
+                              className={`sb-thread sb-thread-animate ${isActive ? "sb-thread-active" : ""}${hasNotification ? " sb-thread-notified" : ""}`}
                               style={{ animationDelay: `${i * 20}ms` }}
                               onClick={() => void onSelectThread(thread)}
                               onContextMenu={(event) => onThreadContextMenu(event, thread, isRunning)}
@@ -923,6 +945,13 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                                     <span />
                                     <span />
                                   </span>
+                                )}
+                                {hasNotification && (
+                                  <span
+                                    className="sb-thread-notification-dot"
+                                    title={t("app:sidebar.unreadThreadNotification")}
+                                    aria-label={t("app:sidebar.unreadThreadNotification")}
+                                  />
                                 )}
                                 <span
                                   className="sb-thread-title-label"
@@ -1388,6 +1417,7 @@ function CollapsedRail({
   const activeView = useUiStore((s) => s.activeView);
   const setActiveView = useUiStore((s) => s.setActiveView);
   const openCommandPalette = useUiStore((s) => s.openCommandPalette);
+  const threadNotificationsByThreadId = useThreadNotificationStore((s) => s.notificationsByThreadId);
 
   async function onNewThread() {
     const activeProject = projects.find((p) => p.id === activeWorkspaceId);
@@ -1491,6 +1521,10 @@ function CollapsedRail({
         {projects.map((ws) => {
           const isActive = ws.id === activeWorkspaceId;
           const name = ws.name || ws.rootPath.split("/").pop() || "P";
+          const notificationCount = countWorkspaceThreadNotifications(
+            threadNotificationsByThreadId,
+            ws.id,
+          );
           return (
             <button
               key={ws.id}
@@ -1508,6 +1542,19 @@ function CollapsedRail({
               >
                 {name.charAt(0).toUpperCase()}
               </span>
+              {notificationCount > 0 && (
+                <span
+                  className="sb-rail-notification-badge"
+                  title={t("sidebar.unreadThreadNotifications", {
+                    count: notificationCount,
+                  })}
+                  aria-label={t("sidebar.unreadThreadNotifications", {
+                    count: notificationCount,
+                  })}
+                >
+                  {notificationCount > 9 ? "9+" : notificationCount}
+                </span>
+              )}
             </button>
           );
         })}
