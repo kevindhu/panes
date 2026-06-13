@@ -6,21 +6,20 @@ use anyhow::Context;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
-    sync::{broadcast, oneshot, Mutex},
+    sync::{mpsc, oneshot, Mutex},
 };
 
 use crate::{process_utils, runtime_env};
 
 use super::codex_protocol::{
-    notification_payload, parse_incoming, request_payload, response_error_payload,
-    response_success_payload, IncomingMessage, RpcResponse,
+    notification_payload, parse_incoming, raw_value_to_value, request_payload,
+    response_error_payload, response_success_payload, IncomingMessage, RpcResponse,
 };
 use super::trim_action_output_delta_content;
 
-// This channel is only a live fan-out for active Codex subscribers. Tokio's
-// broadcast ring retains every slot until it is overwritten, so keeping a large
-// history here can pin already-delivered protocol payloads while Panes is idle.
-const INCOMING_EVENT_BUFFER_CAPACITY: usize = 256;
+const TURN_EVENT_QUEUE_CAPACITY: usize = 1024;
+const RUNTIME_EVENT_QUEUE_CAPACITY: usize = 512;
+const BEST_EFFORT_QUEUE_RESERVE: usize = 64;
 const TRANSPORT_ERROR_LINE_MAX_CHARS: usize = 16 * 1024;
 const TRANSPORT_ERROR_LINE_TRUNCATED_PREFIX: &str = "... [protocol line truncated; showing tail]\n";
 
@@ -28,8 +27,47 @@ pub struct CodexTransport {
     child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<RpcResponse>>>>,
-    incoming_tx: broadcast::Sender<IncomingMessage>,
+    incoming_router: Arc<CodexIncomingRouter>,
     next_request_id: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Clone)]
+struct CodexEventScope {
+    inner: Arc<Mutex<CodexEventScopeState>>,
+}
+
+#[derive(Debug, Clone)]
+struct CodexEventScopeState {
+    thread_id: String,
+    turn_id: Option<String>,
+}
+
+pub struct CodexIncomingSubscription {
+    receiver: mpsc::Receiver<IncomingMessage>,
+    scope: CodexEventScope,
+}
+
+#[derive(Default)]
+struct CodexIncomingRouter {
+    state: Mutex<CodexIncomingRouterState>,
+}
+
+#[derive(Default)]
+struct CodexIncomingRouterState {
+    turn_subscribers: Vec<CodexTurnSubscriber>,
+    runtime_subscribers: Vec<mpsc::Sender<IncomingMessage>>,
+}
+
+#[derive(Clone)]
+struct CodexTurnSubscriber {
+    scope: CodexEventScope,
+    sender: mpsc::Sender<IncomingMessage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexDeliveryClass {
+    Lossless,
+    BestEffort,
 }
 
 impl Drop for CodexTransport {
@@ -75,14 +113,14 @@ impl CodexTransport {
             .take()
             .ok_or_else(|| anyhow::anyhow!("codex app-server stderr not available"))?;
 
-        let (incoming_tx, _) = broadcast::channel(INCOMING_EVENT_BUFFER_CAPACITY);
+        let incoming_router = Arc::new(CodexIncomingRouter::default());
         let pending = Arc::new(Mutex::new(
             HashMap::<String, oneshot::Sender<RpcResponse>>::new(),
         ));
 
         {
             let pending = pending.clone();
-            let incoming_tx = incoming_tx.clone();
+            let incoming_router = incoming_router.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stdout).lines();
 
@@ -96,36 +134,46 @@ impl CodexTransport {
                                 }
                             }
                             Ok(other) => {
-                                let _ = incoming_tx.send(trim_buffered_incoming_message(other));
+                                incoming_router
+                                    .dispatch(trim_buffered_incoming_message(other))
+                                    .await;
                             }
                             Err(error) => {
                                 log::warn!("codex stdout parse error: {error}");
-                                let _ = incoming_tx.send(IncomingMessage::Notification {
-                                    method: "transport/parse_error".to_string(),
-                                    params: transport_parse_error_payload(
-                                        &error.to_string(),
-                                        &line,
-                                    ),
-                                });
+                                incoming_router
+                                    .dispatch(IncomingMessage::Notification {
+                                        method: "transport/parse_error".to_string(),
+                                        params: transport_parse_error_payload(
+                                            &error.to_string(),
+                                            &line,
+                                        ),
+                                    })
+                                    .await;
                             }
                         },
                         Ok(None) => {
-                            let _ = incoming_tx.send(IncomingMessage::Notification {
-                                method: "transport/eof".to_string(),
-                                params: serde_json::value::RawValue::from_string("{}".to_string())
+                            incoming_router
+                                .dispatch(IncomingMessage::Notification {
+                                    method: "transport/eof".to_string(),
+                                    params: serde_json::value::RawValue::from_string(
+                                        "{}".to_string(),
+                                    )
                                     .expect("\"{}\" is valid json"),
-                            });
+                                })
+                                .await;
                             break;
                         }
                         Err(error) => {
                             log::warn!("codex stdout read error: {error}");
-                            let _ = incoming_tx.send(IncomingMessage::Notification {
-                                method: "transport/read_error".to_string(),
-                                params: serde_json::value::to_raw_value(&serde_json::json!({
-                                  "error": error.to_string(),
-                                }))
-                                .expect("internal error payload is valid json"),
-                            });
+                            incoming_router
+                                .dispatch(IncomingMessage::Notification {
+                                    method: "transport/read_error".to_string(),
+                                    params: serde_json::value::to_raw_value(&serde_json::json!({
+                                      "error": error.to_string(),
+                                    }))
+                                    .expect("internal error payload is valid json"),
+                                })
+                                .await;
                             break;
                         }
                     }
@@ -157,13 +205,17 @@ impl CodexTransport {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
             pending,
-            incoming_tx,
+            incoming_router,
             next_request_id: std::sync::atomic::AtomicU64::new(1),
         })
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<IncomingMessage> {
-        self.incoming_tx.subscribe()
+    pub async fn subscribe_thread(&self, thread_id: &str) -> CodexIncomingSubscription {
+        self.incoming_router.subscribe_thread(thread_id).await
+    }
+
+    pub async fn subscribe_runtime(&self) -> mpsc::Receiver<IncomingMessage> {
+        self.incoming_router.subscribe_runtime().await
     }
 
     pub async fn request(
@@ -275,6 +327,168 @@ impl CodexTransport {
     }
 }
 
+impl CodexIncomingSubscription {
+    pub async fn recv(&mut self) -> Option<IncomingMessage> {
+        self.receiver.recv().await
+    }
+
+    #[cfg(test)]
+    fn try_recv(&mut self) -> Option<IncomingMessage> {
+        self.receiver.try_recv().ok()
+    }
+
+    pub async fn set_thread_id(&self, thread_id: &str) {
+        self.scope.set_thread_id(thread_id).await;
+    }
+
+    pub async fn set_turn_id(&self, turn_id: Option<String>) {
+        self.scope.set_turn_id(turn_id).await;
+    }
+}
+
+impl CodexEventScope {
+    fn new(thread_id: &str) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(CodexEventScopeState {
+                thread_id: thread_id.to_string(),
+                turn_id: None,
+            })),
+        }
+    }
+
+    async fn set_thread_id(&self, thread_id: &str) {
+        let mut state = self.inner.lock().await;
+        state.thread_id = thread_id.to_string();
+        state.turn_id = None;
+    }
+
+    async fn set_turn_id(&self, turn_id: Option<String>) {
+        self.inner.lock().await.turn_id = turn_id;
+    }
+
+    async fn matches(&self, message: &IncomingMessage) -> bool {
+        if is_transport_control_message(message) {
+            return true;
+        }
+
+        let params = match message_params(message) {
+            Some(params) => params,
+            None => return true,
+        };
+
+        let message_thread_id = extract_thread_id_from_value(&params);
+        let message_turn_id = extract_turn_id_from_value(&params);
+        let state = self.inner.lock().await.clone();
+
+        if let Some(thread_id) = message_thread_id {
+            if thread_id != state.thread_id {
+                return false;
+            }
+        }
+
+        if let Some(turn_id) = message_turn_id {
+            if let Some(expected_turn_id) = state.turn_id.as_deref() {
+                if turn_id != expected_turn_id {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+}
+
+impl CodexIncomingRouter {
+    async fn subscribe_thread(&self, thread_id: &str) -> CodexIncomingSubscription {
+        let (sender, receiver) = mpsc::channel(TURN_EVENT_QUEUE_CAPACITY);
+        let scope = CodexEventScope::new(thread_id);
+        let subscriber = CodexTurnSubscriber {
+            scope: scope.clone(),
+            sender,
+        };
+        self.state.lock().await.turn_subscribers.push(subscriber);
+
+        CodexIncomingSubscription { receiver, scope }
+    }
+
+    async fn subscribe_runtime(&self) -> mpsc::Receiver<IncomingMessage> {
+        let (sender, receiver) = mpsc::channel(RUNTIME_EVENT_QUEUE_CAPACITY);
+        self.state.lock().await.runtime_subscribers.push(sender);
+        receiver
+    }
+
+    async fn dispatch(&self, message: IncomingMessage) {
+        let delivery_class = delivery_class_for_message(&message);
+        let (turn_subscribers, runtime_subscribers) = {
+            let mut state = self.state.lock().await;
+            state
+                .turn_subscribers
+                .retain(|subscriber| !subscriber.sender.is_closed());
+            state
+                .runtime_subscribers
+                .retain(|subscriber| !subscriber.is_closed());
+            (
+                state.turn_subscribers.clone(),
+                state.runtime_subscribers.clone(),
+            )
+        };
+
+        for subscriber in turn_subscribers {
+            if !subscriber.scope.matches(&message).await {
+                continue;
+            }
+            deliver_message(&subscriber.sender, message.clone(), delivery_class, "turn").await;
+        }
+
+        for sender in runtime_subscribers {
+            deliver_message(
+                &sender,
+                message.clone(),
+                CodexDeliveryClass::BestEffort,
+                "runtime",
+            )
+            .await;
+        }
+    }
+}
+
+async fn deliver_message(
+    sender: &mpsc::Sender<IncomingMessage>,
+    message: IncomingMessage,
+    delivery_class: CodexDeliveryClass,
+    subscriber_kind: &str,
+) {
+    match delivery_class {
+        CodexDeliveryClass::Lossless => {
+            if sender.send(message).await.is_err() {
+                log::debug!("codex {subscriber_kind} event receiver closed during delivery");
+            }
+        }
+        CodexDeliveryClass::BestEffort => {
+            if sender.capacity() <= BEST_EFFORT_QUEUE_RESERVE {
+                log::debug!(
+                    "codex {subscriber_kind} event receiver full; dropping best-effort event"
+                );
+                return;
+            }
+
+            match sender.try_send(message) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    log::debug!(
+                        "codex {subscriber_kind} event receiver closed during best-effort delivery"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    log::debug!(
+                        "codex {subscriber_kind} event receiver full; dropping best-effort event"
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn trim_buffered_incoming_message(message: IncomingMessage) -> IncomingMessage {
     match message {
         IncomingMessage::Notification { method, params } => IncomingMessage::Notification {
@@ -366,6 +580,111 @@ fn is_large_output_event(method: &str) -> bool {
     )
 }
 
+fn delivery_class_for_message(message: &IncomingMessage) -> CodexDeliveryClass {
+    match message {
+        IncomingMessage::Request { .. } => CodexDeliveryClass::Lossless,
+        IncomingMessage::Response(_) => CodexDeliveryClass::Lossless,
+        IncomingMessage::Notification { method, .. } => {
+            let signature = method_signature(method);
+            if matches!(
+                signature.as_str(),
+                "transporteof"
+                    | "transportreaderror"
+                    | "transportparseerror"
+                    | "turnstarted"
+                    | "turncompleted"
+                    | "itemcompleted"
+                    | "itemagentmessagedelta"
+                    | "itemplandelta"
+                    | "itemreasoningsummarytextdelta"
+                    | "itemreasoningtextdelta"
+                    | "threadrealtimetranscriptdelta"
+                    | "threadrealtimetranscriptdone"
+            ) {
+                CodexDeliveryClass::Lossless
+            } else {
+                CodexDeliveryClass::BestEffort
+            }
+        }
+    }
+}
+
+fn is_transport_control_message(message: &IncomingMessage) -> bool {
+    let IncomingMessage::Notification { method, .. } = message else {
+        return false;
+    };
+    matches!(
+        method_signature(method).as_str(),
+        "transporteof" | "transportreaderror" | "transportparseerror"
+    )
+}
+
+fn message_params(message: &IncomingMessage) -> Option<serde_json::Value> {
+    match message {
+        IncomingMessage::Notification { params, .. } | IncomingMessage::Request { params, .. } => {
+            Some(raw_value_to_value(params))
+        }
+        IncomingMessage::Response(_) => None,
+    }
+}
+
+fn extract_thread_id_from_value(value: &serde_json::Value) -> Option<String> {
+    let candidates = [
+        "threadId",
+        "thread_id",
+        "engineThreadId",
+        "engine_thread_id",
+        "conversationId",
+        "conversation_id",
+        "sessionId",
+        "session_id",
+    ];
+
+    if let Some(found) = extract_any_string(value, &candidates) {
+        return Some(found);
+    }
+
+    for key in [
+        "thread", "turn", "session", "context", "meta", "metadata", "item",
+    ] {
+        if let Some(nested) = value.get(key) {
+            if let Some(found) = extract_any_string(nested, &candidates) {
+                return Some(found);
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_turn_id_from_value(value: &serde_json::Value) -> Option<String> {
+    let candidates = ["turnId", "turn_id"];
+
+    if let Some(found) = extract_any_string(value, &candidates) {
+        return Some(found);
+    }
+
+    for key in ["turn", "item", "session", "context", "meta", "metadata"] {
+        if let Some(nested) = value.get(key) {
+            if let Some(found) = extract_any_string(nested, &candidates) {
+                return Some(found);
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_any_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(found) = value.get(*key).and_then(serde_json::Value::as_str) {
+            return Some(found.to_string());
+        }
+    }
+
+    None
+}
+
 fn method_signature(method: &str) -> String {
     method
         .chars()
@@ -381,13 +700,21 @@ fn codex_augmented_path(executable: &str) -> Option<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
+    use serde_json::{json, Value};
 
     #[test]
-    fn incoming_event_buffer_capacity_bounds_idle_retention() {
+    fn event_queue_capacities_bound_idle_retention() {
         assert!(
-            INCOMING_EVENT_BUFFER_CAPACITY <= 256,
-            "Codex incoming events are live fan-out only; raising this can retain large protocol payloads while idle"
+            TURN_EVENT_QUEUE_CAPACITY <= 1024,
+            "Codex turn event queues are live buffers; raising this can retain large protocol payloads"
+        );
+        assert!(
+            RUNTIME_EVENT_QUEUE_CAPACITY <= 512,
+            "Codex runtime event queues should stay best-effort and bounded"
+        );
+        assert!(
+            BEST_EFFORT_QUEUE_RESERVE < TURN_EVENT_QUEUE_CAPACITY,
+            "best-effort reserve must leave room for lossless turn events"
         );
     }
 
@@ -409,5 +736,110 @@ mod tests {
             parsed.get("error").and_then(Value::as_str),
             Some("bad json")
         );
+    }
+
+    #[tokio::test]
+    async fn router_sends_thread_events_only_to_matching_subscribers() {
+        let router = CodexIncomingRouter::default();
+        let mut thread_a = router.subscribe_thread("thread-a").await;
+        let mut thread_b = router.subscribe_thread("thread-b").await;
+
+        router
+            .dispatch(IncomingMessage::Notification {
+                method: "item/agent_message/delta".to_string(),
+                params: serde_json::value::to_raw_value(&json!({
+                    "threadId": "thread-a",
+                    "turnId": "turn-a",
+                    "delta": "hello",
+                }))
+                .expect("valid params"),
+            })
+            .await;
+
+        assert!(thread_a.recv().await.is_some());
+        assert!(thread_b.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn router_filters_by_turn_after_scope_is_bound() {
+        let router = CodexIncomingRouter::default();
+        let mut subscription = router.subscribe_thread("thread-a").await;
+        subscription.set_turn_id(Some("turn-a".to_string())).await;
+
+        router
+            .dispatch(IncomingMessage::Notification {
+                method: "item/agent_message/delta".to_string(),
+                params: serde_json::value::to_raw_value(&json!({
+                    "threadId": "thread-a",
+                    "turnId": "turn-b",
+                    "delta": "wrong",
+                }))
+                .expect("valid params"),
+            })
+            .await;
+
+        assert!(subscription.try_recv().is_none());
+
+        router
+            .dispatch(IncomingMessage::Notification {
+                method: "turn/completed".to_string(),
+                params: serde_json::value::to_raw_value(&json!({
+                    "threadId": "thread-a",
+                    "turnId": "turn-a",
+                    "status": "completed",
+                }))
+                .expect("valid params"),
+            })
+            .await;
+
+        assert!(subscription.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn router_keeps_lossless_turn_completed_when_best_effort_queue_is_full() {
+        let router = CodexIncomingRouter::default();
+        let mut subscription = router.subscribe_thread("thread-a").await;
+
+        for index in 0..(TURN_EVENT_QUEUE_CAPACITY + 16) {
+            router
+                .dispatch(IncomingMessage::Notification {
+                    method: "item/command_execution/output_delta".to_string(),
+                    params: serde_json::value::to_raw_value(&json!({
+                        "threadId": "thread-a",
+                        "turnId": "turn-a",
+                        "delta": format!("line-{index}"),
+                    }))
+                    .expect("valid params"),
+                })
+                .await;
+        }
+
+        router
+            .dispatch(IncomingMessage::Notification {
+                method: "turn/completed".to_string(),
+                params: serde_json::value::to_raw_value(&json!({
+                    "threadId": "thread-a",
+                    "turnId": "turn-a",
+                    "status": "completed",
+                }))
+                .expect("valid params"),
+            })
+            .await;
+
+        let mut saw_completed = false;
+        for _ in 0..TURN_EVENT_QUEUE_CAPACITY {
+            let message = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+                .await
+                .expect("router should deliver queued messages")
+                .expect("subscription should stay open");
+            if let IncomingMessage::Notification { method, .. } = message {
+                if method == "turn/completed" {
+                    saw_completed = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(saw_completed);
     }
 }
