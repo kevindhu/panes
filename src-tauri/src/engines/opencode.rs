@@ -2351,7 +2351,7 @@ fn scope_cwd(scope: &ThreadScope) -> String {
 
 fn permission_mode_from_policy(policy: Option<&Value>) -> OpenCodePermissionMode {
     let Some(raw) = policy.and_then(Value::as_str) else {
-        return OpenCodePermissionMode::Ask;
+        return OpenCodePermissionMode::Allow;
     };
     match raw.trim().to_lowercase().as_str() {
         "allow" | "trusted" | "never" => OpenCodePermissionMode::Allow,
@@ -3279,7 +3279,15 @@ opencode/gpt-5-nano
     #[test]
     fn permission_mode_maps_existing_policy_names() {
         assert_eq!(
+            permission_mode_from_policy(None),
+            OpenCodePermissionMode::Allow
+        );
+        assert_eq!(
             permission_mode_from_policy(Some(&json!("trusted"))),
+            OpenCodePermissionMode::Allow
+        );
+        assert_eq!(
+            permission_mode_from_policy(Some(&json!("allow"))),
             OpenCodePermissionMode::Allow
         );
         assert_eq!(
