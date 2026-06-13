@@ -3735,6 +3735,15 @@ button, input, textarea, select {
 }
 
 /* Project row */
+.sb-project-group {
+  position: relative;
+}
+
+.sb-project-group-dragging {
+  opacity: 0.92;
+  z-index: 2;
+}
+
 .sb-project {
   width: 100%;
   padding: 7px 12px 7px 12px;
@@ -3761,6 +3770,26 @@ button, input, textarea, select {
   content: none;
 }
 
+.sb-project-dragging {
+  background: rgba(9, 105, 218, 0.08);
+  box-shadow: inset 2px 0 0 var(--accent);
+  color: var(--text-1);
+  cursor: grabbing;
+}
+
+.sb-project-dragging:hover {
+  background: rgba(9, 105, 218, 0.1);
+}
+
+.sb-project-dragging .sb-project-name {
+  color: var(--text-1);
+  font-weight: 700;
+}
+
+.sb-project-dragging .sb-project-trailing {
+  opacity: 0.65;
+}
+
 .sb-project-name {
   flex: 1;
   min-width: 0;
@@ -3770,6 +3799,8 @@ button, input, textarea, select {
   font-size: 16px;
   font-weight: 500;
   text-align: left;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 /* Trailing slot — count and more button share the same cell */

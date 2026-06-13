@@ -33,23 +33,30 @@ pub fn upsert_workspace(
     };
 
     if let Some(id) = existing {
+        let top_sort_order = next_workspace_top_sort_order(&conn)?;
         conn.execute(
             "UPDATE workspaces
        SET root_path = ?2,
            last_opened_at = datetime('now'),
            scan_depth = COALESCE(?3, scan_depth),
+           sort_order = CASE
+               WHEN archived_at IS NOT NULL THEN ?4
+               ELSE sort_order
+           END,
            archived_at = NULL
        WHERE id = ?1",
-            params![id, canonical, scan_depth],
+            params![id, canonical, scan_depth, top_sort_order],
         )
         .context("failed to update workspace last_opened_at")?;
     } else {
         let id = Uuid::new_v4().to_string();
         let name = workspace_name_from_path(&canonical);
         let scan_depth = scan_depth.unwrap_or(DEFAULT_SCAN_DEPTH);
+        let sort_order = next_workspace_top_sort_order(&conn)?;
         conn.execute(
-            "INSERT INTO workspaces (id, name, root_path, scan_depth) VALUES (?1, ?2, ?3, ?4)",
-            params![id, name, canonical, scan_depth],
+            "INSERT INTO workspaces (id, name, root_path, scan_depth, sort_order)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, name, canonical, scan_depth, sort_order],
         )
         .context("failed to insert workspace")?;
     }
@@ -63,7 +70,7 @@ pub fn list_workspaces(db: &Database) -> anyhow::Result<Vec<WorkspaceDto>> {
         "SELECT id, name, root_path, scan_depth, created_at, last_opened_at
      FROM workspaces
      WHERE archived_at IS NULL
-     ORDER BY last_opened_at DESC",
+     ORDER BY sort_order ASC, last_opened_at DESC, id ASC",
     )?;
 
     let rows = stmt.query_map([], map_workspace_row)?;
@@ -236,14 +243,16 @@ pub fn archive_workspace(db: &Database, workspace_id: &str) -> anyhow::Result<()
 
 pub fn restore_workspace(db: &Database, workspace_id: &str) -> anyhow::Result<WorkspaceDto> {
     let conn = db.connect()?;
+    let sort_order = next_workspace_top_sort_order(&conn)?;
     let affected = conn
         .execute(
             "UPDATE workspaces
        SET archived_at = NULL,
-           last_opened_at = datetime('now')
+           last_opened_at = datetime('now'),
+           sort_order = ?2
        WHERE id = ?1
          AND archived_at IS NOT NULL",
-            params![workspace_id],
+            params![workspace_id, sort_order],
         )
         .context("failed to restore workspace")?;
 
@@ -321,6 +330,68 @@ pub fn is_git_repo_selection_configured(db: &Database, workspace_id: &str) -> an
     Ok(configured.unwrap_or(0) > 0)
 }
 
+pub fn set_workspace_order(db: &Database, workspace_ids: &[String]) -> anyhow::Result<()> {
+    let mut conn = db.connect()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id
+             FROM workspaces
+             WHERE archived_at IS NULL
+             ORDER BY sort_order ASC, last_opened_at DESC, id ASC",
+        )
+        .context("failed to load active workspace ids")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut active_ids = Vec::new();
+    for row in rows {
+        active_ids.push(row?);
+    }
+    drop(stmt);
+
+    let active_id_set = active_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    let mut seen = std::collections::HashSet::<&str>::new();
+
+    for workspace_id in workspace_ids {
+        if !seen.insert(workspace_id.as_str()) {
+            anyhow::bail!("workspace order contains a duplicate workspace: {workspace_id}");
+        }
+        if !active_id_set.contains(workspace_id.as_str()) {
+            anyhow::bail!("workspace is not active: {workspace_id}");
+        }
+    }
+
+    let provided_id_set = workspace_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    let mut ordered_ids = workspace_ids.to_vec();
+    ordered_ids.extend(
+        active_ids
+            .into_iter()
+            .filter(|workspace_id| !provided_id_set.contains(workspace_id.as_str())),
+    );
+
+    let tx = conn
+        .transaction()
+        .context("failed to start workspace order transaction")?;
+    for (index, workspace_id) in ordered_ids.iter().enumerate() {
+        tx.execute(
+            "UPDATE workspaces
+             SET sort_order = ?1
+             WHERE id = ?2
+               AND archived_at IS NULL",
+            params![index as i64, workspace_id],
+        )
+        .context("failed to persist workspace sort order")?;
+    }
+    tx.commit()
+        .context("failed to commit workspace sort order")?;
+
+    Ok(())
+}
+
 pub fn set_git_repo_selection_configured(
     db: &Database,
     workspace_id: &str,
@@ -393,6 +464,20 @@ fn get_workspace_by_id_optional(
     .context("failed to load workspace by id")
 }
 
+fn next_workspace_top_sort_order(conn: &rusqlite::Connection) -> anyhow::Result<i64> {
+    let current_min = conn
+        .query_row(
+            "SELECT MIN(sort_order)
+             FROM workspaces
+             WHERE archived_at IS NULL",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .context("failed to compute workspace sort order")?;
+
+    Ok(current_min.unwrap_or(1024).saturating_sub(1024))
+}
+
 fn workspace_name_from_path(path: &str) -> String {
     Path::new(path)
         .file_name()
@@ -452,6 +537,150 @@ mod tests {
 
         assert_eq!(created.id, reopened.id);
         assert_eq!(reopened.scan_depth, 7);
+    }
+
+    #[test]
+    fn list_workspaces_uses_persisted_manual_order() {
+        let db = test_db();
+        let root_a = std::env::temp_dir().join(format!("panes-workspace-a-{}", Uuid::new_v4()));
+        let root_b = std::env::temp_dir().join(format!("panes-workspace-b-{}", Uuid::new_v4()));
+        let root_c = std::env::temp_dir().join(format!("panes-workspace-c-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root_a).expect("failed to create temp workspace root");
+        fs::create_dir_all(&root_b).expect("failed to create temp workspace root");
+        fs::create_dir_all(&root_c).expect("failed to create temp workspace root");
+
+        let workspace_a =
+            upsert_workspace(&db, root_a.to_string_lossy().as_ref(), None).expect("create a");
+        let workspace_b =
+            upsert_workspace(&db, root_b.to_string_lossy().as_ref(), None).expect("create b");
+        let workspace_c =
+            upsert_workspace(&db, root_c.to_string_lossy().as_ref(), None).expect("create c");
+
+        set_workspace_order(
+            &db,
+            &[
+                workspace_a.id.clone(),
+                workspace_c.id.clone(),
+                workspace_b.id.clone(),
+            ],
+        )
+        .expect("persist workspace order");
+
+        let listed = list_workspaces(&db).expect("list workspaces");
+        let ids = listed
+            .into_iter()
+            .map(|workspace| workspace.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![workspace_a.id, workspace_c.id, workspace_b.id]);
+    }
+
+    #[test]
+    fn set_workspace_order_accepts_visible_subset_and_preserves_extra_active_rows() {
+        let db = test_db();
+        let root_a = std::env::temp_dir().join(format!("panes-workspace-a-{}", Uuid::new_v4()));
+        let root_b = std::env::temp_dir().join(format!("panes-workspace-b-{}", Uuid::new_v4()));
+        let root_c = std::env::temp_dir().join(format!("panes-workspace-c-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root_a).expect("failed to create temp workspace root");
+        fs::create_dir_all(&root_b).expect("failed to create temp workspace root");
+        fs::create_dir_all(&root_c).expect("failed to create temp workspace root");
+
+        let workspace_a =
+            upsert_workspace(&db, root_a.to_string_lossy().as_ref(), None).expect("create a");
+        let workspace_b =
+            upsert_workspace(&db, root_b.to_string_lossy().as_ref(), None).expect("create b");
+        let workspace_c =
+            upsert_workspace(&db, root_c.to_string_lossy().as_ref(), None).expect("create c");
+
+        set_workspace_order(&db, &[workspace_b.id.clone(), workspace_a.id.clone()])
+            .expect("partial visible order should persist");
+
+        let ids = list_workspaces(&db)
+            .expect("list workspaces")
+            .into_iter()
+            .map(|workspace| workspace.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![workspace_b.id, workspace_a.id, workspace_c.id]);
+    }
+
+    #[test]
+    fn set_workspace_order_rejects_duplicate_and_inactive_ids() {
+        let db = test_db();
+        let root_a = std::env::temp_dir().join(format!("panes-workspace-a-{}", Uuid::new_v4()));
+        let root_b = std::env::temp_dir().join(format!("panes-workspace-b-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root_a).expect("failed to create temp workspace root");
+        fs::create_dir_all(&root_b).expect("failed to create temp workspace root");
+
+        let workspace_a =
+            upsert_workspace(&db, root_a.to_string_lossy().as_ref(), None).expect("create a");
+        let workspace_b =
+            upsert_workspace(&db, root_b.to_string_lossy().as_ref(), None).expect("create b");
+        archive_workspace(&db, &workspace_b.id).expect("archive b");
+
+        let duplicate_error = set_workspace_order(
+            &db,
+            &[workspace_a.id.clone(), workspace_a.id.clone()],
+        )
+        .expect_err("duplicate order should fail");
+        assert!(duplicate_error
+            .to_string()
+            .contains("workspace order contains a duplicate workspace"));
+
+        let inactive_error = set_workspace_order(&db, &[workspace_b.id.clone()])
+            .expect_err("inactive order should fail");
+        assert!(inactive_error
+            .to_string()
+            .contains("workspace is not active"));
+    }
+
+    #[test]
+    fn new_and_restored_workspaces_appear_at_top_without_moving_existing_reopens() {
+        let db = test_db();
+        let root_a = std::env::temp_dir().join(format!("panes-workspace-a-{}", Uuid::new_v4()));
+        let root_b = std::env::temp_dir().join(format!("panes-workspace-b-{}", Uuid::new_v4()));
+        let root_c = std::env::temp_dir().join(format!("panes-workspace-c-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root_a).expect("failed to create temp workspace root");
+        fs::create_dir_all(&root_b).expect("failed to create temp workspace root");
+        fs::create_dir_all(&root_c).expect("failed to create temp workspace root");
+
+        let workspace_a =
+            upsert_workspace(&db, root_a.to_string_lossy().as_ref(), None).expect("create a");
+        let workspace_b =
+            upsert_workspace(&db, root_b.to_string_lossy().as_ref(), None).expect("create b");
+        set_workspace_order(&db, &[workspace_a.id.clone(), workspace_b.id.clone()])
+            .expect("persist workspace order");
+
+        let reopened_a =
+            upsert_workspace(&db, root_a.to_string_lossy().as_ref(), None).expect("reopen a");
+        assert_eq!(reopened_a.id, workspace_a.id);
+        let ids_after_reopen = list_workspaces(&db)
+            .expect("list workspaces")
+            .into_iter()
+            .map(|workspace| workspace.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids_after_reopen, vec![workspace_a.id.clone(), workspace_b.id.clone()]);
+
+        let workspace_c =
+            upsert_workspace(&db, root_c.to_string_lossy().as_ref(), None).expect("create c");
+        let ids_after_new = list_workspaces(&db)
+            .expect("list workspaces")
+            .into_iter()
+            .map(|workspace| workspace.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids_after_new,
+            vec![workspace_c.id.clone(), workspace_a.id.clone(), workspace_b.id.clone()]
+        );
+
+        archive_workspace(&db, &workspace_a.id).expect("archive a");
+        restore_workspace(&db, &workspace_a.id).expect("restore a");
+        let ids_after_restore = list_workspaces(&db)
+            .expect("list workspaces")
+            .into_iter()
+            .map(|workspace| workspace.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids_after_restore.first(), Some(&workspace_a.id));
     }
 
     #[test]

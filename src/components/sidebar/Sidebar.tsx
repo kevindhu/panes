@@ -47,6 +47,11 @@ import { UpdateDialog } from "../onboarding/UpdateDialog";
 import { ConfirmDialog } from "../shared/ConfirmDialog";
 import { WorkspaceMoreMenu } from "../workspace/WorkspaceMoreMenu";
 import { normalizeSidebarCollapsedState } from "./sidebarCollapseState";
+import {
+  getWorkspaceDropIndex,
+  moveWorkspaceId,
+  type WorkspaceDragRowRect,
+} from "./workspaceDragSort";
 import type { Thread, Workspace } from "../../types";
 
 interface ProjectGroup {
@@ -61,7 +66,19 @@ interface ThreadContextMenuState {
   triggerRect: { top: number; bottom: number; right: number };
 }
 
+interface WorkspaceDragState {
+  workspaceId: string;
+  pointerId: number;
+  startX: number;
+  startY: number;
+  dragging: boolean;
+  orderedIds: string[];
+}
+
 const MAX_VISIBLE_THREADS = 8;
+const WORKSPACE_DRAG_THRESHOLD_PX = 5;
+const WORKSPACE_DRAG_EDGE_SCROLL_PX = 36;
+const WORKSPACE_DRAG_MAX_SCROLL_SPEED = 14;
 const LEGACY_SCAN_DEPTH_STORAGE_KEY = "panes.workspace.scanDepth";
 const LEGACY_SCAN_DEPTH_MIN = 0;
 const LEGACY_SCAN_DEPTH_MAX = 12;
@@ -81,6 +98,10 @@ function readLegacyDefaultScanDepth(): number | undefined {
   return parsed;
 }
 
+function areStringArraysEqual(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
 /* ─────────────────────────────────────────────────────
    Sidebar content — shared between pinned and flyout
    ───────────────────────────────────────────────────── */
@@ -96,6 +117,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
     openWorkspace,
     removeWorkspace,
     restoreWorkspace,
+    reorderWorkspaces,
     refreshArchivedWorkspaces,
     error,
   } = useWorkspaceStore();
@@ -144,6 +166,17 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
     [workspaces, threads],
   );
   const workspaceIds = useMemo(() => workspaces.map((workspace) => workspace.id), [workspaces]);
+  const [workspaceDragState, setWorkspaceDragState] = useState<WorkspaceDragState | null>(null);
+  const projectsById = useMemo(
+    () => new Map(projects.map((project) => [project.workspace.id, project])),
+    [projects],
+  );
+  const visibleProjects = useMemo(() => {
+    const orderedIds = workspaceDragState?.dragging ? workspaceDragState.orderedIds : workspaceIds;
+    return orderedIds
+      .map((workspaceId) => projectsById.get(workspaceId))
+      .filter((project): project is ProjectGroup => project !== undefined);
+  }, [projectsById, workspaceDragState, workspaceIds]);
 
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() =>
     normalizeSidebarCollapsedState(workspaceIds, activeWorkspaceId, {}, null),
@@ -164,10 +197,221 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   const settingsMenuRef = useRef<HTMLDivElement>(null);
   const settingsTriggerRef = useRef<HTMLButtonElement>(null);
   const threadContextMenuRef = useRef<HTMLDivElement>(null);
+  const workspaceScrollRef = useRef<HTMLDivElement>(null);
+  const workspaceRowRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  const workspaceDragStateRef = useRef<WorkspaceDragState | null>(null);
+  const workspaceIdsRef = useRef<string[]>(workspaceIds);
+  const workspacePointerCleanupRef = useRef<(() => void) | null>(null);
+  const workspaceAutoScrollFrameRef = useRef<number | null>(null);
+  const workspaceAutoScrollSpeedRef = useRef(0);
+  const workspaceDragClientYRef = useRef(0);
+  const suppressWorkspaceClickRef = useRef(false);
   const previousSyncedActiveWorkspaceIdRef = useRef<string | null>(activeWorkspaceId);
 
   const closeSettingsMenu = useCallback(() => setSettingsMenuOpen(false), []);
   const closeThreadContextMenu = useCallback(() => setThreadContextMenu(null), []);
+
+  useEffect(() => {
+    workspaceIdsRef.current = workspaceIds;
+  }, [workspaceIds]);
+
+  function setWorkspaceDrag(updater: (state: WorkspaceDragState | null) => WorkspaceDragState | null) {
+    const next = updater(workspaceDragStateRef.current);
+    workspaceDragStateRef.current = next;
+    setWorkspaceDragState(next);
+  }
+
+  function getWorkspaceRowRects(orderedIds: string[]): WorkspaceDragRowRect[] {
+    return orderedIds.flatMap((workspaceId) => {
+      const row = workspaceRowRefs.current[workspaceId];
+      if (!row) {
+        return [];
+      }
+      const rect = row.getBoundingClientRect();
+      return [{ id: workspaceId, top: rect.top, bottom: rect.bottom }];
+    });
+  }
+
+  function updateWorkspaceDragOrder(clientY: number) {
+    setWorkspaceDrag((state) => {
+      if (!state?.dragging) {
+        return state;
+      }
+      const rowRects = getWorkspaceRowRects(state.orderedIds);
+      const dropIndex = getWorkspaceDropIndex(clientY, rowRects, state.workspaceId);
+      const orderedIds = moveWorkspaceId(state.orderedIds, state.workspaceId, dropIndex);
+      if (areStringArraysEqual(orderedIds, state.orderedIds)) {
+        return state;
+      }
+      return { ...state, orderedIds };
+    });
+  }
+
+  function stopWorkspaceAutoScroll() {
+    workspaceAutoScrollSpeedRef.current = 0;
+    if (workspaceAutoScrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(workspaceAutoScrollFrameRef.current);
+      workspaceAutoScrollFrameRef.current = null;
+    }
+  }
+
+  function clearWorkspacePointerListeners() {
+    workspacePointerCleanupRef.current?.();
+    workspacePointerCleanupRef.current = null;
+  }
+
+  function runWorkspaceAutoScroll() {
+    const speed = workspaceAutoScrollSpeedRef.current;
+    const scrollContainer = workspaceScrollRef.current;
+    const dragState = workspaceDragStateRef.current;
+    if (!speed || !scrollContainer || !dragState?.dragging) {
+      workspaceAutoScrollFrameRef.current = null;
+      return;
+    }
+
+    scrollContainer.scrollTop += speed;
+    updateWorkspaceDragOrder(workspaceDragClientYRef.current);
+    workspaceAutoScrollFrameRef.current = window.requestAnimationFrame(runWorkspaceAutoScroll);
+  }
+
+  function updateWorkspaceAutoScroll(clientY: number) {
+    const scrollContainer = workspaceScrollRef.current;
+    if (!scrollContainer) {
+      stopWorkspaceAutoScroll();
+      return;
+    }
+
+    const rect = scrollContainer.getBoundingClientRect();
+    if (rect.height <= 0) {
+      stopWorkspaceAutoScroll();
+      return;
+    }
+
+    let speed = 0;
+    if (clientY < rect.top + WORKSPACE_DRAG_EDGE_SCROLL_PX) {
+      const distance = rect.top + WORKSPACE_DRAG_EDGE_SCROLL_PX - clientY;
+      speed = -Math.min(WORKSPACE_DRAG_MAX_SCROLL_SPEED, Math.max(2, Math.ceil(distance / 3)));
+    } else if (clientY > rect.bottom - WORKSPACE_DRAG_EDGE_SCROLL_PX) {
+      const distance = clientY - (rect.bottom - WORKSPACE_DRAG_EDGE_SCROLL_PX);
+      speed = Math.min(WORKSPACE_DRAG_MAX_SCROLL_SPEED, Math.max(2, Math.ceil(distance / 3)));
+    }
+
+    workspaceAutoScrollSpeedRef.current = speed;
+    if (speed !== 0 && workspaceAutoScrollFrameRef.current === null) {
+      workspaceAutoScrollFrameRef.current = window.requestAnimationFrame(runWorkspaceAutoScroll);
+    }
+    if (speed === 0 && workspaceAutoScrollFrameRef.current !== null) {
+      stopWorkspaceAutoScroll();
+    }
+  }
+
+  function suppressNextWorkspaceClick() {
+    suppressWorkspaceClickRef.current = true;
+    window.setTimeout(() => {
+      suppressWorkspaceClickRef.current = false;
+    }, 0);
+  }
+
+  function finishWorkspaceDrag() {
+    stopWorkspaceAutoScroll();
+    const completedDrag = workspaceDragStateRef.current;
+    setWorkspaceDrag(() => null);
+
+    if (!completedDrag?.dragging) {
+      return;
+    }
+
+    suppressNextWorkspaceClick();
+    const currentIds = workspaceIdsRef.current;
+    if (areStringArraysEqual(completedDrag.orderedIds, currentIds)) {
+      return;
+    }
+
+    void reorderWorkspaces(completedDrag.orderedIds).catch(() => {
+      toast.error(t("app:sidebar.workspaceOrderFailed"));
+    });
+  }
+
+  function onWorkspacePointerDown(
+    event: React.PointerEvent<HTMLButtonElement>,
+    workspaceId: string,
+  ) {
+    if (
+      event.button !== 0 ||
+      event.pointerType === "touch" ||
+      (event.target as HTMLElement).closest("[data-workspace-drag-ignore]")
+    ) {
+      return;
+    }
+
+    const pointerId = event.pointerId;
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const initialOrder = workspaceIdsRef.current;
+    clearWorkspacePointerListeners();
+    workspaceDragClientYRef.current = startY;
+    workspaceDragStateRef.current = {
+      workspaceId,
+      pointerId,
+      startX,
+      startY,
+      dragging: false,
+      orderedIds: initialOrder,
+    };
+    setWorkspaceDragState(workspaceDragStateRef.current);
+
+    const onPointerMove = (moveEvent: PointerEvent) => {
+      const state = workspaceDragStateRef.current;
+      if (!state || moveEvent.pointerId !== pointerId) {
+        return;
+      }
+
+      workspaceDragClientYRef.current = moveEvent.clientY;
+      const distance = Math.hypot(moveEvent.clientX - state.startX, moveEvent.clientY - state.startY);
+      const shouldDrag = state.dragging || distance >= WORKSPACE_DRAG_THRESHOLD_PX;
+      if (!shouldDrag) {
+        return;
+      }
+
+      moveEvent.preventDefault();
+      closeSettingsMenu();
+      closeThreadContextMenu();
+
+      if (!state.dragging) {
+        setWorkspaceDrag((current) =>
+          current ? { ...current, dragging: true, orderedIds: workspaceIdsRef.current } : current
+        );
+      }
+
+      updateWorkspaceDragOrder(moveEvent.clientY);
+      updateWorkspaceAutoScroll(moveEvent.clientY);
+    };
+
+    const onPointerEnd = (endEvent: PointerEvent) => {
+      if (endEvent.pointerId !== pointerId) {
+        return;
+      }
+      clearWorkspacePointerListeners();
+      finishWorkspaceDrag();
+    };
+
+    window.addEventListener("pointermove", onPointerMove, { passive: false });
+    window.addEventListener("pointerup", onPointerEnd);
+    window.addEventListener("pointercancel", onPointerEnd);
+    workspacePointerCleanupRef.current = () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerEnd);
+      window.removeEventListener("pointercancel", onPointerEnd);
+    };
+  }
+
+  useEffect(() => {
+    return () => {
+      clearWorkspacePointerListeners();
+      stopWorkspaceAutoScroll();
+      workspaceDragStateRef.current = null;
+    };
+  }, []);
 
   useEffect(() => {
     if (!settingsMenuOpen) return;
@@ -542,7 +786,10 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
       </div>
 
       {/* ── Scrollable content ── */}
-      <div style={{ flex: 1, minHeight: 0, overflow: "auto", paddingBottom: 4, borderTop: "1px solid rgba(31, 35, 40, 0.06)", marginTop: 4 }}>
+      <div
+        ref={workspaceScrollRef}
+        style={{ flex: 1, minHeight: 0, overflow: "auto", paddingBottom: 4, borderTop: "1px solid rgba(31, 35, 40, 0.06)", marginTop: 4 }}
+      >
         <div className="sb-section-label">
           <span>{t("app:sidebar.workspaces")}</span>
           <button
@@ -565,7 +812,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
             {t("app:sidebar.openFolder")}
           </div>
         ) : (
-          projects.map((project) => {
+          visibleProjects.map((project) => {
             const isActiveProject = project.workspace.id === activeWorkspaceId;
             const isCollapsed = collapsed[project.workspace.id] ?? false;
             const projectName = getWorkspaceLabel(project.workspace);
@@ -575,14 +822,33 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
               : project.threads.slice(0, MAX_VISIBLE_THREADS);
             const hasMore = project.threads.length > MAX_VISIBLE_THREADS;
             const constrainExpandedThreads = isShowingAll && hasMore;
+            const isDraggingProject =
+              workspaceDragState?.dragging && workspaceDragState.workspaceId === project.workspace.id;
 
             return (
-              <div key={project.workspace.id} style={{ marginBottom: 2 }}>
+              <div
+                key={project.workspace.id}
+                className={`sb-project-group${isDraggingProject ? " sb-project-group-dragging" : ""}`}
+                style={{ marginBottom: 2 }}
+              >
                 {/* Workspace header */}
                 <button
+                  ref={(node) => {
+                    workspaceRowRefs.current[project.workspace.id] = node;
+                  }}
                   type="button"
-                  className={`sb-project ${isActiveProject ? "sb-project-active" : ""}`}
-                  onClick={() => {
+                  className={`sb-project ${isActiveProject ? "sb-project-active" : ""}${
+                    isDraggingProject ? " sb-project-dragging" : ""
+                  }`}
+                  aria-grabbed={isDraggingProject}
+                  onPointerDown={(event) => onWorkspacePointerDown(event, project.workspace.id)}
+                  onClick={(event) => {
+                    if (suppressWorkspaceClickRef.current) {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      suppressWorkspaceClickRef.current = false;
+                      return;
+                    }
                     if (isActiveProject) {
                       toggleCollapse(project.workspace.id);
                     } else {

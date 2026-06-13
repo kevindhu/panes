@@ -65,6 +65,7 @@
     "terminal": "Terminal",
     "terminalAcceleratedRendering": "Accelerated rendering",
     "terminalAcceleratedRenderingFailed": "Failed to update terminal rendering.",
+    "workspaceOrderFailed": "Failed to save workspace order.",
     "archiveWorkspaceTitle": "Archive workspace",
     "archiveWorkspaceMessage": "Archive workspace \"{{name}}\" and hide its repos/threads/messages from the sidebar? You can reopen this folder later to restore it.",
     "archiveThreadTitle": "Archive thread",

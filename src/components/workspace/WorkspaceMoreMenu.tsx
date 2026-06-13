@@ -75,8 +75,10 @@ export function WorkspaceMoreMenu({
       <span
         ref={triggerRef}
         role="button"
+        data-workspace-drag-ignore="true"
         title={t("more.options")}
         className="sb-project-archive"
+        onPointerDown={(e) => e.stopPropagation()}
         onMouseDown={(e) => e.stopPropagation()}
         onClick={handleTriggerClick}
       >

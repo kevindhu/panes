@@ -196,6 +196,7 @@ pub fn run() {
             commands::chat::search_messages,
             commands::workspace::open_workspace,
             commands::workspace::list_workspaces,
+            commands::workspace::set_workspace_order,
             commands::workspace::list_archived_workspaces,
             commands::workspace::get_repos,
             commands::workspace::set_repo_trust_level,

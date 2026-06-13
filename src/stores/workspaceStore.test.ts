@@ -7,6 +7,7 @@ const mockIpc = vi.hoisted(() => ({
   listArchivedWorkspaces: vi.fn(),
   listWorkspaces: vi.fn(),
   openWorkspace: vi.fn(),
+  setWorkspaceOrder: vi.fn(),
 }));
 
 const mockTerminalStoreState = vi.hoisted(() => ({
@@ -165,6 +166,29 @@ describe("workspaceStore.openWorkspace", () => {
     expect(result).toBeNull();
     expect(useWorkspaceStore.getState().error).toContain("open failed");
   });
+
+  it("updates an already open workspace in place instead of moving it to the top", async () => {
+    const workspaceA = makeWorkspace("ws-a", "/workspace/a");
+    const workspaceB = makeWorkspace("ws-b", "/workspace/b");
+    const reopenedWorkspaceB = {
+      ...workspaceB,
+      scanDepth: 8,
+    };
+
+    mockIpc.openWorkspace.mockResolvedValue(reopenedWorkspaceB);
+    useWorkspaceStore.setState({
+      workspaces: [workspaceA, workspaceB],
+      activeWorkspaceId: workspaceA.id,
+    });
+
+    const result = await useWorkspaceStore.getState().openWorkspace(workspaceB.rootPath);
+
+    expect(result).toEqual(reopenedWorkspaceB);
+    expect(useWorkspaceStore.getState().workspaces).toEqual([
+      workspaceA,
+      reopenedWorkspaceB,
+    ]);
+  });
 });
 
 describe("workspaceStore.rescanWorkspace", () => {
@@ -222,7 +246,10 @@ describe("workspaceStore.rescanWorkspace", () => {
     expect(mockIpc.getRepos).not.toHaveBeenCalled();
     expect(result).toEqual(updatedTargetWorkspace);
     expect(useWorkspaceStore.getState().activeWorkspaceId).toBe(activeWorkspace.id);
-    expect(useWorkspaceStore.getState().workspaces[0]).toEqual(updatedTargetWorkspace);
+    expect(useWorkspaceStore.getState().workspaces).toEqual([
+      activeWorkspace,
+      updatedTargetWorkspace,
+    ]);
   });
 
   it("reloads repos when rescanning the active workspace", async () => {
@@ -305,5 +332,78 @@ describe("workspaceStore.loadWorkspaces", () => {
     expect(mockIpc.getRepos).toHaveBeenCalledWith(validWorkspace.id);
     expect(useWorkspaceStore.getState().activeWorkspaceId).toBe(validWorkspace.id);
     expect(useWorkspaceStore.getState().repos).toEqual([repo]);
+  });
+});
+
+describe("workspaceStore.reorderWorkspaces", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal("localStorage", {
+      getItem: vi.fn(() => null),
+      setItem: vi.fn(),
+      removeItem: vi.fn(),
+      clear: vi.fn(),
+    });
+
+    useWorkspaceStore.setState({
+      workspaces: [],
+      archivedWorkspaces: [],
+      activeWorkspaceId: null,
+      repos: [],
+      activeRepoId: null,
+      reposLoading: false,
+      loading: false,
+      error: undefined,
+    });
+
+    mockIpc.setWorkspaceOrder.mockResolvedValue(undefined);
+    mockIpc.listWorkspaces.mockResolvedValue([]);
+    mockIpc.listArchivedWorkspaces.mockResolvedValue([]);
+    mockIpc.getRepos.mockResolvedValue([]);
+    mockTerminalStoreState.prepareWorkspaceActivation.mockResolvedValue(undefined);
+  });
+
+  it("optimistically reorders workspaces and persists the id order", async () => {
+    const workspaceA = makeWorkspace("ws-a", "/workspace/a");
+    const workspaceB = makeWorkspace("ws-b", "/workspace/b");
+    const workspaceC = makeWorkspace("ws-c", "/workspace/c");
+
+    useWorkspaceStore.setState({
+      workspaces: [workspaceA, workspaceB, workspaceC],
+    });
+
+    await useWorkspaceStore.getState().reorderWorkspaces([
+      workspaceC.id,
+      workspaceA.id,
+      workspaceB.id,
+    ]);
+
+    expect(mockIpc.setWorkspaceOrder).toHaveBeenCalledWith([
+      workspaceC.id,
+      workspaceA.id,
+      workspaceB.id,
+    ]);
+    expect(useWorkspaceStore.getState().workspaces).toEqual([
+      workspaceC,
+      workspaceA,
+      workspaceB,
+    ]);
+  });
+
+  it("rolls back optimistic order when persistence fails", async () => {
+    const workspaceA = makeWorkspace("ws-a", "/workspace/a");
+    const workspaceB = makeWorkspace("ws-b", "/workspace/b");
+
+    mockIpc.setWorkspaceOrder.mockRejectedValue(new Error("save failed"));
+    useWorkspaceStore.setState({
+      workspaces: [workspaceA, workspaceB],
+    });
+
+    await expect(
+      useWorkspaceStore.getState().reorderWorkspaces([workspaceB.id, workspaceA.id]),
+    ).rejects.toThrow("save failed");
+
+    expect(useWorkspaceStore.getState().workspaces).toEqual([workspaceA, workspaceB]);
+    expect(useWorkspaceStore.getState().error).toContain("save failed");
   });
 });
