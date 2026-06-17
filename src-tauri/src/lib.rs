@@ -1,6 +1,7 @@
 mod commands;
 mod config;
 mod db;
+mod diagnostic_logs;
 mod engines;
 mod fs_ops;
 mod git;

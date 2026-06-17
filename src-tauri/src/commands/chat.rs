@@ -2199,6 +2199,19 @@ async fn run_turn(
     let turn_started_at = Instant::now();
     let (event_tx, mut event_rx) = mpsc::channel::<EngineEvent>(ENGINE_EVENT_QUEUE_CAPACITY);
 
+    if thread.engine_id == "codex" && turn_input.plan_mode {
+        let message = format!(
+            "codex plan turn bridge started: local_thread_id={}, engine_thread_id={}, assistant_message_id={}, client_turn_id={:?}, model_id={}",
+            thread.id,
+            engine_thread_id,
+            assistant_message_id,
+            client_turn_id,
+            initial_turn_model_id
+        );
+        log::info!("{message}");
+        crate::diagnostic_logs::append_codex_event_routing_log(&message);
+    }
+
     let engines = state.engines.clone();
     let thread_for_engine = thread.clone();
     let input_for_engine = turn_input.clone();
@@ -5225,8 +5238,7 @@ mod tests {
         let state = test_app_state();
         let mut thread = test_thread(&state, "codex", "gpt-5.5-codex");
         thread.repo_id = Some("repo-1".to_string());
-        let event =
-            build_chat_turn_finished_event(&thread, &MessageStatusDto::Completed, &[]);
+        let event = build_chat_turn_finished_event(&thread, &MessageStatusDto::Completed, &[]);
 
         assert_eq!(event.thread_id, thread.id);
         assert_eq!(event.workspace_id, thread.workspace_id);

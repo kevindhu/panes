@@ -42,6 +42,19 @@ struct CodexEventScopeState {
     turn_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct CodexMessageRoutingInfo {
+    kind: &'static str,
+    method: Option<String>,
+    signature: Option<String>,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    params_keys: Option<Vec<String>>,
+    content_chars: Option<usize>,
+    is_plan_event: bool,
+    is_transport_control: bool,
+}
+
 pub struct CodexIncomingSubscription {
     receiver: mpsc::Receiver<IncomingMessage>,
     scope: CodexEventScope,
@@ -62,6 +75,13 @@ struct CodexIncomingRouterState {
 struct CodexTurnSubscriber {
     scope: CodexEventScope,
     sender: mpsc::Sender<IncomingMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexScopeMatch {
+    Matched,
+    ThreadMismatch { expected: String, found: String },
+    TurnMismatch { expected: String, found: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,35 +386,34 @@ impl CodexEventScope {
         self.inner.lock().await.turn_id = turn_id;
     }
 
-    async fn matches(&self, message: &IncomingMessage) -> bool {
-        if is_transport_control_message(message) {
-            return true;
+    async fn matches_info(&self, info: &CodexMessageRoutingInfo) -> CodexScopeMatch {
+        if info.is_transport_control {
+            return CodexScopeMatch::Matched;
         }
 
-        let params = match message_params(message) {
-            Some(params) => params,
-            None => return true,
-        };
-
-        let message_thread_id = extract_thread_id_from_value(&params);
-        let message_turn_id = extract_turn_id_from_value(&params);
         let state = self.inner.lock().await.clone();
 
-        if let Some(thread_id) = message_thread_id {
+        if let Some(thread_id) = info.thread_id.as_deref() {
             if thread_id != state.thread_id {
-                return false;
+                return CodexScopeMatch::ThreadMismatch {
+                    expected: state.thread_id,
+                    found: thread_id.to_string(),
+                };
             }
         }
 
-        if let Some(turn_id) = message_turn_id {
+        if let Some(turn_id) = info.turn_id.as_deref() {
             if let Some(expected_turn_id) = state.turn_id.as_deref() {
                 if turn_id != expected_turn_id {
-                    return false;
+                    return CodexScopeMatch::TurnMismatch {
+                        expected: expected_turn_id.to_string(),
+                        found: turn_id.to_string(),
+                    };
                 }
             }
         }
 
-        true
+        CodexScopeMatch::Matched
     }
 }
 
@@ -419,6 +438,7 @@ impl CodexIncomingRouter {
 
     async fn dispatch(&self, message: IncomingMessage) {
         let delivery_class = delivery_class_for_message(&message);
+        let routing_info = routing_info_for_message(&message);
         let (turn_subscribers, runtime_subscribers) = {
             let mut state = self.state.lock().await;
             state
@@ -433,23 +453,129 @@ impl CodexIncomingRouter {
             )
         };
 
+        let turn_subscriber_count = turn_subscribers.len();
+        let runtime_subscriber_count = runtime_subscribers.len();
+        let mut delivered_turn_subscribers = 0usize;
+        let mut skipped_scope_reasons = Vec::new();
+
         for subscriber in turn_subscribers {
-            if !subscriber.scope.matches(&message).await {
-                continue;
+            match subscriber.scope.matches_info(&routing_info).await {
+                CodexScopeMatch::Matched => {
+                    if deliver_message(
+                        &subscriber.sender,
+                        message.clone(),
+                        delivery_class,
+                        "turn",
+                        &routing_info,
+                    )
+                    .await
+                    {
+                        delivered_turn_subscribers += 1;
+                    }
+                }
+                CodexScopeMatch::ThreadMismatch { expected, found } => {
+                    let reason = format!("thread_mismatch(expected={expected}, found={found})");
+                    let message = if routing_info.is_plan_event {
+                        format!(
+                            "codex plan event not routed to turn subscriber: {}; {reason}",
+                            routing_info.log_summary()
+                        )
+                    } else {
+                        format!(
+                            "codex event not routed to turn subscriber: {}; {reason}",
+                            routing_info.log_summary()
+                        )
+                    };
+                    if routing_info.is_plan_event {
+                        log::info!("{message}");
+                    } else {
+                        log::debug!("{message}");
+                    }
+                    record_codex_event_routing_log(&message);
+                    skipped_scope_reasons.push(reason);
+                }
+                CodexScopeMatch::TurnMismatch { expected, found } => {
+                    let reason = format!("turn_mismatch(expected={expected}, found={found})");
+                    let message = if routing_info.is_plan_event {
+                        format!(
+                            "codex plan event not routed to turn subscriber: {}; {reason}",
+                            routing_info.log_summary()
+                        )
+                    } else {
+                        format!(
+                            "codex event not routed to turn subscriber: {}; {reason}",
+                            routing_info.log_summary()
+                        )
+                    };
+                    if routing_info.is_plan_event {
+                        log::info!("{message}");
+                    } else {
+                        log::debug!("{message}");
+                    }
+                    record_codex_event_routing_log(&message);
+                    skipped_scope_reasons.push(reason);
+                }
             }
-            deliver_message(&subscriber.sender, message.clone(), delivery_class, "turn").await;
+        }
+
+        if routing_info.should_log_successful_plan_routing() {
+            let message = format!(
+                "codex plan event routing: {}; delivery_class={delivery_class:?}; turn_subscribers={turn_subscriber_count}; delivered_turn_subscribers={delivered_turn_subscribers}; runtime_subscribers={runtime_subscriber_count}; skipped_scope_reasons={:?}",
+                routing_info.log_summary(),
+                skipped_scope_reasons
+            );
+            log::info!("{message}");
+            record_codex_event_routing_log(&message);
+        } else if turn_subscriber_count > 0
+            && delivered_turn_subscribers == 0
+            && !skipped_scope_reasons.is_empty()
+        {
+            let message = format!(
+                "codex event was not delivered to any matching turn subscriber: {}; delivery_class={delivery_class:?}; turn_subscribers={turn_subscriber_count}; runtime_subscribers={runtime_subscriber_count}; skipped_scope_reasons={:?}",
+                routing_info.log_summary(),
+                skipped_scope_reasons
+            );
+            log::debug!("{message}");
+            record_codex_event_routing_log(&message);
         }
 
         for sender in runtime_subscribers {
-            deliver_message(
+            let _ = deliver_message(
                 &sender,
                 message.clone(),
                 CodexDeliveryClass::BestEffort,
                 "runtime",
+                &routing_info,
             )
             .await;
         }
     }
+}
+
+impl CodexMessageRoutingInfo {
+    fn log_summary(&self) -> String {
+        format!(
+            "kind={}; method={}; signature={}; thread_id={}; turn_id={}; params_keys={:?}; content_chars={}; plan_event={}",
+            self.kind,
+            self.method.as_deref().unwrap_or("<none>"),
+            self.signature.as_deref().unwrap_or("<none>"),
+            self.thread_id.as_deref().unwrap_or("<missing>"),
+            self.turn_id.as_deref().unwrap_or("<missing>"),
+            self.params_keys,
+            self.content_chars
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            self.is_plan_event
+        )
+    }
+
+    fn should_log_successful_plan_routing(&self) -> bool {
+        self.signature.as_deref() == Some("turnplanupdated")
+    }
+}
+
+fn record_codex_event_routing_log(message: &str) {
+    crate::diagnostic_logs::append_codex_event_routing_log(message);
 }
 
 async fn deliver_message(
@@ -457,36 +583,120 @@ async fn deliver_message(
     message: IncomingMessage,
     delivery_class: CodexDeliveryClass,
     subscriber_kind: &str,
-) {
+    routing_info: &CodexMessageRoutingInfo,
+) -> bool {
     match delivery_class {
         CodexDeliveryClass::Lossless => {
             if sender.send(message).await.is_err() {
-                log::debug!("codex {subscriber_kind} event receiver closed during delivery");
+                let message = format!(
+                    "codex {subscriber_kind} event receiver closed during delivery; dropped event: {}",
+                    routing_info.log_summary()
+                );
+                log::warn!("{message}");
+                record_codex_event_routing_log(&message);
+                return false;
             }
+            true
         }
         CodexDeliveryClass::BestEffort => {
             if sender.capacity() <= BEST_EFFORT_QUEUE_RESERVE {
-                log::debug!(
-                    "codex {subscriber_kind} event receiver full; dropping best-effort event"
+                let message = format!(
+                    "codex {subscriber_kind} event receiver full; dropping best-effort event: {}",
+                    routing_info.log_summary()
                 );
-                return;
+                log::warn!("{message}");
+                record_codex_event_routing_log(&message);
+                return false;
             }
 
             match sender.try_send(message) {
-                Ok(()) => {}
+                Ok(()) => true,
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    log::debug!(
-                        "codex {subscriber_kind} event receiver closed during best-effort delivery"
+                    let message = format!(
+                        "codex {subscriber_kind} event receiver closed during best-effort delivery; dropped event: {}",
+                        routing_info.log_summary()
                     );
+                    log::warn!("{message}");
+                    record_codex_event_routing_log(&message);
+                    false
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    log::debug!(
-                        "codex {subscriber_kind} event receiver full; dropping best-effort event"
+                    let message = format!(
+                        "codex {subscriber_kind} event receiver full; dropping best-effort event: {}",
+                        routing_info.log_summary()
                     );
+                    log::warn!("{message}");
+                    record_codex_event_routing_log(&message);
+                    false
                 }
             }
         }
     }
+}
+
+fn routing_info_for_message(message: &IncomingMessage) -> CodexMessageRoutingInfo {
+    let (kind, method) = match message {
+        IncomingMessage::Notification { method, .. } => ("notification", Some(method.clone())),
+        IncomingMessage::Request { method, .. } => ("request", Some(method.clone())),
+        IncomingMessage::Response(_) => ("response", None),
+    };
+    let signature = method.as_deref().map(method_signature);
+    let is_plan_event = signature.as_deref().is_some_and(is_plan_event_signature);
+    let is_transport_control = signature
+        .as_deref()
+        .is_some_and(is_transport_control_signature);
+    let params = message_params(message);
+    let thread_id = params.as_ref().and_then(extract_thread_id_from_value);
+    let turn_id = params.as_ref().and_then(extract_turn_id_from_value);
+    let params_keys = params.as_ref().and_then(object_keys);
+    let content_chars = params.as_ref().and_then(plan_event_content_chars);
+
+    CodexMessageRoutingInfo {
+        kind,
+        method,
+        signature,
+        thread_id,
+        turn_id,
+        params_keys,
+        content_chars,
+        is_plan_event,
+        is_transport_control,
+    }
+}
+
+fn object_keys(value: &serde_json::Value) -> Option<Vec<String>> {
+    let mut keys = value
+        .as_object()?
+        .keys()
+        .map(|key| key.to_string())
+        .collect::<Vec<_>>();
+    keys.sort();
+    Some(keys)
+}
+
+fn plan_event_content_chars(value: &serde_json::Value) -> Option<usize> {
+    let mut total = 0usize;
+    let mut found = false;
+
+    for key in ["delta", "text", "content", "explanation"] {
+        if let Some(content) = value.get(key).and_then(serde_json::Value::as_str) {
+            total = total.saturating_add(content.chars().count());
+            found = true;
+        }
+    }
+
+    if let Some(plan) = value.get("plan").and_then(serde_json::Value::as_array) {
+        found = true;
+        for entry in plan {
+            for key in ["step", "title", "description"] {
+                if let Some(content) = entry.get(key).and_then(serde_json::Value::as_str) {
+                    total = total.saturating_add(content.chars().count());
+                }
+            }
+        }
+    }
+
+    found.then_some(total)
 }
 
 fn trim_buffered_incoming_message(message: IncomingMessage) -> IncomingMessage {
@@ -593,6 +803,7 @@ fn delivery_class_for_message(message: &IncomingMessage) -> CodexDeliveryClass {
                     | "transportparseerror"
                     | "turnstarted"
                     | "turncompleted"
+                    | "turnplanupdated"
                     | "itemcompleted"
                     | "itemagentmessagedelta"
                     | "itemplandelta"
@@ -609,14 +820,15 @@ fn delivery_class_for_message(message: &IncomingMessage) -> CodexDeliveryClass {
     }
 }
 
-fn is_transport_control_message(message: &IncomingMessage) -> bool {
-    let IncomingMessage::Notification { method, .. } = message else {
-        return false;
-    };
+fn is_transport_control_signature(signature: &str) -> bool {
     matches!(
-        method_signature(method).as_str(),
+        signature,
         "transporteof" | "transportreaderror" | "transportparseerror"
     )
+}
+
+fn is_plan_event_signature(signature: &str) -> bool {
+    matches!(signature, "turnplanupdated" | "itemplandelta")
 }
 
 fn message_params(message: &IncomingMessage) -> Option<serde_json::Value> {
@@ -841,5 +1053,56 @@ mod tests {
         }
 
         assert!(saw_completed);
+    }
+
+    #[tokio::test]
+    async fn router_keeps_lossless_turn_plan_updated_when_best_effort_queue_is_full() {
+        let router = CodexIncomingRouter::default();
+        let mut subscription = router.subscribe_thread("thread-a").await;
+
+        for index in 0..(TURN_EVENT_QUEUE_CAPACITY + 16) {
+            router
+                .dispatch(IncomingMessage::Notification {
+                    method: "item/command_execution/output_delta".to_string(),
+                    params: serde_json::value::to_raw_value(&json!({
+                        "threadId": "thread-a",
+                        "turnId": "turn-a",
+                        "delta": format!("line-{index}"),
+                    }))
+                    .expect("valid params"),
+                })
+                .await;
+        }
+
+        router
+            .dispatch(IncomingMessage::Notification {
+                method: "turn/plan/updated".to_string(),
+                params: serde_json::value::to_raw_value(&json!({
+                    "threadId": "thread-a",
+                    "turnId": "turn-a",
+                    "plan": [
+                        { "step": "Verify event routing", "status": "in_progress" },
+                        { "step": "Implement the plan", "status": "pending" }
+                    ],
+                }))
+                .expect("valid params"),
+            })
+            .await;
+
+        let mut saw_plan_update = false;
+        for _ in 0..TURN_EVENT_QUEUE_CAPACITY {
+            let message = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+                .await
+                .expect("router should deliver queued messages")
+                .expect("subscription should stay open");
+            if let IncomingMessage::Notification { method, .. } = message {
+                if method == "turn/plan/updated" {
+                    saw_plan_update = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(saw_plan_update);
     }
 }

@@ -3203,17 +3203,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
   useEffect(() => {
     if (planImplementationPrompt && planImplementationPrompt.threadId !== threadId) {
+      pendingPlanImplementationThreadIdRef.current = planImplementationPrompt.threadId;
       setPlanImplementationPrompt(null);
     }
-
-    if (
-      pendingPlanImplementationThreadIdRef.current &&
-      pendingPlanImplementationThreadIdRef.current !== threadId &&
-      !streaming
-    ) {
-      pendingPlanImplementationThreadIdRef.current = null;
-    }
-  }, [planImplementationPrompt, streaming, threadId]);
+  }, [planImplementationPrompt, threadId]);
 
   useEffect(() => {
     const wasStreaming = previousStreamingRef.current;
@@ -3245,6 +3238,14 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         return;
       }
       pendingPlanImplementationThreadIdRef.current = null;
+      console.info("[plan-mode] showing implementation prompt", {
+        threadId: promptThreadId,
+        activeThreadId: threadId,
+        armedThreadId,
+        engineId: promptThread.engineId,
+        modelId: readThreadLastModelId(promptThread) ?? promptThread.modelId,
+        status,
+      });
       setPlanImplementationPrompt({
         threadId: promptThreadId,
         engineId: promptThread.engineId,
@@ -5287,6 +5288,12 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     setPlanImplementationPrompt(null);
     setPlanMode(false);
     try {
+      console.info("[plan-mode] sending implementation turn", {
+        threadId: currentThread.id,
+        engineId: prompt.engineId,
+        modelId: prompt.modelId,
+        effort: prompt.effort,
+      });
       await ipc.setThreadReasoningEffort(currentThread.id, prompt.effort, prompt.modelId);
       setThreadReasoningEffortLocal(currentThread.id, prompt.effort);
       if (
@@ -5341,6 +5348,12 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         ? (response.answers as Record<string, { answers?: string[] }>)
         : null;
     const selectedAnswer = answerMap?.plan_implementation_decision?.answers?.[0]?.trim();
+    console.info("[plan-mode] implementation prompt answered", {
+      threadId: planImplementationPrompt?.threadId ?? null,
+      selectedAnswer: selectedAnswer ?? null,
+      action:
+        selectedAnswer === planImplementationQuestionChoiceStay ? "stay_in_plan_mode" : "implement_plan",
+    });
     if (selectedAnswer === planImplementationQuestionChoiceStay) {
       setPlanImplementationPrompt(null);
       setPlanMode(true);
