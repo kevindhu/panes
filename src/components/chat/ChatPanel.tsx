@@ -1967,6 +1967,24 @@ interface ChatPanelProps {
   embedded?: boolean;
 }
 
+const pendingPlanImplementationThreadIds = new Set<string>();
+
+function armPlanImplementationPrompt(threadId: string | null | undefined): void {
+  if (threadId) {
+    pendingPlanImplementationThreadIds.add(threadId);
+  }
+}
+
+function disarmPlanImplementationPrompt(threadId: string | null | undefined): void {
+  if (threadId) {
+    pendingPlanImplementationThreadIds.delete(threadId);
+  }
+}
+
+function isPlanImplementationPromptArmed(threadId: string | null | undefined): boolean {
+  return Boolean(threadId && pendingPlanImplementationThreadIds.has(threadId));
+}
+
 export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const { t } = useTranslation("chat");
   const renderStartedAtRef = useRef(performance.now());
@@ -2189,6 +2207,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     customApprovalPolicyText: string;
     openCodeAgent: string;
   } | null>(null);
+  const planImplementationPromptRef = useRef<typeof planImplementationPrompt>(null);
 
   const trustLevelOptions = useMemo(() => getTrustLevelOptions(t), [t]);
   const codexThreadApprovalPolicyOptions = useMemo(
@@ -3202,7 +3221,18 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   }, [pendingApprovals, selectedPendingToolInputApprovalId]);
 
   useEffect(() => {
+    planImplementationPromptRef.current = planImplementationPrompt;
+  }, [planImplementationPrompt]);
+
+  useEffect(() => {
+    return () => {
+      armPlanImplementationPrompt(planImplementationPromptRef.current?.threadId);
+    };
+  }, []);
+
+  useEffect(() => {
     if (planImplementationPrompt && planImplementationPrompt.threadId !== threadId) {
+      armPlanImplementationPrompt(planImplementationPrompt.threadId);
       pendingPlanImplementationThreadIdRef.current = planImplementationPrompt.threadId;
       setPlanImplementationPrompt(null);
     }
@@ -3212,7 +3242,9 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     const wasStreaming = previousStreamingRef.current;
     previousStreamingRef.current = streaming;
 
-    const armedThreadId = pendingPlanImplementationThreadIdRef.current;
+    const armedThreadId = isPlanImplementationPromptArmed(threadId)
+      ? threadId
+      : pendingPlanImplementationThreadIdRef.current;
     if (
       shouldPromptToImplementPlan({
         streaming,
@@ -3237,6 +3269,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         pendingPlanImplementationThreadIdRef.current = null;
         return;
       }
+      disarmPlanImplementationPrompt(promptThreadId);
       pendingPlanImplementationThreadIdRef.current = null;
       console.info("[plan-mode] showing implementation prompt", {
         threadId: promptThreadId,
@@ -3269,6 +3302,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       armedThreadId === threadId &&
       shouldClearPendingPlanImplementationPrompt(status)
     ) {
+      disarmPlanImplementationPrompt(armedThreadId);
       pendingPlanImplementationThreadIdRef.current = null;
     }
   }, [
