@@ -106,12 +106,15 @@ function resolveAgentDisplayName(engineId: ChatEngineId): string {
 }
 
 function resolveChatNotificationBody(
-  status: "completed" | "interrupted" | "error",
+  status: "completed" | "interrupted" | "error" | "attention",
   preview?: string | null,
 ): string {
   const normalizedPreview = preview?.trim();
   if (normalizedPreview) {
     return normalizedPreview;
+  }
+  if (status === "attention") {
+    return t("app:notificationSettings.chatNotificationFallbackAttention");
   }
   if (status === "error") {
     return t("app:notificationSettings.chatNotificationFallbackError");
@@ -156,6 +159,44 @@ function clearVisibleThreadNotification(): void {
     })
   ) {
     useThreadNotificationStore.getState().clearThreadNotification(thread.id);
+  }
+}
+
+async function notifyThreadNeedsAttention(thread: Thread): Promise<void> {
+  if (thread.status !== "awaiting_approval") {
+    return;
+  }
+
+  const visible = isChatTurnVisible({
+    threadId: thread.id,
+    workspaceId: thread.workspaceId,
+    repoId: thread.repoId,
+  });
+  const threadNotifications = useThreadNotificationStore.getState();
+  if (visible) {
+    threadNotifications.clearThreadNotification(thread.id);
+    return;
+  }
+
+  const alreadyAttention =
+    threadNotifications.notificationsByThreadId[thread.id]?.status === "attention";
+  const body = resolveChatNotificationBody("attention");
+  threadNotifications.markThreadNeedsAttention(thread, body);
+  if (alreadyAttention) {
+    return;
+  }
+
+  const notificationStore = useTerminalNotificationSettingsStore.getState();
+  const settings = notificationStore.settings ?? await notificationStore.load();
+  if (!settings?.chatEnabled) {
+    return;
+  }
+
+  const title = thread.title.trim() || resolveAgentDisplayName(thread.engineId);
+  try {
+    await ipc.showAgentNotification(title, body);
+  } catch (error) {
+    console.warn(`Failed to show chat attention notification for thread ${thread.id}:`, error);
   }
 }
 
@@ -291,11 +332,13 @@ export function App() {
     void listenThreadUpdated(async ({ workspaceId, thread }) => {
       if (thread) {
         const applied = applyThreadUpdateLocal(thread);
+        await notifyThreadNeedsAttention(thread);
         const activeThreadId = useThreadStore.getState().activeThreadId;
         if (thread.id === activeThreadId && isCodexSyncRequired(thread)) {
           try {
             const syncedThread = await ipc.syncThreadFromEngine(thread.id);
             if (useThreadStore.getState().applyThreadUpdateLocal(syncedThread)) {
+              await notifyThreadNeedsAttention(syncedThread);
               return;
             }
           } catch (error) {
@@ -332,6 +375,14 @@ export function App() {
     let unlisten: (() => void) | undefined;
     void listenChatTurnFinished(async (event) => {
       if (event.status === "interrupted") {
+        return;
+      }
+
+      const eventThread = useThreadStore
+        .getState()
+        .threads.find((thread) => thread.id === event.threadId);
+      if (eventThread?.status === "awaiting_approval") {
+        await notifyThreadNeedsAttention(eventThread);
         return;
       }
 

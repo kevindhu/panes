@@ -1,9 +1,10 @@
 import { create } from "zustand";
 import type { ChatTurnFinishedEvent } from "../lib/ipc";
+import type { Thread } from "../types";
 
 const THREAD_NOTIFICATION_STORAGE_KEY = "panes:threadNotifications:v1";
 
-export type ThreadNotificationStatus = "completed" | "error";
+export type ThreadNotificationStatus = "completed" | "error" | "attention";
 
 export interface ThreadNotificationRecord {
   threadId: string;
@@ -18,6 +19,7 @@ export interface ThreadNotificationRecord {
 interface ThreadNotificationState {
   notificationsByThreadId: Record<string, ThreadNotificationRecord>;
   markThreadFinished: (event: ChatTurnFinishedEvent) => void;
+  markThreadNeedsAttention: (thread: Thread, preview?: string | null) => void;
   clearThreadNotification: (threadId: string | null | undefined) => void;
   pruneThreadNotifications: (validThreadIds: Iterable<string>) => void;
 }
@@ -33,7 +35,10 @@ function normalizeStoredNotification(value: unknown): ThreadNotificationRecord |
 
   const threadId = typeof value.threadId === "string" ? value.threadId : "";
   const workspaceId = typeof value.workspaceId === "string" ? value.workspaceId : "";
-  const status = value.status === "completed" || value.status === "error" ? value.status : null;
+  const status =
+    value.status === "completed" || value.status === "error" || value.status === "attention"
+      ? value.status
+      : null;
   if (!threadId || !workspaceId || !status) {
     return null;
   }
@@ -105,6 +110,21 @@ function createNotificationRecord(event: ChatTurnFinishedEvent): ThreadNotificat
   };
 }
 
+function createAttentionNotificationRecord(
+  thread: Thread,
+  preview?: string | null,
+): ThreadNotificationRecord {
+  return {
+    threadId: thread.id,
+    workspaceId: thread.workspaceId,
+    repoId: thread.repoId ?? null,
+    status: "attention",
+    threadTitle: thread.title,
+    preview: preview?.trim() || null,
+    createdAt: new Date().toISOString(),
+  };
+}
+
 export function countWorkspaceThreadNotifications(
   notificationsByThreadId: Record<string, ThreadNotificationRecord>,
   workspaceId: string,
@@ -122,6 +142,19 @@ export const useThreadNotificationStore = create<ThreadNotificationState>((set) 
     if (!notification) {
       return;
     }
+
+    set((state) => {
+      const notificationsByThreadId = {
+        ...state.notificationsByThreadId,
+        [notification.threadId]: notification,
+      };
+      persistThreadNotifications(notificationsByThreadId);
+      return { notificationsByThreadId };
+    });
+  },
+
+  markThreadNeedsAttention: (thread, preview) => {
+    const notification = createAttentionNotificationRecord(thread, preview);
 
     set((state) => {
       const notificationsByThreadId = {

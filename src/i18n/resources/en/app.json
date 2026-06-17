@@ -40,8 +40,8 @@
     "workspaceFallback": "Workspace",
     "noThreads": "No threads",
     "untitledThread": "Untitled thread",
-    "unreadThreadNotification": "Unread thread completion",
-    "unreadThreadNotifications": "{{count}} unread thread completions",
+    "unreadThreadNotification": "Unread thread notification",
+    "unreadThreadNotifications": "{{count}} unread thread notifications",
     "archiveThread": "Archive thread",
     "showMore": "Show {{count}} more",
     "archived": "Archived",
@@ -570,6 +570,7 @@
       "installFailed": "Failed to configure {{integration}} notifications."
     },
     "chatNotificationFallbackComplete": "Reply ready",
+    "chatNotificationFallbackAttention": "Input needed",
     "chatNotificationFallbackError": "Reply failed"
   },
   "powerModal": {

@@ -475,44 +475,10 @@ impl CodexIncomingRouter {
                 }
                 CodexScopeMatch::ThreadMismatch { expected, found } => {
                     let reason = format!("thread_mismatch(expected={expected}, found={found})");
-                    let message = if routing_info.is_plan_event {
-                        format!(
-                            "codex plan event not routed to turn subscriber: {}; {reason}",
-                            routing_info.log_summary()
-                        )
-                    } else {
-                        format!(
-                            "codex event not routed to turn subscriber: {}; {reason}",
-                            routing_info.log_summary()
-                        )
-                    };
-                    if routing_info.is_plan_event {
-                        log::info!("{message}");
-                    } else {
-                        log::debug!("{message}");
-                    }
-                    record_codex_event_routing_log(&message);
                     skipped_scope_reasons.push(reason);
                 }
                 CodexScopeMatch::TurnMismatch { expected, found } => {
                     let reason = format!("turn_mismatch(expected={expected}, found={found})");
-                    let message = if routing_info.is_plan_event {
-                        format!(
-                            "codex plan event not routed to turn subscriber: {}; {reason}",
-                            routing_info.log_summary()
-                        )
-                    } else {
-                        format!(
-                            "codex event not routed to turn subscriber: {}; {reason}",
-                            routing_info.log_summary()
-                        )
-                    };
-                    if routing_info.is_plan_event {
-                        log::info!("{message}");
-                    } else {
-                        log::debug!("{message}");
-                    }
-                    record_codex_event_routing_log(&message);
                     skipped_scope_reasons.push(reason);
                 }
             }

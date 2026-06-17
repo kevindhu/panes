@@ -7,6 +7,7 @@ import {
   useThreadNotificationStore,
 } from "./threadNotificationStore";
 import type { ChatTurnFinishedEvent } from "../lib/ipc";
+import type { Thread } from "../types";
 
 const completedEvent: ChatTurnFinishedEvent = {
   threadId: "thread-1",
@@ -16,6 +17,21 @@ const completedEvent: ChatTurnFinishedEvent = {
   threadTitle: "Implement feature",
   status: "completed",
   preview: "Done",
+};
+
+const attentionThread: Thread = {
+  id: "thread-attention",
+  workspaceId: "ws-1",
+  repoId: "repo-1",
+  engineId: "codex",
+  modelId: "gpt-5.5",
+  engineThreadId: "engine-thread-1",
+  title: "Answer questions",
+  status: "awaiting_approval",
+  messageCount: 2,
+  totalTokens: 0,
+  createdAt: new Date().toISOString(),
+  lastActivityAt: new Date().toISOString(),
 };
 
 describe("threadNotificationStore", () => {
@@ -56,6 +72,23 @@ describe("threadNotificationStore", () => {
     expect(useThreadNotificationStore.getState().notificationsByThreadId).toEqual({});
   });
 
+  it("records attention-needed threads", () => {
+    useThreadNotificationStore
+      .getState()
+      .markThreadNeedsAttention(attentionThread, "Question waiting");
+
+    const notifications = useThreadNotificationStore.getState().notificationsByThreadId;
+    expect(notifications["thread-attention"]).toMatchObject({
+      threadId: "thread-attention",
+      workspaceId: "ws-1",
+      repoId: "repo-1",
+      status: "attention",
+      threadTitle: "Answer questions",
+      preview: "Question waiting",
+    });
+    expect(countWorkspaceThreadNotifications(notifications, "ws-1")).toBe(1);
+  });
+
   it("clears and prunes stored notifications", () => {
     useThreadNotificationStore.getState().markThreadFinished(completedEvent);
     useThreadNotificationStore.getState().markThreadFinished({
@@ -74,6 +107,7 @@ describe("threadNotificationStore", () => {
 
   it("persists records to localStorage and hydrates valid records", () => {
     useThreadNotificationStore.getState().markThreadFinished(completedEvent);
+    useThreadNotificationStore.getState().markThreadNeedsAttention(attentionThread);
 
     const hydrated = readStoredThreadNotifications();
     expect(hydrated["thread-1"]).toMatchObject({
@@ -81,6 +115,12 @@ describe("threadNotificationStore", () => {
       workspaceId: "ws-1",
       repoId: "repo-1",
       status: "completed",
+    });
+    expect(hydrated["thread-attention"]).toMatchObject({
+      threadId: "thread-attention",
+      workspaceId: "ws-1",
+      repoId: "repo-1",
+      status: "attention",
     });
   });
 });
