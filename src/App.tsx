@@ -32,6 +32,10 @@ import type { ChatEngineId, RuntimeToast, Thread } from "./types";
 import { getActiveEditorView, openSearchPanel } from "./components/editor/CodeMirrorEditor";
 import { CustomWindowFrame } from "./components/shared/CustomWindowFrame";
 import { useCustomWindowFrameState } from "./lib/customWindowFrame";
+import {
+  isPlanImplementationPromptArmed,
+  planImplementationPromptLogOperationId,
+} from "./lib/planImplementationPromptState";
 import { runEditMenuAction } from "./lib/nativeEditActions";
 import { createAndActivateWorkspaceThread } from "./lib/newThreadActions";
 import { isThreadActivityVisible } from "./lib/threadActivityVisibility";
@@ -106,12 +110,15 @@ function resolveAgentDisplayName(engineId: ChatEngineId): string {
 }
 
 function resolveChatNotificationBody(
-  status: "completed" | "interrupted" | "error" | "attention",
+  status: "completed" | "interrupted" | "error" | "attention" | "plan_ready",
   preview?: string | null,
 ): string {
   const normalizedPreview = preview?.trim();
   if (normalizedPreview) {
     return normalizedPreview;
+  }
+  if (status === "plan_ready") {
+    return t("app:notificationSettings.chatNotificationFallbackPlanReady");
   }
   if (status === "attention") {
     return t("app:notificationSettings.chatNotificationFallbackAttention");
@@ -140,6 +147,42 @@ function isChatTurnVisible(
   });
 }
 
+function appendPlanPromptLogBestEffort(
+  threadId: string,
+  step: string,
+  details?: Record<string, unknown>,
+): void {
+  let serializedDetails: string | null = null;
+  if (details && Object.keys(details).length > 0) {
+    serializedDetails = JSON.stringify(details);
+  }
+  void ipc
+    .appendBranchProfileLog(
+      planImplementationPromptLogOperationId(threadId),
+      step,
+      serializedDetails,
+    )
+    .catch((error) => {
+      console.warn(`Failed to append plan prompt log for ${threadId}:`, error);
+    });
+}
+
+function appendThreadAttentionLogBestEffort(
+  threadId: string,
+  step: string,
+  details?: Record<string, unknown>,
+): void {
+  let serializedDetails: string | null = null;
+  if (details && Object.keys(details).length > 0) {
+    serializedDetails = JSON.stringify(details);
+  }
+  void ipc
+    .appendBranchProfileLog(`thread-attention:${threadId}`, step, serializedDetails)
+    .catch((error) => {
+      console.warn(`Failed to append thread attention log for ${threadId}:`, error);
+    });
+}
+
 function clearVisibleThreadNotification(): void {
   const threadId = useChatStore.getState().threadId;
   if (!threadId) {
@@ -162,8 +205,16 @@ function clearVisibleThreadNotification(): void {
   }
 }
 
-async function notifyThreadNeedsAttention(thread: Thread): Promise<void> {
-  if (thread.status !== "awaiting_approval") {
+async function notifyThreadNeedsAttention(
+  thread: Thread,
+  options: {
+    body?: string;
+    reason?: "awaiting_approval" | "plan_ready";
+    requireAwaitingApproval?: boolean;
+  } = {},
+): Promise<void> {
+  const reason = options.reason ?? "awaiting_approval";
+  if (options.requireAwaitingApproval !== false && thread.status !== "awaiting_approval") {
     return;
   }
 
@@ -173,15 +224,58 @@ async function notifyThreadNeedsAttention(thread: Thread): Promise<void> {
     repoId: thread.repoId,
   });
   const threadNotifications = useThreadNotificationStore.getState();
+  const body = options.body ?? resolveChatNotificationBody("attention");
   if (visible) {
     threadNotifications.clearThreadNotification(thread.id);
+    if (reason === "plan_ready") {
+      appendPlanPromptLogBestEffort(thread.id, "frontend.plan_prompt.notification_visible_clear", {
+        threadId: thread.id,
+        status: thread.status,
+        workspaceId: thread.workspaceId,
+        repoId: thread.repoId,
+      });
+    } else {
+      appendThreadAttentionLogBestEffort(
+        thread.id,
+        "frontend.thread_attention.notification_visible_clear",
+        {
+          threadId: thread.id,
+          reason,
+          status: thread.status,
+          workspaceId: thread.workspaceId,
+          repoId: thread.repoId,
+        },
+      );
+    }
     return;
   }
 
-  const alreadyAttention =
-    threadNotifications.notificationsByThreadId[thread.id]?.status === "attention";
-  const body = resolveChatNotificationBody("attention");
-  threadNotifications.markThreadNeedsAttention(thread, body);
+  const existingNotification = threadNotifications.notificationsByThreadId[thread.id];
+  const alreadyAttention = existingNotification?.status === "attention";
+  const alreadySameAttention = alreadyAttention && existingNotification.preview === body;
+  if (!alreadySameAttention) {
+    threadNotifications.markThreadNeedsAttention(thread, body);
+  }
+  if (reason === "plan_ready") {
+    appendPlanPromptLogBestEffort(thread.id, "frontend.plan_prompt.notification_marked", {
+      threadId: thread.id,
+      status: thread.status,
+      workspaceId: thread.workspaceId,
+      repoId: thread.repoId,
+      alreadyAttention,
+      body,
+    });
+  } else {
+    appendThreadAttentionLogBestEffort(thread.id, "frontend.thread_attention.notification_marked", {
+      threadId: thread.id,
+      reason,
+      status: thread.status,
+      workspaceId: thread.workspaceId,
+      repoId: thread.repoId,
+      alreadyAttention,
+      body,
+    });
+  }
   if (alreadyAttention) {
     return;
   }
@@ -384,6 +478,26 @@ export function App() {
       if (eventThread?.status === "awaiting_approval") {
         await notifyThreadNeedsAttention(eventThread);
         return;
+      }
+      if (event.status === "completed" && isPlanImplementationPromptArmed(event.threadId)) {
+        if (eventThread) {
+          await notifyThreadNeedsAttention(eventThread, {
+            body: resolveChatNotificationBody("plan_ready"),
+            reason: "plan_ready",
+            requireAwaitingApproval: false,
+          });
+          return;
+        }
+        appendPlanPromptLogBestEffort(
+          event.threadId,
+          "frontend.plan_prompt.notification_thread_missing",
+          {
+            threadId: event.threadId,
+            workspaceId: event.workspaceId,
+            repoId: event.repoId,
+            status: event.status,
+          },
+        );
       }
 
       const visible = isChatTurnVisible(event);

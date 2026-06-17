@@ -63,6 +63,12 @@ import {
 import { ipc } from "../../lib/ipc";
 import { resolvePreferredOnboardingChatSelection } from "../../lib/onboarding";
 import { recordPerfMetric } from "../../lib/perfTelemetry";
+import {
+  armPlanImplementationPrompt,
+  disarmPlanImplementationPrompt,
+  isPlanImplementationPromptArmed,
+  planImplementationPromptLogOperationId,
+} from "../../lib/planImplementationPromptState";
 import { activateThreadContext } from "../../lib/threadActivation";
 import { isMacDesktop, usesCustomWindowFrame } from "../../lib/windowActions";
 import { MessageBlocks, shouldShowClaudeUnsupportedApproval } from "./MessageBlocks";
@@ -1967,24 +1973,6 @@ interface ChatPanelProps {
   embedded?: boolean;
 }
 
-const pendingPlanImplementationThreadIds = new Set<string>();
-
-function armPlanImplementationPrompt(threadId: string | null | undefined): void {
-  if (threadId) {
-    pendingPlanImplementationThreadIds.add(threadId);
-  }
-}
-
-function disarmPlanImplementationPrompt(threadId: string | null | undefined): void {
-  if (threadId) {
-    pendingPlanImplementationThreadIds.delete(threadId);
-  }
-}
-
-function isPlanImplementationPromptArmed(threadId: string | null | undefined): boolean {
-  return Boolean(threadId && pendingPlanImplementationThreadIds.has(threadId));
-}
-
 export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const { t } = useTranslation("chat");
   const renderStartedAtRef = useRef(performance.now());
@@ -2839,12 +2827,27 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         return "failed";
       }
 
-      pendingPlanImplementationThreadIdRef.current = options.planMode
-        ? options.thread.id
-        : null;
+      if (options.planMode) {
+        armPlanImplementationPrompt(options.thread.id);
+        pendingPlanImplementationThreadIdRef.current = options.thread.id;
+        appendBranchProfileLogBestEffort(
+          planImplementationPromptLogOperationId(options.thread.id),
+          "frontend.plan_prompt.armed_after_send",
+          {
+            threadId: options.thread.id,
+            engineId: options.engineId,
+            modelId: options.modelId,
+            source: "send_prepared_turn",
+          },
+        );
+      } else {
+        disarmPlanImplementationPrompt(options.thread.id);
+        pendingPlanImplementationThreadIdRef.current = null;
+      }
       return "sent";
     },
     [
+      appendBranchProfileLogBestEffort,
       repos,
       send,
       setThreadLastModelLocal,
@@ -3280,6 +3283,18 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         modelId: readThreadLastModelId(promptThread) ?? promptThread.modelId,
         status,
       });
+      appendBranchProfileLogBestEffort(
+        planImplementationPromptLogOperationId(promptThreadId),
+        "frontend.plan_prompt.shown",
+        {
+          threadId: promptThreadId,
+          activeThreadId: threadId,
+          armedThreadId,
+          engineId: promptThread.engineId,
+          modelId: readThreadLastModelId(promptThread) ?? promptThread.modelId,
+          status,
+        },
+      );
       setPlanImplementationPrompt({
         threadId: promptThreadId,
         engineId: promptThread.engineId,
@@ -3309,6 +3324,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   }, [
     activeThread,
     activeThreadReasoningEffort,
+    appendBranchProfileLogBestEffort,
     customApprovalPolicyText,
     messages,
     outputSchemaText,
@@ -5251,6 +5267,15 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       if (promptPlanMode) {
         armPlanImplementationPrompt(prompt.threadId);
         pendingPlanImplementationThreadIdRef.current = prompt.threadId;
+        appendBranchProfileLogBestEffort(
+          planImplementationPromptLogOperationId(prompt.threadId),
+          "frontend.plan_prompt.armed_after_workspace_opt_in_send",
+          {
+            threadId: prompt.threadId,
+            engineId: prompt.engineId,
+            modelId: prompt.modelId,
+          },
+        );
       } else {
         disarmPlanImplementationPrompt(prompt.threadId);
         pendingPlanImplementationThreadIdRef.current = null;
@@ -5279,6 +5304,15 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       return;
     }
     disarmPlanImplementationPrompt(prompt.threadId);
+    appendBranchProfileLogBestEffort(
+      planImplementationPromptLogOperationId(prompt.threadId),
+      "frontend.plan_prompt.disarmed_for_implementation",
+      {
+        threadId: prompt.threadId,
+        engineId: prompt.engineId,
+        modelId: prompt.modelId,
+      },
+    );
     const implementationMessage = getPlanImplementationCodingMessage(prompt.engineId);
 
     const currentThread =
@@ -5398,6 +5432,17 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     });
     if (selectedAnswer === planImplementationQuestionChoiceStay) {
       disarmPlanImplementationPrompt(planImplementationPrompt?.threadId);
+      if (planImplementationPrompt?.threadId) {
+        appendBranchProfileLogBestEffort(
+          planImplementationPromptLogOperationId(planImplementationPrompt.threadId),
+          "frontend.plan_prompt.disarmed_for_stay_in_plan_mode",
+          {
+            threadId: planImplementationPrompt.threadId,
+            engineId: planImplementationPrompt.engineId,
+            modelId: planImplementationPrompt.modelId,
+          },
+        );
+      }
       setPlanImplementationPrompt(null);
       setPlanMode(true);
       return;

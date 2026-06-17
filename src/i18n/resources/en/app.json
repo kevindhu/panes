@@ -571,6 +571,7 @@
     },
     "chatNotificationFallbackComplete": "Reply ready",
     "chatNotificationFallbackAttention": "Input needed",
+    "chatNotificationFallbackPlanReady": "Plan ready to implement",
     "chatNotificationFallbackError": "Reply failed"
   },
   "powerModal": {
