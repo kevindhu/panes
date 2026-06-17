@@ -16,6 +16,17 @@ function normalizeRepoId(repoId: string | null | undefined): string | null {
   return repoId ?? null;
 }
 
+export function resolveVisibleChatThreadId(
+  selectedThreadId: string | null | undefined,
+  boundChatThreadId: string | null | undefined,
+): string | null {
+  if (!selectedThreadId || selectedThreadId !== boundChatThreadId) {
+    return null;
+  }
+
+  return selectedThreadId;
+}
+
 export function isThreadActivityVisible({
   windowFocused,
   activeView,

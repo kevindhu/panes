@@ -42,6 +42,8 @@
     "untitledThread": "Untitled thread",
     "unreadThreadNotification": "Unread thread notification",
     "unreadThreadNotifications": "{{count}} unread thread notifications",
+    "pendingApprovalThreadNotification": "Pending approval",
+    "pendingApprovalThreadNotifications": "{{count}} pending approval notifications",
     "archiveThread": "Archive thread",
     "showMore": "Show {{count}} more",
     "archived": "Archived",

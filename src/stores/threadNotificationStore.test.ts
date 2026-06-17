@@ -2,6 +2,7 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  countWorkspacePendingApprovalNotifications,
   countWorkspaceThreadNotifications,
   readStoredThreadNotifications,
   useThreadNotificationStore,
@@ -89,6 +90,24 @@ describe("threadNotificationStore", () => {
     expect(countWorkspaceThreadNotifications(notifications, "ws-1")).toBe(1);
   });
 
+  it("records pending approval threads separately from attention", () => {
+    useThreadNotificationStore
+      .getState()
+      .markThreadPendingApproval(attentionThread, "Input needed");
+
+    const notifications = useThreadNotificationStore.getState().notificationsByThreadId;
+    expect(notifications["thread-attention"]).toMatchObject({
+      threadId: "thread-attention",
+      workspaceId: "ws-1",
+      repoId: "repo-1",
+      status: "pending_approval",
+      threadTitle: "Answer questions",
+      preview: "Input needed",
+    });
+    expect(countWorkspaceThreadNotifications(notifications, "ws-1")).toBe(1);
+    expect(countWorkspacePendingApprovalNotifications(notifications, "ws-1")).toBe(1);
+  });
+
   it("clears and prunes stored notifications", () => {
     useThreadNotificationStore.getState().markThreadFinished(completedEvent);
     useThreadNotificationStore.getState().markThreadFinished({
@@ -107,7 +126,7 @@ describe("threadNotificationStore", () => {
 
   it("persists records to localStorage and hydrates valid records", () => {
     useThreadNotificationStore.getState().markThreadFinished(completedEvent);
-    useThreadNotificationStore.getState().markThreadNeedsAttention(attentionThread);
+    useThreadNotificationStore.getState().markThreadPendingApproval(attentionThread);
 
     const hydrated = readStoredThreadNotifications();
     expect(hydrated["thread-1"]).toMatchObject({
@@ -120,7 +139,7 @@ describe("threadNotificationStore", () => {
       threadId: "thread-attention",
       workspaceId: "ws-1",
       repoId: "repo-1",
-      status: "attention",
+      status: "pending_approval",
     });
   });
 });

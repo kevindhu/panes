@@ -32,6 +32,7 @@ import { useUpdateStore } from "../../stores/updateStore";
 import { canToggleKeepAwake, useKeepAwakeStore } from "../../stores/keepAwakeStore";
 import { useTerminalNotificationSettingsStore } from "../../stores/terminalNotificationSettingsStore";
 import {
+  countWorkspacePendingApprovalNotifications,
   countWorkspaceThreadNotifications,
   useThreadNotificationStore,
 } from "../../stores/threadNotificationStore";
@@ -833,6 +834,10 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
               threadNotificationsByThreadId,
               project.workspace.id,
             );
+            const workspacePendingApprovalCount = countWorkspacePendingApprovalNotifications(
+              threadNotificationsByThreadId,
+              project.workspace.id,
+            );
 
             return (
               <div
@@ -882,13 +887,23 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                   <span className="sb-project-trailing">
                     {workspaceNotificationCount > 0 ? (
                       <span
-                        className="sb-project-notification-badge"
-                        title={t("app:sidebar.unreadThreadNotifications", {
-                          count: workspaceNotificationCount,
-                        })}
-                        aria-label={t("app:sidebar.unreadThreadNotifications", {
-                          count: workspaceNotificationCount,
-                        })}
+                        className={`sb-project-notification-badge${workspacePendingApprovalCount > 0 ? " sb-project-notification-badge-pending-approval" : ""}`}
+                        title={t(
+                          workspacePendingApprovalCount > 0
+                            ? "app:sidebar.pendingApprovalThreadNotifications"
+                            : "app:sidebar.unreadThreadNotifications",
+                          {
+                            count: workspaceNotificationCount,
+                          },
+                        )}
+                        aria-label={t(
+                          workspacePendingApprovalCount > 0
+                            ? "app:sidebar.pendingApprovalThreadNotifications"
+                            : "app:sidebar.unreadThreadNotifications",
+                          {
+                            count: workspaceNotificationCount,
+                          },
+                        )}
                       >
                         {workspaceNotificationCount > 9 ? "9+" : workspaceNotificationCount}
                       </span>
@@ -918,13 +933,16 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                           const isActive = thread.id === activeThreadId;
                           const isRunning = isThreadRunning(thread);
                           const threadLabel = getThreadLabel(thread);
-                          const hasNotification = thread.id in threadNotificationsByThreadId;
+                          const threadNotification = threadNotificationsByThreadId[thread.id];
+                          const hasNotification = Boolean(threadNotification);
+                          const hasPendingApprovalNotification =
+                            threadNotification?.status === "pending_approval";
                           return (
                             <div
                               key={thread.id}
                               role="button"
                               tabIndex={0}
-                              className={`sb-thread sb-thread-animate ${isActive ? "sb-thread-active" : ""}${hasNotification ? " sb-thread-notified" : ""}`}
+                              className={`sb-thread sb-thread-animate ${isActive ? "sb-thread-active" : ""}${hasNotification ? " sb-thread-notified" : ""}${hasPendingApprovalNotification ? " sb-thread-pending-approval" : ""}`}
                               style={{ animationDelay: `${i * 20}ms` }}
                               onClick={() => void onSelectThread(thread)}
                               onContextMenu={(event) => onThreadContextMenu(event, thread, isRunning)}
@@ -948,9 +966,17 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                                 )}
                                 {hasNotification && (
                                   <span
-                                    className="sb-thread-notification-dot"
-                                    title={t("app:sidebar.unreadThreadNotification")}
-                                    aria-label={t("app:sidebar.unreadThreadNotification")}
+                                    className={`sb-thread-notification-dot${hasPendingApprovalNotification ? " sb-thread-notification-dot-pending-approval" : ""}`}
+                                    title={t(
+                                      hasPendingApprovalNotification
+                                        ? "app:sidebar.pendingApprovalThreadNotification"
+                                        : "app:sidebar.unreadThreadNotification",
+                                    )}
+                                    aria-label={t(
+                                      hasPendingApprovalNotification
+                                        ? "app:sidebar.pendingApprovalThreadNotification"
+                                        : "app:sidebar.unreadThreadNotification",
+                                    )}
                                   />
                                 )}
                                 <span
@@ -1525,6 +1551,10 @@ function CollapsedRail({
             threadNotificationsByThreadId,
             ws.id,
           );
+          const pendingApprovalCount = countWorkspacePendingApprovalNotifications(
+            threadNotificationsByThreadId,
+            ws.id,
+          );
           return (
             <button
               key={ws.id}
@@ -1544,13 +1574,23 @@ function CollapsedRail({
               </span>
               {notificationCount > 0 && (
                 <span
-                  className="sb-rail-notification-badge"
-                  title={t("sidebar.unreadThreadNotifications", {
-                    count: notificationCount,
-                  })}
-                  aria-label={t("sidebar.unreadThreadNotifications", {
-                    count: notificationCount,
-                  })}
+                  className={`sb-rail-notification-badge${pendingApprovalCount > 0 ? " sb-rail-notification-badge-pending-approval" : ""}`}
+                  title={t(
+                    pendingApprovalCount > 0
+                      ? "sidebar.pendingApprovalThreadNotifications"
+                      : "sidebar.unreadThreadNotifications",
+                    {
+                      count: notificationCount,
+                    },
+                  )}
+                  aria-label={t(
+                    pendingApprovalCount > 0
+                      ? "sidebar.pendingApprovalThreadNotifications"
+                      : "sidebar.unreadThreadNotifications",
+                    {
+                      count: notificationCount,
+                    },
+                  )}
                 >
                   {notificationCount > 9 ? "9+" : notificationCount}
                 </span>

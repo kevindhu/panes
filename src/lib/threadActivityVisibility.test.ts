@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { isThreadActivityVisible } from "./threadActivityVisibility";
+import {
+  isThreadActivityVisible,
+  resolveVisibleChatThreadId,
+} from "./threadActivityVisibility";
 
 const visibleInput = {
   windowFocused: true,
@@ -44,5 +47,14 @@ describe("isThreadActivityVisible", () => {
         activityRepoId: null,
       }),
     ).toBe(true);
+  });
+});
+
+describe("resolveVisibleChatThreadId", () => {
+  it("requires the selected thread and bound chat thread to match", () => {
+    expect(resolveVisibleChatThreadId("thread-1", "thread-1")).toBe("thread-1");
+    expect(resolveVisibleChatThreadId("thread-1", "thread-2")).toBeNull();
+    expect(resolveVisibleChatThreadId(null, "thread-1")).toBeNull();
+    expect(resolveVisibleChatThreadId("thread-1", null)).toBeNull();
   });
 });

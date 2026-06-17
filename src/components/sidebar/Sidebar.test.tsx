@@ -163,7 +163,7 @@ const terminalNotificationState = vi.hoisted(() => ({
 }));
 
 const threadNotificationState = vi.hoisted(() => ({
-  notificationsByThreadId: {} as Record<string, { workspaceId: string }>,
+  notificationsByThreadId: {} as Record<string, { workspaceId: string; status?: string }>,
 }));
 
 function applySelector<TState, TResult>(
@@ -254,11 +254,19 @@ vi.mock("../../stores/threadNotificationStore", () => ({
     selector?: (state: typeof threadNotificationState) => unknown,
   ) => applySelector(threadNotificationState, selector),
   countWorkspaceThreadNotifications: (
-    notificationsByThreadId: Record<string, { workspaceId: string }>,
+    notificationsByThreadId: Record<string, { workspaceId: string; status?: string }>,
     workspaceId: string,
   ) =>
     Object.values(notificationsByThreadId).filter(
       (notification) => notification.workspaceId === workspaceId,
+    ).length,
+  countWorkspacePendingApprovalNotifications: (
+    notificationsByThreadId: Record<string, { workspaceId: string; status?: string }>,
+    workspaceId: string,
+  ) =>
+    Object.values(notificationsByThreadId).filter(
+      (notification) =>
+        notification.workspaceId === workspaceId && notification.status === "pending_approval",
     ).length,
 }));
 
@@ -431,6 +439,7 @@ describe("Sidebar thread context menu", () => {
     threadNotificationState.notificationsByThreadId = {
       [codexThread.id]: {
         workspaceId: codexThread.workspaceId,
+        status: "completed",
       },
     };
 
@@ -439,6 +448,21 @@ describe("Sidebar thread context menu", () => {
     const row = findThreadRow("Codex conversation");
     expect(row?.querySelector(".sb-thread-notification-dot")).not.toBeNull();
     expect(container.querySelector(".sb-project-notification-badge")?.textContent).toBe("1");
+  });
+
+  it("shows yellow pending approval badges on thread and workspace rows", async () => {
+    threadNotificationState.notificationsByThreadId = {
+      [codexThread.id]: {
+        workspaceId: codexThread.workspaceId,
+        status: "pending_approval",
+      },
+    };
+
+    await renderSidebar();
+
+    const row = findThreadRow("Codex conversation");
+    expect(row?.querySelector(".sb-thread-notification-dot-pending-approval")).not.toBeNull();
+    expect(container.querySelector(".sb-project-notification-badge-pending-approval")).not.toBeNull();
   });
 
   async function renderSidebar() {

@@ -2276,6 +2276,7 @@ async fn run_turn(
         &mut turn_model_dirty,
     );
     flush_stream_state(
+        &app,
         &state,
         &thread,
         &assistant_message_id,
@@ -2329,6 +2330,7 @@ async fn run_turn(
                             &mut turn_model_dirty,
                         );
                         flush_stream_state(
+                            &app,
                             &state,
                             &thread,
                             &assistant_message_id,
@@ -2394,6 +2396,7 @@ async fn run_turn(
                                 &mut turn_model_dirty,
                             );
                             flush_stream_state(
+                                &app,
                                 &state,
                                 &thread,
                                 &assistant_message_id,
@@ -2444,6 +2447,7 @@ async fn run_turn(
                             &mut turn_model_dirty,
                         );
                         flush_stream_state(
+                            &app,
                             &state,
                             &thread,
                             &assistant_message_id,
@@ -2495,6 +2499,7 @@ async fn run_turn(
                     &mut turn_model_dirty,
                 );
                 flush_stream_state(
+                    &app,
                     &state,
                     &thread,
                     &assistant_message_id,
@@ -2545,6 +2550,7 @@ async fn run_turn(
             &mut turn_model_dirty,
         );
         flush_stream_state(
+            &app,
             &state,
             &thread,
             &assistant_message_id,
@@ -2627,6 +2633,7 @@ async fn run_turn(
     }
 
     flush_stream_state(
+        &app,
         &state,
         &thread,
         &assistant_message_id,
@@ -2846,6 +2853,7 @@ async fn run_codex_review_turn(
         &mut turn_model_dirty,
     );
     flush_stream_state(
+        &app,
         &state,
         &review_thread,
         &assistant_message_id,
@@ -2903,6 +2911,7 @@ async fn run_codex_review_turn(
                             &mut turn_model_dirty,
                         );
                         flush_stream_state(
+                            &app,
                             &state,
                             &review_thread,
                             &assistant_message_id,
@@ -2968,6 +2977,7 @@ async fn run_codex_review_turn(
                                 &mut turn_model_dirty,
                             );
                             flush_stream_state(
+                                &app,
                                 &state,
                                 &review_thread,
                                 &assistant_message_id,
@@ -3018,6 +3028,7 @@ async fn run_codex_review_turn(
                             &mut turn_model_dirty,
                         );
                         flush_stream_state(
+                            &app,
                             &state,
                             &review_thread,
                             &assistant_message_id,
@@ -3069,6 +3080,7 @@ async fn run_codex_review_turn(
                     &mut turn_model_dirty,
                 );
                 flush_stream_state(
+                    &app,
                     &state,
                     &review_thread,
                     &assistant_message_id,
@@ -3119,6 +3131,7 @@ async fn run_codex_review_turn(
             &mut turn_model_dirty,
         );
         flush_stream_state(
+            &app,
             &state,
             &review_thread,
             &assistant_message_id,
@@ -3201,6 +3214,7 @@ async fn run_codex_review_turn(
     }
 
     flush_stream_state(
+        &app,
         &state,
         &review_thread,
         &assistant_message_id,
@@ -3535,7 +3549,7 @@ async fn process_stream_event(
             summary,
             details,
         } => {
-            if let Err(error) = run_db(state.db.clone(), {
+            match run_db(state.db.clone(), {
                 let approval_id = approval_id.clone();
                 let thread_id = thread.id.clone();
                 let assistant_message_id = assistant_message_id.to_string();
@@ -3556,7 +3570,13 @@ async fn process_stream_event(
             })
             .await
             {
-                log::warn!("failed to persist approval: {error}");
+                Ok(()) => {
+                    emit_latest_thread_updated(app, state, thread, "approval request persist")
+                        .await;
+                }
+                Err(error) => {
+                    log::warn!("failed to persist approval: {error}");
+                }
             }
         }
         EngineEvent::UsageLimitsUpdated { usage } => {
@@ -3645,6 +3665,7 @@ fn apply_stream_progress(
 
 #[allow(clippy::too_many_arguments)]
 async fn flush_stream_state(
+    app: &tauri::AppHandle,
     state: &AppState,
     thread: &ThreadDto,
     assistant_message_id: &str,
@@ -3767,6 +3788,7 @@ async fn flush_stream_state(
             *last_persisted_thread_status = thread_status.clone();
             *thread_status_dirty = false;
             did_flush_state = true;
+            emit_latest_thread_updated(app, state, thread, "stream status persist").await;
         }
     }
 
@@ -3981,6 +4003,25 @@ fn build_final_thread_event(
             None,
         ),
     }
+}
+
+async fn emit_latest_thread_updated(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    thread: &ThreadDto,
+    log_context: &str,
+) {
+    let latest_thread = run_db(state.db.clone(), {
+        let thread_id = thread.id.clone();
+        move |db| db::threads::get_thread(db, &thread_id)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        log::warn!("failed to load thread for {log_context}: {error}");
+        None
+    });
+    let (thread_updated_event, _) = build_final_thread_event(latest_thread, thread);
+    let _ = app.emit("thread-updated", thread_updated_event);
 }
 
 fn apply_event_to_blocks(
