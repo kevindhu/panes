@@ -3266,7 +3266,8 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
           .threads.find((thread) => thread.id === promptThreadId) ??
         (activeThread?.id === promptThreadId ? activeThread : null);
       if (!promptThread) {
-        pendingPlanImplementationThreadIdRef.current = null;
+        armPlanImplementationPrompt(promptThreadId);
+        pendingPlanImplementationThreadIdRef.current = promptThreadId;
         return;
       }
       disarmPlanImplementationPrompt(promptThreadId);
@@ -5247,7 +5248,13 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         return;
       }
 
-      pendingPlanImplementationThreadIdRef.current = promptPlanMode ? prompt.threadId : null;
+      if (promptPlanMode) {
+        armPlanImplementationPrompt(prompt.threadId);
+        pendingPlanImplementationThreadIdRef.current = prompt.threadId;
+      } else {
+        disarmPlanImplementationPrompt(prompt.threadId);
+        pendingPlanImplementationThreadIdRef.current = null;
+      }
       if (!accepted) {
         clearAcceptedComposerSubmission(prompt.text);
       }
@@ -5271,6 +5278,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     if (!prompt || !activeWorkspaceId) {
       return;
     }
+    disarmPlanImplementationPrompt(prompt.threadId);
     const implementationMessage = getPlanImplementationCodingMessage(prompt.engineId);
 
     const currentThread =
@@ -5389,6 +5397,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         selectedAnswer === planImplementationQuestionChoiceStay ? "stay_in_plan_mode" : "implement_plan",
     });
     if (selectedAnswer === planImplementationQuestionChoiceStay) {
+      disarmPlanImplementationPrompt(planImplementationPrompt?.threadId);
       setPlanImplementationPrompt(null);
       setPlanMode(true);
       return;
