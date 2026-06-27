@@ -82,6 +82,7 @@ interface Props {
   blocks?: ContentBlock[];
   status?: MessageStatus;
   engineId?: string;
+  workspaceRootPath?: string | null;
   onApproval: (approvalId: string, response: ApprovalResponse) => void;
   onLoadActionOutput?: (actionId: string) => Promise<void>;
 }
@@ -443,7 +444,15 @@ function MessageDiffBlock({ block }: { block: DiffBlock }) {
 
 /* ── Thinking Block ── */
 
-function ThinkingBlockView({ block, isStreaming }: { block: ThinkingBlock; isStreaming: boolean }) {
+function ThinkingBlockView({
+  block,
+  isStreaming,
+  workspaceRootPath,
+}: {
+  block: ThinkingBlock;
+  isStreaming: boolean;
+  workspaceRootPath?: string | null;
+}) {
   const { t } = useTranslation("chat");
   const [expanded, setExpanded] = useState(false);
   const content = String(block.content ?? "");
@@ -499,6 +508,7 @@ function ThinkingBlockView({ block, isStreaming }: { block: ThinkingBlock; isStr
           <MarkdownContent
             content={content}
             className="prose"
+            workspaceRootPath={workspaceRootPath}
             style={{
               fontSize: 12.5,
               color: "var(--text-2)",
@@ -1775,6 +1785,7 @@ function renderSingleBlock(
   sourceBlocks: ContentBlock[],
   status: MessageStatus | undefined,
   engineId: string | undefined,
+  workspaceRootPath: string | null | undefined,
   onApproval: (approvalId: string, response: ApprovalResponse) => void,
   onLoadActionOutput: ((actionId: string) => Promise<void>) | undefined,
 ) {
@@ -1793,6 +1804,7 @@ function renderSingleBlock(
           content={textContent}
           streaming
           className="prose"
+          workspaceRootPath={workspaceRootPath}
           style={{ fontSize: 13, padding: "6px 14px" }}
         />
       );
@@ -1803,6 +1815,7 @@ function renderSingleBlock(
         key={blockKey}
         content={textContent}
         className="prose"
+        workspaceRootPath={workspaceRootPath}
         style={{ fontSize: 13, padding: "6px 14px" }}
       />
     );
@@ -1909,7 +1922,11 @@ function renderSingleBlock(
     const thinkingActive = status === "streaming" && isLastBlock;
     return (
       <div key={blockKey} >
-        <ThinkingBlockView block={block} isStreaming={thinkingActive} />
+        <ThinkingBlockView
+          block={block}
+          isStreaming={thinkingActive}
+          workspaceRootPath={workspaceRootPath}
+        />
       </div>
     );
   }
@@ -1937,7 +1954,14 @@ function renderSingleBlock(
   return null;
 }
 
-function MessageBlocksView({ blocks = [], status, engineId, onApproval, onLoadActionOutput }: Props) {
+function MessageBlocksView({
+  blocks = [],
+  status,
+  engineId,
+  workspaceRootPath,
+  onApproval,
+  onLoadActionOutput,
+}: Props) {
   const safeBlocks = useMemo(
     () => dedupeDiffBlocksByScope(
       (Array.isArray(blocks) ? blocks : []).filter(isBlockLike) as ContentBlock[],
@@ -1991,6 +2015,7 @@ function MessageBlocksView({ blocks = [], status, engineId, onApproval, onLoadAc
                       key={getMessageBlockKey(inner.block, inner.index, safeBlocks)}
                       block={thinkingBlock}
                       isStreaming={thinkingActive}
+                      workspaceRootPath={workspaceRootPath}
                     />
                   );
                 }
@@ -2044,6 +2069,7 @@ function MessageBlocksView({ blocks = [], status, engineId, onApproval, onLoadAc
           safeBlocks,
           status,
           engineId,
+          workspaceRootPath,
           onApproval,
           onLoadActionOutput,
         );
@@ -2058,6 +2084,7 @@ export const MessageBlocks = memo(
     prev.blocks === next.blocks &&
     prev.status === next.status &&
     prev.engineId === next.engineId &&
+    prev.workspaceRootPath === next.workspaceRootPath &&
     prev.onApproval === next.onApproval &&
     prev.onLoadActionOutput === next.onLoadActionOutput,
 );

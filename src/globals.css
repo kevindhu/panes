@@ -742,6 +742,52 @@ button, input, textarea, select {
 .prose ol ol { list-style-type: lower-alpha; }
 .prose li { margin: 2px 0; }
 .prose img { max-width: 100%; border-radius: var(--radius-sm); }
+.prose .markdown-local-image-button {
+  display: block;
+  box-sizing: border-box;
+  width: min(var(--markdown-local-image-frame-width, 360px), 100%);
+  height: var(--markdown-local-image-frame-height, 220px);
+  aspect-ratio: var(--markdown-local-image-aspect, auto);
+  margin: 6px 0;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-2);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+  color: var(--text-3);
+  font: inherit;
+  text-align: center;
+  cursor: zoom-in;
+  contain: paint;
+  transform: translateZ(0);
+  backface-visibility: hidden;
+}
+.prose .markdown-local-image-button:hover {
+  border-color: var(--border-active);
+}
+.prose .markdown-local-image-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.prose .markdown-local-image-thumbnail {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  border-radius: 0;
+  user-select: none;
+}
+.prose .markdown-local-image-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  padding: 12px;
+  font-size: 12px;
+  color: var(--text-3);
+}
 .prose code {
   font-family: "JetBrains Mono", ui-monospace, monospace;
   font-size: 0.88em;

@@ -1252,6 +1252,7 @@ interface MessageRowProps {
   isHighlighted: boolean;
   assistantLabel: string;
   assistantEngineId: string;
+  workspaceRootPath?: string | null;
   canEditUserMessages: boolean;
   editingMessageId: string | null;
   editingMode: MessageEditMode | null;
@@ -1397,6 +1398,7 @@ export function MessageRowView({
   isHighlighted,
   assistantLabel,
   assistantEngineId,
+  workspaceRootPath,
   canEditUserMessages,
   editingMessageId,
   editingMode,
@@ -1709,6 +1711,7 @@ export function MessageRowView({
                 blocks={message.blocks}
                 status={message.status}
                 engineId={assistantEngineId}
+                workspaceRootPath={workspaceRootPath}
                 onApproval={onApproval}
                 onLoadActionOutput={(actionId) => onLoadActionOutput(message.id, actionId)}
               />
@@ -1757,6 +1760,7 @@ const MessageRow = memo(
     prev.isHighlighted === next.isHighlighted &&
     prev.assistantLabel === next.assistantLabel &&
     prev.assistantEngineId === next.assistantEngineId &&
+    prev.workspaceRootPath === next.workspaceRootPath &&
     prev.canEditUserMessages === next.canEditUserMessages &&
     prev.editingMessageId === next.editingMessageId &&
     prev.editingMode === next.editingMode &&
@@ -2081,6 +2085,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     [engines, onboardingSelectedChatEngines],
   );
   const {
+    workspaces,
     repos,
     activeWorkspaceId,
     activeWorkspace,
@@ -2089,6 +2094,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     setAllReposTrustLevel,
   } = useWorkspaceStore(
     useShallow((state) => ({
+      workspaces: state.workspaces,
       repos: state.repos,
       activeWorkspaceId: state.activeWorkspaceId,
       activeWorkspace:
@@ -2099,6 +2105,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     })),
   );
   const {
+    threads,
     activeThread,
     startupRestorePending,
     createThread,
@@ -2116,6 +2123,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     renameThread,
   } = useThreadStore(
     useShallow((state) => ({
+      threads: state.threads,
       activeThread: state.threads.find((thread) => thread.id === state.activeThreadId) ?? null,
       startupRestorePending: state.startupRestorePending,
       createThread: state.createThread,
@@ -2134,6 +2142,45 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     })),
   );
   const gitStatus = useGitStore((s) => s.status);
+  const activeThreadWorkspaceRootPath = useMemo(() => {
+    if (activeThread?.workspaceId) {
+      const threadWorkspace = workspaces.find((workspace) => workspace.id === activeThread.workspaceId);
+
+      if (threadWorkspace?.rootPath) {
+        return threadWorkspace.rootPath;
+      }
+    }
+
+    return activeWorkspace?.rootPath ?? null;
+  }, [activeThread?.workspaceId, activeWorkspace?.rootPath, workspaces]);
+  const messageWorkspaceRootPathByThreadId = useMemo(() => {
+    const workspaceRootPathById = new Map<string, string>();
+
+    for (const workspace of workspaces) {
+      if (workspace.rootPath) {
+        workspaceRootPathById.set(workspace.id, workspace.rootPath);
+      }
+    }
+
+    const rootPathByThreadId = new Map<string, string>();
+
+    for (const thread of threads) {
+      const rootPath = workspaceRootPathById.get(thread.workspaceId);
+      if (rootPath) {
+        rootPathByThreadId.set(thread.id, rootPath);
+      }
+    }
+
+    return rootPathByThreadId;
+  }, [threads, workspaces]);
+  const getMessageWorkspaceRootPath = useCallback(
+    (message: Message) =>
+      messageWorkspaceRootPathByThreadId.get(message.threadId) ??
+      activeThreadWorkspaceRootPath ??
+      activeWorkspace?.rootPath ??
+      null,
+    [activeThreadWorkspaceRootPath, activeWorkspace?.rootPath, messageWorkspaceRootPathByThreadId],
+  );
   const setComposerRuntime = useChatComposerStore((state) => state.setWorkspaceRuntime);
   const clearComposerRuntime = useChatComposerStore((state) => state.clearWorkspaceRuntime);
   const terminalWorkspaceState = useTerminalStore((s) =>
@@ -6305,6 +6352,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                         isHighlighted={message.id === highlightedMessageId}
                         assistantLabel={assistantIdentity?.label ?? ""}
                         assistantEngineId={assistantIdentity?.engineId ?? ""}
+                        workspaceRootPath={getMessageWorkspaceRootPath(message)}
                         canEditUserMessages={canEditUserMessages}
                         editingMessageId={editingMessageId}
                         editingMode={editingMode}
@@ -6343,6 +6391,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                   isHighlighted={message.id === highlightedMessageId}
                   assistantLabel={assistantIdentity?.label ?? ""}
                   assistantEngineId={assistantIdentity?.engineId ?? ""}
+                  workspaceRootPath={getMessageWorkspaceRootPath(message)}
                   canEditUserMessages={canEditUserMessages}
                   editingMessageId={editingMessageId}
                   editingMode={editingMode}

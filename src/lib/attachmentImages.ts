@@ -3,7 +3,15 @@ import { ipc } from "./ipc";
 import type { AttachmentPreview } from "../types";
 
 const attachmentPreviewUrlCache = new Map<string, Promise<string | null>>();
+const attachmentPreviewObjectUrlCache = new Map<string, Promise<string | null>>();
+const attachmentPreviewObjectUrlResolvedCache = new Map<string, string | null>();
+const attachmentPreviewObjectUrls = new Set<string>();
 const attachmentImageBlobCache = new Map<string, Promise<Blob>>();
+
+interface AttachmentPreviewObjectUrlOptions {
+  maxWidth?: number;
+  maxHeight?: number;
+}
 
 function getFileExtension(fileName: string): string {
   const lastDot = fileName.lastIndexOf(".");
@@ -55,6 +63,34 @@ export function attachmentPreviewToDataUrl(preview?: AttachmentPreview | null): 
   return `data:${preview.mimeType};base64,${preview.dataBase64}`;
 }
 
+function attachmentPreviewToBlob(preview?: AttachmentPreview | null): Blob | null {
+  if (!preview?.mimeType || !preview.dataBase64 || typeof Blob === "undefined") {
+    return null;
+  }
+
+  const decodeBase64 = globalThis.atob;
+  if (typeof decodeBase64 !== "function") {
+    return null;
+  }
+
+  const binary = decodeBase64(preview.dataBase64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new Blob([bytes], { type: preview.mimeType });
+}
+
+function createTrackedObjectUrl(blob: Blob): string | null {
+  if (typeof URL === "undefined" || typeof URL.createObjectURL !== "function") {
+    return null;
+  }
+
+  const objectUrl = URL.createObjectURL(blob);
+  attachmentPreviewObjectUrls.add(objectUrl);
+  return objectUrl;
+}
+
 export function loadAttachmentPreviewDataUrl(
   filePath: string,
   mimeType?: string | null,
@@ -79,6 +115,60 @@ export function loadAttachmentPreviewDataUrl(
 
   attachmentPreviewUrlCache.set(cacheKey, previewPromise);
   return previewPromise;
+}
+
+export function loadAttachmentPreviewObjectUrl(
+  filePath: string,
+  mimeType?: string | null,
+  options: AttachmentPreviewObjectUrlOptions = {},
+): Promise<string | null> {
+  const normalizedFilePath = filePath.trim();
+  if (!normalizedFilePath) {
+    return Promise.resolve(null);
+  }
+
+  const cacheKey = getAttachmentPreviewObjectUrlCacheKey(normalizedFilePath, mimeType, options);
+  const cachedPreview = attachmentPreviewObjectUrlCache.get(cacheKey);
+  if (cachedPreview) {
+    return cachedPreview;
+  }
+
+  const previewPromise = ipc.readAttachmentPreview(normalizedFilePath, mimeType ?? null)
+    .then(async (preview) => {
+      const originalBlob = attachmentPreviewToBlob(preview);
+      if (!originalBlob) {
+        return attachmentPreviewToDataUrl(preview);
+      }
+
+      const displayBlob = await maybeResizeImageBlob(originalBlob, preview?.mimeType, options);
+      return createTrackedObjectUrl(displayBlob) ?? attachmentPreviewToDataUrl(preview);
+    })
+    .then((previewSource) => {
+      attachmentPreviewObjectUrlResolvedCache.set(cacheKey, previewSource);
+      return previewSource;
+    })
+    .catch((error) => {
+      attachmentPreviewObjectUrlCache.delete(cacheKey);
+      attachmentPreviewObjectUrlResolvedCache.delete(cacheKey);
+      throw error;
+    });
+
+  attachmentPreviewObjectUrlCache.set(cacheKey, previewPromise);
+  return previewPromise;
+}
+
+export function getCachedAttachmentPreviewObjectUrl(
+  filePath: string,
+  mimeType?: string | null,
+  options: AttachmentPreviewObjectUrlOptions = {},
+): string | null | undefined {
+  const normalizedFilePath = filePath.trim();
+  if (!normalizedFilePath) {
+    return null;
+  }
+
+  const cacheKey = getAttachmentPreviewObjectUrlCacheKey(normalizedFilePath, mimeType, options);
+  return attachmentPreviewObjectUrlResolvedCache.get(cacheKey);
 }
 
 export function getAttachmentOriginalImageSrc(filePath: string): string | null {
@@ -191,6 +281,14 @@ export async function copyAttachmentImage(
 
 export function resetAttachmentImageCachesForTests(): void {
   attachmentPreviewUrlCache.clear();
+  attachmentPreviewObjectUrlCache.clear();
+  attachmentPreviewObjectUrlResolvedCache.clear();
+  if (typeof URL !== "undefined" && typeof URL.revokeObjectURL === "function") {
+    for (const objectUrl of attachmentPreviewObjectUrls) {
+      URL.revokeObjectURL(objectUrl);
+    }
+  }
+  attachmentPreviewObjectUrls.clear();
   attachmentImageBlobCache.clear();
 }
 
@@ -212,6 +310,86 @@ function uniqueSources(sources: Array<string | null | undefined>): string[] {
 function getAttachmentPreviewCacheKey(filePath: string, mimeType?: string | null): string {
   const normalizedMimeType = mimeType?.trim().toLowerCase() ?? "";
   return `${filePath}\u0000${normalizedMimeType}`;
+}
+
+function getAttachmentPreviewObjectUrlCacheKey(
+  filePath: string,
+  mimeType?: string | null,
+  options: AttachmentPreviewObjectUrlOptions = {},
+): string {
+  const baseKey = getAttachmentPreviewCacheKey(filePath, mimeType);
+  return `${baseKey}\u0000${options.maxWidth ?? ""}\u0000${options.maxHeight ?? ""}`;
+}
+
+async function maybeResizeImageBlob(
+  blob: Blob,
+  mimeType: string | undefined,
+  options: AttachmentPreviewObjectUrlOptions,
+): Promise<Blob> {
+  const maxWidth = options.maxWidth ?? 0;
+  const maxHeight = options.maxHeight ?? 0;
+
+  if (
+    (maxWidth <= 0 && maxHeight <= 0) ||
+    typeof createImageBitmap !== "function" ||
+    typeof document === "undefined" ||
+    !isCanvasResizableMimeType(mimeType)
+  ) {
+    return blob;
+  }
+
+  let bitmap: ImageBitmap | null = null;
+  try {
+    bitmap = await createImageBitmap(blob);
+    const width = bitmap.width;
+    const height = bitmap.height;
+    if (width <= 0 || height <= 0) {
+      return blob;
+    }
+
+    const scale = Math.min(
+      1,
+      maxWidth > 0 ? maxWidth / width : 1,
+      maxHeight > 0 ? maxHeight / height : 1,
+    );
+    if (scale >= 1) {
+      return blob;
+    }
+
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(width * scale));
+    canvas.height = Math.max(1, Math.round(height * scale));
+    const context = canvas.getContext("2d");
+    if (!context) {
+      return blob;
+    }
+
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    const outputMimeType = mimeType?.toLowerCase() === "image/jpeg"
+      ? "image/jpeg"
+      : "image/png";
+    const resizedBlob = await canvasToBlob(canvas, outputMimeType);
+    return resizedBlob ?? blob;
+  } catch {
+    return blob;
+  } finally {
+    bitmap?.close();
+  }
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, mimeType: string): Promise<Blob | null> {
+  return new Promise((resolve) => {
+    canvas.toBlob(resolve, mimeType, mimeType === "image/jpeg" ? 0.86 : undefined);
+  });
+}
+
+function isCanvasResizableMimeType(mimeType?: string | null): boolean {
+  const normalizedMimeType = mimeType?.trim().toLowerCase();
+  return (
+    normalizedMimeType === "image/png" ||
+    normalizedMimeType === "image/jpeg" ||
+    normalizedMimeType === "image/webp"
+  );
 }
 
 function loadImageBlobFromSource(source: string): Promise<Blob> {

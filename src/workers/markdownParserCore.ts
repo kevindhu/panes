@@ -7,6 +7,7 @@ import {
   isLocalFileLinkSyntax,
   trimLinkText,
 } from "../lib/localFileLinkPatterns";
+import { isWorkspaceRelativeLocalImageSource } from "../lib/localImageSources";
 
 interface FenceToken {
   placeholder: string;
@@ -65,6 +66,10 @@ function sanitizeUrl(url: string, attrName: string): string {
   }
 
   if (attrName.toLowerCase() === "href" && isLocalFileLinkSyntax(trimmed)) {
+    return trimmed;
+  }
+
+  if (attrName.toLowerCase() === "src" && isWorkspaceRelativeLocalImageSource(trimmed)) {
     return trimmed;
   }
 
