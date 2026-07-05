@@ -97,6 +97,8 @@ export const ipc = {
   showAgentNotification: (title: string, body: string) =>
     invoke<void>("show_agent_notification", { title, body }),
   listWorkspaces: () => invoke<Workspace[]>("list_workspaces"),
+  setWorkspaceOrder: (workspaceIds: string[]) =>
+    invoke<void>("set_workspace_order", { workspaceIds }),
   listArchivedWorkspaces: () => invoke<Workspace[]>("list_archived_workspaces"),
   openWorkspace: (path: string, scanDepth?: number) =>
     invoke<Workspace>("open_workspace", {
@@ -684,6 +686,7 @@ export interface ThreadUpdatedEvent {
 export interface ChatTurnFinishedEvent {
   threadId: string;
   workspaceId: string;
+  repoId: string | null;
   engineId: ChatEngineId;
   threadTitle: string;
   status: "completed" | "interrupted" | "error";

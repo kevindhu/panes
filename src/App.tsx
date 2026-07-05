@@ -8,6 +8,7 @@ import { TerminalNotificationSettingsModal } from "./components/shared/TerminalN
 import { t } from "./i18n";
 import { useUpdateStore } from "./stores/updateStore";
 import {
+  type ChatTurnFinishedEvent,
   ipc,
   listenChatTurnFinished,
   listenEngineRuntimeUpdated,
@@ -24,13 +25,23 @@ import { useTerminalStore, collectSessionIds } from "./stores/terminalStore";
 import { useFileStore } from "./stores/fileStore";
 import { useKeepAwakeStore } from "./stores/keepAwakeStore";
 import { useTerminalNotificationSettingsStore } from "./stores/terminalNotificationSettingsStore";
+import { useThreadNotificationStore } from "./stores/threadNotificationStore";
+import { useWorkspacePaneStore } from "./stores/workspacePaneStore";
 import { toast } from "./stores/toastStore";
-import type { ChatEngineId, RuntimeToast, Thread } from "./types";
+import type { ChatEngineId, Message, RuntimeToast, Thread } from "./types";
 import { getActiveEditorView, openSearchPanel } from "./components/editor/CodeMirrorEditor";
 import { CustomWindowFrame } from "./components/shared/CustomWindowFrame";
 import { useCustomWindowFrameState } from "./lib/customWindowFrame";
+import {
+  isPlanImplementationPromptArmed,
+  planImplementationPromptLogOperationId,
+} from "./lib/planImplementationPromptState";
 import { runEditMenuAction } from "./lib/nativeEditActions";
 import { createAndActivateWorkspaceThread } from "./lib/newThreadActions";
+import {
+  isThreadActivityVisible,
+  resolveVisibleChatThreadId,
+} from "./lib/threadActivityVisibility";
 import { restoreStartupThreadContext } from "./lib/threadActivation";
 import {
   cycleWorkspaceTerminalLayout,
@@ -102,12 +113,18 @@ function resolveAgentDisplayName(engineId: ChatEngineId): string {
 }
 
 function resolveChatNotificationBody(
-  status: "completed" | "interrupted" | "error",
+  status: "completed" | "interrupted" | "error" | "attention" | "plan_ready",
   preview?: string | null,
 ): string {
   const normalizedPreview = preview?.trim();
   if (normalizedPreview) {
     return normalizedPreview;
+  }
+  if (status === "plan_ready") {
+    return t("app:notificationSettings.chatNotificationFallbackPlanReady");
+  }
+  if (status === "attention") {
+    return t("app:notificationSettings.chatNotificationFallbackAttention");
   }
   if (status === "error") {
     return t("app:notificationSettings.chatNotificationFallbackError");
@@ -115,9 +132,327 @@ function resolveChatNotificationBody(
   return t("app:notificationSettings.chatNotificationFallbackComplete");
 }
 
+type ThreadAttentionReason = "awaiting_approval" | "awaiting_approval_visibility_sweep" | "plan_ready";
+
+function isApprovalAttentionReason(reason: ThreadAttentionReason): boolean {
+  return reason === "awaiting_approval" || reason === "awaiting_approval_visibility_sweep";
+}
+
+function messagesHavePendingApprovalBlocks(messages: Message[]): boolean {
+  return messages.some(
+    (message) =>
+      message.role === "assistant" &&
+      (message.blocks ?? []).some(
+        (block) => block.type === "approval" && block.status === "pending",
+      ),
+  );
+}
+
+function messagesHaveAssistantContent(messages: Message[]): boolean {
+  return messages.some((message) => message.role === "assistant");
+}
+
+function loadedChatThreadHasPendingApproval(threadId: string): boolean {
+  const chatState = useChatStore.getState();
+  return chatState.threadId === threadId && messagesHavePendingApprovalBlocks(chatState.messages);
+}
+
+function threadHasPendingApprovalSignal(thread: Thread): boolean {
+  return thread.status === "awaiting_approval" || loadedChatThreadHasPendingApproval(thread.id);
+}
+
+interface ChatTurnVisibilitySnapshot {
+  visible: boolean;
+  windowFocused: boolean;
+  activeView: string;
+  activeWorkspaceId: string | null;
+  activeRepoId: string | null;
+  selectedThreadId: string | null;
+  boundChatThreadId: string | null;
+  visibleThreadId: string | null;
+  activityWorkspaceId: string;
+  activityRepoId: string | null;
+  activityThreadId: string;
+  chatSurfaceVisible: boolean;
+}
+
+function getChatTurnVisibilitySnapshot(
+  event: Pick<ChatTurnFinishedEvent, "threadId" | "workspaceId" | "repoId">,
+): ChatTurnVisibilitySnapshot {
+  const workspaceState = useWorkspaceStore.getState();
+  const uiState = useUiStore.getState();
+  const selectedThreadId = useThreadStore.getState().activeThreadId;
+  const boundChatThreadId = useChatStore.getState().threadId;
+  const visibleThreadId = resolveVisibleChatThreadId(selectedThreadId, boundChatThreadId);
+  const windowFocused = document.hasFocus();
+  const chatSurfaceVisible = isWorkspaceSurfaceVisible(event.workspaceId, "chat");
+  const snapshot = {
+    windowFocused,
+    activeView: uiState.activeView,
+    activeWorkspaceId: workspaceState.activeWorkspaceId,
+    activeRepoId: workspaceState.activeRepoId,
+    selectedThreadId,
+    boundChatThreadId,
+    visibleThreadId,
+    activityWorkspaceId: event.workspaceId,
+    activityRepoId: event.repoId,
+    activityThreadId: event.threadId,
+    chatSurfaceVisible,
+  };
+  return {
+    ...snapshot,
+    visible: isThreadActivityVisible({
+      windowFocused,
+      activeView: uiState.activeView,
+      activeWorkspaceId: workspaceState.activeWorkspaceId,
+      activeRepoId: workspaceState.activeRepoId,
+      activeThreadId: visibleThreadId,
+      activityWorkspaceId: event.workspaceId,
+      activityRepoId: event.repoId,
+      activityThreadId: event.threadId,
+      chatSurfaceVisible,
+    }),
+  };
+}
+
+function isChatTurnVisible(
+  event: Pick<ChatTurnFinishedEvent, "threadId" | "workspaceId" | "repoId">,
+): boolean {
+  return getChatTurnVisibilitySnapshot(event).visible;
+}
+
+function appendPlanPromptLogBestEffort(
+  threadId: string,
+  step: string,
+  details?: Record<string, unknown>,
+): void {
+  let serializedDetails: string | null = null;
+  if (details && Object.keys(details).length > 0) {
+    serializedDetails = JSON.stringify(details);
+  }
+  void ipc
+    .appendBranchProfileLog(
+      planImplementationPromptLogOperationId(threadId),
+      step,
+      serializedDetails,
+    )
+    .catch((error) => {
+      console.warn(`Failed to append plan prompt log for ${threadId}:`, error);
+    });
+}
+
+function appendThreadAttentionLogBestEffort(
+  threadId: string,
+  step: string,
+  details?: Record<string, unknown>,
+): void {
+  let serializedDetails: string | null = null;
+  if (details && Object.keys(details).length > 0) {
+    serializedDetails = JSON.stringify(details);
+  }
+  void ipc
+    .appendBranchProfileLog(`thread-attention:${threadId}`, step, serializedDetails)
+    .catch((error) => {
+      console.warn(`Failed to append thread attention log for ${threadId}:`, error);
+    });
+}
+
+function clearVisibleThreadNotification(): void {
+  const threadId = useChatStore.getState().threadId;
+  if (!threadId) {
+    return;
+  }
+
+  const thread = useThreadStore.getState().threads.find((item) => item.id === threadId);
+  if (!thread) {
+    return;
+  }
+
+  const visibility = getChatTurnVisibilitySnapshot({
+    threadId: thread.id,
+    workspaceId: thread.workspaceId,
+    repoId: thread.repoId,
+  });
+  if (!visibility.visible) {
+    return;
+  }
+
+  const threadNotifications = useThreadNotificationStore.getState();
+  const existingNotification = threadNotifications.notificationsByThreadId[thread.id];
+  if (!existingNotification) {
+    return;
+  }
+
+  if (threadHasPendingApprovalSignal(thread) && existingNotification.status === "pending_approval") {
+    return;
+  }
+
+  threadNotifications.clearThreadNotification(thread.id);
+  appendThreadAttentionLogBestEffort(thread.id, "frontend.thread_attention.visible_clear", {
+    threadId: thread.id,
+    status: thread.status,
+    visibility,
+    notificationStatus: existingNotification.status,
+    preview: existingNotification.preview,
+  });
+}
+
+async function notifyThreadNeedsAttention(
+  thread: Thread,
+  options: {
+    body?: string;
+    reason?: ThreadAttentionReason;
+    requireAwaitingApproval?: boolean;
+    showNative?: boolean;
+  } = {},
+): Promise<void> {
+  const reason = options.reason ?? "awaiting_approval";
+  const hasPendingApprovalSignal = threadHasPendingApprovalSignal(thread);
+  if (options.requireAwaitingApproval !== false && !hasPendingApprovalSignal) {
+    return;
+  }
+
+  const visibility = getChatTurnVisibilitySnapshot({
+    threadId: thread.id,
+    workspaceId: thread.workspaceId,
+    repoId: thread.repoId,
+  });
+  const visible = visibility.visible;
+  const threadNotifications = useThreadNotificationStore.getState();
+  const body = options.body ?? resolveChatNotificationBody("attention");
+  const existingNotification = threadNotifications.notificationsByThreadId[thread.id];
+  const approvalReason = isApprovalAttentionReason(reason);
+  const expectedNotificationStatus = approvalReason ? "pending_approval" : "attention";
+  const alreadyExpectedStatus = existingNotification?.status === expectedNotificationStatus;
+  const alreadySameNotification = alreadyExpectedStatus && existingNotification.preview === body;
+  const shouldPersistVisibleApprovalAttention =
+    visible && hasPendingApprovalSignal && approvalReason;
+  if (shouldPersistVisibleApprovalAttention) {
+    if (!alreadySameNotification) {
+      threadNotifications.markThreadPendingApproval(thread, body);
+      appendThreadAttentionLogBestEffort(
+        thread.id,
+        "frontend.thread_attention.notification_visible_marked",
+        {
+          threadId: thread.id,
+          reason,
+          status: thread.status,
+          visibility,
+          expectedNotificationStatus,
+          existingNotificationStatus: existingNotification?.status ?? null,
+          body,
+        },
+      );
+    }
+    return;
+  }
+
+  if (visible) {
+    if (existingNotification) {
+      threadNotifications.clearThreadNotification(thread.id);
+      if (reason === "plan_ready") {
+        appendPlanPromptLogBestEffort(
+          thread.id,
+          "frontend.plan_prompt.notification_visible_clear",
+          {
+            threadId: thread.id,
+            status: thread.status,
+            visibility,
+          },
+        );
+      } else {
+        appendThreadAttentionLogBestEffort(
+          thread.id,
+          "frontend.thread_attention.notification_visible_clear",
+          {
+            threadId: thread.id,
+            reason,
+            status: thread.status,
+            visibility,
+          },
+        );
+      }
+    } else if (reason !== "awaiting_approval_visibility_sweep") {
+      if (reason === "plan_ready") {
+        appendPlanPromptLogBestEffort(
+          thread.id,
+          "frontend.plan_prompt.notification_visible_skip",
+          {
+            threadId: thread.id,
+            status: thread.status,
+            visibility,
+          },
+        );
+      } else {
+        appendThreadAttentionLogBestEffort(
+          thread.id,
+          "frontend.thread_attention.notification_visible_skip",
+          {
+            threadId: thread.id,
+            reason,
+            status: thread.status,
+            visibility,
+          },
+        );
+      }
+    }
+    return;
+  }
+
+  if (alreadySameNotification) {
+    return;
+  }
+  if (approvalReason) {
+    threadNotifications.markThreadPendingApproval(thread, body);
+  } else {
+    threadNotifications.markThreadNeedsAttention(thread, body);
+  }
+  if (reason === "plan_ready") {
+    appendPlanPromptLogBestEffort(thread.id, "frontend.plan_prompt.notification_marked", {
+      threadId: thread.id,
+      status: thread.status,
+      visibility,
+      alreadyAttention: alreadyExpectedStatus,
+      existingNotificationStatus: existingNotification?.status ?? null,
+      body,
+    });
+  } else {
+    appendThreadAttentionLogBestEffort(thread.id, "frontend.thread_attention.notification_marked", {
+      threadId: thread.id,
+      reason,
+      status: thread.status,
+      visibility,
+      expectedNotificationStatus,
+      existingNotificationStatus: existingNotification?.status ?? null,
+      body,
+    });
+  }
+  if (alreadyExpectedStatus) {
+    return;
+  }
+  if (options.showNative === false) {
+    return;
+  }
+
+  const notificationStore = useTerminalNotificationSettingsStore.getState();
+  const settings = notificationStore.settings ?? await notificationStore.load();
+  if (!settings?.chatEnabled) {
+    return;
+  }
+
+  const title = thread.title.trim() || resolveAgentDisplayName(thread.engineId);
+  try {
+    await ipc.showAgentNotification(title, body);
+  } catch (error) {
+    console.warn(`Failed to show chat attention notification for thread ${thread.id}:`, error);
+  }
+}
+
 export function App() {
   const loadWorkspaces = useWorkspaceStore((s) => s.loadWorkspaces);
   const workspaces = useWorkspaceStore((s) => s.workspaces);
+  const activeWorkspaceId = useWorkspaceStore((s) => s.activeWorkspaceId);
+  const activeRepoId = useWorkspaceStore((s) => s.activeRepoId);
   const workspaceLoading = useWorkspaceStore((s) => s.loading);
   const reposLoading = useWorkspaceStore((s) => s.reposLoading);
   const loadEngines = useEngineStore((s) => s.load);
@@ -134,10 +469,18 @@ export function App() {
   const threads = useThreadStore((s) => s.threads);
   const activeThreadId = useThreadStore((s) => s.activeThreadId);
   const threadLoading = useThreadStore((s) => s.loading);
+  const startupRestorePending = useThreadStore((s) => s.startupRestorePending);
   const setStartupRestorePending = useThreadStore((s) => s.setStartupRestorePending);
   const commandPaletteOpen = useUiStore((s) => s.commandPaletteOpen);
+  const activeView = useUiStore((s) => s.activeView);
   const closeCommandPalette = useUiStore((s) => s.closeCommandPalette);
   const checkForUpdate = useUpdateStore((s) => s.checkForUpdate);
+  const visibleChatThreadId = useChatStore((s) => s.threadId);
+  const chatMessages = useChatStore((s) => s.messages);
+  const activeWorkspacePaneLayout = useWorkspacePaneStore((state) =>
+    activeWorkspaceId ? state.workspaces[activeWorkspaceId] ?? null : null,
+  );
+  const pruneThreadNotifications = useThreadNotificationStore((s) => s.pruneThreadNotifications);
   const customWindowFrame = usesCustomWindowFrame();
   const customWindowFrameState = useCustomWindowFrameState();
   const startupRestoreAttemptedRef = useRef(false);
@@ -152,6 +495,104 @@ export function App() {
   useEffect(() => {
     void refreshAllThreads(workspaces.map((workspace) => workspace.id));
   }, [workspaces, refreshAllThreads]);
+
+  useEffect(() => {
+    if (startupRestorePending || workspaceLoading || threadLoading) {
+      return;
+    }
+    pruneThreadNotifications(threads.map((thread) => thread.id));
+  }, [
+    pruneThreadNotifications,
+    startupRestorePending,
+    threadLoading,
+    threads,
+    workspaceLoading,
+  ]);
+
+  useEffect(() => {
+    if (!visibleChatThreadId || !messagesHaveAssistantContent(chatMessages)) {
+      return;
+    }
+
+    const thread = threads.find((item) => item.id === visibleChatThreadId);
+    if (!thread) {
+      return;
+    }
+
+    const hasPendingApprovalBlocks = messagesHavePendingApprovalBlocks(chatMessages);
+    if (hasPendingApprovalBlocks) {
+      void notifyThreadNeedsAttention(thread, {
+        reason: "awaiting_approval_visibility_sweep",
+        requireAwaitingApproval: false,
+        showNative: false,
+      });
+      return;
+    }
+
+    const threadNotifications = useThreadNotificationStore.getState();
+    const existingNotification = threadNotifications.notificationsByThreadId[thread.id];
+    if (existingNotification?.status !== "pending_approval") {
+      return;
+    }
+
+    const visibility = getChatTurnVisibilitySnapshot({
+      threadId: thread.id,
+      workspaceId: thread.workspaceId,
+      repoId: thread.repoId,
+    });
+    if (!visibility.visible || thread.status === "awaiting_approval") {
+      return;
+    }
+
+    threadNotifications.clearThreadNotification(thread.id);
+    appendThreadAttentionLogBestEffort(
+      thread.id,
+      "frontend.thread_attention.pending_approval_resolved_clear",
+      {
+        threadId: thread.id,
+        status: thread.status,
+        visibility,
+        notificationStatus: existingNotification.status,
+        preview: existingNotification.preview,
+      },
+    );
+  }, [chatMessages, threads, visibleChatThreadId]);
+
+  useEffect(() => {
+    clearVisibleThreadNotification();
+    window.addEventListener("focus", clearVisibleThreadNotification);
+    return () => {
+      window.removeEventListener("focus", clearVisibleThreadNotification);
+    };
+  }, [
+    activeRepoId,
+    activeView,
+    activeWorkspaceId,
+    activeWorkspacePaneLayout,
+    threads,
+    visibleChatThreadId,
+  ]);
+
+  useEffect(() => {
+    for (const thread of threads) {
+      if (thread.status !== "awaiting_approval") {
+        continue;
+      }
+
+      void notifyThreadNeedsAttention(thread, {
+        reason: "awaiting_approval_visibility_sweep",
+        showNative: false,
+      });
+    }
+  }, [
+    activeRepoId,
+    activeThreadId,
+    activeView,
+    activeWorkspaceId,
+    activeWorkspacePaneLayout,
+    threads,
+    visibleChatThreadId,
+  ]);
 
   useEffect(() => {
     if (startupRestoreAttemptedRef.current) {
@@ -210,11 +651,13 @@ export function App() {
     void listenThreadUpdated(async ({ workspaceId, thread }) => {
       if (thread) {
         const applied = applyThreadUpdateLocal(thread);
+        await notifyThreadNeedsAttention(thread);
         const activeThreadId = useThreadStore.getState().activeThreadId;
         if (thread.id === activeThreadId && isCodexSyncRequired(thread)) {
           try {
             const syncedThread = await ipc.syncThreadFromEngine(thread.id);
             if (useThreadStore.getState().applyThreadUpdateLocal(syncedThread)) {
+              await notifyThreadNeedsAttention(syncedThread);
               return;
             }
           } catch (error) {
@@ -250,19 +693,57 @@ export function App() {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void listenChatTurnFinished(async (event) => {
-      const notificationStore = useTerminalNotificationSettingsStore.getState();
-      const settings = notificationStore.settings ?? await notificationStore.load();
-      if (!settings?.chatEnabled || event.status === "interrupted") {
+      if (event.status === "interrupted") {
         return;
       }
 
-      const activeWorkspaceId = useWorkspaceStore.getState().activeWorkspaceId;
-      const activeThreadId = useThreadStore.getState().activeThreadId;
-      if (
-        document.hasFocus()
-        && activeWorkspaceId === event.workspaceId
-        && activeThreadId === event.threadId
-      ) {
+      const eventThread = useThreadStore
+        .getState()
+        .threads.find((thread) => thread.id === event.threadId);
+      if (eventThread?.status === "awaiting_approval") {
+        await notifyThreadNeedsAttention(eventThread);
+        return;
+      }
+      if (eventThread && loadedChatThreadHasPendingApproval(event.threadId)) {
+        await notifyThreadNeedsAttention(eventThread, {
+          reason: "awaiting_approval_visibility_sweep",
+          requireAwaitingApproval: false,
+          showNative: false,
+        });
+        return;
+      }
+      if (event.status === "completed" && isPlanImplementationPromptArmed(event.threadId)) {
+        if (eventThread) {
+          await notifyThreadNeedsAttention(eventThread, {
+            body: resolveChatNotificationBody("plan_ready"),
+            reason: "plan_ready",
+            requireAwaitingApproval: false,
+          });
+          return;
+        }
+        appendPlanPromptLogBestEffort(
+          event.threadId,
+          "frontend.plan_prompt.notification_thread_missing",
+          {
+            threadId: event.threadId,
+            workspaceId: event.workspaceId,
+            repoId: event.repoId,
+            status: event.status,
+          },
+        );
+      }
+
+      const visible = isChatTurnVisible(event);
+      const threadNotifications = useThreadNotificationStore.getState();
+      if (visible) {
+        threadNotifications.clearThreadNotification(event.threadId);
+      } else {
+        threadNotifications.markThreadFinished(event);
+      }
+
+      const notificationStore = useTerminalNotificationSettingsStore.getState();
+      const settings = notificationStore.settings ?? await notificationStore.load();
+      if (!settings?.chatEnabled || visible) {
         return;
       }
 

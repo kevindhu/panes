@@ -25,6 +25,24 @@ const workspace = vi.hoisted((): Workspace => ({
   lastOpenedAt: "2026-05-19T00:00:00.000Z",
 }));
 
+const workspaceTwo = vi.hoisted((): Workspace => ({
+  id: "ws-2",
+  name: "Workspace 2",
+  rootPath: "C:/workspace-two",
+  scanDepth: 3,
+  createdAt: "2026-05-19T00:00:00.000Z",
+  lastOpenedAt: "2026-05-19T00:00:00.000Z",
+}));
+
+const workspaceThree = vi.hoisted((): Workspace => ({
+  id: "ws-3",
+  name: "Workspace 3",
+  rootPath: "C:/workspace-three",
+  scanDepth: 3,
+  createdAt: "2026-05-19T00:00:00.000Z",
+  lastOpenedAt: "2026-05-19T00:00:00.000Z",
+}));
+
 const codexThread = vi.hoisted((): Thread => ({
   id: "codex-1",
   workspaceId: "ws-1",
@@ -74,6 +92,7 @@ const workspaceState = vi.hoisted(() => ({
   openWorkspace: vi.fn(async () => workspace),
   removeWorkspace: vi.fn(async () => undefined),
   restoreWorkspace: vi.fn(async () => workspace),
+  reorderWorkspaces: vi.fn(async () => undefined),
   refreshArchivedWorkspaces: vi.fn(async () => undefined),
   error: undefined as string | undefined,
 }));
@@ -141,6 +160,10 @@ const terminalNotificationState = vi.hoisted(() => ({
   updatingTerminalEnabled: false,
   toggle: vi.fn(async () => undefined),
   openModal: vi.fn(),
+}));
+
+const threadNotificationState = vi.hoisted(() => ({
+  notificationsByThreadId: {} as Record<string, { workspaceId: string; status?: string }>,
 }));
 
 function applySelector<TState, TResult>(
@@ -226,6 +249,27 @@ vi.mock("../../stores/terminalNotificationSettingsStore", () => ({
   ) => applySelector(terminalNotificationState, selector),
 }));
 
+vi.mock("../../stores/threadNotificationStore", () => ({
+  useThreadNotificationStore: (
+    selector?: (state: typeof threadNotificationState) => unknown,
+  ) => applySelector(threadNotificationState, selector),
+  countWorkspaceThreadNotifications: (
+    notificationsByThreadId: Record<string, { workspaceId: string; status?: string }>,
+    workspaceId: string,
+  ) =>
+    Object.values(notificationsByThreadId).filter(
+      (notification) => notification.workspaceId === workspaceId,
+    ).length,
+  countWorkspacePendingApprovalNotifications: (
+    notificationsByThreadId: Record<string, { workspaceId: string; status?: string }>,
+    workspaceId: string,
+  ) =>
+    Object.values(notificationsByThreadId).filter(
+      (notification) =>
+        notification.workspaceId === workspaceId && notification.status === "pending_approval",
+    ).length,
+}));
+
 vi.mock("../workspace/WorkspaceMoreMenu", () => ({
   WorkspaceMoreMenu: () => null,
 }));
@@ -248,6 +292,8 @@ describe("Sidebar thread context menu", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    workspaceState.workspaces = [workspace];
+    workspaceState.archivedWorkspaces = [];
     workspaceState.activeWorkspaceId = "ws-1";
     workspaceState.error = undefined;
     threadState.threads = [codexThread, claudeThread];
@@ -255,6 +301,7 @@ describe("Sidebar thread context menu", () => {
     chatState.threadId = "claude-1";
     chatState.status = "completed";
     chatState.streaming = false;
+    threadNotificationState.notificationsByThreadId = {};
     uiState.sidebarPinned = true;
     uiState.activeView = "harnesses";
     container = document.createElement("div");
@@ -349,6 +396,75 @@ describe("Sidebar thread context menu", () => {
     expect(forkButton?.disabled).toBe(true);
   });
 
+  it("reorders workspace folders by dragging a project row", async () => {
+    workspaceState.workspaces = [workspace, workspaceTwo, workspaceThree];
+    threadState.threads = [];
+    await renderSidebar();
+
+    const rows = findProjectRows();
+    expect(rows).toHaveLength(3);
+    mockProjectRects(rows);
+
+    await act(async () => {
+      dispatchPointer(rows[2], "pointerdown", { clientX: 20, clientY: 75 });
+      dispatchPointer(window, "pointermove", { clientX: 20, clientY: 12 });
+      dispatchPointer(window, "pointerup", { clientX: 20, clientY: 12 });
+      await Promise.resolve();
+    });
+
+    expect(workspaceState.reorderWorkspaces).toHaveBeenCalledWith([
+      workspaceThree.id,
+      workspace.id,
+      workspaceTwo.id,
+    ]);
+  });
+
+  it("does not reorder workspaces when dragging a thread row", async () => {
+    await renderSidebar();
+
+    const row = findThreadRow("Codex conversation");
+    expect(row).not.toBeNull();
+
+    await act(async () => {
+      dispatchPointer(row as HTMLDivElement, "pointerdown", { clientX: 20, clientY: 90 });
+      dispatchPointer(window, "pointermove", { clientX: 20, clientY: 20 });
+      dispatchPointer(window, "pointerup", { clientX: 20, clientY: 20 });
+      await Promise.resolve();
+    });
+
+    expect(workspaceState.reorderWorkspaces).not.toHaveBeenCalled();
+  });
+
+  it("shows unread completion badges on thread and workspace rows", async () => {
+    threadNotificationState.notificationsByThreadId = {
+      [codexThread.id]: {
+        workspaceId: codexThread.workspaceId,
+        status: "completed",
+      },
+    };
+
+    await renderSidebar();
+
+    const row = findThreadRow("Codex conversation");
+    expect(row?.querySelector(".sb-thread-notification-dot")).not.toBeNull();
+    expect(container.querySelector(".sb-project-notification-badge")?.textContent).toBe("1");
+  });
+
+  it("shows yellow pending approval badges on thread and workspace rows", async () => {
+    threadNotificationState.notificationsByThreadId = {
+      [codexThread.id]: {
+        workspaceId: codexThread.workspaceId,
+        status: "pending_approval",
+      },
+    };
+
+    await renderSidebar();
+
+    const row = findThreadRow("Codex conversation");
+    expect(row?.querySelector(".sb-thread-notification-dot-pending-approval")).not.toBeNull();
+    expect(container.querySelector(".sb-project-notification-badge-pending-approval")).not.toBeNull();
+  });
+
   async function renderSidebar() {
     await act(async () => {
       root.render(<Sidebar />);
@@ -360,8 +476,49 @@ describe("Sidebar thread context menu", () => {
     return (
       Array.from(container.querySelectorAll(".sb-thread")).find((element) =>
         element.textContent?.includes(label),
-      ) as HTMLDivElement | undefined
+    ) as HTMLDivElement | undefined
     ) ?? null;
+  }
+
+  function findProjectRows(): HTMLButtonElement[] {
+    return Array.from(container.querySelectorAll(".sb-project")) as HTMLButtonElement[];
+  }
+
+  function mockProjectRects(rows: HTMLButtonElement[]) {
+    rows.forEach((row, index) => {
+      const top = index * 30;
+      Object.defineProperty(row, "getBoundingClientRect", {
+        configurable: true,
+        value: () => ({
+          top,
+          bottom: top + 30,
+          left: 0,
+          right: 240,
+          width: 240,
+          height: 30,
+          x: 0,
+          y: top,
+          toJSON: () => undefined,
+        }),
+      });
+    });
+  }
+
+  function dispatchPointer(
+    target: EventTarget,
+    type: "pointerdown" | "pointermove" | "pointerup",
+    options: { clientX: number; clientY: number },
+  ) {
+    const event = new MouseEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      button: 0,
+      clientX: options.clientX,
+      clientY: options.clientY,
+    });
+    Object.defineProperty(event, "pointerId", { value: 1 });
+    Object.defineProperty(event, "pointerType", { value: "mouse" });
+    target.dispatchEvent(event);
   }
 
   function findForkButton(): HTMLButtonElement | null {

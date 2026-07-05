@@ -22,6 +22,7 @@ interface WorkspaceState {
   openWorkspace: (path: string, scanDepth?: number) => Promise<Workspace | null>;
   removeWorkspace: (workspaceId: string) => Promise<void>;
   restoreWorkspace: (workspaceId: string) => Promise<void>;
+  reorderWorkspaces: (workspaceIds: string[]) => Promise<void>;
   loadRepos: (workspaceId: string) => Promise<void>;
   setActiveWorkspace: (workspaceId: string) => Promise<void>;
   setActiveRepo: (repoId: string | null, options?: SetActiveRepoOptions) => void;
@@ -168,8 +169,12 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     set({ loading: true, error: undefined });
     try {
       const workspace = await ipc.openWorkspace(path, scanDepth);
-      const current = get().workspaces.filter((item) => item.id !== workspace.id);
-      const workspaces = [workspace, ...current];
+      const current = get().workspaces;
+      const existingIndex = current.findIndex((item) => item.id === workspace.id);
+      const workspaces =
+        existingIndex === -1
+          ? [workspace, ...current]
+          : current.map((item) => (item.id === workspace.id ? workspace : item));
       set((state) => ({
         workspaces,
         archivedWorkspaces: state.archivedWorkspaces.filter((item) => item.id !== workspace.id),
@@ -246,6 +251,30 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       }
     } catch (error) {
       set({ loading: false, error: String(error) });
+    }
+  },
+  reorderWorkspaces: async (workspaceIds) => {
+    const previous = get().workspaces;
+    const byId = new Map(previous.map((workspace) => [workspace.id, workspace]));
+    const next = workspaceIds.map((workspaceId) => byId.get(workspaceId));
+
+    if (
+      next.length !== previous.length ||
+      next.some((workspace): workspace is undefined => workspace === undefined)
+    ) {
+      const error = new Error("workspace order must include every active workspace exactly once");
+      set({ error: error.message });
+      throw error;
+    }
+
+    const orderedWorkspaces = next as Workspace[];
+    set({ workspaces: orderedWorkspaces, error: undefined });
+
+    try {
+      await ipc.setWorkspaceOrder(workspaceIds);
+    } catch (error) {
+      set({ workspaces: previous, error: String(error) });
+      throw error;
     }
   },
   loadRepos: async (workspaceId) => {
@@ -386,10 +415,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         scanDepth ?? workspace.scanDepth,
       );
       set((state) => ({
-        workspaces: [
-          updatedWorkspace,
-          ...state.workspaces.filter((item) => item.id !== updatedWorkspace.id),
-        ],
+        workspaces: state.workspaces.map((item) =>
+          item.id === updatedWorkspace.id ? updatedWorkspace : item
+        ),
         archivedWorkspaces: state.archivedWorkspaces.filter(
           (item) => item.id !== updatedWorkspace.id,
         ),

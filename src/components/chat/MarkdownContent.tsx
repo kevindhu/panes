@@ -1,29 +1,48 @@
 import {
+  createElement,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
   type CSSProperties,
   type MouseEvent as ReactMouseEvent,
+  type ReactNode,
+  type SyntheticEvent,
 } from "react";
+import {
+  getCachedAttachmentPreviewObjectUrl,
+  loadAttachmentPreviewObjectUrl,
+} from "../../lib/attachmentImages";
 import { recordPerfMetric } from "../../lib/perfTelemetry";
 import {
   classifyLinkTarget,
   getWorkspacePaneLeafIdFromEventTarget,
   navigateLinkTarget,
 } from "../../lib/fileLinkNavigation";
+import {
+  MARKDOWN_LOCAL_IMAGE_MIME_ATTR,
+  MARKDOWN_LOCAL_IMAGE_PATH_ATTR,
+  rewriteMarkdownImageSources,
+} from "../../lib/markdownImageSources";
 import { renderMarkdownToHtml } from "../../workers/markdownParserCore";
 import type {
   MarkdownParseWorkerRequest,
   MarkdownParseWorkerResponse,
 } from "../../workers/markdownParser.types";
+import { ImageAttachmentViewer } from "./ImageAttachmentViewer";
 
 const MARKDOWN_WORKER_THRESHOLD_CHARS = 1000;
 const STREAMING_MARKDOWN_INLINE_LIMIT_CHARS = 6000;
 const MARKDOWN_CACHE_LIMIT = 280;
 const MARKDOWN_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+const MARKDOWN_LOCAL_IMAGE_THUMBNAIL_MAX_WIDTH = 720;
+const MARKDOWN_LOCAL_IMAGE_THUMBNAIL_MAX_HEIGHT = 440;
+const MARKDOWN_LOCAL_IMAGE_INLINE_MAX_WIDTH = 360;
+const MARKDOWN_LOCAL_IMAGE_INLINE_MAX_HEIGHT = 220;
 
 const markdownHtmlCache = new Map<string, string>();
+const markdownLocalImageFrameCache = new Map<string, MarkdownLocalImageFrame>();
 let markdownHtmlCacheBytes = 0;
 let markdownWorkerInstance: Worker | null = null;
 let markdownWorkerRequestSeq = 0;
@@ -153,6 +172,7 @@ interface MarkdownContentProps {
   className?: string;
   style?: CSSProperties;
   streaming?: boolean;
+  workspaceRootPath?: string | null;
 }
 
 interface MarkdownWorkerPlaceholderOptions {
@@ -161,6 +181,18 @@ interface MarkdownWorkerPlaceholderOptions {
   workerEligible: boolean;
   workerError: boolean;
   workerHtml: string | null;
+}
+
+function getEventElement(target: EventTarget | null): Element | null {
+  if (target instanceof Element) {
+    return target;
+  }
+
+  if (target instanceof Node) {
+    return target.parentElement;
+  }
+
+  return null;
 }
 
 export function shouldRenderMarkdownWorkerPlaceholder({
@@ -184,12 +216,7 @@ function handleMarkdownLinkClick(event: ReactMouseEvent<HTMLDivElement>): void {
     return;
   }
 
-  const target = event.target;
-  const element = target instanceof Element
-    ? target
-    : target instanceof Node
-      ? target.parentElement
-      : null;
+  const element = getEventElement(event.target);
   if (!element) {
     return;
   }
@@ -225,11 +252,287 @@ function handleMarkdownLinkClick(event: ReactMouseEvent<HTMLDivElement>): void {
   });
 }
 
+function getFileNameFromPath(filePath: string): string {
+  const normalizedPath = filePath.replace(/\\/g, "/");
+  return normalizedPath.split("/").filter(Boolean).pop() ?? "image";
+}
+
+interface MarkdownLocalImageProps {
+  filePath: string;
+  mimeType?: string;
+  alt?: string;
+}
+
+interface MarkdownLocalImageFrame {
+  width: number;
+  height: number;
+  aspectRatio: string;
+}
+
+function getThumbnailPreviewOptions() {
+  return {
+    maxWidth: MARKDOWN_LOCAL_IMAGE_THUMBNAIL_MAX_WIDTH,
+    maxHeight: MARKDOWN_LOCAL_IMAGE_THUMBNAIL_MAX_HEIGHT,
+  };
+}
+
+function getMarkdownLocalImageFrameCacheKey(filePath: string, mimeType?: string): string {
+  return `${filePath}\u0000${mimeType ?? ""}`;
+}
+
+function fitMarkdownLocalImageFrame(naturalWidth: number, naturalHeight: number): MarkdownLocalImageFrame | null {
+  if (naturalWidth <= 0 || naturalHeight <= 0) {
+    return null;
+  }
+
+  const aspect = naturalWidth / naturalHeight;
+  let width = MARKDOWN_LOCAL_IMAGE_INLINE_MAX_WIDTH;
+  let height = width / aspect;
+
+  if (height > MARKDOWN_LOCAL_IMAGE_INLINE_MAX_HEIGHT) {
+    height = MARKDOWN_LOCAL_IMAGE_INLINE_MAX_HEIGHT;
+    width = height * aspect;
+  }
+
+  return {
+    width: Math.max(1, Math.round(width)),
+    height: Math.max(1, Math.round(height)),
+    aspectRatio: `${naturalWidth} / ${naturalHeight}`,
+  };
+}
+
+function MarkdownLocalImage({ filePath, mimeType, alt }: MarkdownLocalImageProps) {
+  const fileName = getFileNameFromPath(filePath);
+  const thumbnailOptions = getThumbnailPreviewOptions();
+  const frameCacheKey = getMarkdownLocalImageFrameCacheKey(filePath, mimeType);
+  const [thumbnailSrc, setThumbnailSrc] = useState<string | null>(() => (
+    getCachedAttachmentPreviewObjectUrl(filePath, mimeType, thumbnailOptions) ?? null
+  ));
+  const [thumbnailFrame, setThumbnailFrame] = useState<MarkdownLocalImageFrame | null>(() => (
+    markdownLocalImageFrameCache.get(frameCacheKey) ?? null
+  ));
+  const [thumbnailFailed, setThumbnailFailed] = useState(false);
+  const [viewerOpen, setViewerOpen] = useState(false);
+  const [viewerSrc, setViewerSrc] = useState<string | null>(() => (
+    getCachedAttachmentPreviewObjectUrl(filePath, mimeType) ?? null
+  ));
+
+  useEffect(() => {
+    let disposed = false;
+    setThumbnailFailed(false);
+    setThumbnailFrame(markdownLocalImageFrameCache.get(frameCacheKey) ?? null);
+
+    const cachedThumbnail = getCachedAttachmentPreviewObjectUrl(filePath, mimeType, thumbnailOptions);
+    if (cachedThumbnail !== undefined) {
+      setThumbnailSrc(cachedThumbnail);
+      setThumbnailFailed(!cachedThumbnail);
+      return () => {
+        disposed = true;
+      };
+    }
+
+    setThumbnailSrc(null);
+    void loadAttachmentPreviewObjectUrl(filePath, mimeType, thumbnailOptions)
+      .then((nextThumbnailSrc) => {
+        if (disposed) {
+          return;
+        }
+        setThumbnailSrc(nextThumbnailSrc);
+        setThumbnailFailed(!nextThumbnailSrc);
+      })
+      .catch(() => {
+        if (!disposed) {
+          setThumbnailSrc(null);
+          setThumbnailFailed(true);
+        }
+      });
+
+    return () => {
+      disposed = true;
+    };
+  }, [filePath, frameCacheKey, mimeType]);
+
+  useEffect(() => {
+    setViewerSrc(getCachedAttachmentPreviewObjectUrl(filePath, mimeType) ?? null);
+  }, [filePath, mimeType]);
+
+  const requestViewerPreview = useCallback(async (): Promise<string | null> => {
+    const cachedPreview = getCachedAttachmentPreviewObjectUrl(filePath, mimeType);
+    if (cachedPreview !== undefined) {
+      setViewerSrc(cachedPreview);
+      return cachedPreview;
+    }
+
+    const previewSrc = await loadAttachmentPreviewObjectUrl(filePath, mimeType);
+    setViewerSrc(previewSrc);
+    return previewSrc;
+  }, [filePath, mimeType]);
+
+  function openViewer() {
+    setViewerOpen(true);
+    void requestViewerPreview().catch(() => {});
+  }
+
+  function handleThumbnailLoad(event: SyntheticEvent<HTMLImageElement>) {
+    const nextFrame = fitMarkdownLocalImageFrame(
+      event.currentTarget.naturalWidth,
+      event.currentTarget.naturalHeight,
+    );
+    if (!nextFrame) {
+      return;
+    }
+
+    markdownLocalImageFrameCache.set(frameCacheKey, nextFrame);
+    setThumbnailFrame(nextFrame);
+  }
+
+  const thumbnailFrameStyle = thumbnailFrame
+    ? ({
+        "--markdown-local-image-frame-width": `${thumbnailFrame.width}px`,
+        "--markdown-local-image-frame-height": "auto",
+        "--markdown-local-image-aspect": thumbnailFrame.aspectRatio,
+      } as CSSProperties)
+    : undefined;
+
+  return (
+    <>
+      <button
+        type="button"
+        className="markdown-local-image-button"
+        style={thumbnailFrameStyle}
+        data-panes-markdown-local-image-path={filePath}
+        data-panes-markdown-local-image-mime={mimeType}
+        aria-label="Open image"
+        onClick={openViewer}
+      >
+        {thumbnailSrc ? (
+          <img
+            src={thumbnailSrc}
+            alt={alt ?? fileName}
+            className="markdown-local-image-thumbnail"
+            draggable={false}
+            decoding="async"
+            onLoad={handleThumbnailLoad}
+            onError={() => setThumbnailFailed(true)}
+          />
+        ) : (
+          <span className="markdown-local-image-placeholder">
+            {thumbnailFailed ? "Image unavailable" : "Loading image"}
+          </span>
+        )}
+      </button>
+      {viewerOpen && (
+        <ImageAttachmentViewer
+          open
+          filePath={filePath}
+          fileName={fileName}
+          mimeType={mimeType}
+          originalSrc={null}
+          previewSrc={viewerSrc ?? thumbnailSrc}
+          requestPreview={requestViewerPreview}
+          onClose={() => setViewerOpen(false)}
+        />
+      )}
+    </>
+  );
+}
+
+function isVoidElement(tagName: string): boolean {
+  return tagName === "br" || tagName === "hr" || tagName === "img";
+}
+
+function getReactAttributeName(attributeName: string): string {
+  switch (attributeName) {
+    case "class":
+      return "className";
+    case "for":
+      return "htmlFor";
+    case "tabindex":
+      return "tabIndex";
+    case "colspan":
+      return "colSpan";
+    case "rowspan":
+      return "rowSpan";
+    default:
+      return attributeName;
+  }
+}
+
+function getReactAttributeValue(attributeName: string, value: string): string | number {
+  if (attributeName === "tabindex" || attributeName === "colspan" || attributeName === "rowspan") {
+    const numericValue = Number(value);
+    return Number.isFinite(numericValue) ? numericValue : value;
+  }
+
+  return value;
+}
+
+function convertHtmlNodeToReact(node: ChildNode, key: string): ReactNode {
+  if (node.nodeType === Node.TEXT_NODE) {
+    return node.textContent;
+  }
+
+  if (!(node instanceof Element)) {
+    return null;
+  }
+
+  const tagName = node.tagName.toLowerCase();
+  if (tagName === "img") {
+    const filePath = node.getAttribute(MARKDOWN_LOCAL_IMAGE_PATH_ATTR)?.trim();
+    if (filePath) {
+      return (
+        <MarkdownLocalImage
+          key={key}
+          filePath={filePath}
+          mimeType={node.getAttribute(MARKDOWN_LOCAL_IMAGE_MIME_ATTR)?.trim() || undefined}
+          alt={node.getAttribute("alt")?.trim() || undefined}
+        />
+      );
+    }
+  }
+
+  const props: Record<string, unknown> = { key };
+  for (const attribute of Array.from(node.attributes)) {
+    if (attribute.name === "style") {
+      continue;
+    }
+    const reactName = getReactAttributeName(attribute.name);
+    props[reactName] = getReactAttributeValue(attribute.name, attribute.value);
+  }
+
+  if (isVoidElement(tagName)) {
+    return createElement(tagName, props);
+  }
+
+  const children = Array.from(node.childNodes).map((childNode, childIndex) =>
+    convertHtmlNodeToReact(childNode, `${key}.${childIndex}`),
+  );
+  return createElement(tagName, props, ...children);
+}
+
+function renderMarkdownHtmlAsReact(html: string): ReactNode[] | null {
+  if (typeof document === "undefined") {
+    return null;
+  }
+
+  const template = document.createElement("template");
+  template.innerHTML = html;
+
+  if (!template.content.querySelector(`img[${MARKDOWN_LOCAL_IMAGE_PATH_ATTR}]`)) {
+    return null;
+  }
+
+  return Array.from(template.content.childNodes).map((node, index) =>
+    convertHtmlNodeToReact(node, `${index}`),
+  );
+}
+
 export default function MarkdownContent({
   content,
   className,
   style,
   streaming = false,
+  workspaceRootPath,
 }: MarkdownContentProps) {
   const [workerHtml, setWorkerHtml] = useState<string | null>(null);
   const [workerError, setWorkerError] = useState(false);
@@ -320,6 +623,18 @@ export default function MarkdownContent({
     };
   }, [cacheKey, content, hasStreamed, streaming, workerEligible]);
 
+  const html = workerEligible && !streaming && !hasStreamed && workerHtml !== null
+    ? workerHtml
+    : immediateHtml;
+  const renderedHtml = useMemo(
+    () => (html === null ? null : rewriteMarkdownImageSources(html, workspaceRootPath)),
+    [html, workspaceRootPath],
+  );
+  const renderedReactNodes = useMemo(
+    () => (renderedHtml === null ? null : renderMarkdownHtmlAsReact(renderedHtml)),
+    [renderedHtml],
+  );
+
   if (showWorkerPlaceholder) {
     return (
       <div className={className} style={style}>
@@ -337,11 +652,7 @@ export default function MarkdownContent({
     );
   }
 
-  const html = workerEligible && !streaming && !hasStreamed && workerHtml !== null
-    ? workerHtml
-    : immediateHtml;
-
-  if (html === null) {
+  if (renderedHtml === null) {
     return (
       <div className={className} style={style}>
         <pre
@@ -358,12 +669,24 @@ export default function MarkdownContent({
     );
   }
 
+  if (renderedReactNodes !== null) {
+    return (
+      <div
+        className={className}
+        style={style}
+        onClickCapture={handleMarkdownLinkClick}
+      >
+        {renderedReactNodes}
+      </div>
+    );
+  }
+
   return (
     <div
       className={className}
       style={style}
       onClickCapture={handleMarkdownLinkClick}
-      dangerouslySetInnerHTML={{ __html: html }}
+      dangerouslySetInnerHTML={{ __html: renderedHtml }}
     />
   );
 }

@@ -544,8 +544,8 @@ impl Engine for CodexEngine {
         }
 
         let mut mapper = TurnEventMapper::default();
-        let mut subscription = transport.subscribe();
         let thread_id = engine_thread_id.to_string();
+        let mut subscription = transport.subscribe_thread(&thread_id).await;
 
         let runtime = self.thread_runtime(&thread_id).await;
         let plan_mode_activation = self
@@ -648,6 +648,7 @@ impl Engine for CodexEngine {
                     &thread_id,
                     "turn/start result",
                   );
+                  subscription.set_turn_id(Some(turn_id.clone())).await;
                   self.set_active_turn(&thread_id, &turn_id).await;
                 }
 
@@ -675,7 +676,7 @@ impl Engine for CodexEngine {
               }
               incoming = subscription.recv() => {
                 match incoming {
-                  Ok(IncomingMessage::Notification { method, params }) => {
+                  Some(IncomingMessage::Notification { method, params }) => {
                     let params = raw_value_to_value(&params);
                     let normalized_method = normalize_method(&method);
                     if let Some(error_message) =
@@ -700,7 +701,25 @@ impl Engine for CodexEngine {
                       return Err(anyhow::anyhow!(error_message));
                     }
 
+                    log_codex_plan_notification(
+                      "received",
+                      &method,
+                      &normalized_method,
+                      &params,
+                      &thread_id,
+                      expected_turn_id.as_deref(),
+                    );
+
                     if !belongs_to_thread(&params, &thread_id) {
+                      log_codex_incoming_drop(
+                        "notification",
+                        &method,
+                        &normalized_method,
+                        &params,
+                        &thread_id,
+                        expected_turn_id.as_deref(),
+                        "thread_mismatch",
+                      );
                       continue;
                     }
                     if normalized_method == "turn/started" {
@@ -711,9 +730,19 @@ impl Engine for CodexEngine {
                           &thread_id,
                           "turn/started notification",
                         );
+                        subscription.set_turn_id(Some(turn_id.clone())).await;
                         self.set_active_turn(&thread_id, &turn_id).await;
                       }
                     } else if !belongs_to_turn(&params, expected_turn_id.as_deref()) {
+                      log_codex_incoming_drop(
+                        "notification",
+                        &method,
+                        &normalized_method,
+                        &params,
+                        &thread_id,
+                        expected_turn_id.as_deref(),
+                        "turn_mismatch",
+                      );
                       continue;
                     }
 
@@ -727,6 +756,23 @@ impl Engine for CodexEngine {
                     }
 
                     let mapped_events = mapper.map_notification(&method, &params);
+                    if should_log_successful_plan_notification(&normalized_method) {
+                        let event_kinds = mapped_events
+                            .iter()
+                            .map(engine_event_kind)
+                            .collect::<Vec<_>>();
+                        let message = format!(
+                            "codex plan notification mapped: method={method}, normalized={normalized_method}, event_count={}, event_kinds={event_kinds:?}, {}",
+                            mapped_events.len(),
+                            incoming_event_summary(
+                                &params,
+                                &thread_id,
+                                expected_turn_id.as_deref()
+                            )
+                        );
+                        log::info!("{message}");
+                        record_codex_event_routing_log(&message);
+                    }
                     if mapped_events.is_empty()
                         && !is_known_codex_notification_method(&normalized_method)
                     {
@@ -754,18 +800,34 @@ impl Engine for CodexEngine {
                       event_tx.send(event).await.ok();
                     }
                   }
-                  Ok(IncomingMessage::Request { id, raw_id, method, params }) => {
+                  Some(IncomingMessage::Request { id, raw_id, method, params }) => {
                     let params = raw_value_to_value(&params);
                     log::debug!(
                       "codex server request: method={method}, id={id}, raw_id={raw_id}, params_keys={:?}",
                       params.as_object().map(|o| o.keys().collect::<Vec<_>>())
                     );
                     if !belongs_to_thread(&params, &thread_id) {
-                      log::warn!("codex server request dropped by belongs_to_thread: method={method}");
+                      log_codex_incoming_drop(
+                        "server request",
+                        &method,
+                        &normalize_method(&method),
+                        &params,
+                        &thread_id,
+                        expected_turn_id.as_deref(),
+                        "thread_mismatch",
+                      );
                       continue;
                     }
                     if !belongs_to_turn(&params, expected_turn_id.as_deref()) {
-                      log::warn!("codex server request dropped by belongs_to_turn: method={method}");
+                      log_codex_incoming_drop(
+                        "server request",
+                        &method,
+                        &normalize_method(&method),
+                        &params,
+                        &thread_id,
+                        expected_turn_id.as_deref(),
+                        "turn_mismatch",
+                      );
                       continue;
                     }
                     let normalized_method = normalize_method(&method);
@@ -857,32 +919,10 @@ impl Engine for CodexEngine {
                         .ok();
                     }
                   }
-                  Ok(IncomingMessage::Response(_)) => {
+                  Some(IncomingMessage::Response(_)) => {
                     // Responses are routed by request ID in the transport pending map.
                   }
-                  Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    let error_message = format!(
-                        "codex transport lagged while waiting for turn events; skipped {skipped} messages"
-                    );
-                    self.clear_active_turn(&thread_id).await;
-                    self.invalidate_transport(&error_message).await;
-                    if turn_request_done
-                        && self
-                            .try_emit_reconciled_turn_completion(
-                                &thread_id,
-                                expected_turn_id.as_deref(),
-                                &event_tx,
-                                "lagged turn-event subscription",
-                                TurnCompletionRecoveryMode::StreamLost,
-                            )
-                            .await
-                    {
-                        completion_seen = true;
-                        break;
-                    }
-                    return Err(anyhow::anyhow!(error_message));
-                  }
-                  Err(broadcast::error::RecvError::Closed) => {
+                  None => {
                     self.clear_active_turn(&thread_id).await;
                     self
                       .invalidate_transport("codex transport subscription closed while waiting for turn events")
@@ -1304,8 +1344,8 @@ impl CodexEngine {
         }
 
         let mut mapper = TurnEventMapper::default();
-        let mut subscription = transport.subscribe();
         let source_thread_id = source_engine_thread_id.to_string();
+        let mut subscription = transport.subscribe_thread(&source_thread_id).await;
         let mut active_thread_id = source_thread_id.clone();
         let requested_delivery = delivery.map(str::to_string);
 
@@ -1403,6 +1443,7 @@ impl CodexEngine {
                     }
                 };
                 active_thread_id = review_thread_id.clone();
+                subscription.set_thread_id(&active_thread_id).await;
                 if let Some(started_tx) = started_tx.take() {
                     let _ = started_tx.send(CodexReviewStarted {
                         review_thread_id: review_thread_id.clone(),
@@ -1416,6 +1457,7 @@ impl CodexEngine {
                     &active_thread_id,
                     "review/start result",
                   );
+                  subscription.set_turn_id(Some(turn_id.clone())).await;
                   self.set_active_turn(&active_thread_id, &turn_id).await;
                 }
 
@@ -1443,7 +1485,7 @@ impl CodexEngine {
               }
               incoming = subscription.recv() => {
                 match incoming {
-                  Ok(IncomingMessage::Notification { method, params }) => {
+                  Some(IncomingMessage::Notification { method, params }) => {
                     let params = raw_value_to_value(&params);
                     let normalized_method = normalize_method(&method);
                     if let Some(error_message) =
@@ -1469,7 +1511,25 @@ impl CodexEngine {
                       return Err(anyhow::anyhow!(error_message));
                     }
 
+                    log_codex_plan_notification(
+                      "received during review",
+                      &method,
+                      &normalized_method,
+                      &params,
+                      &active_thread_id,
+                      expected_turn_id.as_deref(),
+                    );
+
                     if !belongs_to_thread(&params, &active_thread_id) {
+                      log_codex_incoming_drop(
+                        "review notification",
+                        &method,
+                        &normalized_method,
+                        &params,
+                        &active_thread_id,
+                        expected_turn_id.as_deref(),
+                        "thread_mismatch",
+                      );
                       continue;
                     }
                     if normalized_method == "turn/started" {
@@ -1480,9 +1540,19 @@ impl CodexEngine {
                           &active_thread_id,
                           "turn/started review notification",
                         );
+                        subscription.set_turn_id(Some(turn_id.clone())).await;
                         self.set_active_turn(&active_thread_id, &turn_id).await;
                       }
                     } else if !belongs_to_turn(&params, expected_turn_id.as_deref()) {
+                      log_codex_incoming_drop(
+                        "review notification",
+                        &method,
+                        &normalized_method,
+                        &params,
+                        &active_thread_id,
+                        expected_turn_id.as_deref(),
+                        "turn_mismatch",
+                      );
                       continue;
                     }
 
@@ -1496,6 +1566,23 @@ impl CodexEngine {
                     }
 
                     let mapped_events = mapper.map_notification(&method, &params);
+                    if should_log_successful_plan_notification(&normalized_method) {
+                        let event_kinds = mapped_events
+                            .iter()
+                            .map(engine_event_kind)
+                            .collect::<Vec<_>>();
+                        let message = format!(
+                            "codex plan notification mapped during review: method={method}, normalized={normalized_method}, event_count={}, event_kinds={event_kinds:?}, {}",
+                            mapped_events.len(),
+                            incoming_event_summary(
+                                &params,
+                                &active_thread_id,
+                                expected_turn_id.as_deref()
+                            )
+                        );
+                        log::info!("{message}");
+                        record_codex_event_routing_log(&message);
+                    }
                     if mapped_events.is_empty()
                         && !is_known_codex_notification_method(&normalized_method)
                     {
@@ -1523,18 +1610,34 @@ impl CodexEngine {
                       event_tx.send(event).await.ok();
                     }
                   }
-                  Ok(IncomingMessage::Request { id, raw_id, method, params }) => {
+                  Some(IncomingMessage::Request { id, raw_id, method, params }) => {
                     let params = raw_value_to_value(&params);
                     log::debug!(
                       "codex review server request: method={method}, id={id}, raw_id={raw_id}, params_keys={:?}",
                       params.as_object().map(|o| o.keys().collect::<Vec<_>>())
                     );
                     if !belongs_to_thread(&params, &active_thread_id) {
-                      log::warn!("codex review server request dropped by belongs_to_thread: method={method}");
+                      log_codex_incoming_drop(
+                        "review server request",
+                        &method,
+                        &normalize_method(&method),
+                        &params,
+                        &active_thread_id,
+                        expected_turn_id.as_deref(),
+                        "thread_mismatch",
+                      );
                       continue;
                     }
                     if !belongs_to_turn(&params, expected_turn_id.as_deref()) {
-                      log::warn!("codex review server request dropped by belongs_to_turn: method={method}");
+                      log_codex_incoming_drop(
+                        "review server request",
+                        &method,
+                        &normalize_method(&method),
+                        &params,
+                        &active_thread_id,
+                        expected_turn_id.as_deref(),
+                        "turn_mismatch",
+                      );
                       continue;
                     }
                     let normalized_method = normalize_method(&method);
@@ -1626,31 +1729,8 @@ impl CodexEngine {
                         .ok();
                     }
                   }
-                  Ok(IncomingMessage::Response(_)) => {}
-                  Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    let error_message = format!(
-                        "codex transport lagged while waiting for review events; skipped {skipped} messages"
-                    );
-                    self.clear_active_turn(&active_thread_id).await;
-                    self.invalidate_transport(&error_message).await;
-                    if turn_request_done
-                        && self
-                            .try_emit_reconciled_turn_completion(
-                                &active_thread_id,
-                                expected_turn_id.as_deref(),
-                                &event_tx,
-                                "lagged review-event subscription",
-                                TurnCompletionRecoveryMode::StreamLost,
-                            )
-                            .await
-                    {
-                        completion_seen = true;
-                        break;
-                    }
-                    drop(started_tx.take());
-                    return Err(anyhow::anyhow!(error_message));
-                  }
-                  Err(broadcast::error::RecvError::Closed) => {
+                  Some(IncomingMessage::Response(_)) => {}
+                  None => {
                     self.clear_active_turn(&active_thread_id).await;
                     self
                       .invalidate_transport("codex transport subscription closed while waiting for review events")
@@ -2366,8 +2446,6 @@ impl CodexEngine {
             let transport = state.transport.take();
             state.initialized = false;
             state.approval_requests.clear();
-            state.active_turn_ids.clear();
-            state.thread_runtimes.clear();
             state.sandbox_probe_completed = false;
             state.force_external_sandbox = false;
             if let Some(diagnostics) = state.protocol_diagnostics.as_mut() {
@@ -2568,10 +2646,10 @@ impl CodexEngine {
                 });
             }
 
-            let mut subscription = transport.subscribe();
+            let mut subscription = transport.subscribe_runtime().await;
             loop {
                 match subscription.recv().await {
-                    Ok(IncomingMessage::Notification { method, params }) => {
+                    Some(IncomingMessage::Notification { method, params }) => {
                         let params = raw_value_to_value(&params);
                         let normalized_method = normalize_method(&method);
                         match normalized_method.as_str() {
@@ -2881,13 +2959,8 @@ impl CodexEngine {
                             _ => {}
                         }
                     }
-                    Ok(IncomingMessage::Request { .. }) | Ok(IncomingMessage::Response(_)) => {}
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        log::warn!(
-                            "codex runtime monitor lagged on notifications, skipped {skipped} messages"
-                        );
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    Some(IncomingMessage::Request { .. }) | Some(IncomingMessage::Response(_)) => {}
+                    None => break,
                 }
             }
         });
@@ -4628,7 +4701,7 @@ fn build_reconciled_turn_completion_events(
             "Codex finished after Panes lost the live event stream, so the transcript may be incomplete."
                 .to_string(),
         );
-        TurnCompletionStatus::Failed
+        TurnCompletionStatus::Completed
     } else if provisional_interrupted {
         synthetic_error_message = Some(
             "Panes lost the live Codex stream and could not verify Codex's final turn state."
@@ -6695,29 +6768,8 @@ fn approval_response_target_error_message(
 }
 
 fn belongs_to_thread(params: &serde_json::Value, thread_id: &str) -> bool {
-    let candidates = [
-        "threadId",
-        "thread_id",
-        "engineThreadId",
-        "engine_thread_id",
-        "conversationId",
-        "conversation_id",
-        "sessionId",
-        "session_id",
-    ];
-
-    if let Some(found) = extract_any_string(params, &candidates) {
+    if let Some(found) = extract_incoming_thread_id(params) {
         return found == thread_id;
-    }
-
-    for key in [
-        "thread", "turn", "session", "context", "meta", "metadata", "item",
-    ] {
-        if let Some(nested) = params.get(key) {
-            if let Some(found) = extract_any_string(nested, &candidates) {
-                return found == thread_id;
-            }
-        }
     }
 
     // No thread ID field found in params — pass through.
@@ -6758,20 +6810,192 @@ fn belongs_to_turn(params: &serde_json::Value, expected_turn_id: Option<&str>) -
         return true;
     };
 
-    let candidates = ["turnId", "turn_id"];
-    if let Some(found) = extract_any_string(params, &candidates) {
+    if let Some(found) = extract_incoming_turn_id(params) {
         return found == expected_turn_id;
+    }
+
+    true
+}
+
+fn extract_incoming_thread_id(params: &serde_json::Value) -> Option<String> {
+    let candidates = [
+        "threadId",
+        "thread_id",
+        "engineThreadId",
+        "engine_thread_id",
+        "conversationId",
+        "conversation_id",
+        "sessionId",
+        "session_id",
+    ];
+
+    if let Some(found) = extract_any_string(params, &candidates) {
+        return Some(found);
+    }
+
+    for key in [
+        "thread", "turn", "session", "context", "meta", "metadata", "item",
+    ] {
+        if let Some(nested) = params.get(key) {
+            if let Some(found) = extract_any_string(nested, &candidates) {
+                return Some(found);
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_incoming_turn_id(params: &serde_json::Value) -> Option<String> {
+    let candidates = ["turnId", "turn_id"];
+
+    if let Some(found) = extract_any_string(params, &candidates) {
+        return Some(found);
     }
 
     for key in ["turn", "item", "session", "context", "meta", "metadata"] {
         if let Some(nested) = params.get(key) {
             if let Some(found) = extract_any_string(nested, &candidates) {
-                return found == expected_turn_id;
+                return Some(found);
             }
         }
     }
 
-    true
+    None
+}
+
+fn is_plan_protocol_method(normalized_method: &str) -> bool {
+    matches!(
+        method_signature(normalized_method).as_str(),
+        "turnplanupdated" | "itemplandelta"
+    )
+}
+
+fn should_log_successful_plan_notification(normalized_method: &str) -> bool {
+    method_signature(normalized_method) == "turnplanupdated"
+}
+
+fn incoming_params_keys(params: &serde_json::Value) -> Option<Vec<String>> {
+    let mut keys = params
+        .as_object()?
+        .keys()
+        .map(|key| key.to_string())
+        .collect::<Vec<_>>();
+    keys.sort();
+    Some(keys)
+}
+
+fn incoming_plan_content_chars(params: &serde_json::Value) -> Option<usize> {
+    let mut total = 0usize;
+    let mut found = false;
+
+    for key in ["delta", "text", "content", "explanation"] {
+        if let Some(content) = params.get(key).and_then(serde_json::Value::as_str) {
+            total = total.saturating_add(content.chars().count());
+            found = true;
+        }
+    }
+
+    if let Some(plan) = params.get("plan").and_then(serde_json::Value::as_array) {
+        found = true;
+        for entry in plan {
+            for key in ["step", "title", "description"] {
+                if let Some(content) = entry.get(key).and_then(serde_json::Value::as_str) {
+                    total = total.saturating_add(content.chars().count());
+                }
+            }
+        }
+    }
+
+    found.then_some(total)
+}
+
+fn incoming_event_summary(
+    params: &serde_json::Value,
+    expected_thread_id: &str,
+    expected_turn_id: Option<&str>,
+) -> String {
+    format!(
+        "expected_thread_id={}; expected_turn_id={}; server_thread_id={}; server_turn_id={}; params_keys={:?}; content_chars={}",
+        expected_thread_id,
+        expected_turn_id.unwrap_or("<unbound>"),
+        extract_incoming_thread_id(params)
+            .as_deref()
+            .unwrap_or("<missing>"),
+        extract_incoming_turn_id(params)
+            .as_deref()
+            .unwrap_or("<missing>"),
+        incoming_params_keys(params),
+        incoming_plan_content_chars(params)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string())
+    )
+}
+
+fn record_codex_event_routing_log(message: &str) {
+    crate::diagnostic_logs::append_codex_event_routing_log(message);
+}
+
+fn log_codex_incoming_drop(
+    context: &str,
+    method: &str,
+    normalized_method: &str,
+    params: &serde_json::Value,
+    expected_thread_id: &str,
+    expected_turn_id: Option<&str>,
+    reason: &str,
+) {
+    let message = if is_plan_protocol_method(normalized_method) {
+        format!(
+            "codex plan {context} dropped: method={method}, normalized={normalized_method}, reason={reason}, {}",
+            incoming_event_summary(params, expected_thread_id, expected_turn_id)
+        )
+    } else {
+        format!(
+            "codex {context} dropped: method={method}, normalized={normalized_method}, reason={reason}, {}",
+            incoming_event_summary(params, expected_thread_id, expected_turn_id)
+        )
+    };
+    log::warn!("{message}");
+    record_codex_event_routing_log(&message);
+}
+
+fn log_codex_plan_notification(
+    stage: &str,
+    method: &str,
+    normalized_method: &str,
+    params: &serde_json::Value,
+    expected_thread_id: &str,
+    expected_turn_id: Option<&str>,
+) {
+    if should_log_successful_plan_notification(normalized_method) {
+        let message = format!(
+            "codex plan notification {stage}: method={method}, normalized={normalized_method}, {}",
+            incoming_event_summary(params, expected_thread_id, expected_turn_id)
+        );
+        log::info!("{message}");
+        record_codex_event_routing_log(&message);
+    }
+}
+
+fn engine_event_kind(event: &EngineEvent) -> &'static str {
+    match event {
+        EngineEvent::TurnStarted { .. } => "TurnStarted",
+        EngineEvent::TurnCompleted { .. } => "TurnCompleted",
+        EngineEvent::TurnSnapshotRecovered { .. } => "TurnSnapshotRecovered",
+        EngineEvent::TextDelta { .. } => "TextDelta",
+        EngineEvent::ThinkingDelta { .. } => "ThinkingDelta",
+        EngineEvent::ActionStarted { .. } => "ActionStarted",
+        EngineEvent::ActionOutputDelta { .. } => "ActionOutputDelta",
+        EngineEvent::ActionProgressUpdated { .. } => "ActionProgressUpdated",
+        EngineEvent::ActionCompleted { .. } => "ActionCompleted",
+        EngineEvent::DiffUpdated { .. } => "DiffUpdated",
+        EngineEvent::ApprovalRequested { .. } => "ApprovalRequested",
+        EngineEvent::UsageLimitsUpdated { .. } => "UsageLimitsUpdated",
+        EngineEvent::ModelRerouted { .. } => "ModelRerouted",
+        EngineEvent::Notice { .. } => "Notice",
+        EngineEvent::Error { .. } => "Error",
+    }
 }
 
 fn rebind_expected_turn_id(
@@ -7700,7 +7924,7 @@ mod tests {
     }
 
     #[test]
-    fn build_reconciled_turn_completion_events_marks_lost_completed_turn_failed() {
+    fn build_reconciled_turn_completion_events_keeps_verified_lost_completed_turn_completed() {
         let events = build_reconciled_turn_completion_events(
             ReconciledTurnCompletion {
                 status: TurnCompletionStatus::Completed,
@@ -7729,7 +7953,7 @@ mod tests {
                 token_usage,
                 diagnostics,
             } => {
-                assert_eq!(*status, TurnCompletionStatus::Failed);
+                assert_eq!(*status, TurnCompletionStatus::Completed);
                 assert!(token_usage.is_none());
                 assert_eq!(
                     diagnostics.as_ref().map(|value| &value.source),

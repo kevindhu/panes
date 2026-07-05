@@ -85,6 +85,22 @@ describe("renderMarkdownToHtml", () => {
     expect(html).not.toContain('src="file:///repo/secret.png"');
   });
 
+  it("preserves safe workspace-relative image sources", () => {
+    const html = renderMarkdownToHtml(
+      "![page](screenshots/page.png) ![other](./images/other.webp?cache=1)",
+    );
+
+    expect(html).toContain('src="screenshots/page.png"');
+    expect(html).toContain('src="./images/other.webp?cache=1"');
+  });
+
+  it("does not allow non-image bare paths in image sources", () => {
+    const html = renderMarkdownToHtml("![notes](docs/notes.md)");
+
+    expect(html).toContain('src="#"');
+    expect(html).not.toContain('src="docs/notes.md"');
+  });
+
   it("sanitizes dangerous tags, handlers and javascript links", () => {
     const html = renderMarkdownToHtml(
       [

@@ -65,6 +65,29 @@ describe("planModePrompt", () => {
     expect(messageHasStructuredPlan(message)).toBe(true);
   });
 
+  it("detects markdown plan sections inside GPT thinking output", () => {
+    const message = buildAssistantMessage(
+      [
+        "**Finalizing the plan**",
+        "",
+        "# Docs Polish Plan",
+        "",
+        "## Summary",
+        "Update the README only, keeping the change very small.",
+        "",
+        "## Key Changes",
+        "- Add a short \"Which flow should I use?\" section.",
+        "- Explain that the JSON resume uses `generate.sh`.",
+        "",
+        "## Test Plan",
+        "- Run `git diff --check`.",
+        "- Read the updated README.",
+      ].join("\n"),
+    );
+
+    expect(messageHasStructuredPlan(message)).toBe(true);
+  });
+
   it("detects Codex native plan updates that use camelCase inProgress statuses", () => {
     const message = buildAssistantMessage(
       [

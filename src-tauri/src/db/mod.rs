@@ -124,6 +124,7 @@ impl Database {
         conn.execute_batch(include_str!("migrations/001_initial.sql"))
             .context("failed to apply migrations")?;
         ensure_archived_columns(&conn)?;
+        ensure_workspace_sort_order_column(&conn)?;
         ensure_workspace_git_columns(&conn)?;
         ensure_repo_columns(&conn)?;
         ensure_workspace_startup_columns(&conn)?;
@@ -152,6 +153,51 @@ fn configure_connection(conn: &Connection) -> anyhow::Result<()> {
 fn ensure_archived_columns(conn: &Connection) -> anyhow::Result<()> {
     ensure_column(conn, "workspaces", "archived_at", "TEXT")?;
     ensure_column(conn, "threads", "archived_at", "TEXT")?;
+    Ok(())
+}
+
+fn ensure_workspace_sort_order_column(conn: &Connection) -> anyhow::Result<()> {
+    ensure_column(
+        conn,
+        "workspaces",
+        "sort_order",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+
+    let (active_count, distinct_order_count): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COUNT(DISTINCT sort_order)
+             FROM workspaces
+             WHERE archived_at IS NULL",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .context("failed to inspect workspace sort order migration state")?;
+
+    if active_count <= 1 || distinct_order_count > 1 {
+        return Ok(());
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id
+             FROM workspaces
+             WHERE archived_at IS NULL
+             ORDER BY last_opened_at DESC, id ASC",
+        )
+        .context("failed to load workspaces for sort order migration")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+
+    for (index, workspace_id) in rows.enumerate() {
+        conn.execute(
+            "UPDATE workspaces
+             SET sort_order = ?1
+             WHERE id = ?2",
+            params![index as i64, workspace_id?],
+        )
+        .context("failed to initialize workspace sort order")?;
+    }
+
     Ok(())
 }
 
@@ -241,6 +287,7 @@ struct WorkspacePathRow {
     archived_at: Option<String>,
     created_at: String,
     last_opened_at: String,
+    sort_order: i64,
     git_repo_selection_configured: bool,
 }
 
@@ -416,8 +463,9 @@ fn update_workspace_row(tx: &Transaction<'_>, workspace: &WorkspacePathRow) -> a
              archived_at = ?6,
              created_at = ?7,
              last_opened_at = ?8,
-             git_repo_selection_configured = ?9
-         WHERE id = ?10",
+             sort_order = ?9,
+             git_repo_selection_configured = ?10
+         WHERE id = ?11",
         params![
             workspace.name,
             workspace.root_path,
@@ -427,6 +475,7 @@ fn update_workspace_row(tx: &Transaction<'_>, workspace: &WorkspacePathRow) -> a
             workspace.archived_at,
             workspace.created_at,
             workspace.last_opened_at,
+            workspace.sort_order,
             if workspace.git_repo_selection_configured {
                 1
             } else {
@@ -470,7 +519,7 @@ fn load_workspace_rows(conn: &Connection) -> anyhow::Result<Vec<WorkspacePathRow
         .prepare(
             "SELECT id, name, root_path, scan_depth, startup_preset_json,
                     startup_preset_updated_at, archived_at, created_at, last_opened_at,
-                    git_repo_selection_configured
+                    sort_order, git_repo_selection_configured
              FROM workspaces",
         )
         .context("failed to prepare workspace path repair query")?;
@@ -486,7 +535,8 @@ fn load_workspace_rows(conn: &Connection) -> anyhow::Result<Vec<WorkspacePathRow
                 archived_at: row.get(6)?,
                 created_at: row.get(7)?,
                 last_opened_at: row.get(8)?,
-                git_repo_selection_configured: row.get::<_, i64>(9)? > 0,
+                sort_order: row.get(9)?,
+                git_repo_selection_configured: row.get::<_, i64>(10)? > 0,
             })
         })
         .context("failed to query workspace rows for path repair")?;
@@ -645,6 +695,11 @@ fn merge_workspace_metadata(
             .map(|workspace| workspace.last_opened_at.clone())
             .max()
             .unwrap_or(canonical.last_opened_at.clone()),
+        sort_order: group
+            .iter()
+            .map(|workspace| workspace.sort_order)
+            .min()
+            .unwrap_or(canonical.sort_order),
         git_repo_selection_configured: group
             .iter()
             .any(|workspace| workspace.git_repo_selection_configured),

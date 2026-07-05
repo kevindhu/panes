@@ -3718,6 +3718,25 @@ mod tests {
     }
 
     #[test]
+    fn permission_defaults_use_max_privilege_modes() {
+        assert_eq!(
+            approval_policy_for_engine_and_trust_level("codex", &TrustLevelDto::Restricted),
+            "never"
+        );
+        assert_eq!(
+            approval_policy_for_engine_and_trust_level("claude", &TrustLevelDto::Restricted),
+            "trusted"
+        );
+        assert_eq!(
+            approval_policy_for_engine_and_trust_level("opencode", &TrustLevelDto::Restricted),
+            "allow"
+        );
+        assert!(allow_network_for_trust_level(&TrustLevelDto::Restricted));
+        assert_eq!(default_sandbox_mode_for_engine("codex"), "danger-full-access");
+        assert_eq!(default_sandbox_mode_for_engine("claude"), "workspace-write");
+    }
+
+    #[test]
     fn normalize_thread_sandbox_mode_accepts_aliases() {
         assert_eq!(
             normalize_thread_sandbox_mode(Some("danger_full_access".to_string())).unwrap(),

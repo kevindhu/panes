@@ -596,6 +596,7 @@ struct ThreadUpdatedEvent {
 struct ChatTurnFinishedEvent {
     thread_id: String,
     workspace_id: String,
+    repo_id: Option<String>,
     engine_id: String,
     thread_title: String,
     status: String,
@@ -2198,6 +2199,19 @@ async fn run_turn(
     let turn_started_at = Instant::now();
     let (event_tx, mut event_rx) = mpsc::channel::<EngineEvent>(ENGINE_EVENT_QUEUE_CAPACITY);
 
+    if thread.engine_id == "codex" && turn_input.plan_mode {
+        let message = format!(
+            "codex plan turn bridge started: local_thread_id={}, engine_thread_id={}, assistant_message_id={}, client_turn_id={:?}, model_id={}",
+            thread.id,
+            engine_thread_id,
+            assistant_message_id,
+            client_turn_id,
+            initial_turn_model_id
+        );
+        log::info!("{message}");
+        crate::diagnostic_logs::append_codex_event_routing_log(&message);
+    }
+
     let engines = state.engines.clone();
     let thread_for_engine = thread.clone();
     let input_for_engine = turn_input.clone();
@@ -2262,6 +2276,7 @@ async fn run_turn(
         &mut turn_model_dirty,
     );
     flush_stream_state(
+        &app,
         &state,
         &thread,
         &assistant_message_id,
@@ -2315,6 +2330,7 @@ async fn run_turn(
                             &mut turn_model_dirty,
                         );
                         flush_stream_state(
+                            &app,
                             &state,
                             &thread,
                             &assistant_message_id,
@@ -2380,6 +2396,7 @@ async fn run_turn(
                                 &mut turn_model_dirty,
                             );
                             flush_stream_state(
+                                &app,
                                 &state,
                                 &thread,
                                 &assistant_message_id,
@@ -2430,6 +2447,7 @@ async fn run_turn(
                             &mut turn_model_dirty,
                         );
                         flush_stream_state(
+                            &app,
                             &state,
                             &thread,
                             &assistant_message_id,
@@ -2481,6 +2499,7 @@ async fn run_turn(
                     &mut turn_model_dirty,
                 );
                 flush_stream_state(
+                    &app,
                     &state,
                     &thread,
                     &assistant_message_id,
@@ -2531,6 +2550,7 @@ async fn run_turn(
             &mut turn_model_dirty,
         );
         flush_stream_state(
+            &app,
             &state,
             &thread,
             &assistant_message_id,
@@ -2613,6 +2633,7 @@ async fn run_turn(
     }
 
     flush_stream_state(
+        &app,
         &state,
         &thread,
         &assistant_message_id,
@@ -2832,6 +2853,7 @@ async fn run_codex_review_turn(
         &mut turn_model_dirty,
     );
     flush_stream_state(
+        &app,
         &state,
         &review_thread,
         &assistant_message_id,
@@ -2889,6 +2911,7 @@ async fn run_codex_review_turn(
                             &mut turn_model_dirty,
                         );
                         flush_stream_state(
+                            &app,
                             &state,
                             &review_thread,
                             &assistant_message_id,
@@ -2954,6 +2977,7 @@ async fn run_codex_review_turn(
                                 &mut turn_model_dirty,
                             );
                             flush_stream_state(
+                                &app,
                                 &state,
                                 &review_thread,
                                 &assistant_message_id,
@@ -3004,6 +3028,7 @@ async fn run_codex_review_turn(
                             &mut turn_model_dirty,
                         );
                         flush_stream_state(
+                            &app,
                             &state,
                             &review_thread,
                             &assistant_message_id,
@@ -3055,6 +3080,7 @@ async fn run_codex_review_turn(
                     &mut turn_model_dirty,
                 );
                 flush_stream_state(
+                    &app,
                     &state,
                     &review_thread,
                     &assistant_message_id,
@@ -3105,6 +3131,7 @@ async fn run_codex_review_turn(
             &mut turn_model_dirty,
         );
         flush_stream_state(
+            &app,
             &state,
             &review_thread,
             &assistant_message_id,
@@ -3187,6 +3214,7 @@ async fn run_codex_review_turn(
     }
 
     flush_stream_state(
+        &app,
         &state,
         &review_thread,
         &assistant_message_id,
@@ -3521,7 +3549,7 @@ async fn process_stream_event(
             summary,
             details,
         } => {
-            if let Err(error) = run_db(state.db.clone(), {
+            match run_db(state.db.clone(), {
                 let approval_id = approval_id.clone();
                 let thread_id = thread.id.clone();
                 let assistant_message_id = assistant_message_id.to_string();
@@ -3542,7 +3570,13 @@ async fn process_stream_event(
             })
             .await
             {
-                log::warn!("failed to persist approval: {error}");
+                Ok(()) => {
+                    emit_latest_thread_updated(app, state, thread, "approval request persist")
+                        .await;
+                }
+                Err(error) => {
+                    log::warn!("failed to persist approval: {error}");
+                }
             }
         }
         EngineEvent::UsageLimitsUpdated { usage } => {
@@ -3631,6 +3665,7 @@ fn apply_stream_progress(
 
 #[allow(clippy::too_many_arguments)]
 async fn flush_stream_state(
+    app: &tauri::AppHandle,
     state: &AppState,
     thread: &ThreadDto,
     assistant_message_id: &str,
@@ -3753,6 +3788,7 @@ async fn flush_stream_state(
             *last_persisted_thread_status = thread_status.clone();
             *thread_status_dirty = false;
             did_flush_state = true;
+            emit_latest_thread_updated(app, state, thread, "stream status persist").await;
         }
     }
 
@@ -3919,9 +3955,19 @@ fn emit_chat_turn_finished(
     status: &MessageStatusDto,
     blocks: &[ContentBlock],
 ) {
-    let event = ChatTurnFinishedEvent {
+    let event = build_chat_turn_finished_event(thread, status, blocks);
+    let _ = app.emit("chat-turn-finished", event);
+}
+
+fn build_chat_turn_finished_event(
+    thread: &ThreadDto,
+    status: &MessageStatusDto,
+    blocks: &[ContentBlock],
+) -> ChatTurnFinishedEvent {
+    ChatTurnFinishedEvent {
         thread_id: thread.id.clone(),
         workspace_id: thread.workspace_id.clone(),
+        repo_id: thread.repo_id.clone(),
         engine_id: thread.engine_id.clone(),
         thread_title: thread.title.clone(),
         status: match status {
@@ -3932,8 +3978,7 @@ fn emit_chat_turn_finished(
         }
         .to_string(),
         preview: chat_notification_preview(blocks),
-    };
-    let _ = app.emit("chat-turn-finished", event);
+    }
 }
 
 fn build_final_thread_event(
@@ -3958,6 +4003,25 @@ fn build_final_thread_event(
             None,
         ),
     }
+}
+
+async fn emit_latest_thread_updated(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    thread: &ThreadDto,
+    log_context: &str,
+) {
+    let latest_thread = run_db(state.db.clone(), {
+        let thread_id = thread.id.clone();
+        move |db| db::threads::get_thread(db, &thread_id)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        log::warn!("failed to load thread for {log_context}: {error}");
+        None
+    });
+    let (thread_updated_event, _) = build_final_thread_event(latest_thread, thread);
+    let _ = app.emit("thread-updated", thread_updated_event);
 }
 
 fn apply_event_to_blocks(
@@ -5208,6 +5272,19 @@ mod tests {
         assert_eq!(event.workspace_id, fallback_thread.workspace_id);
         assert!(event.thread.is_none());
         assert!(final_thread.is_none());
+    }
+
+    #[test]
+    fn build_chat_turn_finished_event_includes_repo_id() {
+        let state = test_app_state();
+        let mut thread = test_thread(&state, "codex", "gpt-5.5-codex");
+        thread.repo_id = Some("repo-1".to_string());
+        let event = build_chat_turn_finished_event(&thread, &MessageStatusDto::Completed, &[]);
+
+        assert_eq!(event.thread_id, thread.id);
+        assert_eq!(event.workspace_id, thread.workspace_id);
+        assert_eq!(event.repo_id.as_deref(), Some("repo-1"));
+        assert_eq!(event.status, "completed");
     }
 
     #[test]

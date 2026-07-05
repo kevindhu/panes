@@ -64,6 +64,12 @@ import {
 import { ipc } from "../../lib/ipc";
 import { resolvePreferredOnboardingChatSelection } from "../../lib/onboarding";
 import { recordPerfMetric } from "../../lib/perfTelemetry";
+import {
+  armPlanImplementationPrompt,
+  disarmPlanImplementationPrompt,
+  isPlanImplementationPromptArmed,
+  planImplementationPromptLogOperationId,
+} from "../../lib/planImplementationPromptState";
 import { activateThreadContext } from "../../lib/threadActivation";
 import { isMacDesktop, usesCustomWindowFrame } from "../../lib/windowActions";
 import { MessageBlocks, shouldShowClaudeUnsupportedApproval } from "./MessageBlocks";
@@ -1392,6 +1398,7 @@ interface MessageRowProps {
   isHighlighted: boolean;
   assistantLabel: string;
   assistantEngineId: string;
+  workspaceRootPath?: string | null;
   canEditUserMessages: boolean;
   editingMessageId: string | null;
   editingMode: MessageEditMode | null;
@@ -1537,6 +1544,7 @@ export function MessageRowView({
   isHighlighted,
   assistantLabel,
   assistantEngineId,
+  workspaceRootPath,
   canEditUserMessages,
   editingMessageId,
   editingMode,
@@ -1849,6 +1857,7 @@ export function MessageRowView({
                 blocks={message.blocks}
                 status={message.status}
                 engineId={assistantEngineId}
+                workspaceRootPath={workspaceRootPath}
                 onApproval={onApproval}
                 onLoadActionOutput={(actionId) => onLoadActionOutput(message.id, actionId)}
               />
@@ -1897,6 +1906,7 @@ const MessageRow = memo(
     prev.isHighlighted === next.isHighlighted &&
     prev.assistantLabel === next.assistantLabel &&
     prev.assistantEngineId === next.assistantEngineId &&
+    prev.workspaceRootPath === next.workspaceRootPath &&
     prev.canEditUserMessages === next.canEditUserMessages &&
     prev.editingMessageId === next.editingMessageId &&
     prev.editingMode === next.editingMode &&
@@ -2221,6 +2231,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     [engines, onboardingSelectedChatEngines],
   );
   const {
+    workspaces,
     repos,
     activeWorkspaceId,
     activeWorkspace,
@@ -2229,6 +2240,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     setAllReposTrustLevel,
   } = useWorkspaceStore(
     useShallow((state) => ({
+      workspaces: state.workspaces,
       repos: state.repos,
       activeWorkspaceId: state.activeWorkspaceId,
       activeWorkspace:
@@ -2239,6 +2251,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     })),
   );
   const {
+    threads,
     activeThread,
     startupRestorePending,
     createThread,
@@ -2256,6 +2269,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     renameThread,
   } = useThreadStore(
     useShallow((state) => ({
+      threads: state.threads,
       activeThread: state.threads.find((thread) => thread.id === state.activeThreadId) ?? null,
       startupRestorePending: state.startupRestorePending,
       createThread: state.createThread,
@@ -2274,6 +2288,45 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     })),
   );
   const gitStatus = useGitStore((s) => s.status);
+  const activeThreadWorkspaceRootPath = useMemo(() => {
+    if (activeThread?.workspaceId) {
+      const threadWorkspace = workspaces.find((workspace) => workspace.id === activeThread.workspaceId);
+
+      if (threadWorkspace?.rootPath) {
+        return threadWorkspace.rootPath;
+      }
+    }
+
+    return activeWorkspace?.rootPath ?? null;
+  }, [activeThread?.workspaceId, activeWorkspace?.rootPath, workspaces]);
+  const messageWorkspaceRootPathByThreadId = useMemo(() => {
+    const workspaceRootPathById = new Map<string, string>();
+
+    for (const workspace of workspaces) {
+      if (workspace.rootPath) {
+        workspaceRootPathById.set(workspace.id, workspace.rootPath);
+      }
+    }
+
+    const rootPathByThreadId = new Map<string, string>();
+
+    for (const thread of threads) {
+      const rootPath = workspaceRootPathById.get(thread.workspaceId);
+      if (rootPath) {
+        rootPathByThreadId.set(thread.id, rootPath);
+      }
+    }
+
+    return rootPathByThreadId;
+  }, [threads, workspaces]);
+  const getMessageWorkspaceRootPath = useCallback(
+    (message: Message) =>
+      messageWorkspaceRootPathByThreadId.get(message.threadId) ??
+      activeThreadWorkspaceRootPath ??
+      activeWorkspace?.rootPath ??
+      null,
+    [activeThreadWorkspaceRootPath, activeWorkspace?.rootPath, messageWorkspaceRootPathByThreadId],
+  );
   const setComposerRuntime = useChatComposerStore((state) => state.setWorkspaceRuntime);
   const clearComposerRuntime = useChatComposerStore((state) => state.clearWorkspaceRuntime);
   const terminalWorkspaceState = useTerminalStore((s) =>
@@ -2341,6 +2394,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     customApprovalPolicyText: string;
     openCodeAgent: string;
   } | null>(null);
+  const planImplementationPromptRef = useRef<typeof planImplementationPrompt>(null);
 
   if (messageHeightsThreadIdRef.current !== threadId) {
     messageHeightsRef.current.clear();
@@ -2977,12 +3031,27 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         return "failed";
       }
 
-      pendingPlanImplementationThreadIdRef.current = options.planMode
-        ? options.thread.id
-        : null;
+      if (options.planMode) {
+        armPlanImplementationPrompt(options.thread.id);
+        pendingPlanImplementationThreadIdRef.current = options.thread.id;
+        appendBranchProfileLogBestEffort(
+          planImplementationPromptLogOperationId(options.thread.id),
+          "frontend.plan_prompt.armed_after_send",
+          {
+            threadId: options.thread.id,
+            engineId: options.engineId,
+            modelId: options.modelId,
+            source: "send_prepared_turn",
+          },
+        );
+      } else {
+        disarmPlanImplementationPrompt(options.thread.id);
+        pendingPlanImplementationThreadIdRef.current = null;
+      }
       return "sent";
     },
     [
+      appendBranchProfileLogBestEffort,
       repos,
       send,
       setThreadLastModelLocal,
@@ -3359,24 +3428,30 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   }, [pendingApprovals, selectedPendingToolInputApprovalId]);
 
   useEffect(() => {
+    planImplementationPromptRef.current = planImplementationPrompt;
+  }, [planImplementationPrompt]);
+
+  useEffect(() => {
+    return () => {
+      armPlanImplementationPrompt(planImplementationPromptRef.current?.threadId);
+    };
+  }, []);
+
+  useEffect(() => {
     if (planImplementationPrompt && planImplementationPrompt.threadId !== threadId) {
+      armPlanImplementationPrompt(planImplementationPrompt.threadId);
+      pendingPlanImplementationThreadIdRef.current = planImplementationPrompt.threadId;
       setPlanImplementationPrompt(null);
     }
-
-    if (
-      pendingPlanImplementationThreadIdRef.current &&
-      pendingPlanImplementationThreadIdRef.current !== threadId &&
-      !streaming
-    ) {
-      pendingPlanImplementationThreadIdRef.current = null;
-    }
-  }, [planImplementationPrompt, streaming, threadId]);
+  }, [planImplementationPrompt, threadId]);
 
   useEffect(() => {
     const wasStreaming = previousStreamingRef.current;
     previousStreamingRef.current = streaming;
 
-    const armedThreadId = pendingPlanImplementationThreadIdRef.current;
+    const armedThreadId = isPlanImplementationPromptArmed(threadId)
+      ? threadId
+      : pendingPlanImplementationThreadIdRef.current;
     if (
       shouldPromptToImplementPlan({
         streaming,
@@ -3398,10 +3473,32 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
           .threads.find((thread) => thread.id === promptThreadId) ??
         (activeThread?.id === promptThreadId ? activeThread : null);
       if (!promptThread) {
-        pendingPlanImplementationThreadIdRef.current = null;
+        armPlanImplementationPrompt(promptThreadId);
+        pendingPlanImplementationThreadIdRef.current = promptThreadId;
         return;
       }
+      disarmPlanImplementationPrompt(promptThreadId);
       pendingPlanImplementationThreadIdRef.current = null;
+      console.info("[plan-mode] showing implementation prompt", {
+        threadId: promptThreadId,
+        activeThreadId: threadId,
+        armedThreadId,
+        engineId: promptThread.engineId,
+        modelId: readThreadLastModelId(promptThread) ?? promptThread.modelId,
+        status,
+      });
+      appendBranchProfileLogBestEffort(
+        planImplementationPromptLogOperationId(promptThreadId),
+        "frontend.plan_prompt.shown",
+        {
+          threadId: promptThreadId,
+          activeThreadId: threadId,
+          armedThreadId,
+          engineId: promptThread.engineId,
+          modelId: readThreadLastModelId(promptThread) ?? promptThread.modelId,
+          status,
+        },
+      );
       setPlanImplementationPrompt({
         threadId: promptThreadId,
         engineId: promptThread.engineId,
@@ -3425,11 +3522,13 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       armedThreadId === threadId &&
       shouldClearPendingPlanImplementationPrompt(status)
     ) {
+      disarmPlanImplementationPrompt(armedThreadId);
       pendingPlanImplementationThreadIdRef.current = null;
     }
   }, [
     activeThread,
     activeThreadReasoningEffort,
+    appendBranchProfileLogBestEffort,
     customApprovalPolicyText,
     messages,
     outputSchemaText,
@@ -5447,7 +5546,22 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         return;
       }
 
-      pendingPlanImplementationThreadIdRef.current = promptPlanMode ? prompt.threadId : null;
+      if (promptPlanMode) {
+        armPlanImplementationPrompt(prompt.threadId);
+        pendingPlanImplementationThreadIdRef.current = prompt.threadId;
+        appendBranchProfileLogBestEffort(
+          planImplementationPromptLogOperationId(prompt.threadId),
+          "frontend.plan_prompt.armed_after_workspace_opt_in_send",
+          {
+            threadId: prompt.threadId,
+            engineId: prompt.engineId,
+            modelId: prompt.modelId,
+          },
+        );
+      } else {
+        disarmPlanImplementationPrompt(prompt.threadId);
+        pendingPlanImplementationThreadIdRef.current = null;
+      }
       if (!accepted) {
         clearAcceptedComposerSubmission(prompt.text);
       }
@@ -5471,6 +5585,16 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     if (!prompt || !activeWorkspaceId) {
       return;
     }
+    disarmPlanImplementationPrompt(prompt.threadId);
+    appendBranchProfileLogBestEffort(
+      planImplementationPromptLogOperationId(prompt.threadId),
+      "frontend.plan_prompt.disarmed_for_implementation",
+      {
+        threadId: prompt.threadId,
+        engineId: prompt.engineId,
+        modelId: prompt.modelId,
+      },
+    );
     const implementationMessage = getPlanImplementationCodingMessage(prompt.engineId);
 
     const currentThread =
@@ -5522,6 +5646,12 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     setPlanImplementationPrompt(null);
     setPlanMode(false);
     try {
+      console.info("[plan-mode] sending implementation turn", {
+        threadId: currentThread.id,
+        engineId: prompt.engineId,
+        modelId: prompt.modelId,
+        effort: prompt.effort,
+      });
       await ipc.setThreadReasoningEffort(currentThread.id, prompt.effort, prompt.modelId);
       setThreadReasoningEffortLocal(currentThread.id, prompt.effort);
       if (
@@ -5576,7 +5706,25 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         ? (response.answers as Record<string, { answers?: string[] }>)
         : null;
     const selectedAnswer = answerMap?.plan_implementation_decision?.answers?.[0]?.trim();
+    console.info("[plan-mode] implementation prompt answered", {
+      threadId: planImplementationPrompt?.threadId ?? null,
+      selectedAnswer: selectedAnswer ?? null,
+      action:
+        selectedAnswer === planImplementationQuestionChoiceStay ? "stay_in_plan_mode" : "implement_plan",
+    });
     if (selectedAnswer === planImplementationQuestionChoiceStay) {
+      disarmPlanImplementationPrompt(planImplementationPrompt?.threadId);
+      if (planImplementationPrompt?.threadId) {
+        appendBranchProfileLogBestEffort(
+          planImplementationPromptLogOperationId(planImplementationPrompt.threadId),
+          "frontend.plan_prompt.disarmed_for_stay_in_plan_mode",
+          {
+            threadId: planImplementationPrompt.threadId,
+            engineId: planImplementationPrompt.engineId,
+            modelId: planImplementationPrompt.modelId,
+          },
+        );
+      }
       setPlanImplementationPrompt(null);
       setPlanMode(true);
       return;
@@ -6409,6 +6557,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                         isHighlighted={message.id === highlightedMessageId}
                         assistantLabel={assistantIdentity?.label ?? ""}
                         assistantEngineId={assistantIdentity?.engineId ?? ""}
+                        workspaceRootPath={getMessageWorkspaceRootPath(message)}
                         canEditUserMessages={canEditUserMessages}
                         editingMessageId={editingMessageId}
                         editingMode={editingMode}
@@ -6446,6 +6595,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                   isHighlighted={message.id === highlightedMessageId}
                   assistantLabel={assistantIdentity?.label ?? ""}
                   assistantEngineId={assistantIdentity?.engineId ?? ""}
+                  workspaceRootPath={getMessageWorkspaceRootPath(message)}
                   canEditUserMessages={canEditUserMessages}
                   editingMessageId={editingMessageId}
                   editingMode={editingMode}

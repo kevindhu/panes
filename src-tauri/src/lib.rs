@@ -1,6 +1,7 @@
 mod commands;
 mod config;
 mod db;
+mod diagnostic_logs;
 mod engines;
 mod fs_ops;
 mod git;
@@ -196,6 +197,7 @@ pub fn run() {
             commands::chat::search_messages,
             commands::workspace::open_workspace,
             commands::workspace::list_workspaces,
+            commands::workspace::set_workspace_order,
             commands::workspace::list_archived_workspaces,
             commands::workspace::get_repos,
             commands::workspace::set_repo_trust_level,
