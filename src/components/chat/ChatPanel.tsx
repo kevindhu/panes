@@ -923,6 +923,10 @@ function formatReasoningEffortLabel(
       return t("modelPicker.effort.high");
     case "xhigh":
       return t("modelPicker.effort.xhigh");
+    case "max":
+      return t("modelPicker.effort.max");
+    case "ultra":
+      return t("modelPicker.effort.ultra");
     default:
       break;
   }

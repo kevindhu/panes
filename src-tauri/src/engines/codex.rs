@@ -236,6 +236,40 @@ enum TurnCompletionRecoveryMode {
     StreamLost,
 }
 
+fn gpt56_reasoning_efforts(include_ultra: bool) -> Vec<ReasoningEffortOption> {
+    let mut efforts = vec![
+        ReasoningEffortOption {
+            reasoning_effort: "low".to_string(),
+            description: "Fast responses with lighter reasoning".to_string(),
+        },
+        ReasoningEffortOption {
+            reasoning_effort: "medium".to_string(),
+            description: "Balances speed and reasoning depth for everyday tasks".to_string(),
+        },
+        ReasoningEffortOption {
+            reasoning_effort: "high".to_string(),
+            description: "Greater reasoning depth for complex problems".to_string(),
+        },
+        ReasoningEffortOption {
+            reasoning_effort: "xhigh".to_string(),
+            description: "Extra high reasoning depth for complex problems".to_string(),
+        },
+        ReasoningEffortOption {
+            reasoning_effort: "max".to_string(),
+            description: "Maximum reasoning depth for the hardest problems".to_string(),
+        },
+    ];
+
+    if include_ultra {
+        efforts.push(ReasoningEffortOption {
+            reasoning_effort: "ultra".to_string(),
+            description: "Maximum reasoning with automatic task delegation".to_string(),
+        });
+    }
+
+    efforts
+}
+
 #[async_trait]
 impl Engine for CodexEngine {
     fn id(&self) -> &str {
@@ -249,14 +283,162 @@ impl Engine for CodexEngine {
     fn models(&self) -> Vec<ModelInfo> {
         vec![
             ModelInfo {
-                id: "gpt-5.4".to_string(),
-                display_name: "gpt-5.4".to_string(),
+                id: "gpt-5.6-sol".to_string(),
+                display_name: "GPT-5.6-Sol".to_string(),
                 description: "Latest frontier agentic coding model.".to_string(),
                 hidden: false,
                 is_default: true,
                 upgrade: None,
                 availability_nux: None,
                 upgrade_info: None,
+                input_modalities: vec!["text".to_string(), "image".to_string()],
+                attachment_modalities: vec!["text".to_string(), "image".to_string()],
+                limits: None,
+                supports_personality: true,
+                default_reasoning_effort: "low".to_string(),
+                supported_reasoning_efforts: gpt56_reasoning_efforts(true),
+            },
+            ModelInfo {
+                id: "gpt-5.6-terra".to_string(),
+                display_name: "GPT-5.6-Terra".to_string(),
+                description: "Balanced agentic coding model for everyday work.".to_string(),
+                hidden: false,
+                is_default: false,
+                upgrade: None,
+                availability_nux: None,
+                upgrade_info: None,
+                input_modalities: vec!["text".to_string(), "image".to_string()],
+                attachment_modalities: vec!["text".to_string(), "image".to_string()],
+                limits: None,
+                supports_personality: true,
+                default_reasoning_effort: "medium".to_string(),
+                supported_reasoning_efforts: gpt56_reasoning_efforts(true),
+            },
+            ModelInfo {
+                id: "gpt-5.6-luna".to_string(),
+                display_name: "GPT-5.6-Luna".to_string(),
+                description: "Fast and affordable agentic coding model.".to_string(),
+                hidden: false,
+                is_default: false,
+                upgrade: None,
+                availability_nux: None,
+                upgrade_info: None,
+                input_modalities: vec!["text".to_string(), "image".to_string()],
+                attachment_modalities: vec!["text".to_string(), "image".to_string()],
+                limits: None,
+                supports_personality: true,
+                default_reasoning_effort: "medium".to_string(),
+                supported_reasoning_efforts: gpt56_reasoning_efforts(false),
+            },
+            ModelInfo {
+                id: "gpt-5.6".to_string(),
+                display_name: "GPT-5.6".to_string(),
+                description: "Alias that routes to GPT-5.6 Sol.".to_string(),
+                hidden: true,
+                is_default: false,
+                upgrade: None,
+                availability_nux: None,
+                upgrade_info: None,
+                input_modalities: vec!["text".to_string(), "image".to_string()],
+                attachment_modalities: vec!["text".to_string(), "image".to_string()],
+                limits: None,
+                supports_personality: true,
+                default_reasoning_effort: "low".to_string(),
+                supported_reasoning_efforts: gpt56_reasoning_efforts(true),
+            },
+            ModelInfo {
+                id: "gpt-5.5".to_string(),
+                display_name: "GPT-5.5".to_string(),
+                description: "Frontier model for complex coding, research, and real-world work."
+                    .to_string(),
+                hidden: false,
+                is_default: false,
+                upgrade: Some("gpt-5.6-sol".to_string()),
+                availability_nux: None,
+                upgrade_info: Some(ModelUpgradeInfo {
+                    model: "gpt-5.6-sol".to_string(),
+                    upgrade_copy: None,
+                    model_link: None,
+                    migration_markdown: None,
+                }),
+                input_modalities: vec!["text".to_string(), "image".to_string()],
+                attachment_modalities: vec!["text".to_string(), "image".to_string()],
+                limits: None,
+                supports_personality: true,
+                default_reasoning_effort: "medium".to_string(),
+                supported_reasoning_efforts: vec![
+                    ReasoningEffortOption {
+                        reasoning_effort: "low".to_string(),
+                        description: "Fast responses with lighter reasoning".to_string(),
+                    },
+                    ReasoningEffortOption {
+                        reasoning_effort: "medium".to_string(),
+                        description: "Balances speed and reasoning depth for everyday tasks"
+                            .to_string(),
+                    },
+                    ReasoningEffortOption {
+                        reasoning_effort: "high".to_string(),
+                        description: "Greater reasoning depth for complex problems".to_string(),
+                    },
+                    ReasoningEffortOption {
+                        reasoning_effort: "xhigh".to_string(),
+                        description: "Extra high reasoning depth for complex problems".to_string(),
+                    },
+                ],
+            },
+            ModelInfo {
+                id: "gpt-5.4".to_string(),
+                display_name: "GPT-5.4".to_string(),
+                description: "Previous frontier agentic coding model.".to_string(),
+                hidden: false,
+                is_default: false,
+                upgrade: Some("gpt-5.6-sol".to_string()),
+                availability_nux: None,
+                upgrade_info: Some(ModelUpgradeInfo {
+                    model: "gpt-5.6-sol".to_string(),
+                    upgrade_copy: None,
+                    model_link: None,
+                    migration_markdown: None,
+                }),
+                input_modalities: vec!["text".to_string(), "image".to_string()],
+                attachment_modalities: vec!["text".to_string(), "image".to_string()],
+                limits: None,
+                supports_personality: true,
+                default_reasoning_effort: "medium".to_string(),
+                supported_reasoning_efforts: vec![
+                    ReasoningEffortOption {
+                        reasoning_effort: "low".to_string(),
+                        description: "Fast responses with lighter reasoning".to_string(),
+                    },
+                    ReasoningEffortOption {
+                        reasoning_effort: "medium".to_string(),
+                        description: "Balances speed and reasoning depth for everyday tasks"
+                            .to_string(),
+                    },
+                    ReasoningEffortOption {
+                        reasoning_effort: "high".to_string(),
+                        description: "Greater reasoning depth for complex problems".to_string(),
+                    },
+                    ReasoningEffortOption {
+                        reasoning_effort: "xhigh".to_string(),
+                        description: "Extra high reasoning depth for complex problems".to_string(),
+                    },
+                ],
+            },
+            ModelInfo {
+                id: "gpt-5.4-mini".to_string(),
+                display_name: "GPT-5.4-Mini".to_string(),
+                description: "Lower cost and latency coding model.".to_string(),
+                hidden: false,
+                is_default: false,
+                upgrade: Some("gpt-5.6-sol".to_string()),
+                availability_nux: None,
+                upgrade_info: Some(ModelUpgradeInfo {
+                    model: "gpt-5.6-sol".to_string(),
+                    upgrade_copy: None,
+                    model_link: None,
+                    migration_markdown: None,
+                }),
                 input_modalities: vec!["text".to_string(), "image".to_string()],
                 attachment_modalities: vec!["text".to_string(), "image".to_string()],
                 limits: None,
@@ -286,12 +468,12 @@ impl Engine for CodexEngine {
                 id: "gpt-5.3-codex".to_string(),
                 display_name: "gpt-5.3-codex".to_string(),
                 description: "Frontier Codex-optimized agentic coding model.".to_string(),
-                hidden: false,
+                hidden: true,
                 is_default: false,
-                upgrade: Some("gpt-5.4".to_string()),
+                upgrade: Some("gpt-5.6-sol".to_string()),
                 availability_nux: None,
                 upgrade_info: Some(ModelUpgradeInfo {
-                    model: "gpt-5.4".to_string(),
+                    model: "gpt-5.6-sol".to_string(),
                     upgrade_copy: None,
                     model_link: None,
                     migration_markdown: None,
@@ -358,12 +540,12 @@ impl Engine for CodexEngine {
                 id: "gpt-5.1-codex-mini".to_string(),
                 display_name: "gpt-5.1-codex-mini".to_string(),
                 description: "Optimized for codex. Cheaper, faster, but less capable.".to_string(),
-                hidden: false,
+                hidden: true,
                 is_default: false,
-                upgrade: Some("gpt-5.4".to_string()),
+                upgrade: Some("gpt-5.6-sol".to_string()),
                 availability_nux: None,
                 upgrade_info: Some(ModelUpgradeInfo {
-                    model: "gpt-5.4".to_string(),
+                    model: "gpt-5.6-sol".to_string(),
                     upgrade_copy: None,
                     model_link: None,
                     migration_markdown: None,
@@ -8548,6 +8730,73 @@ mod tests {
                 .into_iter()
                 .map(|model| model.id)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn static_model_fallback_includes_current_codex_models() {
+        let engine = CodexEngine::default();
+        let models = engine.models();
+
+        let gpt56_sol = models
+            .iter()
+            .find(|model| model.id == "gpt-5.6-sol")
+            .expect("static fallback should include gpt-5.6-sol");
+        assert_eq!(gpt56_sol.display_name, "GPT-5.6-Sol");
+        assert!(gpt56_sol.is_default);
+        assert_eq!(gpt56_sol.default_reasoning_effort, "low");
+        assert!(gpt56_sol
+            .supported_reasoning_efforts
+            .iter()
+            .any(|option| option.reasoning_effort == "max"));
+        assert!(gpt56_sol
+            .supported_reasoning_efforts
+            .iter()
+            .any(|option| option.reasoning_effort == "ultra"));
+        assert!(models.iter().any(|model| model.id == "gpt-5.6-terra"));
+        let gpt56_luna = models
+            .iter()
+            .find(|model| model.id == "gpt-5.6-luna")
+            .expect("static fallback should include gpt-5.6-luna");
+        assert!(!gpt56_luna
+            .supported_reasoning_efforts
+            .iter()
+            .any(|option| option.reasoning_effort == "ultra"));
+        assert_eq!(
+            models
+                .iter()
+                .find(|model| model.id == "gpt-5.6")
+                .map(|model| model.hidden),
+            Some(true)
+        );
+
+        let gpt55 = models
+            .iter()
+            .find(|model| model.id == "gpt-5.5")
+            .expect("static fallback should include gpt-5.5");
+        assert_eq!(gpt55.display_name, "GPT-5.5");
+        assert!(!gpt55.is_default);
+        assert_eq!(gpt55.upgrade.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(gpt55.default_reasoning_effort, "medium");
+        assert!(gpt55
+            .supported_reasoning_efforts
+            .iter()
+            .any(|option| option.reasoning_effort == "xhigh"));
+
+        let gpt54 = models
+            .iter()
+            .find(|model| model.id == "gpt-5.4")
+            .expect("static fallback should include gpt-5.4");
+        assert!(!gpt54.is_default);
+        assert_eq!(gpt54.upgrade.as_deref(), Some("gpt-5.6-sol"));
+
+        assert!(models.iter().any(|model| model.id == "gpt-5.4-mini"));
+        assert_eq!(
+            models
+                .iter()
+                .find(|model| model.id == "gpt-5.3-codex")
+                .map(|model| model.hidden),
+            Some(true)
         );
     }
 

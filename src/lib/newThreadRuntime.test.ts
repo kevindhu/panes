@@ -11,11 +11,30 @@ const engines: EngineInfo[] = [
     name: "Codex",
     models: [
       {
-        id: "gpt-5.5",
-        displayName: "gpt-5.5",
+        id: "gpt-5.6-sol",
+        displayName: "GPT-5.6-Sol",
         description: "Latest",
         hidden: false,
         isDefault: true,
+        inputModalities: ["text"],
+        attachmentModalities: ["text"],
+        supportsPersonality: true,
+        defaultReasoningEffort: "low",
+        supportedReasoningEfforts: [
+          { reasoningEffort: "low", description: "Fast" },
+          { reasoningEffort: "medium", description: "Balanced" },
+          { reasoningEffort: "high", description: "Deep" },
+          { reasoningEffort: "xhigh", description: "Extra" },
+          { reasoningEffort: "max", description: "Max" },
+          { reasoningEffort: "ultra", description: "Delegated" },
+        ],
+      },
+      {
+        id: "gpt-5.5",
+        displayName: "gpt-5.5",
+        description: "Previous",
+        hidden: false,
+        isDefault: false,
         inputModalities: ["text"],
         attachmentModalities: ["text"],
         supportsPersonality: true,
@@ -187,12 +206,38 @@ describe("resolveNewThreadRuntime", () => {
     });
   });
 
-  it("falls back to codex gpt-5.5 high when no other preference exists", () => {
+  it("falls back to codex gpt-5.6-sol high when no other preference exists", () => {
     expect(
       resolveNewThreadRuntime({
         engines,
         onboardingSelection: null,
       }),
     ).toEqual(NEW_THREAD_FALLBACK_RUNTIME);
+  });
+
+  it("uses the live catalog default when the hard fallback is not available yet", () => {
+    const staleCodexCatalog: EngineInfo[] = [
+      {
+        ...engines[0],
+        models: engines[0].models
+          .filter((model) => model.id !== "gpt-5.6-sol")
+          .map((model) => ({
+            ...model,
+            isDefault: model.id === "gpt-5.5",
+          })),
+      },
+    ];
+
+    expect(
+      resolveNewThreadRuntime({
+        engines: staleCodexCatalog,
+        onboardingSelection: null,
+      }),
+    ).toEqual({
+      engineId: "codex",
+      modelId: "gpt-5.5",
+      reasoningEffort: "high",
+      serviceTier: null,
+    });
   });
 });
