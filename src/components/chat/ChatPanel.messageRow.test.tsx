@@ -45,13 +45,16 @@ vi.mock("../../stores/toastStore", () => ({
   },
 }));
 
+import { MessageRowView } from "./ChatPanel";
 import {
-  MessageRowView,
-  getActiveTextSelectionRangeInsideElement,
-  hasActiveTextSelectionInsideElement,
-  restoreTextSelectionRange,
+  areMessageRowsMeasured,
+  buildVirtualizedMessageLayout,
+  computeVirtualMessageWindow,
+  resolveVirtualMessageWindow,
+  retainedMessageRangeForIndexes,
   shouldVirtualizeMessages,
-} from "./ChatPanel";
+} from "./messageVirtualization";
+import { hasActiveTextSelectionInsideElement } from "./useVirtualizedMessageSelection";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -271,11 +274,122 @@ describe("MessageRowView editing attachments", () => {
     expect(container.textContent).toContain("Task took 2m 3s.");
   });
 });
-
 describe("shouldVirtualizeMessages", () => {
-  it("keeps long transcripts fully mounted", () => {
-    expect(shouldVirtualizeMessages(114, false)).toBe(false);
-    expect(shouldVirtualizeMessages(80, true)).toBe(false);
+  const readyLargeTranscript = {
+    messageCount: 120,
+    streaming: false,
+    allRowsMeasured: true,
+    editing: false,
+    loadingOlderMessages: false,
+  };
+
+  it("virtualizes only large completed transcripts with exact row measurements", () => {
+    expect(shouldVirtualizeMessages({ ...readyLargeTranscript, messageCount: 119 })).toBe(false);
+    expect(shouldVirtualizeMessages(readyLargeTranscript)).toBe(true);
+    expect(shouldVirtualizeMessages({ ...readyLargeTranscript, streaming: true })).toBe(false);
+    expect(shouldVirtualizeMessages({ ...readyLargeTranscript, allRowsMeasured: false })).toBe(false);
+  });
+
+  it("does not virtualize while editing or older-message loading can move DOM nodes", () => {
+    expect(shouldVirtualizeMessages({ ...readyLargeTranscript, editing: true })).toBe(false);
+    expect(shouldVirtualizeMessages({ ...readyLargeTranscript, loadingOlderMessages: true })).toBe(false);
+  });
+});
+
+describe("virtualized message layout", () => {
+  it("refuses to build a layout until every row has a real measured height", () => {
+    const messages = Array.from({ length: 120 }, (_, index) => ({ id: `message-${index}` }));
+    const measuredHeights = new Map<string, number>();
+    for (let index = 0; index < messages.length - 1; index += 1) {
+      measuredHeights.set(messages[index].id, 120);
+    }
+
+    expect(areMessageRowsMeasured(messages, measuredHeights)).toBe(false);
+    expect(buildVirtualizedMessageLayout(messages, measuredHeights)).toBeNull();
+
+    measuredHeights.set(messages[messages.length - 1].id, 120);
+
+    expect(areMessageRowsMeasured(messages, measuredHeights)).toBe(true);
+    expect(buildVirtualizedMessageLayout(messages, measuredHeights)).not.toBeNull();
+  });
+
+  it("keeps the actual tall row mounted when the viewport is inside it", () => {
+    const messages = Array.from({ length: 130 }, (_, index) => ({ id: `message-${index}` }));
+    const measuredHeights = new Map<string, number>();
+    for (const message of messages) {
+      measuredHeights.set(message.id, 96);
+    }
+    measuredHeights.set("message-64", 5200);
+
+    const layout = buildVirtualizedMessageLayout(messages, measuredHeights);
+    expect(layout).not.toBeNull();
+
+    const tallRowTop = layout!.offsets[64];
+    const window = computeVirtualMessageWindow(layout!, tallRowTop + 2600, 700, 700);
+
+    expect(window.startIndex).toBeLessThanOrEqual(64);
+    expect(window.endIndexExclusive).toBeGreaterThan(64);
+  });
+
+  it("preserves the hidden gap below the last rendered row in the bottom spacer", () => {
+    const messages = [{ id: "a" }, { id: "b" }, { id: "c" }];
+    const layout = buildVirtualizedMessageLayout(
+      messages,
+      new Map([
+        ["a", 100],
+        ["b", 100],
+        ["c", 100],
+      ]),
+    );
+
+    expect(layout).not.toBeNull();
+
+    const window = computeVirtualMessageWindow(layout!, 113, 1, 0);
+
+    expect(window.startIndex).toBe(1);
+    expect(window.endIndexExclusive).toBe(2);
+    expect(window.topSpacerHeight).toBe(112);
+    expect(window.bottomSpacerHeight).toBe(112);
+  });
+
+  it("unions the viewport with the message range retained by native selection", () => {
+    const messages = Array.from({ length: 140 }, (_, index) => ({ id: `message-${index}` }));
+    const measuredHeights = new Map<string, number>();
+    for (const message of messages) {
+      measuredHeights.set(message.id, 100);
+    }
+
+    const layout = buildVirtualizedMessageLayout(messages, measuredHeights);
+    expect(layout).not.toBeNull();
+
+    const previousWindow = computeVirtualMessageWindow(layout!, 1200, 700, 300);
+    const retainedRange = retainedMessageRangeForIndexes(
+      messages,
+      previousWindow.startIndex,
+      previousWindow.endIndexExclusive,
+    );
+    const mergedWindow = resolveVirtualMessageWindow({
+      virtualizationEnabled: true,
+      layout,
+      messages,
+      retainedRange,
+      viewportScrollTop: 6000,
+      viewportHeight: 700,
+      overscanPx: 300,
+    });
+    const viewportOnlyWindow = resolveVirtualMessageWindow({
+      virtualizationEnabled: true,
+      layout,
+      messages,
+      retainedRange: null,
+      viewportScrollTop: 6000,
+      viewportHeight: 700,
+      overscanPx: 300,
+    });
+
+    expect(mergedWindow?.startIndex).toBe(previousWindow.startIndex);
+    expect(mergedWindow?.endIndexExclusive).toBe(viewportOnlyWindow?.endIndexExclusive);
+    expect(viewportOnlyWindow?.startIndex).toBeGreaterThan(previousWindow.startIndex);
   });
 });
 
@@ -300,39 +414,6 @@ describe("hasActiveTextSelectionInsideElement", () => {
     selection?.addRange(range);
 
     expect(hasActiveTextSelectionInsideElement(viewport)).toBe(true);
-    expect(getActiveTextSelectionRangeInsideElement(viewport)?.toString()).toBe(
-      "selected",
-    );
-
-    selection?.removeAllRanges();
-    document.body.removeChild(viewport);
-  });
-
-  it("restores a preserved selection range after the current selection changes", () => {
-    const viewport = document.createElement("div");
-    const paragraph = document.createElement("p");
-    paragraph.textContent = "selected chat text";
-    viewport.appendChild(paragraph);
-    document.body.appendChild(viewport);
-
-    const originalRange = document.createRange();
-    originalRange.setStart(paragraph.firstChild!, 0);
-    originalRange.setEnd(paragraph.firstChild!, 8);
-
-    const selection = window.getSelection();
-    selection?.removeAllRanges();
-    selection?.addRange(originalRange);
-    const preservedRange = getActiveTextSelectionRangeInsideElement(viewport);
-
-    const changedRange = document.createRange();
-    changedRange.setStart(paragraph.firstChild!, 0);
-    changedRange.setEnd(paragraph.firstChild!, paragraph.textContent!.length);
-    selection?.removeAllRanges();
-    selection?.addRange(changedRange);
-
-    expect(selection?.toString()).toBe("selected chat text");
-    expect(restoreTextSelectionRange(preservedRange)).toBe(true);
-    expect(selection?.toString()).toBe("selected");
 
     selection?.removeAllRanges();
     document.body.removeChild(viewport);
