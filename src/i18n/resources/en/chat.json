@@ -43,13 +43,15 @@
       "high": "High",
       "xhigh": "XHigh",
       "max": "Max",
+      "ultra": "Ultra",
       "noneShort": "None",
       "minimalShort": "Min",
       "lowShort": "Lo",
       "mediumShort": "Med",
       "highShort": "Hi",
       "xhighShort": "XHi",
-      "maxShort": "Max"
+      "maxShort": "Max",
+      "ultraShort": "Ultra"
     }
   },
   "attachments": {

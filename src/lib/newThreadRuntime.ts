@@ -14,7 +14,7 @@ export type ComposerRuntimeSnapshot = NewThreadRuntimeSelection;
 
 export const NEW_THREAD_FALLBACK_RUNTIME: NewThreadRuntimeSelection = {
   engineId: "codex",
-  modelId: "gpt-5.5",
+  modelId: "gpt-5.6-sol",
   reasoningEffort: "high",
   serviceTier: null,
 };
@@ -115,6 +115,34 @@ function resolveRuntimeCandidate(
   };
 }
 
+function runtimeFromCatalogDefault(
+  engines: ReadonlyArray<EngineInfo>,
+): NewThreadRuntimeSelection | null {
+  const codexEngine = engines.find((item) => item.id === "codex");
+  const model =
+    codexEngine?.models.find((item) => item.isDefault && !item.hidden) ??
+    codexEngine?.models.find((item) => !item.hidden) ??
+    codexEngine?.models[0];
+
+  if (!codexEngine || !model) {
+    return null;
+  }
+
+  const fallbackEffort = normalizeString(NEW_THREAD_FALLBACK_RUNTIME.reasoningEffort);
+  const modelEffort = model.supportedReasoningEfforts.some(
+    (option) => option.reasoningEffort === fallbackEffort,
+  )
+    ? fallbackEffort
+    : normalizeString(model.defaultReasoningEffort);
+
+  return resolveRuntimeCandidate(engines, {
+    engineId: codexEngine.id,
+    modelId: model.id,
+    reasoningEffort: modelEffort,
+    serviceTier: NEW_THREAD_FALLBACK_RUNTIME.serviceTier,
+  });
+}
+
 export function resolveNewThreadRuntime({
   engines,
   composerRuntime,
@@ -142,5 +170,5 @@ export function resolveNewThreadRuntime({
     }
   }
 
-  return { ...NEW_THREAD_FALLBACK_RUNTIME };
+  return runtimeFromCatalogDefault(engines) ?? { ...NEW_THREAD_FALLBACK_RUNTIME };
 }
