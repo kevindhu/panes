@@ -118,6 +118,21 @@ import { ChatCommandPanel, type ActiveSlashCommand } from "./ChatCommandPanel";
 import { ConfirmDialog } from "../shared/ConfirmDialog";
 import { handleDragMouseDown, handleDragDoubleClick } from "../../lib/windowDrag";
 import { shouldSubmitChatInput } from "./chatInputShortcuts";
+import {
+  MESSAGE_MIN_ROW_HEIGHT,
+  MESSAGE_OVERSCAN_PX,
+  MESSAGE_ROW_GAP,
+  MESSAGE_VIRTUALIZATION_THRESHOLD,
+  buildVirtualizedMessageLayout,
+  resolveVirtualMessageWindow,
+  retainedMessageRangeForIndexes,
+  shouldVirtualizeMessages,
+  type RetainedMessageRange,
+} from "./messageVirtualization";
+import {
+  hasActiveTextSelectionInsideElement,
+  useVirtualizedMessageSelection,
+} from "./useVirtualizedMessageSelection";
 import type {
   ApprovalBlock,
   ApprovalResponse,
@@ -136,81 +151,6 @@ import type {
   Thread,
   TrustLevel,
 } from "../../types";
-
-const MESSAGE_ESTIMATED_ROW_HEIGHT = 220;
-const MESSAGE_ROW_GAP = 12;
-const MESSAGE_OVERSCAN_PX = 700;
-
-export function shouldVirtualizeMessages(messageCount: number, streaming: boolean): boolean {
-  // Chat rows can contain very large, dynamic markdown blocks. Keeping the
-  // transcript mounted is more important than risking a bad virtual window.
-  void messageCount;
-  void streaming;
-  return false;
-}
-
-function selectionEndpointInsideElement(
-  element: HTMLElement,
-  node: Node | null,
-): boolean {
-  if (!node) {
-    return false;
-  }
-  const endpoint = node instanceof Element ? node : node.parentElement;
-  return endpoint ? element.contains(endpoint) : false;
-}
-
-export function hasActiveTextSelectionInsideElement(element: HTMLElement | null): boolean {
-  return getActiveTextSelectionRangeInsideElement(element) !== null;
-}
-
-export function getActiveTextSelectionRangeInsideElement(
-  element: HTMLElement | null,
-): Range | null {
-  if (!element) {
-    return null;
-  }
-
-  const selection = window.getSelection?.();
-  if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
-    return null;
-  }
-
-  for (let index = 0; index < selection.rangeCount; index += 1) {
-    const range = selection.getRangeAt(index);
-    try {
-      if (range.intersectsNode(element)) {
-        return range.cloneRange();
-      }
-    } catch {
-      // Fall back to endpoint checks below if the browser rejects intersectsNode.
-    }
-  }
-
-  const endpointInside =
-    selectionEndpointInsideElement(element, selection.anchorNode) ||
-    selectionEndpointInsideElement(element, selection.focusNode);
-  return endpointInside ? selection.getRangeAt(0).cloneRange() : null;
-}
-
-function rangeIsConnected(range: Range): boolean {
-  return range.startContainer.isConnected && range.endContainer.isConnected;
-}
-
-export function restoreTextSelectionRange(range: Range | null): boolean {
-  if (!range || !rangeIsConnected(range)) {
-    return false;
-  }
-
-  const selection = window.getSelection?.();
-  if (!selection) {
-    return false;
-  }
-
-  selection.removeAllRanges();
-  selection.addRange(range);
-  return true;
-}
 const LazyTerminalPanel = lazy(() =>
   import("../terminal/TerminalPanel").then((module) => ({
     default: module.TerminalPanel,
@@ -224,7 +164,9 @@ const LazyEditorWithExplorer = lazy(() =>
 
 interface MeasuredMessageRowProps {
   messageId: string;
-  onHeightChange: (messageId: string, height: number) => void;
+  threadId: string | null;
+  measure: boolean;
+  onHeightChange: (threadId: string | null, messageId: string, height: number) => void;
   children: ReactNode;
 }
 
@@ -314,17 +256,23 @@ export function buildPermissionApprovalResponseForEngine(
   );
 }
 
-function MeasuredMessageRow({ messageId, onHeightChange, children }: MeasuredMessageRowProps) {
+function MeasuredMessageRow({
+  messageId,
+  threadId,
+  measure,
+  onHeightChange,
+  children,
+}: MeasuredMessageRowProps) {
   const rowRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const element = rowRef.current;
-    if (!element) {
+    if (!element || !measure) {
       return;
     }
 
     const publishHeight = () => {
-      onHeightChange(messageId, element.getBoundingClientRect().height);
+      onHeightChange(threadId, messageId, element.getBoundingClientRect().height);
     };
 
     publishHeight();
@@ -336,7 +284,7 @@ function MeasuredMessageRow({ messageId, onHeightChange, children }: MeasuredMes
     const observer = new ResizeObserver(() => publishHeight());
     observer.observe(element);
     return () => observer.disconnect();
-  }, [messageId, onHeightChange]);
+  }, [measure, messageId, onHeightChange, threadId]);
 
   return <div ref={rowRef}>{children}</div>;
 }
@@ -1231,16 +1179,18 @@ function formatResetTime(
   return t("status.daysHoursShort", { days: diffDays, hours: diffHr % 24 });
 }
 
-function estimateMessageOffset(
+function getMeasuredMessageOffset(
   messages: Message[],
   index: number,
   measuredHeights: Map<string, number>,
-): number {
+): number | null {
   let offset = 0;
   for (let current = 0; current < index; current += 1) {
     const currentMessageId = messages[current].id;
-    const rowHeight =
-      measuredHeights.get(currentMessageId) ?? MESSAGE_ESTIMATED_ROW_HEIGHT;
+    const rowHeight = measuredHeights.get(currentMessageId);
+    if (rowHeight === undefined) {
+      return null;
+    }
     offset += rowHeight + MESSAGE_ROW_GAP;
   }
   return offset;
@@ -2200,13 +2150,15 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const prependLoadInFlightRef = useRef(false);
   const threadActivatedAtRef = useRef(0);
   const initialScrollThreadRef = useRef<string | null>(null);
-  const preservedSelectionRangeRef = useRef<Range | null>(null);
-  const preservedSelectionUntilRef = useRef(0);
-  const selectionRestoreRafRef = useRef<number | null>(null);
+  const renderedMessageRangeRef = useRef<RetainedMessageRange | null>(null);
   const messageHeightsRef = useRef<Map<string, number>>(new Map());
+  const messageHeightsThreadIdRef = useRef<string | null>(null);
   const layoutVersionRafRef = useRef<number | null>(null);
   const threadExecutionPolicyRequestIdsRef = useRef<Record<string, number>>({});
   const [listLayoutVersion, setListLayoutVersion] = useState(0);
+  const scrollVersionRafRef = useRef<number | null>(null);
+  const virtualWindowUpdatesEnabledRef = useRef(false);
+  const [scrollVersion, setScrollVersion] = useState(0);
   const viewportScrollTopRef = useRef(0);
   const [nearTopLoadRequest, setNearTopLoadRequest] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(0);
@@ -2243,6 +2195,11 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     openCodeAgent: string;
   } | null>(null);
   const planImplementationPromptRef = useRef<typeof planImplementationPrompt>(null);
+
+  if (messageHeightsThreadIdRef.current !== threadId) {
+    messageHeightsRef.current.clear();
+    messageHeightsThreadIdRef.current = threadId;
+  }
 
   const trustLevelOptions = useMemo(() => getTrustLevelOptions(t), [t]);
   const codexThreadApprovalPolicyOptions = useMemo(
@@ -3648,6 +3605,27 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     });
   }, []);
 
+  const scheduleVirtualWindowUpdate = useCallback(() => {
+    if (!virtualWindowUpdatesEnabledRef.current) {
+      return;
+    }
+    if (scrollVersionRafRef.current !== null) {
+      return;
+    }
+    scrollVersionRafRef.current = window.requestAnimationFrame(() => {
+      scrollVersionRafRef.current = null;
+      setScrollVersion((version) => version + 1);
+    });
+  }, []);
+
+  const virtualizedMessageSelection = useVirtualizedMessageSelection({
+    viewportRef,
+    threadId,
+    messages,
+    renderedRangeRef: renderedMessageRangeRef,
+    onSelectionCleared: scheduleVirtualWindowUpdate,
+  });
+
   useEffect(() => {
     if (activeWorkspaceId) {
       void syncTerminalSessions(activeWorkspaceId);
@@ -3723,38 +3701,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     }
 
     let rafId = 0;
-    const preserveSelectionRange = () => {
-      const range = getActiveTextSelectionRangeInsideElement(viewport);
-      if (!range) {
-        return false;
-      }
-
-      preservedSelectionRangeRef.current = range;
-      preservedSelectionUntilRef.current = performance.now() + 1500;
-      return true;
-    };
-    const scheduleSelectionRestore = () => {
-      if (
-        !preservedSelectionRangeRef.current ||
-        performance.now() > preservedSelectionUntilRef.current ||
-        selectionRestoreRafRef.current !== null
-      ) {
-        return;
-      }
-
-      selectionRestoreRafRef.current = window.requestAnimationFrame(() => {
-        selectionRestoreRafRef.current = null;
-        if (performance.now() > preservedSelectionUntilRef.current) {
-          preservedSelectionRangeRef.current = null;
-          return;
-        }
-        if (!restoreTextSelectionRange(preservedSelectionRangeRef.current)) {
-          preservedSelectionRangeRef.current = null;
-        }
-      });
-    };
     const updateScroll = () => {
-      const selectionActive = preserveSelectionRange();
+      const selectionActive =
+        virtualizedMessageSelection.current.phase !== "idle" ||
+        hasActiveTextSelectionInsideElement(viewport);
       const scrollTop = viewport.scrollTop;
       viewportScrollTopRef.current = scrollTop;
       const nearBottom =
@@ -3765,15 +3715,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
           return current === next ? current : next;
         });
       }
-      if (
-        scrollTop <= 80 &&
-        !selectionActive
-      ) {
+      if (scrollTop <= 80 && !selectionActive) {
         setNearTopLoadRequest((request) => request + 1);
       }
-      if (selectionActive) {
-        scheduleSelectionRestore();
-      }
+      scheduleVirtualWindowUpdate();
     };
     const updateHeight = () => {
       setViewportHeight(viewport.clientHeight);
@@ -3791,17 +3736,8 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         updateScroll();
       });
     };
-    const onWheel = (event: WheelEvent) => {
-      if (event.buttons !== 0) {
-        return;
-      }
-      if (preserveSelectionRange()) {
-        scheduleSelectionRestore();
-      }
-    };
 
     viewport.addEventListener("scroll", onScroll, { passive: true });
-    viewport.addEventListener("wheel", onWheel, { passive: true });
 
     let resizeObserver: ResizeObserver | null = null;
     if (typeof ResizeObserver !== "undefined") {
@@ -3813,13 +3749,12 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
     return () => {
       viewport.removeEventListener("scroll", onScroll);
-      viewport.removeEventListener("wheel", onWheel);
       if (rafId !== 0) {
         window.cancelAnimationFrame(rafId);
       }
-      if (selectionRestoreRafRef.current !== null) {
-        window.cancelAnimationFrame(selectionRestoreRafRef.current);
-        selectionRestoreRafRef.current = null;
+      if (scrollVersionRafRef.current !== null) {
+        window.cancelAnimationFrame(scrollVersionRafRef.current);
+        scrollVersionRafRef.current = null;
       }
       if (resizeObserver) {
         resizeObserver.disconnect();
@@ -3827,12 +3762,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         window.removeEventListener("resize", updateHeight);
       }
     };
-  }, []);
-
-  useEffect(() => {
-    messageHeightsRef.current.clear();
-    scheduleListLayoutVersionBump();
-  }, [activeThread?.id, scheduleListLayoutVersionBump]);
+  }, [scheduleVirtualWindowUpdate, virtualizedMessageSelection]);
 
   useEffect(() => {
     const existingIds = new Set(messages.map((message) => message.id));
@@ -4383,20 +4313,21 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     }
 
     const targetMessageId = messages[targetIndex].id;
-    const targetHeight =
-      messageHeightsRef.current.get(targetMessageId) ??
-      MESSAGE_ESTIMATED_ROW_HEIGHT;
-    const targetTopOffset = estimateMessageOffset(
+    const targetHeight = messageHeightsRef.current.get(targetMessageId);
+    const targetTopOffset = getMeasuredMessageOffset(
       messages,
       targetIndex,
       messageHeightsRef.current,
     );
-    const centeredTop = Math.max(
-      0,
-      targetTopOffset - Math.max((viewport.clientHeight - targetHeight) / 2, 0),
-    );
 
-    viewport.scrollTo({ top: centeredTop, behavior: "smooth" });
+    if (targetTopOffset !== null && targetHeight !== undefined) {
+      const centeredTop = Math.max(
+        0,
+        targetTopOffset - Math.max((viewport.clientHeight - targetHeight) / 2, 0),
+      );
+      viewport.scrollTo({ top: centeredTop, behavior: "smooth" });
+    }
+
     window.setTimeout(() => {
       const targetElement = viewport.querySelector<HTMLElement>(
         `[data-message-id="${targetMessageId}"]`,
@@ -5713,8 +5644,12 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   }
 
   const onMessageRowHeightChange = useCallback(
-    (messageId: string, height: number) => {
-      const normalizedHeight = Math.max(56, Math.ceil(height));
+    (rowThreadId: string | null, messageId: string, height: number) => {
+      if (rowThreadId !== messageHeightsThreadIdRef.current) {
+        return;
+      }
+
+      const normalizedHeight = Math.max(MESSAGE_MIN_ROW_HEIGHT, Math.ceil(height));
       const previousHeight = messageHeightsRef.current.get(messageId);
       if (
         previousHeight !== undefined &&
@@ -5729,16 +5664,40 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     [scheduleListLayoutVersionBump],
   );
 
-  const virtualizationEnabled = shouldVirtualizeMessages(messages.length, streaming);
+  const virtualizationCandidate =
+    messages.length >= MESSAGE_VIRTUALIZATION_THRESHOLD && !streaming;
+  const virtualizedLayout = useMemo(() => {
+    if (!virtualizationCandidate) {
+      return null;
+    }
+
+    return buildVirtualizedMessageLayout(messages, messageHeightsRef.current);
+  }, [messages, virtualizationCandidate, listLayoutVersion]);
+  const virtualizationEnabled = shouldVirtualizeMessages({
+    messageCount: messages.length,
+    streaming,
+    allRowsMeasured: virtualizedLayout !== null,
+    editing: editingMessageId !== null,
+    loadingOlderMessages,
+  });
+  virtualWindowUpdatesEnabledRef.current = virtualizationEnabled;
+  const shouldMeasureMessageRows = virtualizationCandidate;
 
   useEffect(() => {
     recordPerfMetric("chat.render.commit.ms", performance.now() - renderStartedAtRef.current, {
       threadId,
       messageCount: messages.length,
       virtualized: virtualizationEnabled,
+      selectionPinned: virtualizedMessageSelection.current.phase === "pinned",
       streaming,
     });
-  }, [messages.length, streaming, threadId, virtualizationEnabled]);
+  }, [
+    messages.length,
+    streaming,
+    threadId,
+    virtualizationEnabled,
+    virtualizedMessageSelection,
+  ]);
 
   const handleApproval = useCallback(
     (approvalId: string, response: ApprovalResponse) => {
@@ -5752,79 +5711,22 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     [hydrateActionOutput],
   );
 
-  const virtualizedLayout = useMemo(() => {
-    if (!virtualizationEnabled || messages.length === 0) {
-      return null;
-    }
-
-    const rowCount = messages.length;
-    const offsets = new Array<number>(rowCount + 1);
-    offsets[0] = 0;
-
-    for (let index = 0; index < rowCount; index += 1) {
-      const messageId = messages[index].id;
-      const measuredHeight = messageHeightsRef.current.get(messageId);
-      const rowHeight = measuredHeight ?? MESSAGE_ESTIMATED_ROW_HEIGHT;
-      offsets[index + 1] =
-        offsets[index] + rowHeight + (index < rowCount - 1 ? MESSAGE_ROW_GAP : 0);
-    }
-
-    return {
-      offsets,
-      rowCount,
-    };
-  }, [messages, virtualizationEnabled, listLayoutVersion]);
-
   const virtualWindow = useMemo(() => {
-    if (!virtualizedLayout) {
-      return null;
-    }
-
-    const { offsets, rowCount } = virtualizedLayout;
-
-    const viewportScrollTop = viewportScrollTopRef.current;
-    const visibleStart = Math.max(0, viewportScrollTop - MESSAGE_OVERSCAN_PX);
-    const visibleEnd =
-      viewportScrollTop + viewportHeight + MESSAGE_OVERSCAN_PX;
-
-    // Binary search: find first row whose bottom edge (offsets[i+1]) >= visibleStart
-    let lo = 0;
-    let hi = rowCount;
-    while (lo < hi) {
-      const mid = (lo + hi) >>> 1;
-      if (offsets[mid + 1] < visibleStart) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
-    }
-    const startIndex = lo;
-
-    // Binary search: find first row whose top edge (offsets[i]) > visibleEnd
-    lo = startIndex;
-    hi = rowCount;
-    while (lo < hi) {
-      const mid = (lo + hi) >>> 1;
-      if (offsets[mid] <= visibleEnd) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
-    }
-    let endIndexExclusive = lo;
-
-    if (endIndexExclusive <= startIndex) {
-      endIndexExclusive = Math.min(rowCount, startIndex + 1);
-    }
-
-    return {
-      startIndex,
-      endIndexExclusive,
-      topSpacerHeight: offsets[startIndex],
-      bottomSpacerHeight: offsets[rowCount] - offsets[endIndexExclusive],
-    };
+    return resolveVirtualMessageWindow({
+      virtualizationEnabled,
+      layout: virtualizedLayout,
+      messages,
+      retainedRange: virtualizedMessageSelection.current.retainedRange,
+      viewportScrollTop: viewportScrollTopRef.current,
+      viewportHeight,
+      overscanPx: MESSAGE_OVERSCAN_PX,
+    });
   }, [
+    messages,
+    virtualizationEnabled,
     virtualizedLayout,
+    virtualizedMessageSelection,
+    scrollVersion,
     viewportHeight,
   ]);
 
@@ -5835,6 +5737,13 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
     return messages.slice(virtualWindow.startIndex, virtualWindow.endIndexExclusive);
   }, [messages, virtualWindow, virtualizationEnabled]);
+  const renderedMessageStartIndex =
+    virtualizationEnabled && virtualWindow ? virtualWindow.startIndex : 0;
+  renderedMessageRangeRef.current = retainedMessageRangeForIndexes(
+    messages,
+    renderedMessageStartIndex,
+    renderedMessageStartIndex + visibleMessages.length,
+  );
 
   const assistantIdentityByMessageId = useMemo(() => {
     const identityByMessageId = new Map<string, { label: string; engineId: string }>();
@@ -6330,20 +6239,32 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
               </p>
             </div>
           </div>
-        ) : virtualizationEnabled && virtualWindow ? (
+        ) : (
           <div style={{ display: "flex", flexDirection: "column" }}>
-            {virtualWindow.topSpacerHeight > 0 && (
-              <div style={{ height: virtualWindow.topSpacerHeight }} />
-            )}
+            <div
+              key="top-spacer"
+              aria-hidden="true"
+              style={{
+                height:
+                  virtualizationEnabled && virtualWindow
+                    ? virtualWindow.topSpacerHeight
+                    : 0,
+              }}
+            />
 
-            <div style={{ display: "flex", flexDirection: "column", gap: MESSAGE_ROW_GAP }}>
+            <div
+              key="message-window"
+              style={{ display: "flex", flexDirection: "column", gap: MESSAGE_ROW_GAP }}
+            >
               {visibleMessages.map((message, relativeIndex) => {
-                  const absoluteIndex = virtualWindow.startIndex + relativeIndex;
+                  const absoluteIndex = renderedMessageStartIndex + relativeIndex;
                   const assistantIdentity = assistantIdentityByMessageId.get(message.id);
                   return (
                     <MeasuredMessageRow
                       key={message.id}
                       messageId={message.id}
+                      threadId={threadId}
+                      measure={shouldMeasureMessageRows}
                       onHeightChange={onMessageRowHeightChange}
                     >
                       <MessageRow
@@ -6375,42 +6296,16 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                 })}
             </div>
 
-            {virtualWindow.bottomSpacerHeight > 0 && (
-              <div style={{ height: virtualWindow.bottomSpacerHeight }} />
-            )}
-          </div>
-        ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: MESSAGE_ROW_GAP }}>
-            {visibleMessages.map((message, index) => {
-              const assistantIdentity = assistantIdentityByMessageId.get(message.id);
-              return (
-                <MessageRow
-                  key={message.id}
-                  message={message}
-                  index={index}
-                  isHighlighted={message.id === highlightedMessageId}
-                  assistantLabel={assistantIdentity?.label ?? ""}
-                  assistantEngineId={assistantIdentity?.engineId ?? ""}
-                  workspaceRootPath={getMessageWorkspaceRootPath(message)}
-                  canEditUserMessages={canEditUserMessages}
-                  editingMessageId={editingMessageId}
-                  editingMode={editingMode}
-                  editingDraftText={editingDraftText}
-                  editingDraftAttachments={editingMessageDraft?.attachments ?? []}
-                  editingRollbackTurns={editingRollbackTurns}
-                  editingBusy={editingBusy}
-                  onStartEdit={handleStartEdit}
-                  onStartRollback={handleStartRollback}
-                  onChangeEditText={handleChangeEditText}
-                  onRemoveEditAttachment={handleRemoveEditAttachment}
-                  onPasteEditAttachments={handleEditDraftPaste}
-                  onCancelEdit={handleCancelEdit}
-                  onSubmitEdit={handleSubmitEdit}
-                  onApproval={handleApproval}
-                  onLoadActionOutput={handleLoadActionOutput}
-                />
-              );
-            })}
+            <div
+              key="bottom-spacer"
+              aria-hidden="true"
+              style={{
+                height:
+                  virtualizationEnabled && virtualWindow
+                    ? virtualWindow.bottomSpacerHeight
+                    : 0,
+              }}
+            />
           </div>
         )}
 
