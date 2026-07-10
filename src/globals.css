@@ -9452,47 +9452,174 @@ button, input, textarea, select {
 .mp-model-controls-label {
   font-size: 9px;
   font-weight: 600;
-  letter-spacing: 0.06em;
+  letter-spacing: 0;
   text-transform: uppercase;
   color: var(--text-3);
   flex-shrink: 0;
 }
 
-.mp-model-option-pills {
-  display: flex;
+.mp-effort-select {
+  display: inline-flex;
+  min-width: 0;
+  flex: 0 1 148px;
+}
+
+.mp-effort-trigger {
+  display: inline-flex;
   align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  height: 24px;
+  padding: 0 7px 0 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--bg-2) 68%, transparent);
+  color: var(--text-2);
+  cursor: pointer;
+  transition:
+    background var(--duration-fast) var(--ease-out),
+    border-color var(--duration-fast) var(--ease-out),
+    color var(--duration-fast) var(--ease-out);
+}
+
+.mp-effort-trigger:hover,
+.mp-effort-trigger-open {
+  background: var(--bg-2);
+  border-color: var(--border-active);
+  color: var(--text-1);
+}
+
+.mp-effort-trigger:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 42%, transparent);
+  outline-offset: 1px;
+}
+
+.mp-effort-trigger-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  font-weight: 500;
+}
+
+.mp-effort-trigger-chevron {
+  flex-shrink: 0;
+  opacity: 0.55;
+  transition: transform var(--duration-fast) var(--ease-out);
+}
+
+.mp-effort-trigger-open .mp-effort-trigger-chevron {
+  transform: rotate(180deg);
+}
+
+@keyframes mp-effort-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(-3px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.mp-effort-menu {
+  z-index: 10001;
+  overflow-y: auto;
+  padding: 4px;
+  border: 1px solid var(--border-active);
+  border-radius: var(--radius-md);
+  outline: none;
+  background: var(--bg-3);
+  box-shadow:
+    0 14px 32px rgba(31, 35, 40, 0.16),
+    0 0 0 1px rgba(31, 35, 40, 0.04);
+  transform-origin: top right;
+  animation: mp-effort-menu-in var(--duration-fast) var(--ease-out) both;
+}
+
+.mp-effort-menu[data-placement="top"] {
+  transform-origin: bottom right;
+}
+
+.mp-effort-option {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 16px;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 42px;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+  text-align: left;
+  transition:
+    background var(--duration-fast) var(--ease-out),
+    border-color var(--duration-fast) var(--ease-out),
+    color var(--duration-fast) var(--ease-out);
+}
+
+.mp-effort-option:hover,
+.mp-effort-option-active {
+  background: rgba(31, 35, 40, 0.06);
+  color: var(--text-1);
+}
+
+.mp-effort-option-selected {
+  background: color-mix(in srgb, var(--accent-dim) 58%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--text-1);
+}
+
+.mp-effort-option-selected.mp-effort-option-active,
+.mp-effort-option-selected:hover {
+  background: color-mix(in srgb, var(--accent-dim) 76%, transparent);
+}
+
+.mp-effort-option-copy {
+  display: flex;
+  flex-direction: column;
   gap: 2px;
-  background: rgba(31, 35, 40, 0.04);
-  border-radius: 99px;
-  padding: 2px;
   min-width: 0;
 }
 
-.mp-model-option-pill {
-  font-size: 9.5px;
-  font-weight: 500;
-  padding: 2px 8px;
-  border-radius: 99px;
-  color: var(--text-3);
-  border: none;
-  background: transparent;
-  cursor: pointer;
-  transition: all var(--duration-fast) var(--ease-out);
+.mp-effort-option-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.mp-effort-option-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
+  font-size: 11px;
+  font-weight: 600;
 }
 
-.mp-model-option-pill:hover {
-  color: var(--text-2);
-  background: rgba(31, 35, 40, 0.06);
+.mp-effort-option-default {
+  flex-shrink: 0;
+  color: var(--text-3);
+  font-size: 9px;
+  font-style: italic;
 }
 
-.mp-model-option-pill-active {
-  background: var(--accent-dim);
-  color: var(--accent);
+.mp-effort-option-description {
+  overflow-wrap: anywhere;
+  color: var(--text-3);
+  font-size: 9.5px;
+  line-height: 1.35;
 }
 
-.mp-model-option-pill-active:hover {
-  background: color-mix(in srgb, var(--accent) 16%, transparent);
+.mp-effort-option-check {
+  justify-self: end;
   color: var(--accent);
 }
 

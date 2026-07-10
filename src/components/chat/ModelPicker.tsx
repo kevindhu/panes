@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import type { KeyboardEvent as ReactKeyboardEvent, RefObject } from "react";
 import { createPortal } from "react-dom";
 import { Check, ChevronDown, ChevronRight, Search } from "lucide-react";
 import type { TFunction } from "i18next";
@@ -6,6 +15,7 @@ import { useTranslation } from "react-i18next";
 import { useEngineStore } from "../../stores/engineStore";
 import { getHarnessIcon } from "../shared/HarnessLogos";
 import type { EngineHealth, EngineInfo, EngineModel } from "../../types";
+import { resolveReasoningEffortForModel } from "./reasoningEffort";
 
 /* ── Props ── */
 
@@ -278,6 +288,7 @@ export function ModelPicker({
   const [legacyExpanded, setLegacyExpanded] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
+  const effortMenuRef = useRef<HTMLDivElement>(null);
   const wasOpenRef = useRef(false);
   const [pos, setPos] = useState({ bottom: 0, left: 0 });
   const ensureEngineHealth = useEngineStore((state) => state.ensureHealth);
@@ -334,7 +345,8 @@ export function ModelPicker({
       const target = e.target as Node;
       if (
         triggerRef.current?.contains(target) ||
-        popoverRef.current?.contains(target)
+        popoverRef.current?.contains(target) ||
+        effortMenuRef.current?.contains(target)
       ) {
         return;
       }
@@ -342,7 +354,7 @@ export function ModelPicker({
     }
 
     function onKeyDown(e: KeyboardEvent) {
-      if (e.key === "Escape") setOpen(false);
+      if (e.key === "Escape" && !effortMenuRef.current) setOpen(false);
     }
 
     document.addEventListener("pointerdown", onPointerDown, true);
@@ -419,6 +431,7 @@ export function ModelPicker({
             selectedEffort={selectedEffort}
             onSelect={handleModelSelect}
             onEffortChange={onEffortChange}
+            effortMenuRef={effortMenuRef}
           />
         ))}
 
@@ -450,6 +463,7 @@ export function ModelPicker({
                   selectedEffort={selectedEffort}
                   onSelect={handleModelSelect}
                   onEffortChange={onEffortChange}
+                  effortMenuRef={effortMenuRef}
                 />
               ))}
           </>
@@ -524,6 +538,7 @@ export function ModelPicker({
                 selectedEffort={selectedEffort}
                 onSelect={handleModelSelect}
                 onEffortChange={onEffortChange}
+                effortMenuRef={effortMenuRef}
               />
             ))}
 
@@ -555,6 +570,7 @@ export function ModelPicker({
                       selectedEffort={selectedEffort}
                       onSelect={handleModelSelect}
                       onEffortChange={onEffortChange}
+                      effortMenuRef={effortMenuRef}
                     />
                   ))}
               </>
@@ -663,6 +679,314 @@ export function ModelPicker({
 
 /* ── Model Row ── */
 
+interface EffortMenuPosition {
+  top: number;
+  left: number;
+  width: number;
+  maxHeight: number;
+  placement: "top" | "bottom";
+  ready: boolean;
+}
+
+const EFFORT_MENU_WIDTH = 264;
+const EFFORT_MENU_MAX_HEIGHT = 320;
+const EFFORT_MENU_GAP = 4;
+const EFFORT_MENU_MARGIN = 8;
+
+function reasoningEffortsMatch(left: string, right: string): boolean {
+  return left.trim().toLowerCase() === right.trim().toLowerCase();
+}
+
+function ReasoningEffortDropdown({
+  model,
+  selectedEffort,
+  onChange,
+  menuRef,
+}: {
+  model: EngineModel;
+  selectedEffort: string;
+  onChange: (effort: string) => void;
+  menuRef: RefObject<HTMLDivElement | null>;
+}) {
+  const { t } = useTranslation("chat");
+  const listboxId = useId();
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const [open, setOpen] = useState(false);
+  const efforts = model.supportedReasoningEfforts ?? [];
+  const effectiveEffort =
+    resolveReasoningEffortForModel(model, selectedEffort) ??
+    efforts[0]?.reasoningEffort ??
+    selectedEffort;
+  const selectedIndex = Math.max(
+    0,
+    efforts.findIndex((option) =>
+      reasoningEffortsMatch(option.reasoningEffort, effectiveEffort),
+    ),
+  );
+  const selectedOption = efforts[selectedIndex] ?? null;
+  const [activeIndex, setActiveIndex] = useState(selectedIndex);
+  const [position, setPosition] = useState<EffortMenuPosition>({
+    top: 0,
+    left: 0,
+    width: EFFORT_MENU_WIDTH,
+    maxHeight: EFFORT_MENU_MAX_HEIGHT,
+    placement: "bottom",
+    ready: false,
+  });
+
+  const closeMenu = useCallback((restoreFocus = false) => {
+    setOpen(false);
+    if (restoreFocus) {
+      triggerRef.current?.focus();
+    }
+  }, []);
+
+  const openMenu = useCallback((initialIndex: number) => {
+    setActiveIndex(initialIndex);
+    setPosition((current) => ({ ...current, ready: false }));
+    setOpen(true);
+  }, []);
+
+  const updatePosition = useCallback(() => {
+    const trigger = triggerRef.current;
+    if (!trigger) {
+      return;
+    }
+
+    const rect = trigger.getBoundingClientRect();
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+    const width = Math.min(
+      EFFORT_MENU_WIDTH,
+      Math.max(0, viewportWidth - EFFORT_MENU_MARGIN * 2),
+    );
+    const maxHeight = Math.min(
+      EFFORT_MENU_MAX_HEIGHT,
+      Math.max(0, viewportHeight - EFFORT_MENU_MARGIN * 2),
+    );
+    const estimatedHeight = efforts.length * 52 + 8;
+    const menuHeight = Math.min(
+      menuRef.current?.scrollHeight ?? estimatedHeight,
+      maxHeight,
+    );
+    const spaceBelow = viewportHeight - rect.bottom - EFFORT_MENU_GAP - EFFORT_MENU_MARGIN;
+    const spaceAbove = rect.top - EFFORT_MENU_GAP - EFFORT_MENU_MARGIN;
+    const placement =
+      spaceBelow >= menuHeight || spaceBelow >= spaceAbove ? "bottom" : "top";
+    const idealTop =
+      placement === "bottom"
+        ? rect.bottom + EFFORT_MENU_GAP
+        : rect.top - menuHeight - EFFORT_MENU_GAP;
+    const top = Math.max(
+      EFFORT_MENU_MARGIN,
+      Math.min(idealTop, viewportHeight - menuHeight - EFFORT_MENU_MARGIN),
+    );
+    const maxLeft = Math.max(
+      EFFORT_MENU_MARGIN,
+      viewportWidth - width - EFFORT_MENU_MARGIN,
+    );
+    const left = Math.max(
+      EFFORT_MENU_MARGIN,
+      Math.min(rect.right - width, maxLeft),
+    );
+
+    setPosition({ top, left, width, maxHeight, placement, ready: true });
+  }, [efforts.length, menuRef]);
+
+  useLayoutEffect(() => {
+    if (open) {
+      updatePosition();
+    }
+  }, [open, updatePosition]);
+
+  useLayoutEffect(() => {
+    if (open && position.ready) {
+      menuRef.current?.focus();
+    }
+  }, [menuRef, open, position.ready]);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+
+    function onPointerDown(event: PointerEvent) {
+      const target = event.target as Node;
+      if (
+        triggerRef.current?.contains(target) ||
+        menuRef.current?.contains(target)
+      ) {
+        return;
+      }
+      closeMenu();
+    }
+
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      closeMenu(true);
+    }
+
+    window.addEventListener("resize", updatePosition);
+    window.addEventListener("scroll", updatePosition, true);
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => {
+      window.removeEventListener("resize", updatePosition);
+      window.removeEventListener("scroll", updatePosition, true);
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+    };
+  }, [closeMenu, menuRef, open, updatePosition]);
+
+  useEffect(() => {
+    setActiveIndex(selectedIndex);
+  }, [selectedIndex]);
+
+  function selectEffort(index: number) {
+    const option = efforts[index];
+    if (!option) {
+      return;
+    }
+    onChange(option.reasoningEffort);
+    closeMenu(true);
+  }
+
+  function handleTriggerKeyDown(event: ReactKeyboardEvent<HTMLButtonElement>) {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      openMenu(selectedIndex);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      openMenu(0);
+    } else if (event.key === "End") {
+      event.preventDefault();
+      openMenu(Math.max(0, efforts.length - 1));
+    }
+  }
+
+  function handleMenuKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setActiveIndex((current) => (current + 1) % efforts.length);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setActiveIndex((current) => (current - 1 + efforts.length) % efforts.length);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      setActiveIndex(0);
+    } else if (event.key === "End") {
+      event.preventDefault();
+      setActiveIndex(Math.max(0, efforts.length - 1));
+    } else if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      selectEffort(activeIndex);
+    } else if (event.key === "Tab") {
+      closeMenu(true);
+    }
+  }
+
+  if (!selectedOption) {
+    return null;
+  }
+
+  const selectedLabel = effortDisplayLabel(t, selectedOption.reasoningEffort);
+  const triggerId = `${listboxId}-trigger`;
+  const activeOptionId = `${listboxId}-option-${activeIndex}`;
+  const menu = open
+    ? createPortal(
+        <div
+          ref={menuRef}
+          id={listboxId}
+          className="mp-effort-menu"
+          role="listbox"
+          tabIndex={-1}
+          aria-labelledby={triggerId}
+          aria-activedescendant={activeOptionId}
+          data-placement={position.placement}
+          onKeyDown={handleMenuKeyDown}
+          style={{
+            position: "fixed",
+            top: position.top,
+            left: position.left,
+            width: position.width,
+            maxHeight: position.maxHeight,
+            visibility: position.ready ? "visible" : "hidden",
+          }}
+        >
+          {efforts.map((option, index) => {
+            const isSelected = reasoningEffortsMatch(
+              option.reasoningEffort,
+              effectiveEffort,
+            );
+            const isDefault = reasoningEffortsMatch(
+              option.reasoningEffort,
+              model.defaultReasoningEffort,
+            );
+            const isActive = index === activeIndex;
+            return (
+              <button
+                key={option.reasoningEffort}
+                id={`${listboxId}-option-${index}`}
+                type="button"
+                role="option"
+                aria-selected={isSelected}
+                className={`mp-effort-option${isSelected ? " mp-effort-option-selected" : ""}${isActive ? " mp-effort-option-active" : ""}`}
+                onMouseMove={() => setActiveIndex(index)}
+                onClick={() => selectEffort(index)}
+              >
+                <span className="mp-effort-option-copy">
+                  <span className="mp-effort-option-heading">
+                    <span className="mp-effort-option-name">
+                      {effortDisplayLabel(t, option.reasoningEffort)}
+                    </span>
+                    {isDefault ? (
+                      <span className="mp-effort-option-default">
+                        {t("modelPicker.default")}
+                      </span>
+                    ) : null}
+                  </span>
+                  {option.description ? (
+                    <span className="mp-effort-option-description">
+                      {option.description}
+                    </span>
+                  ) : null}
+                </span>
+                {isSelected ? <Check size={13} className="mp-effort-option-check" /> : null}
+              </button>
+            );
+          })}
+        </div>,
+        document.body,
+      )
+    : null;
+
+  return (
+    <div className="mp-effort-select">
+      <button
+        ref={triggerRef}
+        id={triggerId}
+        type="button"
+        className={`mp-effort-trigger${open ? " mp-effort-trigger-open" : ""}`}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-controls={open ? listboxId : undefined}
+        aria-label={`${t("modelPicker.thinking")}: ${selectedLabel}`}
+        title={selectedOption.description || selectedLabel}
+        onClick={() => (open ? closeMenu() : openMenu(selectedIndex))}
+        onKeyDown={handleTriggerKeyDown}
+      >
+        <span className="mp-effort-trigger-label">{selectedLabel}</span>
+        <ChevronDown size={11} className="mp-effort-trigger-chevron" />
+      </button>
+      {menu}
+    </div>
+  );
+}
+
 function ModelRow({
   model,
   engineId,
@@ -670,6 +994,7 @@ function ModelRow({
   selectedEffort,
   onSelect,
   onEffortChange,
+  effortMenuRef,
 }: {
   model: EngineModel;
   engineId: string;
@@ -677,6 +1002,7 @@ function ModelRow({
   selectedEffort: string;
   onSelect: (engineId: string, modelId: string) => void;
   onEffortChange: (effort: string) => void;
+  effortMenuRef: RefObject<HTMLDivElement | null>;
 }) {
   const { t } = useTranslation("chat");
   const efforts = model.supportedReasoningEfforts ?? [];
@@ -727,25 +1053,13 @@ function ModelRow({
 
       {isSelected && showControls && (
         <div className="mp-model-controls">
-          {efforts.length > 0 ? (
-            <span className="mp-model-controls-label">{t("modelPicker.thinking")}</span>
-          ) : null}
-          <div className="mp-model-option-pills">
-            {efforts.map((opt) => {
-              const active = opt.reasoningEffort === selectedEffort;
-              return (
-                <button
-                  key={opt.reasoningEffort}
-                  type="button"
-                  className={`mp-model-option-pill${active ? " mp-model-option-pill-active" : ""}`}
-                  onClick={() => onEffortChange(opt.reasoningEffort)}
-                  title={opt.description}
-                >
-                  {effortDisplayLabel(t, opt.reasoningEffort)}
-                </button>
-                );
-              })}
-          </div>
+          <span className="mp-model-controls-label">{t("modelPicker.thinking")}</span>
+          <ReasoningEffortDropdown
+            model={model}
+            selectedEffort={selectedEffort}
+            onChange={onEffortChange}
+            menuRef={effortMenuRef}
+          />
         </div>
       )}
     </div>
