@@ -1,5 +1,9 @@
 import { create } from "zustand";
-import { ipc, listenThreadEvents } from "../lib/ipc";
+import {
+  ipc,
+  listenThreadEvents,
+  type ChatTurnFinishedEvent,
+} from "../lib/ipc";
 import {
   armPlanImplementationPrompt,
   disarmPlanImplementationPrompt,
@@ -137,8 +141,81 @@ interface AssistantMessageTarget {
 const pendingTurnMetaByThread = new Map<string, PendingTurnMeta>();
 const inflightActionOutputHydration = new Map<string, Promise<void>>();
 
-export function clearPendingTurnRuntimeForThread(threadId: string): void {
-  pendingTurnMetaByThread.delete(threadId);
+function pendingTurnMatchesFinishedEvent(
+  pendingTurn: PendingTurnMeta,
+  event: ChatTurnFinishedEvent,
+): boolean {
+  const pendingClientTurnId = pendingTurn.clientTurnId?.trim();
+  const eventClientTurnId = event.clientTurnId?.trim();
+  if (pendingClientTurnId && eventClientTurnId) {
+    return pendingClientTurnId === eventClientTurnId;
+  }
+
+  const pendingAssistantMessageId = pendingTurn.assistantMessageId?.trim();
+  const eventAssistantMessageId = event.assistantMessageId?.trim();
+  return Boolean(
+    pendingAssistantMessageId &&
+      eventAssistantMessageId &&
+      pendingAssistantMessageId === eventAssistantMessageId,
+  );
+}
+
+function assistantMessageMatchesFinishedEvent(
+  message: Message,
+  event: ChatTurnFinishedEvent,
+): boolean {
+  const messageClientTurnId = message.clientTurnId?.trim();
+  const eventClientTurnId = event.clientTurnId?.trim();
+  if (messageClientTurnId && eventClientTurnId) {
+    return messageClientTurnId === eventClientTurnId;
+  }
+  return message.id === event.assistantMessageId;
+}
+
+/**
+ * Accepts a terminal event only when it still describes the current turn for
+ * its thread. A newer turn can start after the backend releases its turn lock
+ * but before the older global completion event reaches the frontend.
+ */
+export function acceptTurnFinishedRuntimeEvent(
+  event: ChatTurnFinishedEvent,
+): boolean {
+  // The backend read the latest thread after finishing this assistant message.
+  // An active snapshot means another turn has already superseded this event;
+  // an unknown snapshot is rejected rather than risking a false completion.
+  if (
+    event.threadStatus !== "completed" &&
+    event.threadStatus !== "idle" &&
+    event.threadStatus !== "error"
+  ) {
+    return false;
+  }
+
+  const pendingTurn = pendingTurnMetaByThread.get(event.threadId);
+  if (pendingTurn) {
+    if (!pendingTurnMatchesFinishedEvent(pendingTurn, event)) {
+      return false;
+    }
+    pendingTurnMetaByThread.delete(event.threadId);
+    return true;
+  }
+
+  const chatState = useChatStore.getState();
+  if (chatState.threadId === event.threadId) {
+    const latestAssistant = [...chatState.messages]
+      .reverse()
+      .find((message) => message.role === "assistant");
+    if (
+      latestAssistant &&
+      !assistantMessageMatchesFinishedEvent(latestAssistant, event) &&
+      (latestAssistant.status === "streaming" ||
+        Boolean(latestAssistant.clientTurnId && event.clientTurnId))
+    ) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 function isCodexThreadSyncRequired(metadata: Record<string, unknown> | undefined): boolean {

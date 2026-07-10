@@ -599,6 +599,10 @@ struct ChatTurnFinishedEvent {
     repo_id: Option<String>,
     engine_id: String,
     thread_title: String,
+    assistant_message_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_turn_id: Option<String>,
+    thread_status: String,
     status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     preview: Option<String>,
@@ -2259,7 +2263,9 @@ async fn run_turn(
     let approval_event_topic = format!("approval-request-{}", thread.id);
     let mut pending_event: Option<EngineEvent> = None;
 
-    let initial_turn_started_event = EngineEvent::TurnStarted { client_turn_id };
+    let initial_turn_started_event = EngineEvent::TurnStarted {
+        client_turn_id: client_turn_id.clone(),
+    };
     let initial_progress = process_stream_event(
         &app,
         &state,
@@ -2712,7 +2718,14 @@ async fn run_turn(
     let (thread_updated_event, final_thread) = build_final_thread_event(latest_thread, &thread);
     let _ = app.emit("thread-updated", thread_updated_event);
     if let Some(final_thread) = final_thread.as_ref() {
-        emit_chat_turn_finished(&app, final_thread, &message_status, &blocks);
+        emit_chat_turn_finished(
+            &app,
+            final_thread,
+            &assistant_message_id,
+            client_turn_id.as_deref(),
+            &message_status,
+            &blocks,
+        );
     }
 }
 
@@ -3291,7 +3304,14 @@ async fn run_codex_review_turn(
         build_final_thread_event(latest_review_thread, &review_thread);
     let _ = app.emit("thread-updated", thread_updated_event);
     if let Some(final_review_thread) = final_review_thread.as_ref() {
-        emit_chat_turn_finished(&app, final_review_thread, &message_status, &blocks);
+        emit_chat_turn_finished(
+            &app,
+            final_review_thread,
+            &assistant_message_id,
+            None,
+            &message_status,
+            &blocks,
+        );
     }
 }
 
@@ -3963,15 +3983,25 @@ fn chat_notification_preview(blocks: &[ContentBlock]) -> Option<String> {
 fn emit_chat_turn_finished(
     app: &tauri::AppHandle,
     thread: &ThreadDto,
+    assistant_message_id: &str,
+    client_turn_id: Option<&str>,
     status: &MessageStatusDto,
     blocks: &[ContentBlock],
 ) {
-    let event = build_chat_turn_finished_event(thread, status, blocks);
+    let event = build_chat_turn_finished_event(
+        thread,
+        assistant_message_id,
+        client_turn_id,
+        status,
+        blocks,
+    );
     let _ = app.emit("chat-turn-finished", event);
 }
 
 fn build_chat_turn_finished_event(
     thread: &ThreadDto,
+    assistant_message_id: &str,
+    client_turn_id: Option<&str>,
     status: &MessageStatusDto,
     blocks: &[ContentBlock],
 ) -> ChatTurnFinishedEvent {
@@ -3981,6 +4011,9 @@ fn build_chat_turn_finished_event(
         repo_id: thread.repo_id.clone(),
         engine_id: thread.engine_id.clone(),
         thread_title: thread.title.clone(),
+        assistant_message_id: assistant_message_id.to_string(),
+        client_turn_id: client_turn_id.map(ToOwned::to_owned),
+        thread_status: thread.status.as_str().to_string(),
         status: match status {
             MessageStatusDto::Completed => "completed",
             MessageStatusDto::Interrupted => "interrupted",
@@ -5286,15 +5319,25 @@ mod tests {
     }
 
     #[test]
-    fn build_chat_turn_finished_event_includes_repo_id() {
+    fn build_chat_turn_finished_event_includes_turn_identity_and_thread_status() {
         let state = test_app_state();
         let mut thread = test_thread(&state, "codex", "gpt-5.5-codex");
         thread.repo_id = Some("repo-1".to_string());
-        let event = build_chat_turn_finished_event(&thread, &MessageStatusDto::Completed, &[]);
+        thread.status = ThreadStatusDto::Completed;
+        let event = build_chat_turn_finished_event(
+            &thread,
+            "assistant-1",
+            Some("client-turn-1"),
+            &MessageStatusDto::Completed,
+            &[],
+        );
 
         assert_eq!(event.thread_id, thread.id);
         assert_eq!(event.workspace_id, thread.workspace_id);
         assert_eq!(event.repo_id.as_deref(), Some("repo-1"));
+        assert_eq!(event.assistant_message_id, "assistant-1");
+        assert_eq!(event.client_turn_id.as_deref(), Some("client-turn-1"));
+        assert_eq!(event.thread_status, "completed");
         assert_eq!(event.status, "completed");
     }
 

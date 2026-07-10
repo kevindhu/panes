@@ -88,6 +88,7 @@ import {
 } from "./messageEditBranching";
 import {
   getPlanImplementationCodingMessage,
+  resolvePlanImplementationDecision,
   shouldClearPendingPlanImplementationPrompt,
   shouldPromptToImplementPlan,
 } from "./planModePrompt";
@@ -5609,13 +5610,36 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         ? (response.answers as Record<string, { answers?: string[] }>)
         : null;
     const selectedAnswer = answerMap?.plan_implementation_decision?.answers?.[0]?.trim();
+    const decision = resolvePlanImplementationDecision(
+      selectedAnswer,
+      planImplementationQuestionChoiceImplement,
+      planImplementationQuestionChoiceStay,
+    );
     console.info("[plan-mode] implementation prompt answered", {
       threadId: planImplementationPrompt?.threadId ?? null,
       selectedAnswer: selectedAnswer ?? null,
       action:
-        selectedAnswer === planImplementationQuestionChoiceStay ? "stay_in_plan_mode" : "implement_plan",
+        decision === "stay"
+          ? "stay_in_plan_mode"
+          : decision === "implement"
+            ? "implement_plan"
+            : "invalid_answer_ignored",
     });
-    if (selectedAnswer === planImplementationQuestionChoiceStay) {
+    if (!decision) {
+      if (planImplementationPrompt?.threadId) {
+        appendBranchProfileLogBestEffort(
+          planImplementationPromptLogOperationId(planImplementationPrompt.threadId),
+          "frontend.plan_prompt.invalid_answer_ignored",
+          {
+            threadId: planImplementationPrompt.threadId,
+            selectedAnswer: selectedAnswer ?? null,
+          },
+        );
+      }
+      return;
+    }
+
+    if (decision === "stay") {
       disarmPlanImplementationPrompt(planImplementationPrompt?.threadId);
       if (planImplementationPrompt?.threadId) {
         appendBranchProfileLogBestEffort(
@@ -5638,6 +5662,9 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       return;
     }
 
+    // Only the exact questionnaire choice reaches this branch. Missing,
+    // malformed, or manually altered answers leave the prompt and plan state
+    // untouched instead of accidentally starting implementation.
     void executePlanImplementation();
   }
 

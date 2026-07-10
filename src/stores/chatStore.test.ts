@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { ChatTurnFinishedEvent } from "../lib/ipc";
 import type { ApprovalResponse, Message, StreamEvent, Thread } from "../types";
 
 const mockIpc = vi.hoisted(() => ({
@@ -43,7 +44,11 @@ vi.mock("./toastStore", () => ({
   toast: mockToast,
 }));
 
-import { resetUsageLimitCachesForTests, useChatStore } from "./chatStore";
+import {
+  acceptTurnFinishedRuntimeEvent,
+  resetUsageLimitCachesForTests,
+  useChatStore,
+} from "./chatStore";
 import { useThreadStore } from "./threadStore";
 import { useThreadPlanModeStore } from "./threadPlanModeStore";
 
@@ -79,6 +84,24 @@ function seedThreads(...threads: Thread[]) {
     threads,
     threadsByWorkspace: { "workspace-1": threads },
   });
+}
+
+function makeTurnFinishedEvent(
+  overrides: Partial<ChatTurnFinishedEvent> = {},
+): ChatTurnFinishedEvent {
+  return {
+    threadId: "thread-1",
+    workspaceId: "workspace-1",
+    repoId: null,
+    engineId: "codex",
+    threadTitle: "Thread 1",
+    assistantMessageId: "assistant-message-id",
+    clientTurnId: "client-turn-id",
+    threadStatus: "completed",
+    status: "completed",
+    preview: null,
+    ...overrides,
+  };
 }
 
 describe("chatStore send", () => {
@@ -168,6 +191,124 @@ describe("chatStore send", () => {
 
     pendingRequest.resolve("assistant-message-id");
     await expect(sendPromise).resolves.toBe(true);
+  });
+
+  it("accepts a matching fast terminal event before the send IPC response settles", async () => {
+    const pendingRequest = deferred<string>();
+    mockIpc.sendMessage.mockReturnValueOnce(pendingRequest.promise);
+
+    const sendPromise = useChatStore.getState().send("finish immediately");
+    const clientTurnId = mockIpc.sendMessage.mock.calls[0]?.[7] as string;
+
+    expect(
+      acceptTurnFinishedRuntimeEvent(
+        makeTurnFinishedEvent({
+          assistantMessageId: "backend-assistant-id",
+          clientTurnId,
+        }),
+      ),
+    ).toBe(true);
+
+    pendingRequest.resolve("backend-assistant-id");
+    await expect(sendPromise).resolves.toBe(true);
+  });
+
+  it("rejects an older terminal event after a newer turn has started", async () => {
+    mockIpc.sendMessage.mockResolvedValueOnce("assistant-a");
+    await expect(useChatStore.getState().send("turn a")).resolves.toBe(true);
+    const clientTurnA = mockIpc.sendMessage.mock.calls[0]?.[7] as string;
+
+    useChatStore.setState({ status: "completed", streaming: false });
+    mockIpc.sendMessage.mockResolvedValueOnce("assistant-b");
+    await expect(useChatStore.getState().send("turn b")).resolves.toBe(true);
+    const clientTurnB = mockIpc.sendMessage.mock.calls[1]?.[7] as string;
+
+    expect(
+      acceptTurnFinishedRuntimeEvent(
+        makeTurnFinishedEvent({
+          assistantMessageId: "assistant-a",
+          clientTurnId: clientTurnA,
+        }),
+      ),
+    ).toBe(false);
+    expect(useChatStore.getState()).toMatchObject({
+      status: "streaming",
+      streaming: true,
+    });
+
+    expect(
+      acceptTurnFinishedRuntimeEvent(
+        makeTurnFinishedEvent({
+          assistantMessageId: "assistant-b",
+          clientTurnId: clientTurnB,
+          threadStatus: "streaming",
+        }),
+      ),
+    ).toBe(false);
+
+    expect(
+      acceptTurnFinishedRuntimeEvent(
+        makeTurnFinishedEvent({
+          assistantMessageId: "assistant-b",
+          clientTurnId: clientTurnB,
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a terminal event for an older assistant when a newer transcript is streaming", () => {
+    useChatStore.setState({
+      messages: [
+        {
+          id: "assistant-b",
+          threadId: "thread-1",
+          role: "assistant",
+          blocks: [],
+          status: "streaming",
+          schemaVersion: 1,
+          createdAt: new Date().toISOString(),
+        },
+      ],
+      status: "streaming",
+      streaming: true,
+    });
+
+    expect(
+      acceptTurnFinishedRuntimeEvent(
+        makeTurnFinishedEvent({
+          assistantMessageId: "assistant-a",
+          clientTurnId: null,
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("rejects a delayed terminal event after the newer live turn also completed", () => {
+    useChatStore.setState({
+      messages: [
+        {
+          id: "optimistic-assistant-b",
+          threadId: "thread-1",
+          role: "assistant",
+          clientTurnId: "client-turn-b",
+          blocks: [{ type: "text", content: "Newer result" }],
+          status: "completed",
+          schemaVersion: 1,
+          createdAt: new Date().toISOString(),
+        },
+      ],
+      status: "completed",
+      streaming: false,
+    });
+
+    expect(
+      acceptTurnFinishedRuntimeEvent(
+        makeTurnFinishedEvent({
+          assistantMessageId: "assistant-a",
+          clientTurnId: "client-turn-a",
+        }),
+      ),
+    ).toBe(false);
   });
 
   it("keeps a background thread marked running and clears it on terminal completion", async () => {

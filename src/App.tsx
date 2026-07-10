@@ -20,7 +20,7 @@ import { useEngineStore } from "./stores/engineStore";
 import { useUiStore } from "./stores/uiStore";
 import { useThreadStore } from "./stores/threadStore";
 import {
-  clearPendingTurnRuntimeForThread,
+  acceptTurnFinishedRuntimeEvent,
   useChatStore,
 } from "./stores/chatStore";
 import { useGitStore } from "./stores/gitStore";
@@ -703,7 +703,16 @@ export function App() {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void listenChatTurnFinished(async (event) => {
-      clearPendingTurnRuntimeForThread(event.threadId);
+      if (!acceptTurnFinishedRuntimeEvent(event)) {
+        console.info("[chat-runtime] ignored stale turn completion", {
+          threadId: event.threadId,
+          assistantMessageId: event.assistantMessageId,
+          clientTurnId: event.clientTurnId ?? null,
+          threadStatus: event.threadStatus,
+          status: event.status,
+        });
+        return;
+      }
       const threadStore = useThreadStore.getState();
       const currentThread = threadStore.threads.find(
         (thread) => thread.id === event.threadId,

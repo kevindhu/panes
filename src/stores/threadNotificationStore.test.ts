@@ -16,6 +16,9 @@ const completedEvent: ChatTurnFinishedEvent = {
   repoId: "repo-1",
   engineId: "codex",
   threadTitle: "Implement feature",
+  assistantMessageId: "assistant-1",
+  clientTurnId: "client-turn-1",
+  threadStatus: "completed",
   status: "completed",
   preview: "Done",
 };
