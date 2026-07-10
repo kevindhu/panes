@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ApprovalResponse, Message, StreamEvent } from "../types";
+import type { ApprovalResponse, Message, StreamEvent, Thread } from "../types";
 
 const mockIpc = vi.hoisted(() => ({
   sendMessage: vi.fn(),
@@ -13,6 +13,10 @@ const mockIpc = vi.hoisted(() => ({
 
 const mockListenThreadEvents = vi.hoisted(() => vi.fn());
 const mockRecordPerfMetric = vi.hoisted(() => vi.fn());
+const mockPlanImplementationPromptState = vi.hoisted(() => ({
+  arm: vi.fn(),
+  disarm: vi.fn(),
+}));
 const mockToast = vi.hoisted(() => ({
   info: vi.fn(),
   success: vi.fn(),
@@ -29,12 +33,19 @@ vi.mock("../lib/perfTelemetry", () => ({
   recordPerfMetric: mockRecordPerfMetric,
 }));
 
+vi.mock("../lib/planImplementationPromptState", () => ({
+  armPlanImplementationPrompt: mockPlanImplementationPromptState.arm,
+  disarmPlanImplementationPrompt: mockPlanImplementationPromptState.disarm,
+  listPendingPlanImplementationPromptThreadIds: () => [],
+}));
+
 vi.mock("./toastStore", () => ({
   toast: mockToast,
 }));
 
 import { resetUsageLimitCachesForTests, useChatStore } from "./chatStore";
 import { useThreadStore } from "./threadStore";
+import { useThreadPlanModeStore } from "./threadPlanModeStore";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -44,6 +55,30 @@ function deferred<T>() {
     reject = rej;
   });
   return { promise, resolve, reject };
+}
+
+function makeThread(id: string, status: Thread["status"] = "completed"): Thread {
+  return {
+    id,
+    workspaceId: "workspace-1",
+    repoId: null,
+    engineId: "codex",
+    modelId: "gpt-5.3-codex",
+    engineThreadId: `engine-${id}`,
+    title: id,
+    status,
+    messageCount: 0,
+    totalTokens: 0,
+    createdAt: "2026-05-19T12:00:00.000Z",
+    lastActivityAt: "2026-05-19T12:00:00.000Z",
+  };
+}
+
+function seedThreads(...threads: Thread[]) {
+  useThreadStore.setState({
+    threads,
+    threadsByWorkspace: { "workspace-1": threads },
+  });
 }
 
 describe("chatStore send", () => {
@@ -100,6 +135,10 @@ describe("chatStore send", () => {
       error: undefined,
       unlisten: undefined,
     });
+    useThreadPlanModeStore.setState({
+      threadModes: {},
+      newThreadModesByWorkspaceId: {},
+    });
   });
 
   it("adds an assistant placeholder immediately while the turn request is in flight", async () => {
@@ -131,6 +170,61 @@ describe("chatStore send", () => {
     await expect(sendPromise).resolves.toBe(true);
   });
 
+  it("keeps a background thread marked running and clears it on terminal completion", async () => {
+    const threadOne = makeThread("thread-1", "idle");
+    const threadTwo = makeThread("thread-2");
+    seedThreads(threadOne, threadTwo);
+
+    const handlers = new Map<string, (event: StreamEvent) => void>();
+    mockListenThreadEvents.mockImplementation(
+      async (threadId: string, handler: (event: StreamEvent) => void) => {
+        handlers.set(threadId, handler);
+        return vi.fn();
+      },
+    );
+    useChatStore.setState({ unlisten: vi.fn() });
+    mockIpc.sendMessage.mockResolvedValueOnce("assistant-message-id");
+
+    await expect(useChatStore.getState().send("keep working")).resolves.toBe(true);
+    expect(
+      useThreadStore.getState().threads.find((thread) => thread.id === "thread-1")?.status,
+    ).toBe("streaming");
+
+    await useChatStore.getState().setActiveThread("thread-2");
+
+    expect(useChatStore.getState().threadId).toBe("thread-2");
+    expect(
+      useThreadStore.getState().threads.find((thread) => thread.id === "thread-1")?.status,
+    ).toBe("streaming");
+
+    handlers.get("thread-1")?.({
+      type: "TurnCompleted",
+      status: "completed",
+    });
+
+    expect(
+      useThreadStore.getState().threads.find((thread) => thread.id === "thread-1")?.status,
+    ).toBe("completed");
+  });
+
+  it("clears a stale running thread cache before switching away from a completed transcript", async () => {
+    const threadOne = makeThread("thread-1", "streaming");
+    const threadTwo = makeThread("thread-2");
+    seedThreads(threadOne, threadTwo);
+    useChatStore.setState({
+      threadId: "thread-1",
+      status: "completed",
+      streaming: false,
+      unlisten: vi.fn(),
+    });
+
+    await useChatStore.getState().setActiveThread("thread-2");
+
+    expect(
+      useThreadStore.getState().threads.find((thread) => thread.id === "thread-1")?.status,
+    ).toBe("completed");
+  });
+
   it("notifies when a submitted turn is accepted into local chat state", async () => {
     const pendingRequest = deferred<string>();
     const onAccepted = vi.fn();
@@ -156,6 +250,70 @@ describe("chatStore send", () => {
     expect(state.streaming).toBe(false);
     expect(state.status).toBe("error");
     expect(state.messages).toEqual([]);
+  });
+
+  it("refuses a thread override that is not the currently bound transcript", async () => {
+    await expect(
+      useChatStore.getState().send("implement", {
+        threadIdOverride: "thread-2",
+        planMode: false,
+      }),
+    ).resolves.toBe(false);
+
+    expect(mockIpc.sendMessage).not.toHaveBeenCalled();
+    expect(useChatStore.getState().messages).toEqual([]);
+    expect(useChatStore.getState().error).toBe(
+      "Cannot send a turn to a thread that is not currently active",
+    );
+  });
+
+  it("persists and arms the exact plan mode sent to the backend", async () => {
+    mockIpc.sendMessage.mockResolvedValueOnce(undefined);
+
+    await expect(
+      useChatStore.getState().send("plan this", {
+        threadIdOverride: "thread-1",
+        planMode: true,
+      }),
+    ).resolves.toBe(true);
+
+    expect(useThreadPlanModeStore.getState().threadModes["thread-1"]).toBe("plan");
+    expect(mockPlanImplementationPromptState.arm).toHaveBeenCalledWith("thread-1");
+    expect(mockIpc.sendMessage).toHaveBeenCalledWith(
+      "thread-1",
+      "plan this",
+      null,
+      null,
+      null,
+      null,
+      true,
+      expect.any(String),
+    );
+  });
+
+  it("persists explicit default and clears stale plan handoff state", async () => {
+    mockIpc.sendMessage.mockResolvedValueOnce(undefined);
+    useThreadPlanModeStore.getState().setThreadMode("thread-1", "plan");
+
+    await expect(
+      useChatStore.getState().send("anything at all", {
+        threadIdOverride: "thread-1",
+        planMode: false,
+      }),
+    ).resolves.toBe(true);
+
+    expect(useThreadPlanModeStore.getState().threadModes["thread-1"]).toBe("default");
+    expect(mockPlanImplementationPromptState.disarm).toHaveBeenCalledWith("thread-1");
+    expect(mockIpc.sendMessage).toHaveBeenCalledWith(
+      "thread-1",
+      "anything at all",
+      null,
+      null,
+      null,
+      null,
+      false,
+      expect.any(String),
+    );
   });
 
   it("immediately clears streaming state and terminalizes retained assistant blocks on cancel", async () => {
@@ -2028,6 +2186,82 @@ describe("chatStore send", () => {
       });
     },
   );
+
+  it("reconciles a completed transcript over a stale streaming cache on project re-entry", async () => {
+    const thread = makeThread("thread-1", "streaming");
+    seedThreads(thread);
+    mockIpc.getThreadMessagesWindow.mockResolvedValueOnce({
+      messages: [
+        {
+          id: "user-completed-turn",
+          threadId: "thread-1",
+          role: "user",
+          content: "implement it",
+          blocks: [{ type: "text", content: "implement it" }],
+          status: "completed",
+          schemaVersion: 1,
+          createdAt: "2026-07-10T09:11:28.000Z",
+        },
+        {
+          id: "assistant-completed-turn",
+          threadId: "thread-1",
+          role: "assistant",
+          blocks: [{ type: "text", content: "Implemented." }],
+          status: "completed",
+          schemaVersion: 1,
+          createdAt: "2026-07-10T09:11:42.000Z",
+        },
+      ],
+      nextCursor: null,
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    expect(useChatStore.getState()).toMatchObject({
+      status: "completed",
+      streaming: false,
+    });
+    expect(
+      useThreadStore.getState().threads.find((item) => item.id === "thread-1")?.status,
+    ).toBe("completed");
+  });
+
+  it("preserves a genuinely pending local turn when re-entry only loads older terminal history", async () => {
+    const threadOne = makeThread("thread-1", "idle");
+    const threadTwo = makeThread("thread-2");
+    seedThreads(threadOne, threadTwo);
+    const pendingRequest = deferred<string>();
+    mockIpc.sendMessage.mockReturnValueOnce(pendingRequest.promise);
+    mockIpc.getThreadMessagesWindow
+      .mockResolvedValueOnce({ messages: [], nextCursor: null })
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            id: "older-terminal-assistant",
+            threadId: "thread-1",
+            role: "assistant",
+            blocks: [{ type: "text", content: "Previous turn" }],
+            status: "completed",
+            schemaVersion: 1,
+            createdAt: "2026-07-10T09:00:00.000Z",
+          },
+        ],
+        nextCursor: null,
+      });
+    useChatStore.setState({ unlisten: vi.fn() });
+
+    const sendPromise = useChatStore.getState().send("new pending turn");
+    await useChatStore.getState().setActiveThread("thread-2");
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    expect(useChatStore.getState()).toMatchObject({
+      status: "streaming",
+      streaming: true,
+    });
+
+    pendingRequest.resolve("backend-assistant-message");
+    await expect(sendPromise).resolves.toBe(true);
+  });
 
   it("does not let a late bind replace an active optimistic turn", async () => {
     const existingUnlisten = vi.fn();

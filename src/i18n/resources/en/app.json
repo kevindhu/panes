@@ -44,6 +44,7 @@
     "unreadThreadNotifications": "{{count}} unread thread notifications",
     "pendingApprovalThreadNotification": "Pending approval",
     "pendingApprovalThreadNotifications": "{{count}} pending approval notifications",
+    "planModeThread": "Plan mode active for this thread",
     "archiveThread": "Archive thread",
     "showMore": "Show {{count}} more",
     "archived": "Archived",

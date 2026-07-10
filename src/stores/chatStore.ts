@@ -1,7 +1,12 @@
 import { create } from "zustand";
 import { ipc, listenThreadEvents } from "../lib/ipc";
+import {
+  armPlanImplementationPrompt,
+  disarmPlanImplementationPrompt,
+} from "../lib/planImplementationPromptState";
 import { recordPerfMetric } from "../lib/perfTelemetry";
 import { useThreadStore } from "./threadStore";
+import { useThreadPlanModeStore } from "./threadPlanModeStore";
 import { toast } from "./toastStore";
 import type {
   ApprovalResponse,
@@ -117,6 +122,7 @@ interface PendingTurnMeta {
   turnReasoningEffort?: string | null;
   clientTurnId?: string | null;
   assistantMessageId?: string | null;
+  backendAccepted: boolean;
   startedAt: number;
   firstShellRecorded: boolean;
   firstContentRecorded: boolean;
@@ -130,6 +136,10 @@ interface AssistantMessageTarget {
 
 const pendingTurnMetaByThread = new Map<string, PendingTurnMeta>();
 const inflightActionOutputHydration = new Map<string, Promise<void>>();
+
+export function clearPendingTurnRuntimeForThread(threadId: string): void {
+  pendingTurnMetaByThread.delete(threadId);
+}
 
 function isCodexThreadSyncRequired(metadata: Record<string, unknown> | undefined): boolean {
   return metadata?.codexSyncRequired === true;
@@ -263,10 +273,23 @@ function syncThreadContextUsageCache(threadId: string, usage: ContextUsage | nul
 
 export function resetUsageLimitCachesForTests(): void {
   lastKnownCodexAccountUsageWindows = null;
+  pendingTurnMetaByThread.clear();
 }
 
 function isThreadTurnActive(status: ThreadStatus): boolean {
   return status === "streaming" || status === "awaiting_approval";
+}
+
+function threadStatusFromTurnCompletion(
+  event: Extract<StreamEvent, { type: "TurnCompleted" }>,
+): ThreadStatus {
+  if (event.status === "failed") {
+    return "error";
+  }
+  if (event.status === "interrupted") {
+    return "idle";
+  }
+  return "completed";
 }
 
 function applyRuntimeStateFromEvent(
@@ -1364,6 +1387,55 @@ function deriveRuntimeStateFromMessages(
   }
 
   return null;
+}
+
+function threadHasConfirmedRemoteTurn(thread: Thread | undefined): boolean {
+  return Boolean(
+    thread &&
+      isThreadTurnActive(thread.status) &&
+      thread.engineMetadata?.codexSyncRequired === true &&
+      thread.engineMetadata?.codexSyncReason === "remote thread has an active turn",
+  );
+}
+
+function resolveBoundThreadRuntimeState(
+  threadId: string,
+  thread: Thread | undefined,
+  messages: Message[],
+): Pick<ChatState, "status" | "streaming"> {
+  const pendingTurn = pendingTurnMetaByThread.get(threadId);
+  if (pendingTurn) {
+    if (!pendingTurn.backendAccepted) {
+      return { status: "streaming", streaming: true };
+    }
+
+    const persistedAssistant = pendingTurn.assistantMessageId
+      ? messages.find((message) => message.id === pendingTurn.assistantMessageId)
+      : undefined;
+    if (!persistedAssistant || persistedAssistant.status === "streaming") {
+      return { status: "streaming", streaming: true };
+    }
+
+    pendingTurnMetaByThread.delete(threadId);
+  }
+
+  if (threadHasConfirmedRemoteTurn(thread)) {
+    return {
+      status: thread?.status ?? "streaming",
+      streaming: true,
+    };
+  }
+
+  const messageRuntimeState = deriveRuntimeStateFromMessages(messages);
+  if (messageRuntimeState) {
+    return messageRuntimeState;
+  }
+
+  const status = thread?.status ?? "idle";
+  return {
+    status,
+    streaming: isThreadStatusStreaming(status),
+  };
 }
 
 function describeTurnCompletionSource(source?: TurnCompletionSource | null): string | null {
@@ -2573,6 +2645,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
     activeThreadBindSeq += 1;
     const bindSeq = activeThreadBindSeq;
 
+    if (currentThreadId && currentThreadId !== threadId) {
+      useThreadStore
+        .getState()
+        .setThreadStatusLocal(currentThreadId, get().status);
+    }
+
     // Tear down the current listener. If the thread was still streaming,
     // install a lightweight background listener that watches for TurnCompleted
     // so the thread status updates correctly when the user switches back.
@@ -2581,13 +2659,40 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
     if (currentThreadId && get().streaming) {
       cleanupBackgroundListener(currentThreadId);
+      let backgroundTurnFinished = false;
       listenThreadEvents(currentThreadId, (event) => {
+        if (event.type === "ApprovalRequested") {
+          useThreadStore
+            .getState()
+            .setThreadStatusLocal(currentThreadId, "awaiting_approval");
+          return;
+        }
+        if (event.type === "ApprovalResolved") {
+          useThreadStore.getState().setThreadStatusLocal(currentThreadId, "streaming");
+          return;
+        }
+        if (event.type === "Error" && !event.recoverable) {
+          backgroundTurnFinished = true;
+          pendingTurnMetaByThread.delete(currentThreadId);
+          useThreadStore.getState().setThreadStatusLocal(currentThreadId, "error");
+          cleanupBackgroundListener(currentThreadId);
+          return;
+        }
         if (event.type === "TurnCompleted") {
+          backgroundTurnFinished = true;
+          pendingTurnMetaByThread.delete(currentThreadId);
+          useThreadStore
+            .getState()
+            .setThreadStatusLocal(currentThreadId, threadStatusFromTurnCompletion(event));
           cleanupBackgroundListener(currentThreadId!);
         }
       }).then((unsub) => {
-        // If the user already switched back to this thread, don't register
-        if (useChatStore.getState().threadId === currentThreadId) {
+        // If the turn finished before listener registration settled, or the user
+        // already switched back to this thread, do not retain a stale listener.
+        if (
+          backgroundTurnFinished ||
+          useChatStore.getState().threadId === currentThreadId
+        ) {
           unsub();
           return;
         }
@@ -2749,6 +2854,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
           streamFlushInProgress = false;
         }
 
+        const currentRuntimeState = get();
+        if (currentRuntimeState.threadId === threadId) {
+          useThreadStore
+            .getState()
+            .setThreadStatusLocal(threadId, currentRuntimeState.status);
+        }
+
         if (usageUpdateSeen) {
           const currentState = useChatStore.getState();
           if (currentState.threadId === threadId) {
@@ -2841,7 +2953,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
         return;
       }
 
-      const threadStatus = activeThread?.status ?? "idle";
       const currentState = get();
       if (currentState.threadId === threadId && currentState.streaming) {
         if (currentState.unlisten) {
@@ -2866,6 +2977,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
         return;
       }
 
+      const latestActiveThread =
+        useThreadStore
+          .getState()
+          .threads.find((candidate) => candidate.id === threadId) ?? activeThread;
+      const boundRuntimeState = resolveBoundThreadRuntimeState(
+        threadId,
+        latestActiveThread,
+        messages,
+      );
+
       set({
         threadId,
         messages,
@@ -2875,16 +2996,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
         olderLoadBlockedUntil: 0,
         unlisten,
         error: undefined,
-        streaming: isThreadStatusStreaming(threadStatus),
-        status: threadStatus,
+        streaming: boundRuntimeState.streaming,
+        status: boundRuntimeState.status,
         usageLimits:
-          activeThread?.engineId === "codex"
+          latestActiveThread?.engineId === "codex"
             ? mergeUsageLimits(
-                contextUsageFromThreadMetadata(activeThread?.engineMetadata),
+                contextUsageFromThreadMetadata(latestActiveThread.engineMetadata),
                 lastKnownCodexAccountUsageWindows,
               )
             : null,
       });
+      useThreadStore
+        .getState()
+        .setThreadStatusLocal(threadId, boundRuntimeState.status);
     } catch (error) {
       if (bindSeq !== activeThreadBindSeq) {
         return;
@@ -2988,6 +3112,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set({ error: "No active thread selected" });
       return false;
     }
+    if (options?.threadIdOverride && options.threadIdOverride !== state.threadId) {
+      set({ error: "Cannot send a turn to a thread that is not currently active" });
+      return false;
+    }
     const startedAt = performance.now();
     const clientTurnId = crypto.randomUUID();
     const optimisticAssistantMessageId = crypto.randomUUID();
@@ -2997,6 +3125,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       turnReasoningEffort: options?.reasoningEffort ?? null,
       clientTurnId,
       assistantMessageId: optimisticAssistantMessageId,
+      backendAccepted: false,
       startedAt,
       firstShellRecorded: false,
       firstContentRecorded: false,
@@ -3006,6 +3135,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const attachments = options?.attachments ?? [];
     const inputItems = options?.inputItems ?? [];
     const planMode = options?.planMode ?? false;
+    useThreadPlanModeStore
+      .getState()
+      .setThreadMode(threadId, planMode ? "plan" : "default");
+    if (planMode) {
+      armPlanImplementationPrompt(threadId);
+    } else {
+      disarmPlanImplementationPrompt(threadId);
+    }
     const userMessage = createOptimisticUserMessage(threadId, message, {
       attachments,
       inputItems,
@@ -3026,11 +3163,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
       streaming: true,
       error: undefined
     }));
+    useThreadStore.getState().setThreadStatusLocal(threadId, "streaming");
     notifyTurnAccepted(options?.onAccepted);
     schedulePendingTurnShellMetric(threadId, clientTurnId);
 
     try {
-      await ipc.sendMessage(
+      const backendAssistantMessageId = await ipc.sendMessage(
         threadId,
         message,
         options?.modelId ?? null,
@@ -3040,8 +3178,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
         planMode,
         clientTurnId,
       );
+      const pendingTurn = pendingTurnMetaByThread.get(threadId);
+      if (pendingTurn?.clientTurnId === clientTurnId) {
+        pendingTurn.backendAccepted = true;
+        if (
+          typeof backendAssistantMessageId === "string" &&
+          backendAssistantMessageId.trim().length > 0
+        ) {
+          pendingTurn.assistantMessageId = backendAssistantMessageId;
+        }
+      }
       return true;
     } catch (error) {
+      if (planMode) {
+        disarmPlanImplementationPrompt(threadId);
+      }
       pendingTurnMetaByThread.delete(threadId);
       set((state) => ({
         messages: state.messages.filter(
@@ -3051,6 +3202,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         streaming: false,
         error: String(error),
       }));
+      useThreadStore.getState().setThreadStatusLocal(threadId, "error");
       return false;
     }
   },
@@ -3118,6 +3270,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       streaming: false,
       messages: cancelActiveAssistantMessage(state.messages),
     }));
+    useThreadStore.getState().setThreadStatusLocal(threadId, "idle");
 
     try {
       await ipc.cancelTurn(threadId);
@@ -3155,6 +3308,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         streaming: nextRuntimeState?.streaming ?? state.streaming,
       };
     });
+    useThreadStore
+      .getState()
+      .setThreadStatusLocal(threadId, get().status);
 
     try {
       await ipc.respondApproval(threadId, approvalId, response);
@@ -3166,6 +3322,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         streaming: previousState.streaming,
         error: String(error),
       });
+      useThreadStore
+        .getState()
+        .setThreadStatusLocal(threadId, previousState.status);
     }
   },
   hydrateActionOutput: async (messageId, actionId) => {

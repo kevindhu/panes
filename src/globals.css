@@ -4050,6 +4050,12 @@ button, input, textarea, select {
   animation-delay: 0.3s;
 }
 
+.sb-thread-plan-indicator {
+  display: inline-flex;
+  color: var(--accent-2);
+  flex-shrink: 0;
+}
+
 .sb-thread-notification-dot {
   width: 7px;
   height: 7px;

@@ -1165,7 +1165,7 @@ pub async fn send_message(
         );
     }
 
-    let assistant_message = match run_db(db.clone(), {
+    let (assistant_message, streaming_thread) = match run_db(db.clone(), {
         let thread_id = thread.id.clone();
         let message = message.clone();
         let attachments = attachments.clone();
@@ -1199,17 +1199,28 @@ pub async fn send_message(
                 reasoning_effort.as_deref(),
             )?;
             db::threads::update_thread_status(db, &thread_id, ThreadStatusDto::Streaming)?;
-            Ok(assistant_message)
+            let streaming_thread = db::threads::get_thread(db, &thread_id)?
+                .ok_or_else(|| anyhow::anyhow!("thread not found after turn start: {thread_id}"))?;
+            Ok((assistant_message, streaming_thread))
         }
     })
     .await
     {
-        Ok(assistant_message) => assistant_message,
+        Ok(result) => result,
         Err(error) => {
             state.turns.finish(&thread.id).await;
             return Err(error);
         }
     };
+
+    let _ = app.emit(
+        "thread-updated",
+        ThreadUpdatedEvent {
+            thread_id: streaming_thread.id.clone(),
+            workspace_id: streaming_thread.workspace_id.clone(),
+            thread: Some(streaming_thread),
+        },
+    );
 
     let state_cloned = state.inner().clone();
     let app_handle = app.clone();

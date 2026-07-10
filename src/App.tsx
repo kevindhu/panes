@@ -19,13 +19,17 @@ import { useWorkspaceStore } from "./stores/workspaceStore";
 import { useEngineStore } from "./stores/engineStore";
 import { useUiStore } from "./stores/uiStore";
 import { useThreadStore } from "./stores/threadStore";
-import { useChatStore } from "./stores/chatStore";
+import {
+  clearPendingTurnRuntimeForThread,
+  useChatStore,
+} from "./stores/chatStore";
 import { useGitStore } from "./stores/gitStore";
 import { useTerminalStore, collectSessionIds } from "./stores/terminalStore";
 import { useFileStore } from "./stores/fileStore";
 import { useKeepAwakeStore } from "./stores/keepAwakeStore";
 import { useTerminalNotificationSettingsStore } from "./stores/terminalNotificationSettingsStore";
 import { useThreadNotificationStore } from "./stores/threadNotificationStore";
+import { useThreadPlanModeStore } from "./stores/threadPlanModeStore";
 import { useWorkspacePaneStore } from "./stores/workspacePaneStore";
 import { toast } from "./stores/toastStore";
 import type { ChatEngineId, Message, RuntimeToast, Thread } from "./types";
@@ -469,6 +473,7 @@ export function App() {
   const threads = useThreadStore((s) => s.threads);
   const activeThreadId = useThreadStore((s) => s.activeThreadId);
   const threadLoading = useThreadStore((s) => s.loading);
+  const threadLoadError = useThreadStore((s) => s.error);
   const startupRestorePending = useThreadStore((s) => s.startupRestorePending);
   const setStartupRestorePending = useThreadStore((s) => s.setStartupRestorePending);
   const commandPaletteOpen = useUiStore((s) => s.commandPaletteOpen);
@@ -481,6 +486,7 @@ export function App() {
     activeWorkspaceId ? state.workspaces[activeWorkspaceId] ?? null : null,
   );
   const pruneThreadNotifications = useThreadNotificationStore((s) => s.pruneThreadNotifications);
+  const pruneThreadPlanModes = useThreadPlanModeStore((s) => s.pruneThreadModes);
   const customWindowFrame = usesCustomWindowFrame();
   const customWindowFrameState = useCustomWindowFrameState();
   const startupRestoreAttemptedRef = useRef(false);
@@ -497,13 +503,17 @@ export function App() {
   }, [workspaces, refreshAllThreads]);
 
   useEffect(() => {
-    if (startupRestorePending || workspaceLoading || threadLoading) {
+    if (startupRestorePending || workspaceLoading || threadLoading || threadLoadError) {
       return;
     }
-    pruneThreadNotifications(threads.map((thread) => thread.id));
+    const validThreadIds = threads.map((thread) => thread.id);
+    pruneThreadNotifications(validThreadIds);
+    pruneThreadPlanModes(validThreadIds);
   }, [
     pruneThreadNotifications,
+    pruneThreadPlanModes,
     startupRestorePending,
+    threadLoadError,
     threadLoading,
     threads,
     workspaceLoading,
@@ -693,6 +703,24 @@ export function App() {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void listenChatTurnFinished(async (event) => {
+      clearPendingTurnRuntimeForThread(event.threadId);
+      const threadStore = useThreadStore.getState();
+      const currentThread = threadStore.threads.find(
+        (thread) => thread.id === event.threadId,
+      );
+      const awaitingApproval =
+        currentThread?.status === "awaiting_approval" ||
+        loadedChatThreadHasPendingApproval(event.threadId);
+      const finishedStatus =
+        event.status === "interrupted"
+          ? "idle"
+          : event.status === "error"
+            ? "error"
+            : awaitingApproval
+              ? "awaiting_approval"
+              : "completed";
+      threadStore.setThreadStatusLocal(event.threadId, finishedStatus);
+
       if (event.status === "interrupted") {
         return;
       }
