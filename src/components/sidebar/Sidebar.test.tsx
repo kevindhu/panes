@@ -478,6 +478,25 @@ describe("Sidebar thread context menu", () => {
     expect(container.querySelector(".sb-project-notification-badge-pending-approval")).not.toBeNull();
   });
 
+  it("shows a terminal warning badge for an interrupted background turn", async () => {
+    threadNotificationState.notificationsByThreadId = {
+      [codexThread.id]: {
+        workspaceId: codexThread.workspaceId,
+        status: "interrupted",
+      },
+    };
+
+    await renderSidebar();
+
+    const row = findThreadRow("Codex conversation");
+    const badge = row?.querySelector(".sb-thread-notification-dot-interrupted");
+    expect(badge).not.toBeNull();
+    expect(badge?.getAttribute("aria-label")).toBe(
+      "app:sidebar.interruptedThreadNotification",
+    );
+    expect(container.querySelector(".sb-project-notification-badge")?.textContent).toBe("1");
+  });
+
   it("shows plan mode only on the thread that owns it", async () => {
     threadPlanModeState.threadModes = {
       [codexThread.id]: "plan",

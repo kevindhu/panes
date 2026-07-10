@@ -120,6 +120,9 @@ function resolveChatNotificationBody(
   status: "completed" | "interrupted" | "error" | "attention" | "plan_ready",
   preview?: string | null,
 ): string {
+  if (status === "interrupted") {
+    return t("app:notificationSettings.chatNotificationFallbackInterrupted");
+  }
   const normalizedPreview = preview?.trim();
   if (normalizedPreview) {
     return normalizedPreview;
@@ -729,10 +732,6 @@ export function App() {
               ? "awaiting_approval"
               : "completed";
       threadStore.setThreadStatusLocal(event.threadId, finishedStatus);
-
-      if (event.status === "interrupted") {
-        return;
-      }
 
       const eventThread = useThreadStore
         .getState()

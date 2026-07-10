@@ -67,13 +67,25 @@ describe("threadNotificationStore", () => {
     expect(countWorkspaceThreadNotifications(notifications, "ws-1")).toBe(2);
   });
 
-  it("ignores interrupted turns", () => {
+  it("records interrupted turns as terminal notifications", () => {
     useThreadNotificationStore.getState().markThreadFinished({
       ...completedEvent,
+      threadStatus: "idle",
       status: "interrupted",
+      preview: null,
     });
 
-    expect(useThreadNotificationStore.getState().notificationsByThreadId).toEqual({});
+    expect(useThreadNotificationStore.getState().notificationsByThreadId["thread-1"])
+      .toMatchObject({
+        threadId: "thread-1",
+        workspaceId: "ws-1",
+        status: "interrupted",
+        preview: null,
+      });
+    expect(countWorkspaceThreadNotifications(
+      useThreadNotificationStore.getState().notificationsByThreadId,
+      "ws-1",
+    )).toBe(1);
   });
 
   it("records attention-needed threads", () => {

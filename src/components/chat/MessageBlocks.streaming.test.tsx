@@ -95,5 +95,62 @@ describe("MessageBlocks streaming text", () => {
 
     const renderedMarkdown = container.querySelector("[data-markdown-streaming]");
     expect(renderedMarkdown?.getAttribute("data-markdown-streaming")).toBe("true");
+    expect(container.textContent).toContain("Turn still open");
+  });
+
+  it.each([
+    ["completed", "Turn completed", "The turn reached a terminal completion."],
+    ["interrupted", "Turn interrupted", "The turn ended before a normal completion."],
+    ["error", "Turn failed", "The turn ended with an error."],
+  ] as const)(
+    "shows a %s terminal card for legacy messages without a status notice",
+    async (status, title, message) => {
+      const blocks: ContentBlock[] = [
+        { type: "text", content: "Response stored before terminal notices were persisted" },
+      ];
+
+      await act(async () => {
+        root.render(
+          <MessageBlocks
+            blocks={blocks}
+            status={status}
+            engineId="codex"
+            onApproval={vi.fn()}
+            onLoadActionOutput={vi.fn(async () => undefined)}
+          />,
+        );
+      });
+
+      expect(container.textContent).toContain(title);
+      expect(container.textContent).toContain(message);
+    },
+  );
+
+  it("keeps a persisted terminal notice authoritative over the compatibility fallback", async () => {
+    const blocks: ContentBlock[] = [
+      {
+        type: "notice",
+        kind: "turn_status",
+        level: "warning",
+        title: "Persisted terminal outcome",
+        message: "Loaded from the backend snapshot.",
+        status: "interrupted",
+      },
+    ];
+
+    await act(async () => {
+      root.render(
+        <MessageBlocks
+          blocks={blocks}
+          status="interrupted"
+          engineId="codex"
+          onApproval={vi.fn()}
+          onLoadActionOutput={vi.fn(async () => undefined)}
+        />,
+      );
+    });
+
+    expect(container.textContent).toContain("Persisted terminal outcome");
+    expect(container.textContent).not.toContain("The turn ended before a normal completion.");
   });
 });

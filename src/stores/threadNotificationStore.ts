@@ -4,7 +4,12 @@ import type { Thread } from "../types";
 
 const THREAD_NOTIFICATION_STORAGE_KEY = "panes:threadNotifications:v1";
 
-export type ThreadNotificationStatus = "completed" | "error" | "attention" | "pending_approval";
+export type ThreadNotificationStatus =
+  | "completed"
+  | "interrupted"
+  | "error"
+  | "attention"
+  | "pending_approval";
 
 export interface ThreadNotificationRecord {
   threadId: string;
@@ -38,6 +43,7 @@ function normalizeStoredNotification(value: unknown): ThreadNotificationRecord |
   const workspaceId = typeof value.workspaceId === "string" ? value.workspaceId : "";
   const status =
     value.status === "completed" ||
+    value.status === "interrupted" ||
     value.status === "error" ||
     value.status === "attention" ||
     value.status === "pending_approval"
@@ -99,10 +105,6 @@ function persistThreadNotifications(
 }
 
 function createNotificationRecord(event: ChatTurnFinishedEvent): ThreadNotificationRecord | null {
-  if (event.status === "interrupted") {
-    return null;
-  }
-
   return {
     threadId: event.threadId,
     workspaceId: event.workspaceId,

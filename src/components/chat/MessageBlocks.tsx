@@ -522,7 +522,10 @@ function ThinkingBlockView({
   );
 }
 
-function buildLiveTurnStatusNotice(blocks: ContentBlock[]): NoticeBlock {
+function buildFallbackTurnStatusNotice(
+  blocks: ContentBlock[],
+  status: MessageStatus,
+): NoticeBlock {
   let actionsTotal = 0;
   let actionsDone = 0;
   let actionsError = 0;
@@ -586,17 +589,58 @@ function buildLiveTurnStatusNotice(blocks: ContentBlock[]): NoticeBlock {
     details.push("No tool, approval, diff, or error activity has been recorded yet.");
   }
 
-  const awaitingApproval = approvalsPending > 0;
+  if (approvalsPending > 0) {
+    return {
+      type: "notice",
+      kind: "turn_status",
+      level: "warning",
+      title: status === "streaming" ? "Waiting for approval" : "Approval still pending",
+      message:
+        status === "streaming"
+          ? "Waiting for approval before the turn can continue."
+          : "The turn reached a terminal state while an approval was still unresolved.",
+      details,
+      status: "awaiting_approval",
+    };
+  }
+
+  const terminalPresentation =
+    status === "completed"
+      ? {
+          level: "info" as const,
+          title: "Turn completed",
+          message: "The turn reached a terminal completion.",
+          noticeStatus: "completed",
+        }
+      : status === "interrupted"
+        ? {
+            level: "warning" as const,
+            title: "Turn interrupted",
+            message: "The turn ended before a normal completion.",
+            noticeStatus: "interrupted",
+          }
+        : status === "error"
+          ? {
+              level: "error" as const,
+              title: "Turn failed",
+              message: "The turn ended with an error.",
+              noticeStatus: "failed",
+            }
+          : {
+              level: "info" as const,
+              title: "Turn still open",
+              message: "No terminal completion event has been recorded yet.",
+              noticeStatus: "streaming",
+            };
+
   return {
     type: "notice",
     kind: "turn_status",
-    level: awaitingApproval ? "warning" : "info",
-    title: awaitingApproval ? "Waiting for approval" : "Turn still open",
-    message: awaitingApproval
-      ? "Waiting for approval before the turn can continue."
-      : "No terminal completion event has been recorded yet.",
+    level: terminalPresentation.level,
+    title: terminalPresentation.title,
+    message: terminalPresentation.message,
     details,
-    status: awaitingApproval ? "awaiting_approval" : "streaming",
+    status: terminalPresentation.noticeStatus,
   };
 }
 
@@ -1974,11 +2018,11 @@ function MessageBlocksView({
     const hasTurnStatus = safeBlocks.some(
       (block) => block.type === "notice" && block.kind === "turn_status",
     );
-    if (!isStreaming || hasTurnStatus) {
+    if (hasTurnStatus || !status) {
       return safeBlocks;
     }
-    return [...safeBlocks, buildLiveTurnStatusNotice(safeBlocks)];
-  }, [isStreaming, safeBlocks]);
+    return [...safeBlocks, buildFallbackTurnStatusNotice(safeBlocks, status)];
+  }, [safeBlocks, status]);
   const blockSegments = useMemo(
     () => buildBlockSegments(renderedBlocks, isStreaming),
     [renderedBlocks, isStreaming],

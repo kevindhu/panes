@@ -938,6 +938,8 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                           const hasNotification = Boolean(threadNotification);
                           const hasPendingApprovalNotification =
                             threadNotification?.status === "pending_approval";
+                          const hasInterruptedNotification =
+                            threadNotification?.status === "interrupted";
                           const hasPlanMode = threadPlanModes[thread.id] === "plan";
                           return (
                             <div
@@ -978,15 +980,19 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                                 )}
                                 {hasNotification && (
                                   <span
-                                    className={`sb-thread-notification-dot${hasPendingApprovalNotification ? " sb-thread-notification-dot-pending-approval" : ""}`}
+                                    className={`sb-thread-notification-dot${hasPendingApprovalNotification ? " sb-thread-notification-dot-pending-approval" : ""}${hasInterruptedNotification ? " sb-thread-notification-dot-interrupted" : ""}`}
                                     title={t(
                                       hasPendingApprovalNotification
                                         ? "app:sidebar.pendingApprovalThreadNotification"
+                                        : hasInterruptedNotification
+                                          ? "app:sidebar.interruptedThreadNotification"
                                         : "app:sidebar.unreadThreadNotification",
                                     )}
                                     aria-label={t(
                                       hasPendingApprovalNotification
                                         ? "app:sidebar.pendingApprovalThreadNotification"
+                                        : hasInterruptedNotification
+                                          ? "app:sidebar.interruptedThreadNotification"
                                         : "app:sidebar.unreadThreadNotification",
                                     )}
                                   />

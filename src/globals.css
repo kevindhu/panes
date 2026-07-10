@@ -4070,6 +4070,11 @@ button, input, textarea, select {
   box-shadow: 0 0 0 3px rgba(251, 191, 36, 0.22);
 }
 
+.sb-thread-notification-dot-interrupted {
+  background: var(--warning);
+  box-shadow: 0 0 0 3px rgba(251, 191, 36, 0.22);
+}
+
 .sb-thread-trailing {
   display: grid;
   justify-items: end;
