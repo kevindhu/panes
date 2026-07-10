@@ -24,6 +24,19 @@ describe("MarkdownContent", () => {
     expect(html).toContain('href="https://example.com"');
     expect(html).not.toContain("**bold**");
   });
+
+  it("defers markdown parsing for very large streaming content", () => {
+    const content = `${"streaming ".repeat(700)}**bold**`;
+    const html = renderToStaticMarkup(
+      <MarkdownContent
+        content={content}
+        streaming
+      />,
+    );
+
+    expect(html).toContain("**bold**");
+    expect(html).not.toContain("<strong>bold</strong>");
+  });
 });
 
 describe("shouldRenderMarkdownWorkerPlaceholder", () => {
