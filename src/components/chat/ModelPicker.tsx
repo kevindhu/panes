@@ -251,6 +251,7 @@ function shortEffortLabel(t: TFunction<"chat">, effort: string): string {
     case "high": return t("modelPicker.effort.highShort");
     case "xhigh": return t("modelPicker.effort.xhighShort");
     case "max": return t("modelPicker.effort.maxShort");
+    case "ultra": return t("modelPicker.effort.ultraShort");
     default: return effort.charAt(0).toUpperCase() + effort.slice(1);
   }
 }
@@ -264,6 +265,7 @@ function effortDisplayLabel(t: TFunction<"chat">, effort: string): string {
     case "high": return t("modelPicker.effort.high");
     case "xhigh": return t("modelPicker.effort.xhigh");
     case "max": return t("modelPicker.effort.max");
+    case "ultra": return t("modelPicker.effort.ultra");
     default: return effort.charAt(0).toUpperCase() + effort.slice(1);
   }
 }

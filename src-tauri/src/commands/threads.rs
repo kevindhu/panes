@@ -19,7 +19,8 @@ use crate::{
     engines::ThreadSyncSnapshot,
     models::{
         CodexRemoteThreadDto, CodexRemoteThreadPageDto, MessageStatusDto, OpenCodeRemoteSessionDto,
-        OpenCodeRemoteSessionPageDto, RepoDto, ThreadDto, ThreadStatusDto, TrustLevelDto,
+        OpenCodeRemoteSessionPageDto, ReasoningEffortOptionDto, RepoDto, ThreadDto,
+        ThreadStatusDto, TrustLevelDto,
     },
     state::AppState,
 };
@@ -2458,42 +2459,59 @@ async fn validate_reasoning_effort(
     model_id: &str,
     requested_effort: &str,
 ) -> Result<String, String> {
-    const KNOWN_REASONING_EFFORTS: &[&str] =
-        &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
-    if !KNOWN_REASONING_EFFORTS.contains(&requested_effort) {
-        return Err(format!(
-            "invalid reasoning effort `{requested_effort}`. expected one of: {}",
-            KNOWN_REASONING_EFFORTS.join(", ")
-        ));
-    }
-
     if let Ok(engines) = state.engines.list_engines().await {
         if let Some(engine) = engines.iter().find(|engine| engine.id == engine_id) {
             if let Some(model) = engine.models.iter().find(|model| model.id == model_id) {
-                if let Some(option) = model
-                    .supported_reasoning_efforts
-                    .iter()
-                    .find(|option| option.reasoning_effort == requested_effort)
-                {
-                    return Ok(option.reasoning_effort.clone());
-                }
-
-                let supported = model
-                    .supported_reasoning_efforts
-                    .iter()
-                    .map(|option| option.reasoning_effort.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-
-                return Err(format!(
-                    "reasoning effort `{requested_effort}` is not supported by model `{}`. supported values: {}",
-                    model.id, supported
-                ));
+                return validate_reasoning_effort_for_model(
+                    &model.id,
+                    &model.supported_reasoning_efforts,
+                    requested_effort,
+                );
             }
         }
     }
 
+    validate_known_reasoning_effort(requested_effort)?;
     Ok(requested_effort.to_string())
+}
+
+fn validate_reasoning_effort_for_model(
+    model_id: &str,
+    supported_efforts: &[ReasoningEffortOptionDto],
+    requested_effort: &str,
+) -> Result<String, String> {
+    if let Some(option) = supported_efforts
+        .iter()
+        .find(|option| option.reasoning_effort == requested_effort)
+    {
+        return Ok(option.reasoning_effort.clone());
+    }
+
+    validate_known_reasoning_effort(requested_effort)?;
+
+    let supported = supported_efforts
+        .iter()
+        .map(|option| option.reasoning_effort.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    Err(format!(
+        "reasoning effort `{requested_effort}` is not supported by model `{model_id}`. supported values: {supported}"
+    ))
+}
+
+fn validate_known_reasoning_effort(requested_effort: &str) -> Result<(), String> {
+    const KNOWN_REASONING_EFFORTS: &[&str] = &[
+        "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+    ];
+    if KNOWN_REASONING_EFFORTS.contains(&requested_effort) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "invalid reasoning effort `{requested_effort}`. expected one of: {}",
+        KNOWN_REASONING_EFFORTS.join(", ")
+    ))
 }
 
 async fn validate_model_for_thread_engine(
@@ -3732,7 +3750,10 @@ mod tests {
             "allow"
         );
         assert!(allow_network_for_trust_level(&TrustLevelDto::Restricted));
-        assert_eq!(default_sandbox_mode_for_engine("codex"), "danger-full-access");
+        assert_eq!(
+            default_sandbox_mode_for_engine("codex"),
+            "danger-full-access"
+        );
         assert_eq!(default_sandbox_mode_for_engine("claude"), "workspace-write");
     }
 
@@ -4379,6 +4400,28 @@ mod tests {
         .expect_err("expected invalid effort to be rejected");
 
         assert!(error.contains("invalid reasoning effort `turbo`"));
+    }
+
+    #[test]
+    fn validate_reasoning_effort_for_model_accepts_catalog_provided_future_effort() {
+        let supported = vec![ReasoningEffortOptionDto {
+            reasoning_effort: "solar".to_string(),
+            description: "Preview reasoning mode".to_string(),
+        }];
+
+        assert_eq!(
+            validate_reasoning_effort_for_model("gpt-preview", &supported, "solar")
+                .expect("catalog-provided effort should be accepted"),
+            "solar"
+        );
+    }
+
+    #[test]
+    fn validate_known_reasoning_effort_rejects_unknown_without_catalog_match() {
+        let error = validate_known_reasoning_effort("solar")
+            .expect_err("unknown effort should be rejected without model catalog support");
+
+        assert!(error.contains("invalid reasoning effort `solar`"));
     }
 
     #[tokio::test]
