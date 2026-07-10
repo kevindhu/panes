@@ -1932,8 +1932,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const renderStartedAtRef = useRef(performance.now());
   renderStartedAtRef.current = performance.now();
 
-  const [input, setInput] = useState("");
+  const inputValueRef = useRef("");
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const inputHasTextRef = useRef(false);
+  const [inputHasText, setInputHasText] = useState(false);
   const inputHistoryRef = useRef<string[]>([]);
   const inputHistCursorRef = useRef(-1);
   const inputLiveDraftRef = useRef("");
@@ -1977,6 +1979,27 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   );
   const [editingMessageDraft, setEditingMessageDraft] = useState<EditingMessageDraft | null>(null);
   const [editingMessageBusy, setEditingMessageBusy] = useState(false);
+
+  const updateInputHasText = useCallback((value: string) => {
+    const nextHasText = value.trim().length > 0;
+    if (inputHasTextRef.current === nextHasText) {
+      return;
+    }
+
+    inputHasTextRef.current = nextHasText;
+    setInputHasText(nextHasText);
+  }, []);
+
+  const setInput = useCallback(
+    (value: string) => {
+      inputValueRef.current = value;
+      if (inputRef.current && inputRef.current.value !== value) {
+        inputRef.current.value = value;
+      }
+      updateInputHasText(value);
+    },
+    [updateInputHasText],
+  );
   const {
     messages,
     status,
@@ -2715,7 +2738,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       setInput("");
       setAttachments([]);
     },
-    [recordSubmittedInput],
+    [recordSubmittedInput, setInput],
   );
 
   const restoreAcceptedComposerSubmission = useCallback(
@@ -2724,7 +2747,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       setInput(draft.text);
       setAttachments(draft.attachments);
     },
-    [],
+    [setInput],
   );
 
   const canRestoreAcceptedComposerSubmission = useCallback(() => {
@@ -2738,7 +2761,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       setAttachments(draft.attachments);
       setPlanMode(draft.planMode);
     },
-    [],
+    [setInput],
   );
 
   const sendPreparedTurn = useCallback(
@@ -5022,8 +5045,8 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
-    if (!input.trim() || !activeWorkspaceId) return;
-    const text = input.trim();
+    const text = inputValueRef.current.trim();
+    if (!text || !activeWorkspaceId) return;
     const currentAttachments = [...attachments];
 
     if (streaming) {
@@ -6750,10 +6773,11 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                 <textarea
                   ref={inputRef}
                   rows={3}
-                  value={input}
+                  defaultValue={inputValueRef.current}
                   onChange={(e) => {
                     inputHistCursorRef.current = -1;
-                    setInput(e.target.value);
+                    inputValueRef.current = e.target.value;
+                    updateInputHasText(e.target.value);
                     handleSlashDetection(
                       e.target.value,
                       e.target.selectionStart ?? e.target.value.length,
@@ -6800,7 +6824,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                       e.preventDefault();
                       if (e.key === "ArrowUp") {
                         if (inputHistCursorRef.current === -1) {
-                          inputLiveDraftRef.current = input;
+                          inputLiveDraftRef.current = inputValueRef.current;
                         }
                         const next = Math.min(inputHistCursorRef.current + 1, history.length - 1);
                         inputHistCursorRef.current = next;
@@ -7136,7 +7160,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                 {(!streaming || canSteerActiveTurn) && !showSpecialInputComposer && (
                 <button
                   type="submit"
-                  disabled={!activeWorkspaceId || !input.trim()}
+                  disabled={!activeWorkspaceId || !inputHasText}
                   title={streaming ? t("panel.sendFollowUp") : undefined}
                   aria-label={streaming ? t("panel.sendFollowUp") : undefined}
                   style={{
@@ -7144,20 +7168,20 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                     height: 30,
                     borderRadius: "50%",
                     background:
-                      activeWorkspaceId && input.trim()
+                      activeWorkspaceId && inputHasText
                         ? "var(--accent)"
                         : "var(--bg-4)",
                     color:
-                      activeWorkspaceId && input.trim()
+                      activeWorkspaceId && inputHasText
                         ? "var(--bg-0)"
                         : "var(--text-3)",
-                    cursor: activeWorkspaceId && input.trim() ? "pointer" : "default",
+                    cursor: activeWorkspaceId && inputHasText ? "pointer" : "default",
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "center",
                     transition: "all var(--duration-fast) var(--ease-out)",
                     boxShadow:
-                      activeWorkspaceId && input.trim()
+                      activeWorkspaceId && inputHasText
                         ? "var(--accent-glow)"
                         : "none",
                   }}
