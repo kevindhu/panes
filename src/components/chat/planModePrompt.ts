@@ -6,6 +6,29 @@ export function getPlanImplementationCodingMessage(engineId?: string | null): st
     : "Implement the plan.";
 }
 
+export type PlanImplementationDecision = "implement" | "stay";
+
+export function resolvePlanImplementationDecision(
+  selectedAnswer: string | null | undefined,
+  implementChoice: string,
+  stayChoice: string,
+): PlanImplementationDecision | null {
+  const selected = selectedAnswer?.trim();
+  const implement = implementChoice.trim();
+  const stay = stayChoice.trim();
+
+  if (!selected || !implement || !stay || implement === stay) {
+    return null;
+  }
+  if (selected === implement) {
+    return "implement";
+  }
+  if (selected === stay) {
+    return "stay";
+  }
+  return null;
+}
+
 const STRUCTURED_PLAN_LINE_PATTERN =
   /(^|\n)- \[(?:pending|in_progress|inProgress|completed)\] /;
 const GENERIC_PLAN_LIST_PATTERN = /(^|\n)(?:[-*]|\d+\.)\s+\S+/g;

@@ -29,6 +29,10 @@ export async function createAndActivateWorkspaceThread(
 
   useUiStore.getState().setActiveView("chat");
 
+  // New Chat is an explicit scope. Clear the previous session before any
+  // workspace or creation awaits so its composer state cannot bleed through.
+  await activateThreadContext(null);
+
   if (activeWorkspaceId !== workspaceId) {
     await workspaceStore.setActiveWorkspace(workspaceId);
   }

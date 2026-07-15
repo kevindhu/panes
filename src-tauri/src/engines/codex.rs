@@ -2730,34 +2730,34 @@ impl CodexEngine {
         runtime: Option<&ThreadRuntime>,
         input: &TurnInput,
     ) -> PlanModeActivation {
-        if !input.plan_mode {
-            return if runtime
-                .map(|thread_runtime| thread_runtime.native_plan_mode_active)
-                .unwrap_or(false)
-            {
-                PlanModeActivation::NativeCollaboration
-            } else {
-                PlanModeActivation::Disabled
-            };
-        }
+        let native_plan_mode_was_active = runtime
+            .map(|thread_runtime| thread_runtime.native_plan_mode_active)
+            .unwrap_or(false);
 
         let cached_diagnostics = {
             let state = self.state.lock().await;
             state.protocol_diagnostics.clone()
         };
 
+        let mut advertised_activation = None;
         if let Some(diagnostics) = cached_diagnostics.as_ref() {
             if !diagnostics.stale {
-                if let Some(activation) = plan_mode_activation_from_diagnostics(Some(diagnostics)) {
-                    return activation;
-                }
+                advertised_activation = plan_mode_activation_from_diagnostics(Some(diagnostics));
             }
         }
 
-        let refreshed_diagnostics = self.protocol_diagnostics_snapshot().await;
-        plan_mode_activation_from_diagnostics(refreshed_diagnostics.as_ref())
-            .or_else(|| plan_mode_activation_from_diagnostics(cached_diagnostics.as_ref()))
-            .unwrap_or(PlanModeActivation::NativeCollaboration)
+        if advertised_activation.is_none() {
+            let refreshed_diagnostics = self.protocol_diagnostics_snapshot().await;
+            advertised_activation =
+                plan_mode_activation_from_diagnostics(refreshed_diagnostics.as_ref())
+                    .or_else(|| plan_mode_activation_from_diagnostics(cached_diagnostics.as_ref()));
+        }
+
+        resolve_requested_plan_mode_activation(
+            input.plan_mode,
+            native_plan_mode_was_active,
+            advertised_activation,
+        )
     }
 
     async fn unsupported_external_auth_tokens_message(&self) -> Option<String> {
@@ -4109,6 +4109,33 @@ fn plan_mode_activation_from_diagnostics(
             PlanModeActivation::PromptPrefix
         }),
         None => None,
+    }
+}
+
+fn resolve_requested_plan_mode_activation(
+    plan_mode: bool,
+    native_plan_mode_was_active: bool,
+    advertised_activation: Option<PlanModeActivation>,
+) -> PlanModeActivation {
+    if plan_mode {
+        return advertised_activation.unwrap_or(PlanModeActivation::NativeCollaboration);
+    }
+
+    // The UI's normal-mode state is an explicit contract for the next turn. Do not
+    // omit `collaborationMode: default` merely because this process lost its
+    // in-memory native-plan flag while resuming an otherwise live Codex thread.
+    if native_plan_mode_was_active
+        || matches!(
+            advertised_activation,
+            Some(PlanModeActivation::NativeCollaboration)
+        )
+        || advertised_activation.is_none()
+    {
+        PlanModeActivation::NativeCollaboration
+    } else {
+        // Prompt-guided plan mode has no native server state to reset. A normal
+        // unprefixed turn is therefore the explicit default-mode request.
+        PlanModeActivation::Disabled
     }
 }
 
@@ -7766,6 +7793,73 @@ mod tests {
         assert_eq!(
             payload[0].get("text").and_then(Value::as_str),
             Some(handoff_message)
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_turn_forces_default_mode_after_resuming_with_a_stale_false_flag() {
+        let runtime = ThreadRuntime {
+            cwd: "/tmp/workspace".to_string(),
+            model_id: "gpt-5.4".to_string(),
+            approval_policy: json!("on-request"),
+            permission_profile: None,
+            approvals_reviewer: None,
+            sandbox_policy: json!({
+                "type": "workspaceWrite",
+                "writableRoots": ["/tmp/workspace"],
+                "networkAccess": false,
+            }),
+            reasoning_effort: Some("medium".to_string()),
+            service_tier: None,
+            personality: None,
+            output_schema: None,
+            // `thread/resume` cannot currently recover this process-local flag.
+            native_plan_mode_active: false,
+        };
+        let input = TurnInput {
+            message: "Anything the user types next".to_string(),
+            attachments: Vec::new(),
+            plan_mode: false,
+            input_items: vec![TurnInputItem::Text {
+                text: "Anything the user types next".to_string(),
+            }],
+        };
+        let activation = resolve_requested_plan_mode_activation(
+            input.plan_mode,
+            runtime.native_plan_mode_active,
+            Some(PlanModeActivation::NativeCollaboration),
+        );
+
+        assert_eq!(activation, PlanModeActivation::NativeCollaboration);
+        let params = build_turn_start_params("thread-123", Some(&runtime), &input, activation)
+            .await
+            .expect("turn/start params");
+        assert_eq!(
+            params
+                .get("collaborationMode")
+                .and_then(|value| value.get("mode")),
+            Some(&json!("default"))
+        );
+        assert_eq!(params.get("summary"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn normal_turn_uses_an_unprefixed_default_when_native_collaboration_is_unsupported() {
+        assert_eq!(
+            resolve_requested_plan_mode_activation(
+                false,
+                false,
+                Some(PlanModeActivation::PromptPrefix),
+            ),
+            PlanModeActivation::Disabled
+        );
+    }
+
+    #[test]
+    fn normal_turn_optimistically_requests_default_when_capabilities_are_unknown() {
+        assert_eq!(
+            resolve_requested_plan_mode_activation(false, false, None),
+            PlanModeActivation::NativeCollaboration
         );
     }
 

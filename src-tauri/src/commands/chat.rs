@@ -434,6 +434,21 @@ fn build_turn_status_notice_block(
     }
 }
 
+fn finalize_turn_blocks_with_notice(
+    blocks: &mut Vec<ContentBlock>,
+    action_index: &mut HashMap<String, usize>,
+    approval_index: &mut HashMap<String, usize>,
+    status: &TurnCompletionStatus,
+    token_usage: Option<&crate::engines::TokenUsage>,
+    source: Option<&TurnCompletionSource>,
+    duration_ms: Option<u64>,
+) -> bool {
+    let mut changed = terminalize_unresolved_turn_blocks(blocks, status, source);
+    let notice = build_turn_status_notice_block(blocks, status, token_usage, source, duration_ms);
+    changed |= upsert_notice_block(blocks, action_index, approval_index, "turn_status", notice);
+    changed
+}
+
 fn unresolved_action_terminal_error(
     status: &TurnCompletionStatus,
     source: Option<&TurnCompletionSource>,
@@ -582,6 +597,40 @@ fn terminalize_unresolved_turn_blocks_json(
     changed
 }
 
+fn upsert_turn_status_notice_json(
+    blocks: &mut Value,
+    status: &TurnCompletionStatus,
+    source: Option<&TurnCompletionSource>,
+    duration_ms: Option<u64>,
+) -> bool {
+    let decoded_blocks = serde_json::from_value::<Vec<ContentBlock>>(blocks.clone())
+        .unwrap_or_else(|error| {
+            log::warn!("failed to decode blocks while adding terminal status notice: {error}");
+            Vec::new()
+        });
+    let notice = build_turn_status_notice_block(&decoded_blocks, status, None, source, duration_ms);
+    let Ok(notice_value) = serde_json::to_value(notice) else {
+        return false;
+    };
+    let Some(items) = blocks.as_array_mut() else {
+        return false;
+    };
+
+    if let Some(existing) = items.iter_mut().find(|item| {
+        item.get("type").and_then(Value::as_str) == Some("notice")
+            && item.get("kind").and_then(Value::as_str) == Some("turn_status")
+    }) {
+        if *existing == notice_value {
+            return false;
+        }
+        *existing = notice_value;
+        return true;
+    }
+
+    items.push(notice_value);
+    true
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ThreadUpdatedEvent {
@@ -599,6 +648,10 @@ struct ChatTurnFinishedEvent {
     repo_id: Option<String>,
     engine_id: String,
     thread_title: String,
+    assistant_message_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_turn_id: Option<String>,
+    thread_status: String,
     status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     preview: Option<String>,
@@ -1165,7 +1218,7 @@ pub async fn send_message(
         );
     }
 
-    let assistant_message = match run_db(db.clone(), {
+    let (assistant_message, streaming_thread) = match run_db(db.clone(), {
         let thread_id = thread.id.clone();
         let message = message.clone();
         let attachments = attachments.clone();
@@ -1199,17 +1252,28 @@ pub async fn send_message(
                 reasoning_effort.as_deref(),
             )?;
             db::threads::update_thread_status(db, &thread_id, ThreadStatusDto::Streaming)?;
-            Ok(assistant_message)
+            let streaming_thread = db::threads::get_thread(db, &thread_id)?
+                .ok_or_else(|| anyhow::anyhow!("thread not found after turn start: {thread_id}"))?;
+            Ok((assistant_message, streaming_thread))
         }
     })
     .await
     {
-        Ok(assistant_message) => assistant_message,
+        Ok(result) => result,
         Err(error) => {
             state.turns.finish(&thread.id).await;
             return Err(error);
         }
     };
+
+    let _ = app.emit(
+        "thread-updated",
+        ThreadUpdatedEvent {
+            thread_id: streaming_thread.id.clone(),
+            workspace_id: streaming_thread.workspace_id.clone(),
+            thread: Some(streaming_thread),
+        },
+    );
 
     let state_cloned = state.inner().clone();
     let app_handle = app.clone();
@@ -1835,24 +1899,26 @@ fn persist_cancelled_turn_snapshot(
     if let Some((message_id, blocks_json)) = latest_streaming_assistant {
         db::actions::resolve_pending_approvals_for_message(db, &message_id, Some("cancel"))?;
 
-        let mut updated_blocks = None;
-        if let Some(blocks_json) = blocks_json.as_deref() {
-            match serde_json::from_str::<Value>(blocks_json) {
-                Ok(mut blocks) => {
-                    terminalize_unresolved_turn_blocks_json(
-                        &mut blocks,
-                        &TurnCompletionStatus::Interrupted,
-                        None,
-                    );
-                    updated_blocks = Some(blocks.to_string());
-                }
+        let mut updated_blocks = match blocks_json.as_deref() {
+            Some(blocks_json) => match serde_json::from_str::<Value>(blocks_json) {
+                Ok(blocks) => Some(blocks),
                 Err(error) => {
                     log::warn!("failed to parse streaming assistant blocks during cancel: {error}");
+                    None
                 }
-            }
+            },
+            None => Some(Value::Array(Vec::new())),
+        };
+        if let Some(blocks) = updated_blocks.as_mut() {
+            terminalize_unresolved_turn_blocks_json(
+                blocks,
+                &TurnCompletionStatus::Interrupted,
+                None,
+            );
+            upsert_turn_status_notice_json(blocks, &TurnCompletionStatus::Interrupted, None, None);
         }
 
-        if let Some(blocks_json) = updated_blocks {
+        if let Some(blocks_json) = updated_blocks.map(|blocks| blocks.to_string()) {
             db::messages::update_assistant_blocks_json(
                 db,
                 &message_id,
@@ -2248,7 +2314,9 @@ async fn run_turn(
     let approval_event_topic = format!("approval-request-{}", thread.id);
     let mut pending_event: Option<EngineEvent> = None;
 
-    let initial_turn_started_event = EngineEvent::TurnStarted { client_turn_id };
+    let initial_turn_started_event = EngineEvent::TurnStarted {
+        client_turn_id: client_turn_id.clone(),
+    };
     let initial_progress = process_stream_event(
         &app,
         &state,
@@ -2586,8 +2654,15 @@ async fn run_turn(
                 thread_status = ThreadStatusDto::Error;
                 thread_status_dirty = true;
             }
-            if terminalize_unresolved_turn_blocks(&mut blocks, &TurnCompletionStatus::Failed, None)
-            {
+            if finalize_turn_blocks_with_notice(
+                &mut blocks,
+                &mut action_index,
+                &mut approval_index,
+                &TurnCompletionStatus::Failed,
+                None,
+                None,
+                Some(elapsed_duration_ms(turn_started_at)),
+            ) {
                 blocks_dirty = true;
             }
             resolve_pending_approvals_for_terminal_message(&state, &assistant_message_id).await;
@@ -2612,8 +2687,15 @@ async fn run_turn(
                 thread_status = ThreadStatusDto::Error;
                 thread_status_dirty = true;
             }
-            if terminalize_unresolved_turn_blocks(&mut blocks, &TurnCompletionStatus::Failed, None)
-            {
+            if finalize_turn_blocks_with_notice(
+                &mut blocks,
+                &mut action_index,
+                &mut approval_index,
+                &TurnCompletionStatus::Failed,
+                None,
+                None,
+                Some(elapsed_duration_ms(turn_started_at)),
+            ) {
                 blocks_dirty = true;
             }
             resolve_pending_approvals_for_terminal_message(&state, &assistant_message_id).await;
@@ -2625,8 +2707,15 @@ async fn run_turn(
         message_state_dirty = true;
         thread_status = ThreadStatusDto::Idle;
         thread_status_dirty = true;
-        if terminalize_unresolved_turn_blocks(&mut blocks, &TurnCompletionStatus::Interrupted, None)
-        {
+        if finalize_turn_blocks_with_notice(
+            &mut blocks,
+            &mut action_index,
+            &mut approval_index,
+            &TurnCompletionStatus::Interrupted,
+            None,
+            None,
+            Some(elapsed_duration_ms(turn_started_at)),
+        ) {
             blocks_dirty = true;
         }
         resolve_pending_approvals_for_terminal_message(&state, &assistant_message_id).await;
@@ -2701,7 +2790,14 @@ async fn run_turn(
     let (thread_updated_event, final_thread) = build_final_thread_event(latest_thread, &thread);
     let _ = app.emit("thread-updated", thread_updated_event);
     if let Some(final_thread) = final_thread.as_ref() {
-        emit_chat_turn_finished(&app, final_thread, &message_status, &blocks);
+        emit_chat_turn_finished(
+            &app,
+            final_thread,
+            &assistant_message_id,
+            client_turn_id.as_deref(),
+            &message_status,
+            &blocks,
+        );
     }
 }
 
@@ -3167,8 +3263,15 @@ async fn run_codex_review_turn(
                 thread_status = ThreadStatusDto::Error;
                 thread_status_dirty = true;
             }
-            if terminalize_unresolved_turn_blocks(&mut blocks, &TurnCompletionStatus::Failed, None)
-            {
+            if finalize_turn_blocks_with_notice(
+                &mut blocks,
+                &mut action_index,
+                &mut approval_index,
+                &TurnCompletionStatus::Failed,
+                None,
+                None,
+                Some(elapsed_duration_ms(turn_started_at)),
+            ) {
                 blocks_dirty = true;
             }
             resolve_pending_approvals_for_terminal_message(&state, &assistant_message_id).await;
@@ -3193,8 +3296,15 @@ async fn run_codex_review_turn(
                 thread_status = ThreadStatusDto::Error;
                 thread_status_dirty = true;
             }
-            if terminalize_unresolved_turn_blocks(&mut blocks, &TurnCompletionStatus::Failed, None)
-            {
+            if finalize_turn_blocks_with_notice(
+                &mut blocks,
+                &mut action_index,
+                &mut approval_index,
+                &TurnCompletionStatus::Failed,
+                None,
+                None,
+                Some(elapsed_duration_ms(turn_started_at)),
+            ) {
                 blocks_dirty = true;
             }
             resolve_pending_approvals_for_terminal_message(&state, &assistant_message_id).await;
@@ -3206,8 +3316,15 @@ async fn run_codex_review_turn(
         message_state_dirty = true;
         thread_status = ThreadStatusDto::Idle;
         thread_status_dirty = true;
-        if terminalize_unresolved_turn_blocks(&mut blocks, &TurnCompletionStatus::Interrupted, None)
-        {
+        if finalize_turn_blocks_with_notice(
+            &mut blocks,
+            &mut action_index,
+            &mut approval_index,
+            &TurnCompletionStatus::Interrupted,
+            None,
+            None,
+            Some(elapsed_duration_ms(turn_started_at)),
+        ) {
             blocks_dirty = true;
         }
         resolve_pending_approvals_for_terminal_message(&state, &assistant_message_id).await;
@@ -3280,7 +3397,14 @@ async fn run_codex_review_turn(
         build_final_thread_event(latest_review_thread, &review_thread);
     let _ = app.emit("thread-updated", thread_updated_event);
     if let Some(final_review_thread) = final_review_thread.as_ref() {
-        emit_chat_turn_finished(&app, final_review_thread, &message_status, &blocks);
+        emit_chat_turn_finished(
+            &app,
+            final_review_thread,
+            &assistant_message_id,
+            None,
+            &message_status,
+            &blocks,
+        );
     }
 }
 
@@ -3952,15 +4076,25 @@ fn chat_notification_preview(blocks: &[ContentBlock]) -> Option<String> {
 fn emit_chat_turn_finished(
     app: &tauri::AppHandle,
     thread: &ThreadDto,
+    assistant_message_id: &str,
+    client_turn_id: Option<&str>,
     status: &MessageStatusDto,
     blocks: &[ContentBlock],
 ) {
-    let event = build_chat_turn_finished_event(thread, status, blocks);
+    let event = build_chat_turn_finished_event(
+        thread,
+        assistant_message_id,
+        client_turn_id,
+        status,
+        blocks,
+    );
     let _ = app.emit("chat-turn-finished", event);
 }
 
 fn build_chat_turn_finished_event(
     thread: &ThreadDto,
+    assistant_message_id: &str,
+    client_turn_id: Option<&str>,
     status: &MessageStatusDto,
     blocks: &[ContentBlock],
 ) -> ChatTurnFinishedEvent {
@@ -3970,6 +4104,9 @@ fn build_chat_turn_finished_event(
         repo_id: thread.repo_id.clone(),
         engine_id: thread.engine_id.clone(),
         thread_title: thread.title.clone(),
+        assistant_message_id: assistant_message_id.to_string(),
+        client_turn_id: client_turn_id.map(ToOwned::to_owned),
+        thread_status: thread.status.as_str().to_string(),
         status: match status {
             MessageStatusDto::Completed => "completed",
             MessageStatusDto::Interrupted => "interrupted",
@@ -4063,7 +4200,15 @@ fn apply_event_to_blocks(
         } => {
             progress.force_persist = true;
             let source = diagnostics.as_ref().map(|value| &value.source);
-            progress.blocks_changed |= terminalize_unresolved_turn_blocks(blocks, status, source);
+            progress.blocks_changed |= finalize_turn_blocks_with_notice(
+                blocks,
+                action_index,
+                approval_index,
+                status,
+                token_usage.as_ref(),
+                source,
+                turn_duration_ms,
+            );
             let has_pending_approvals = collect_turn_block_stats(blocks).approvals_pending > 0;
             progress.message_status = Some(match status {
                 TurnCompletionStatus::Completed => MessageStatusDto::Completed,
@@ -4082,20 +4227,6 @@ fn apply_event_to_blocks(
             progress.token_usage = token_usage
                 .as_ref()
                 .map(|usage| (usage.input, usage.output));
-            let turn_status_block = build_turn_status_notice_block(
-                blocks,
-                status,
-                token_usage.as_ref(),
-                source,
-                turn_duration_ms,
-            );
-            progress.blocks_changed |= upsert_notice_block(
-                blocks,
-                action_index,
-                approval_index,
-                "turn_status",
-                turn_status_block,
-            );
         }
         EngineEvent::TextDelta { content } => {
             progress.blocks_changed = append_text_delta(blocks, content);
@@ -5275,15 +5406,25 @@ mod tests {
     }
 
     #[test]
-    fn build_chat_turn_finished_event_includes_repo_id() {
+    fn build_chat_turn_finished_event_includes_turn_identity_and_thread_status() {
         let state = test_app_state();
         let mut thread = test_thread(&state, "codex", "gpt-5.5-codex");
         thread.repo_id = Some("repo-1".to_string());
-        let event = build_chat_turn_finished_event(&thread, &MessageStatusDto::Completed, &[]);
+        thread.status = ThreadStatusDto::Completed;
+        let event = build_chat_turn_finished_event(
+            &thread,
+            "assistant-1",
+            Some("client-turn-1"),
+            &MessageStatusDto::Completed,
+            &[],
+        );
 
         assert_eq!(event.thread_id, thread.id);
         assert_eq!(event.workspace_id, thread.workspace_id);
         assert_eq!(event.repo_id.as_deref(), Some("repo-1"));
+        assert_eq!(event.assistant_message_id, "assistant-1");
+        assert_eq!(event.client_turn_id.as_deref(), Some("client-turn-1"));
+        assert_eq!(event.thread_status, "completed");
         assert_eq!(event.status, "completed");
     }
 
@@ -5384,6 +5525,21 @@ mod tests {
         assert_eq!(
             blocks[1].get("decision").and_then(Value::as_str),
             Some("cancel")
+        );
+        let terminal_notice = blocks
+            .iter()
+            .find(|block| {
+                block.get("type").and_then(Value::as_str) == Some("notice")
+                    && block.get("kind").and_then(Value::as_str) == Some("turn_status")
+            })
+            .expect("cancelled snapshots must include a terminal status notice");
+        assert_eq!(
+            terminal_notice.get("title").and_then(Value::as_str),
+            Some("Turn interrupted")
+        );
+        assert_eq!(
+            terminal_notice.get("status").and_then(Value::as_str),
+            Some("interrupted")
         );
     }
 

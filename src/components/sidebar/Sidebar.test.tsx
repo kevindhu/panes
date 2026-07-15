@@ -166,6 +166,10 @@ const threadNotificationState = vi.hoisted(() => ({
   notificationsByThreadId: {} as Record<string, { workspaceId: string; status?: string }>,
 }));
 
+const threadPlanModeState = vi.hoisted(() => ({
+  threadModes: {} as Record<string, "default" | "plan">,
+}));
+
 function applySelector<TState, TResult>(
   state: TState,
   selector?: ((state: TState) => TResult) | undefined,
@@ -270,6 +274,12 @@ vi.mock("../../stores/threadNotificationStore", () => ({
     ).length,
 }));
 
+vi.mock("../../stores/threadPlanModeStore", () => ({
+  useThreadPlanModeStore: (
+    selector?: (state: typeof threadPlanModeState) => unknown,
+  ) => applySelector(threadPlanModeState, selector),
+}));
+
 vi.mock("../workspace/WorkspaceMoreMenu", () => ({
   WorkspaceMoreMenu: () => null,
 }));
@@ -302,6 +312,7 @@ describe("Sidebar thread context menu", () => {
     chatState.status = "completed";
     chatState.streaming = false;
     threadNotificationState.notificationsByThreadId = {};
+    threadPlanModeState.threadModes = {};
     uiState.sidebarPinned = true;
     uiState.activeView = "harnesses";
     container = document.createElement("div");
@@ -374,6 +385,8 @@ describe("Sidebar thread context menu", () => {
     threadState.threads = [{ ...codexThread, status: "streaming" }, claudeThread];
     threadState.activeThreadId = "codex-1";
     chatState.threadId = "codex-1";
+    chatState.status = "streaming";
+    chatState.streaming = true;
 
     await renderSidebar();
 
@@ -463,6 +476,67 @@ describe("Sidebar thread context menu", () => {
     const row = findThreadRow("Codex conversation");
     expect(row?.querySelector(".sb-thread-notification-dot-pending-approval")).not.toBeNull();
     expect(container.querySelector(".sb-project-notification-badge-pending-approval")).not.toBeNull();
+  });
+
+  it("shows a terminal warning badge for an interrupted background turn", async () => {
+    threadNotificationState.notificationsByThreadId = {
+      [codexThread.id]: {
+        workspaceId: codexThread.workspaceId,
+        status: "interrupted",
+      },
+    };
+
+    await renderSidebar();
+
+    const row = findThreadRow("Codex conversation");
+    const badge = row?.querySelector(".sb-thread-notification-dot-interrupted");
+    expect(badge).not.toBeNull();
+    expect(badge?.getAttribute("aria-label")).toBe(
+      "app:sidebar.interruptedThreadNotification",
+    );
+    expect(container.querySelector(".sb-project-notification-badge")?.textContent).toBe("1");
+  });
+
+  it("shows plan mode only on the thread that owns it", async () => {
+    threadPlanModeState.threadModes = {
+      [codexThread.id]: "plan",
+      [claudeThread.id]: "default",
+    };
+
+    await renderSidebar();
+
+    expect(findThreadRow("Codex conversation")?.querySelector(".sb-thread-plan-indicator"))
+      .not.toBeNull();
+    expect(findThreadRow("Claude conversation")?.querySelector(".sb-thread-plan-indicator"))
+      .toBeNull();
+  });
+
+  it("shows running dots for a streaming thread while another session is focused", async () => {
+    threadState.threads = [{ ...codexThread, status: "streaming" }, claudeThread];
+    threadState.activeThreadId = claudeThread.id;
+    chatState.threadId = claudeThread.id;
+    chatState.status = "completed";
+    chatState.streaming = false;
+
+    await renderSidebar();
+
+    expect(findThreadRow("Codex conversation")?.querySelector(".sb-thread-running-indicator"))
+      .not.toBeNull();
+    expect(findThreadRow("Claude conversation")?.querySelector(".sb-thread-running-indicator"))
+      .toBeNull();
+  });
+
+  it("hides running dots when the focused transcript is done even if its thread cache is stale", async () => {
+    threadState.threads = [{ ...codexThread, status: "streaming" }, claudeThread];
+    threadState.activeThreadId = codexThread.id;
+    chatState.threadId = codexThread.id;
+    chatState.status = "completed";
+    chatState.streaming = false;
+
+    await renderSidebar();
+
+    expect(findThreadRow("Codex conversation")?.querySelector(".sb-thread-running-indicator"))
+      .toBeNull();
   });
 
   async function renderSidebar() {

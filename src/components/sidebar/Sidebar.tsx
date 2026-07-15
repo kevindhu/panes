@@ -22,6 +22,7 @@ import {
   RefreshCw,
   PillBottle,
   BellRing,
+  ListChecks,
 } from "lucide-react";
 import { useChatStore } from "../../stores/chatStore";
 import { useThreadStore } from "../../stores/threadStore";
@@ -36,6 +37,7 @@ import {
   countWorkspaceThreadNotifications,
   useThreadNotificationStore,
 } from "../../stores/threadNotificationStore";
+import { useThreadPlanModeStore } from "../../stores/threadPlanModeStore";
 import { toast } from "../../stores/toastStore";
 import { canUseNativeCodexHistoryTools } from "../../lib/codexThreadCapabilities";
 import { ipc } from "../../lib/ipc";
@@ -160,6 +162,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   const toggleTerminalNotifications = useTerminalNotificationSettingsStore((s) => s.toggle);
   const openTerminalNotificationSettings = useTerminalNotificationSettingsStore((s) => s.openModal);
   const threadNotificationsByThreadId = useThreadNotificationStore((s) => s.notificationsByThreadId);
+  const threadPlanModes = useThreadPlanModeStore((s) => s.threadModes);
   const hasUpdate = updateStatus === "available" && !updateSnoozed;
   const keepAwakeAvailable = canToggleKeepAwake(keepAwakeState);
 
@@ -536,6 +539,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
     setCollapsed(
       Object.fromEntries(projects.map((p) => [p.workspace.id, p.workspace.id !== wsId]))
     );
+    await activateThreadContext(null);
     await setActiveWorkspace(wsId);
   }
 
@@ -654,14 +658,11 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   }
 
   function isThreadRunning(thread: Thread) {
-    if (isRunningThreadStatus(thread.status)) {
-      return true;
+    if (thread.id === boundChatThreadId) {
+      return boundChatStreaming || isRunningThreadStatus(boundChatStatus);
     }
 
-    return (
-      thread.id === boundChatThreadId &&
-      (boundChatStreaming || isRunningThreadStatus(boundChatStatus))
-    );
+    return isRunningThreadStatus(thread.status);
   }
 
   const keepAwakeDescription = useMemo(() => {
@@ -937,6 +938,9 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                           const hasNotification = Boolean(threadNotification);
                           const hasPendingApprovalNotification =
                             threadNotification?.status === "pending_approval";
+                          const hasInterruptedNotification =
+                            threadNotification?.status === "interrupted";
+                          const hasPlanMode = threadPlanModes[thread.id] === "plan";
                           return (
                             <div
                               key={thread.id}
@@ -964,17 +968,31 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                                     <span />
                                   </span>
                                 )}
+                                {hasPlanMode && (
+                                  <span
+                                    className="sb-thread-plan-indicator"
+                                    title={t("app:sidebar.planModeThread")}
+                                    aria-label={t("app:sidebar.planModeThread")}
+                                    role="img"
+                                  >
+                                    <ListChecks size={12} aria-hidden="true" />
+                                  </span>
+                                )}
                                 {hasNotification && (
                                   <span
-                                    className={`sb-thread-notification-dot${hasPendingApprovalNotification ? " sb-thread-notification-dot-pending-approval" : ""}`}
+                                    className={`sb-thread-notification-dot${hasPendingApprovalNotification ? " sb-thread-notification-dot-pending-approval" : ""}${hasInterruptedNotification ? " sb-thread-notification-dot-interrupted" : ""}`}
                                     title={t(
                                       hasPendingApprovalNotification
                                         ? "app:sidebar.pendingApprovalThreadNotification"
+                                        : hasInterruptedNotification
+                                          ? "app:sidebar.interruptedThreadNotification"
                                         : "app:sidebar.unreadThreadNotification",
                                     )}
                                     aria-label={t(
                                       hasPendingApprovalNotification
                                         ? "app:sidebar.pendingApprovalThreadNotification"
+                                        : hasInterruptedNotification
+                                          ? "app:sidebar.interruptedThreadNotification"
                                         : "app:sidebar.unreadThreadNotification",
                                     )}
                                   />
@@ -1451,6 +1469,14 @@ function CollapsedRail({
     await createAndActivateWorkspaceThread(activeProject.id);
   }
 
+  async function onSelectRailWorkspace(workspaceId: string) {
+    if (workspaceId === activeWorkspaceId) {
+      return;
+    }
+    await activateThreadContext(null);
+    await setActiveWorkspace(workspaceId);
+  }
+
   return (
     <div
       className="sb-rail"
@@ -1561,7 +1587,10 @@ function CollapsedRail({
               type="button"
               className={`sb-rail-btn ${isActive ? "sb-rail-btn-active" : ""}`}
               title={ws.name || ws.rootPath}
-              onClick={() => { if (activeView !== "chat") setActiveView("chat"); void setActiveWorkspace(ws.id); }}
+              onClick={() => {
+                if (activeView !== "chat") setActiveView("chat");
+                void onSelectRailWorkspace(ws.id);
+              }}
             >
               <span
                 style={{

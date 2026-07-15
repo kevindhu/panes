@@ -4,6 +4,7 @@ import {
   getPlanImplementationCodingMessage,
   latestAssistantMessage,
   messageHasStructuredPlan,
+  resolvePlanImplementationDecision,
   shouldClearPendingPlanImplementationPrompt,
   shouldPromptToImplementPlan,
 } from "./planModePrompt";
@@ -33,6 +34,45 @@ describe("planModePrompt", () => {
       "Exit plan mode and implement the plan.",
     );
     expect(getPlanImplementationCodingMessage("codex")).toBe("Implement the plan.");
+  });
+
+  it("accepts only the exact implementation questionnaire choices", () => {
+    expect(
+      resolvePlanImplementationDecision(
+        "Implement the plan",
+        "Implement the plan",
+        "Stay in plan mode",
+      ),
+    ).toBe("implement");
+    expect(
+      resolvePlanImplementationDecision(
+        "Stay in plan mode",
+        "Implement the plan",
+        "Stay in plan mode",
+      ),
+    ).toBe("stay");
+  });
+
+  it("fails closed for missing, misspelled, or altered questionnaire answers", () => {
+    const resolve = (answer: string | null | undefined) =>
+      resolvePlanImplementationDecision(
+        answer,
+        "Implement the plan",
+        "Stay in plan mode",
+      );
+
+    expect(resolve(undefined)).toBeNull();
+    expect(resolve(null)).toBeNull();
+    expect(resolve("")).toBeNull();
+    expect(resolve("Implement teh plan")).toBeNull();
+    expect(resolve("implement the plan")).toBeNull();
+    expect(resolve("Something else")).toBeNull();
+    expect(
+      resolvePlanImplementationDecision("Same", "Same", "Same"),
+    ).toBeNull();
+    expect(
+      resolvePlanImplementationDecision("Implement", "Implement", ""),
+    ).toBeNull();
   });
 
   it("detects structured plan output from assistant messages", () => {

@@ -50,6 +50,16 @@ vi.mock("../../stores/chatStore", () => ({
   },
 }));
 
+vi.mock("../../stores/threadPlanModeStore", () => ({
+  readThreadComposerMode: vi.fn(() => "default"),
+  useThreadPlanModeStore: {
+    getState: () => ({
+      threadModes: {},
+      newThreadModesByWorkspaceId: {},
+    }),
+  },
+}));
+
 vi.mock("../../stores/gitStore", () => ({
   useGitStore: {
     getState: () => ({}),

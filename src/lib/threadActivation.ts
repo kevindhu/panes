@@ -33,6 +33,8 @@ interface ChatThreadActivationState {
   ) => Promise<void>;
 }
 
+let activeThreadActivationSeq = 0;
+
 function readStoreState<T>(store: { getState?: () => T } | (() => T)): T {
   if (typeof (store as { getState?: () => T }).getState === "function") {
     return (store as { getState: () => T }).getState();
@@ -47,6 +49,7 @@ export async function activateThreadContext(
   thread: Thread | null,
   options?: ActivateThreadContextOptions,
 ): Promise<void> {
+  const activationSeq = ++activeThreadActivationSeq;
   const workspaceStore = readStoreState<WorkspaceThreadActivationState>(
     useWorkspaceStore as unknown as
       | { getState?: () => WorkspaceThreadActivationState }
@@ -71,8 +74,20 @@ export async function activateThreadContext(
     return;
   }
 
+  // Both stores publish their synchronous selection state before the first
+  // await. React therefore never observes the target thread paired with the
+  // previous workspace, even though workspace preparation continues async.
+  let workspaceActivation: Promise<void> | null = null;
   if (workspaceStore.activeWorkspaceId !== thread.workspaceId) {
-    await workspaceStore.setActiveWorkspace(thread.workspaceId);
+    workspaceActivation = workspaceStore.setActiveWorkspace(thread.workspaceId);
+  }
+  threadStore.setActiveThread(thread.id);
+  if (workspaceActivation) {
+    await workspaceActivation;
+  }
+
+  if (activationSeq !== activeThreadActivationSeq) {
+    return;
   }
 
   if (thread.repoId) {
@@ -80,8 +95,6 @@ export async function activateThreadContext(
   } else {
     workspaceStore.setActiveRepo(null, { remember: false });
   }
-
-  threadStore.setActiveThread(thread.id);
 
   if (options?.forceChatReload) {
     await chatStore.setActiveThread(thread.id, { forceReload: true });

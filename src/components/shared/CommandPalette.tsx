@@ -65,6 +65,10 @@ import { useUiStore } from "../../stores/uiStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
 import { useThreadStore } from "../../stores/threadStore";
 import { useChatStore } from "../../stores/chatStore";
+import {
+  readThreadComposerMode,
+  useThreadPlanModeStore,
+} from "../../stores/threadPlanModeStore";
 import { useGitStore } from "../../stores/gitStore";
 import { useTerminalStore } from "../../stores/terminalStore";
 import { useFileStore } from "../../stores/fileStore";
@@ -722,7 +726,7 @@ export function getStaticCommands(
       try {
         const forked = await forkCodexThread(activeThreadId);
         if (forked) {
-          useThreadStore.getState().setActiveThread(forked.id);
+          await activateThreadContext(forked);
           toast.success(t("commandPalette.toasts.codexForked"));
         }
       } catch (err) {
@@ -1049,17 +1053,14 @@ export function CommandPalette({ open, onClose }: Props) {
 
   // Store selectors
   const activeWorkspaceId = useWorkspaceStore((s) => s.activeWorkspaceId);
-  const setActiveRepo = useWorkspaceStore((s) => s.setActiveRepo);
   const repos = useWorkspaceStore((s) => s.repos);
   const activeRepoId = useWorkspaceStore((s) => s.activeRepoId);
   const workspaces = useWorkspaceStore((s) => s.workspaces);
   const threads = useThreadStore((s) => s.threads);
   const activeThreadId = useThreadStore((s) => s.activeThreadId);
-  const setActiveThread = useThreadStore((s) => s.setActiveThread);
   const harnesses = useHarnessStore((s) => s.harnesses);
   const harnessesLoadedOnce = useHarnessStore((s) => s.loadedOnce);
   const ensureHarnessesScanned = useHarnessStore((s) => s.ensureScanned);
-  const bindChatThread = useChatStore((s) => s.setActiveThread);
   const setMessageFocusTarget = useUiStore((s) => s.setMessageFocusTarget);
   const commandPaletteLaunch = useUiStore((s) => s.commandPaletteLaunch);
   const activeGitRepos = useMemo(() => getActiveGitRepos(repos), [repos]);
@@ -1923,10 +1924,7 @@ export function CommandPalette({ open, onClose }: Props) {
     },
     [
       activeWorkspaceId,
-      bindChatThread,
       onClose,
-      setActiveRepo,
-      setActiveThread,
       setMessageFocusTarget,
     ],
   );
@@ -1974,18 +1972,17 @@ export function CommandPalette({ open, onClose }: Props) {
         }
         case "thread": {
           const thread = item.entry;
-          if (thread.workspaceId !== activeWorkspaceId) {
-            await useWorkspaceStore.getState().setActiveWorkspace(thread.workspaceId);
-          }
           showWorkspaceSurface(thread.workspaceId, "chat");
-          useThreadStore.getState().setActiveThread(thread.id);
-          await useChatStore.getState().setActiveThread(thread.id);
+          await activateThreadContext(thread);
           useUiStore.getState().setActiveView("chat");
           onClose();
           break;
         }
         case "workspace": {
           onClose();
+          if (item.entry.id !== activeWorkspaceId) {
+            await activateThreadContext(null);
+          }
           await useWorkspaceStore.getState().setActiveWorkspace(item.entry.id);
           break;
         }
@@ -2072,7 +2069,15 @@ export function CommandPalette({ open, onClose }: Props) {
         case "send-message": {
           onClose();
           if (activeThreadId) {
-            await useChatStore.getState().send(item.query);
+            const planMode =
+              readThreadComposerMode(
+                useThreadPlanModeStore.getState(),
+                activeThreadId,
+              ) === "plan";
+            await useChatStore.getState().send(item.query, {
+              threadIdOverride: activeThreadId,
+              planMode,
+            });
           }
           break;
         }
@@ -2153,7 +2158,7 @@ export function CommandPalette({ open, onClose }: Props) {
       try {
         const rolled = await rollbackCodexThread(activeThreadId, numTurns);
         if (rolled) {
-          useThreadStore.getState().setActiveThread(rolled.id);
+          await activateThreadContext(rolled);
           toast.success(t("commandPalette.toasts.codexRolledBack", { count: numTurns }));
         }
       } catch (err) {

@@ -44,6 +44,8 @@
     "unreadThreadNotifications": "{{count}} unread thread notifications",
     "pendingApprovalThreadNotification": "Pending approval",
     "pendingApprovalThreadNotifications": "{{count}} pending approval notifications",
+    "interruptedThreadNotification": "Turn interrupted",
+    "planModeThread": "Plan mode active for this thread",
     "archiveThread": "Archive thread",
     "showMore": "Show {{count}} more",
     "archived": "Archived",
@@ -572,6 +574,7 @@
       "installFailed": "Failed to configure {{integration}} notifications."
     },
     "chatNotificationFallbackComplete": "Reply ready",
+    "chatNotificationFallbackInterrupted": "Turn interrupted",
     "chatNotificationFallbackAttention": "Input needed",
     "chatNotificationFallbackPlanReady": "Plan ready to implement",
     "chatNotificationFallbackError": "Reply failed"

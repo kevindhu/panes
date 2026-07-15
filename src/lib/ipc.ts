@@ -64,6 +64,7 @@ import type {
   WorkspaceStartupPreset,
   WorkspaceStartupPresetFormat,
   Thread,
+  ThreadStatus,
   TrustLevel,
   WorkspaceGitSelectionStatus,
   Workspace
@@ -689,6 +690,9 @@ export interface ChatTurnFinishedEvent {
   repoId: string | null;
   engineId: ChatEngineId;
   threadTitle: string;
+  assistantMessageId: string;
+  clientTurnId?: string | null;
+  threadStatus: ThreadStatus;
   status: "completed" | "interrupted" | "error";
   preview?: string | null;
 }

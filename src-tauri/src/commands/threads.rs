@@ -14,6 +14,7 @@ use crate::{
     db,
     engines::validate_engine_sandbox_mode,
     engines::CodexRemoteThreadSummary,
+    engines::ImportedThreadMessage,
     engines::OpenCodeRemoteSessionSummary,
     engines::SandboxPolicy,
     engines::ThreadSyncSnapshot,
@@ -1338,11 +1339,7 @@ pub async fn sync_thread_from_engine(
         sync_required.then_some("remote thread has an active turn"),
     );
     let metadata = mark_codex_transcript_imported(metadata, should_import_messages);
-    let next_status = map_codex_thread_status_to_local(
-        snapshot.raw_status.as_deref(),
-        &snapshot.active_flags,
-        has_local_turn,
-    );
+    let next_status = resolve_codex_sync_thread_status(&snapshot, has_local_turn);
 
     run_db(db, {
         let thread_id = thread_id.clone();
@@ -3271,6 +3268,57 @@ fn map_codex_thread_status_to_local(
     }
 }
 
+fn imported_messages_thread_status(messages: &[ImportedThreadMessage]) -> Option<ThreadStatusDto> {
+    let latest_assistant = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")?;
+
+    match latest_assistant.status.trim() {
+        "streaming" => Some(ThreadStatusDto::Streaming),
+        "completed" => Some(ThreadStatusDto::Completed),
+        "error" => Some(ThreadStatusDto::Error),
+        "interrupted" => Some(ThreadStatusDto::Idle),
+        _ => None,
+    }
+}
+
+fn resolve_codex_sync_thread_status(
+    snapshot: &ThreadSyncSnapshot,
+    has_local_turn: bool,
+) -> Option<ThreadStatusDto> {
+    if has_local_turn {
+        return None;
+    }
+
+    if snapshot.raw_status.as_deref() == Some("systemError") {
+        return Some(ThreadStatusDto::Error);
+    }
+
+    if snapshot
+        .active_flags
+        .iter()
+        .any(|flag| matches!(flag.as_str(), "waitingOnApproval" | "waitingOnUserInput"))
+    {
+        return Some(ThreadStatusDto::AwaitingApproval);
+    }
+
+    let imported_status = imported_messages_thread_status(&snapshot.imported_messages);
+    if imported_status == Some(ThreadStatusDto::Streaming) || !snapshot.active_flags.is_empty() {
+        return Some(ThreadStatusDto::Streaming);
+    }
+    if imported_status.is_some() {
+        return imported_status;
+    }
+
+    match snapshot.raw_status.as_deref() {
+        Some("idle") | Some("notLoaded") => Some(ThreadStatusDto::Idle),
+        // An unflagged `active` summary is not enough to resurrect a running
+        // state when the sync snapshot contains no active turn evidence.
+        _ => None,
+    }
+}
+
 fn err_to_string(error: impl std::fmt::Display) -> String {
     format!("{error:#}")
 }
@@ -3951,6 +3999,68 @@ mod tests {
             map_codex_thread_status_to_local(Some("active"), &[], true),
             None
         );
+    }
+
+    #[test]
+    fn codex_sync_does_not_resurrect_a_completed_transcript_from_unflagged_active_metadata() {
+        let snapshot = ThreadSyncSnapshot {
+            title: Some("Completed thread".to_string()),
+            preview: Some("Done".to_string()),
+            raw_status: Some("active".to_string()),
+            active_flags: Vec::new(),
+            imported_messages: vec![ImportedThreadMessage {
+                role: "assistant".to_string(),
+                content: Some("Finished".to_string()),
+                blocks: json!([]),
+                status: "completed".to_string(),
+                turn_engine_id: Some("codex".to_string()),
+                turn_model_id: Some("gpt-5.4".to_string()),
+                turn_reasoning_effort: Some("high".to_string()),
+                token_input: 0,
+                token_output: 0,
+                created_at: Some("2026-07-10T09:11:28Z".to_string()),
+            }],
+        };
+
+        assert_eq!(
+            resolve_codex_sync_thread_status(&snapshot, false),
+            Some(ThreadStatusDto::Completed)
+        );
+    }
+
+    #[test]
+    fn codex_sync_preserves_real_active_turn_evidence() {
+        let mut snapshot = ThreadSyncSnapshot {
+            title: None,
+            preview: None,
+            raw_status: Some("active".to_string()),
+            active_flags: Vec::new(),
+            imported_messages: vec![ImportedThreadMessage {
+                role: "assistant".to_string(),
+                content: None,
+                blocks: json!([]),
+                status: "streaming".to_string(),
+                turn_engine_id: Some("codex".to_string()),
+                turn_model_id: Some("gpt-5.4".to_string()),
+                turn_reasoning_effort: None,
+                token_input: 0,
+                token_output: 0,
+                created_at: None,
+            }],
+        };
+
+        assert_eq!(
+            resolve_codex_sync_thread_status(&snapshot, false),
+            Some(ThreadStatusDto::Streaming)
+        );
+
+        snapshot.imported_messages[0].status = "completed".to_string();
+        snapshot.active_flags = vec!["waitingOnApproval".to_string()];
+        assert_eq!(
+            resolve_codex_sync_thread_status(&snapshot, false),
+            Some(ThreadStatusDto::AwaitingApproval)
+        );
+        assert_eq!(resolve_codex_sync_thread_status(&snapshot, true), None);
     }
 
     #[test]

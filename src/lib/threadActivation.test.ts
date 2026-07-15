@@ -78,13 +78,13 @@ describe("threadActivation", () => {
     mockThreadStoreState.activeThreadId = null;
   });
 
-  it("activates a thread context in workspace, repo, thread, chat order", async () => {
+  it("publishes workspace and thread selection before loading the transcript", async () => {
     await activateThreadContext(buildThread());
 
     expect(callOrder).toEqual([
       "workspace:ws-2",
-      "repo:repo-2",
       "thread:thread-1",
+      "repo:repo-2",
       "chat:thread-1",
     ]);
     expect(mockWorkspaceStoreState.activeWorkspaceId).toBe("ws-2");
@@ -117,9 +117,43 @@ describe("threadActivation", () => {
     ).resolves.toBe(true);
     expect(callOrder).toEqual([
       "workspace:ws-2",
-      "repo:repo-2",
       "thread:thread-startup",
+      "repo:repo-2",
       "chat:thread-startup",
     ]);
+  });
+
+  it("does not let an older cross-workspace activation finish after a newer click", async () => {
+    let releaseFirstWorkspace!: () => void;
+    const firstWorkspacePending = new Promise<void>((resolve) => {
+      releaseFirstWorkspace = resolve;
+    });
+    mockWorkspaceStoreState.setActiveWorkspace.mockImplementation(
+      async (workspaceId: string) => {
+        callOrder.push(`workspace:${workspaceId}`);
+        mockWorkspaceStoreState.activeWorkspaceId = workspaceId;
+        if (workspaceId === "ws-a") {
+          await firstWorkspacePending;
+        }
+      },
+    );
+
+    const first = activateThreadContext(
+      buildThread({ id: "thread-a", workspaceId: "ws-a", repoId: "repo-a" }),
+    );
+    await Promise.resolve();
+    const second = activateThreadContext(
+      buildThread({ id: "thread-b", workspaceId: "ws-b", repoId: "repo-b" }),
+    );
+    await second;
+    releaseFirstWorkspace();
+    await first;
+
+    expect(mockThreadStoreState.activeThreadId).toBe("thread-b");
+    expect(mockWorkspaceStoreState.activeWorkspaceId).toBe("ws-b");
+    expect(mockWorkspaceStoreState.setActiveRepo).toHaveBeenCalledTimes(1);
+    expect(mockWorkspaceStoreState.setActiveRepo).toHaveBeenCalledWith("repo-b");
+    expect(mockChatStoreState.setActiveThread).toHaveBeenCalledTimes(1);
+    expect(mockChatStoreState.setActiveThread).toHaveBeenCalledWith("thread-b");
   });
 });
