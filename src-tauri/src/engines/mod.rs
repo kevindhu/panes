@@ -630,29 +630,29 @@ impl EngineManager {
         engine_thread_id: &str,
         cwd: &str,
         model: &str,
+        last_turn_id: Option<&str>,
         sandbox: SandboxPolicy,
     ) -> anyhow::Result<CodexForkedThread> {
         self.codex
-            .fork_thread(engine_thread_id, cwd, model, sandbox)
+            .fork_thread(engine_thread_id, cwd, model, last_turn_id, sandbox)
             .await
     }
 
-    pub async fn rollback_codex_thread(
+    pub async fn fork_codex_thread_dropping_turns(
         &self,
         engine_thread_id: &str,
+        cwd: &str,
+        model: &str,
         num_turns: u32,
-    ) -> anyhow::Result<ThreadSyncSnapshot> {
+        sandbox: SandboxPolicy,
+    ) -> anyhow::Result<CodexForkedThread> {
         self.codex
-            .rollback_thread(engine_thread_id, num_turns)
+            .fork_thread_dropping_turns(engine_thread_id, cwd, model, num_turns, sandbox)
             .await
     }
 
     pub async fn compact_codex_thread(&self, engine_thread_id: &str) -> anyhow::Result<()> {
         self.codex.compact_thread(engine_thread_id).await
-    }
-
-    pub async fn archive_codex_thread(&self, engine_thread_id: &str) -> anyhow::Result<()> {
-        self.codex.archive_thread(engine_thread_id).await
     }
 
     pub async fn list_codex_remote_threads(

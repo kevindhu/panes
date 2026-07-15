@@ -144,13 +144,10 @@ describe("MessageRowView editing attachments", () => {
           assistantEngineId="codex"
           canEditUserMessages
           editingMessageId="user-1"
-          editingMode="branch"
           editingDraftText="Please revise this"
           editingDraftAttachments={attachments}
-          editingRollbackTurns={null}
           editingBusy={false}
           onStartEdit={vi.fn()}
-          onStartRollback={vi.fn()}
           onChangeEditText={vi.fn()}
           onRemoveEditAttachment={(attachmentId) =>
             setAttachments((current) =>
@@ -197,13 +194,10 @@ describe("MessageRowView editing attachments", () => {
           assistantEngineId="codex"
           canEditUserMessages
           editingMessageId="user-1"
-          editingMode="branch"
           editingDraftText="Please revise this"
           editingDraftAttachments={[]}
-          editingRollbackTurns={null}
           editingBusy={false}
           onStartEdit={vi.fn()}
-          onStartRollback={vi.fn()}
           onChangeEditText={vi.fn()}
           onRemoveEditAttachment={vi.fn()}
           onPasteEditAttachments={onPasteEditAttachments}
@@ -253,13 +247,10 @@ describe("MessageRowView editing attachments", () => {
           assistantEngineId="codex"
           canEditUserMessages
           editingMessageId={null}
-          editingMode={null}
           editingDraftText=""
           editingDraftAttachments={[]}
-          editingRollbackTurns={null}
           editingBusy={false}
           onStartEdit={vi.fn()}
-          onStartRollback={vi.fn()}
           onChangeEditText={vi.fn()}
           onRemoveEditAttachment={vi.fn()}
           onPasteEditAttachments={vi.fn()}

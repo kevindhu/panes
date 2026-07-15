@@ -80,7 +80,7 @@ import { MessageBlocks, shouldShowClaudeUnsupportedApproval } from "./MessageBlo
 import { resolveEngineCapabilities } from "./engineCapabilities";
 import { buildCodexInputItems } from "./codexInputItems";
 import {
-  computeRollbackTurnsForEditedMessage,
+  computeDroppedTurnsForEditedMessage,
   extractEditableMessageContext,
   isEditableUserTurn,
   mergeUniqueChatAttachments,
@@ -1215,13 +1215,10 @@ interface MessageRowProps {
   workspaceRootPath?: string | null;
   canEditUserMessages: boolean;
   editingMessageId: string | null;
-  editingMode: MessageEditMode | null;
   editingDraftText: string;
   editingDraftAttachments: ChatAttachment[];
-  editingRollbackTurns: number | null;
   editingBusy: boolean;
   onStartEdit: (message: Message) => void;
-  onStartRollback: (message: Message) => void;
   onChangeEditText: (text: string) => void;
   onRemoveEditAttachment: (attachmentId: string) => void;
   onPasteEditAttachments: (files: File[]) => void;
@@ -1279,14 +1276,11 @@ function formatBranchProfileElapsedMs(elapsedMs: number): string {
   return elapsedMs.toFixed(1);
 }
 
-type MessageEditMode = "branch" | "rollback";
-
 interface EditingMessageDraft {
   messageId: string;
   text: string;
   attachments: ChatAttachment[];
   planMode: boolean;
-  mode: MessageEditMode;
 }
 
 function MessageActionButton({
@@ -1361,13 +1355,10 @@ export function MessageRowView({
   workspaceRootPath,
   canEditUserMessages,
   editingMessageId,
-  editingMode,
   editingDraftText,
   editingDraftAttachments,
-  editingRollbackTurns,
   editingBusy,
   onStartEdit,
-  onStartRollback,
   onChangeEditText,
   onRemoveEditAttachment,
   onPasteEditAttachments,
@@ -1420,7 +1411,6 @@ export function MessageRowView({
   const showThinkingPlaceholder = showAssistantShell && !hasAssistantContent;
   const thinkingVariant = useThinkingVariant(showThinkingPlaceholder);
   const isEditingUserMessage = isUser && editingMessageId === message.id;
-  const isRollbackEditing = isEditingUserMessage && editingMode === "rollback";
   const canEditThisMessage = canEditUserMessages && isEditableUserTurn(message);
   const displayedUserAttachments = useMemo(
     () =>
@@ -1509,26 +1499,6 @@ export function MessageRowView({
                 <span>{t("panel.planMode")}</span>
               </div>
             )}
-            {isRollbackEditing && editingRollbackTurns ? (
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "flex-start",
-                  gap: 6,
-                  marginBottom: 8,
-                  padding: "7px 9px",
-                  borderRadius: "var(--radius-sm)",
-                  background: "rgba(154, 103, 0, 0.10)",
-                  border: "1px solid rgba(154, 103, 0, 0.18)",
-                  color: "var(--warning)",
-                  fontSize: 11,
-                  lineHeight: 1.45,
-                }}
-              >
-                <RotateCcw size={11} style={{ marginTop: 2, flexShrink: 0 }} />
-                <span>{t("panel.messageActions.rollbackWarning", { count: editingRollbackTurns })}</span>
-              </div>
-            ) : null}
             {isEditingUserMessage ? (
               <textarea
                 value={editingDraftText}
@@ -1599,19 +1569,13 @@ export function MessageRowView({
                     color:
                       editingBusy || editingDraftText.trim().length === 0
                         ? "var(--text-4)"
-                        : isRollbackEditing
-                          ? "var(--warning)"
-                          : "var(--accent)",
+                        : "var(--accent)",
                     fontSize: 11,
                   }}
                 >
                   {editingBusy
-                    ? isRollbackEditing
-                      ? t("panel.messageActions.rollingBack")
-                      : t("panel.messageActions.branching")
-                    : isRollbackEditing
-                      ? t("panel.messageActions.saveRollback")
-                      : t("panel.messageActions.save")}
+                    ? t("panel.messageActions.branching")
+                    : t("panel.messageActions.save")}
                 </button>
                 <button
                   type="button"
@@ -1641,15 +1605,6 @@ export function MessageRowView({
                     label={t("panel.messageActions.edit")}
                   >
                     <FilePen size={11} />
-                  </MessageActionButton>
-                )}
-                {canEditThisMessage && (
-                  <MessageActionButton
-                    onClick={() => onStartRollback(message)}
-                    label={t("panel.messageActions.rollback")}
-                    color="var(--warning)"
-                  >
-                    <RotateCcw size={11} />
                   </MessageActionButton>
                 )}
               </>
@@ -1723,13 +1678,10 @@ const MessageRow = memo(
     prev.workspaceRootPath === next.workspaceRootPath &&
     prev.canEditUserMessages === next.canEditUserMessages &&
     prev.editingMessageId === next.editingMessageId &&
-    prev.editingMode === next.editingMode &&
     prev.editingDraftText === next.editingDraftText &&
     prev.editingDraftAttachments === next.editingDraftAttachments &&
-    prev.editingRollbackTurns === next.editingRollbackTurns &&
     prev.editingBusy === next.editingBusy &&
     prev.onStartEdit === next.onStartEdit &&
-    prev.onStartRollback === next.onStartRollback &&
     prev.onChangeEditText === next.onChangeEditText &&
     prev.onRemoveEditAttachment === next.onRemoveEditAttachment &&
     prev.onPasteEditAttachments === next.onPasteEditAttachments &&
@@ -2093,8 +2045,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     startupRestorePending,
     createThread,
     forkCodexThread,
-    rollbackCodexThread,
-    rollbackCodexThreadInPlace,
+    forkCodexThreadDroppingTurns,
     compactCodexThread,
     attachCodexRemoteThread,
     attachOpenCodeRemoteSession,
@@ -2112,8 +2063,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       startupRestorePending: state.startupRestorePending,
       createThread: state.createThread,
       forkCodexThread: state.forkCodexThread,
-      rollbackCodexThread: state.rollbackCodexThread,
-      rollbackCodexThreadInPlace: state.rollbackCodexThreadInPlace,
+      forkCodexThreadDroppingTurns: state.forkCodexThreadDroppingTurns,
       compactCodexThread: state.compactCodexThread,
       attachCodexRemoteThread: state.attachCodexRemoteThread,
       attachOpenCodeRemoteSession: state.attachOpenCodeRemoteSession,
@@ -2949,10 +2899,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     ],
   );
 
-  const beginEditingUserMessage = useCallback((
-    message: Message,
-    mode: MessageEditMode,
-  ) => {
+  const startEditingUserMessage = useCallback((message: Message) => {
     if (!canEditActiveThreadMessages) {
       return;
     }
@@ -2966,17 +2913,8 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       text: context.text,
       attachments: context.attachments,
       planMode: context.planMode,
-      mode,
     });
   }, [canEditActiveThreadMessages]);
-
-  const startEditingUserMessage = useCallback((message: Message) => {
-    beginEditingUserMessage(message, "branch");
-  }, [beginEditingUserMessage]);
-
-  const startRollbackUserMessage = useCallback((message: Message) => {
-    beginEditingUserMessage(message, "rollback");
-  }, [beginEditingUserMessage]);
 
   const changeEditingMessageText = useCallback((text: string) => {
     setEditingMessageDraft((current) =>
@@ -3023,40 +2961,31 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       return;
     }
 
-    const rollbackTurns = computeRollbackTurnsForEditedMessage(
+    const droppedTurns = computeDroppedTurnsForEditedMessage(
       messages,
       draft.messageId,
     );
-    if (!rollbackTurns) {
-      toast.error(
-        t(
-          draft.mode === "rollback"
-            ? "panel.toasts.codexThreadRollbackEditFailed"
-            : "panel.toasts.codexThreadEditFailed",
-        ),
-      );
+    if (!droppedTurns) {
+      toast.error(t("panel.toasts.codexThreadEditFailed"));
       return;
     }
 
-    const isRollbackMode = draft.mode === "rollback";
     const profileOperationId = createBranchProfileOperationId(
-      isRollbackMode ? "edit-rollback-in-place" : "edit-rollback",
+      "edit-bounded-fork",
       activeThread.id,
     );
-    const logPrefix = isRollbackMode ? "frontend.rollback_edit" : "frontend.edit_branch";
+    const logPrefix = "frontend.edit_branch";
     const totalStartedAt = performance.now();
     appendBranchProfileLogBestEffort(profileOperationId, `${logPrefix}.start`, {
       threadId: activeThread.id,
       messageId: draft.messageId,
-      rollbackTurns,
+      droppedTurns,
       textLength: text.length,
       attachmentCount: draft.attachments.length,
       planMode: draft.planMode,
-      mode: draft.mode,
     });
 
     setEditingMessageBusy(true);
-    let rollbackApplied = false;
     try {
       const resolveInputItemsStartedAt = performance.now();
       const inputItems = await resolveCodexInputItems(text, activeThread.engineId);
@@ -3068,117 +2997,30 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
           inputItemCount: inputItems?.length ?? 0,
         },
       );
-      if (isRollbackMode) {
-        const rollbackStartedAt = performance.now();
-        const rolledBackThread = await rollbackCodexThreadInPlace(
-          activeThread.id,
-          rollbackTurns,
-          profileOperationId,
-        );
-        appendBranchProfileLogBestEffort(
-          profileOperationId,
-          `${logPrefix}.rollback_command.done`,
-          {
-            elapsedMs: formatBranchProfileElapsedMs(performance.now() - rollbackStartedAt),
-            threadId: rolledBackThread?.id ?? null,
-          },
-        );
-        if (!rolledBackThread) {
-          throw new Error(t("panel.toasts.codexThreadRollbackEditFailed"));
-        }
-
-        rollbackApplied = true;
-        const bindStartedAt = performance.now();
-        await bindChatThread(rolledBackThread.id, { forceReload: true });
-        appendBranchProfileLogBestEffort(
-          profileOperationId,
-          `${logPrefix}.bind_chat_thread.done`,
-          {
-            elapsedMs: formatBranchProfileElapsedMs(performance.now() - bindStartedAt),
-            threadId: rolledBackThread.id,
-          },
-        );
-
-        const nextModelId = readThreadLastModelId(rolledBackThread) ?? rolledBackThread.modelId;
-        const nextReasoningEffort =
-          typeof rolledBackThread.engineMetadata?.reasoningEffort === "string"
-            ? rolledBackThread.engineMetadata.reasoningEffort
-            : activeThreadReasoningEffort ?? null;
-        const sendPreparedTurnStartedAt = performance.now();
-        const submission = await sendPreparedTurn({
-          text,
-          attachments: draft.attachments,
-          inputItems,
-          planMode: draft.planMode,
-          thread: rolledBackThread,
-          engineId: rolledBackThread.engineId,
-          modelId: nextModelId,
-          reasoningEffort: nextReasoningEffort,
-          personality: readThreadPersonalityValue(rolledBackThread),
-          serviceTier: readThreadServiceTierValue(rolledBackThread),
-          outputSchemaText: readThreadOutputSchemaText(rolledBackThread),
-          customApprovalPolicyText: readCodexThreadCustomApprovalPolicyText(rolledBackThread),
-          openCodeAgent: readThreadOpenCodeAgentValue(rolledBackThread),
-        });
-        appendBranchProfileLogBestEffort(
-          profileOperationId,
-          `${logPrefix}.send_prepared_turn.done`,
-          {
-            elapsedMs: formatBranchProfileElapsedMs(
-              performance.now() - sendPreparedTurnStartedAt,
-            ),
-            submission,
-          },
-        );
-        if (submission === "sent") {
-          recordSubmittedInput(text);
-          inputHistCursorRef.current = -1;
-          inputLiveDraftRef.current = "";
-          setEditingMessageDraft(null);
-          appendBranchProfileLogBestEffort(profileOperationId, `${logPrefix}.success`, {
-            totalElapsedMs: formatBranchProfileElapsedMs(performance.now() - totalStartedAt),
-            threadId: rolledBackThread.id,
-            rollbackTurns,
-          });
-        } else if (submission === "failed") {
-          restoreComposerFromEditDraft({
-            text,
-            attachments: draft.attachments,
-            planMode: draft.planMode,
-          });
-          appendBranchProfileLogBestEffort(profileOperationId, `${logPrefix}.failed`, {
-            totalElapsedMs: formatBranchProfileElapsedMs(performance.now() - totalStartedAt),
-            submission,
-          });
-          toast.error(t("panel.toasts.codexThreadRollbackEditIncomplete"));
-        }
-        return;
-      }
-
-      const rollbackStartedAt = performance.now();
-      const rollbackBranch = await rollbackCodexThread(
+      const boundedForkStartedAt = performance.now();
+      const editedBranch = await forkCodexThreadDroppingTurns(
         activeThread.id,
-        rollbackTurns,
+        droppedTurns,
         profileOperationId,
       );
       appendBranchProfileLogBestEffort(
         profileOperationId,
-        `${logPrefix}.rollback_command.done`,
+        `${logPrefix}.bounded_fork_command.done`,
         {
-          elapsedMs: formatBranchProfileElapsedMs(performance.now() - rollbackStartedAt),
-          createdThreadId: rollbackBranch?.id ?? null,
+          elapsedMs: formatBranchProfileElapsedMs(performance.now() - boundedForkStartedAt),
+          createdThreadId: editedBranch?.id ?? null,
         },
       );
-      if (!rollbackBranch) {
-        throw new Error(t("panel.toasts.codexThreadRollbackFailed"));
+      if (!editedBranch) {
+        throw new Error(t("panel.toasts.codexThreadEditFailed"));
       }
 
-      manualThreadBindTargetRef.current = rollbackBranch.id;
+      manualThreadBindTargetRef.current = editedBranch.id;
       const bindStartedAt = performance.now();
       try {
-        await bindChatThread(rollbackBranch.id);
+        await bindChatThread(editedBranch.id);
       } finally {
-        if (manualThreadBindTargetRef.current === rollbackBranch.id) {
+        if (manualThreadBindTargetRef.current === editedBranch.id) {
           manualThreadBindTargetRef.current = null;
         }
       }
@@ -3187,14 +3029,14 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         `${logPrefix}.bind_chat_thread.done`,
         {
           elapsedMs: formatBranchProfileElapsedMs(performance.now() - bindStartedAt),
-          createdThreadId: rollbackBranch.id,
+          createdThreadId: editedBranch.id,
         },
       );
 
-      const nextModelId = readThreadLastModelId(rollbackBranch) ?? rollbackBranch.modelId;
+      const nextModelId = readThreadLastModelId(editedBranch) ?? editedBranch.modelId;
       const nextReasoningEffort =
-        typeof rollbackBranch.engineMetadata?.reasoningEffort === "string"
-          ? rollbackBranch.engineMetadata.reasoningEffort
+        typeof editedBranch.engineMetadata?.reasoningEffort === "string"
+          ? editedBranch.engineMetadata.reasoningEffort
           : activeThreadReasoningEffort ?? null;
       const sendPreparedTurnStartedAt = performance.now();
       const submission = await sendPreparedTurn({
@@ -3202,15 +3044,15 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         attachments: draft.attachments,
         inputItems,
         planMode: draft.planMode,
-        thread: rollbackBranch,
-        engineId: rollbackBranch.engineId,
+        thread: editedBranch,
+        engineId: editedBranch.engineId,
         modelId: nextModelId,
         reasoningEffort: nextReasoningEffort,
-        personality: readThreadPersonalityValue(rollbackBranch),
-        serviceTier: readThreadServiceTierValue(rollbackBranch),
-        outputSchemaText: readThreadOutputSchemaText(rollbackBranch),
-        customApprovalPolicyText: readCodexThreadCustomApprovalPolicyText(rollbackBranch),
-        openCodeAgent: readThreadOpenCodeAgentValue(rollbackBranch),
+        personality: readThreadPersonalityValue(editedBranch),
+        serviceTier: readThreadServiceTierValue(editedBranch),
+        outputSchemaText: readThreadOutputSchemaText(editedBranch),
+        customApprovalPolicyText: readCodexThreadCustomApprovalPolicyText(editedBranch),
+        openCodeAgent: readThreadOpenCodeAgentValue(editedBranch),
       });
       appendBranchProfileLogBestEffort(
         profileOperationId,
@@ -3229,7 +3071,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         setEditingMessageDraft(null);
         appendBranchProfileLogBestEffort(profileOperationId, `${logPrefix}.success`, {
           totalElapsedMs: formatBranchProfileElapsedMs(performance.now() - totalStartedAt),
-          createdThreadId: rollbackBranch.id,
+          createdThreadId: editedBranch.id,
         });
       } else if (submission === "failed") {
         restoreComposerFromEditDraft({
@@ -3251,22 +3093,12 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       appendBranchProfileLogBestEffort(profileOperationId, `${logPrefix}.error`, {
         totalElapsedMs: formatBranchProfileElapsedMs(performance.now() - totalStartedAt),
         error: String(error),
-        rollbackApplied,
       });
-      if (rollbackApplied) {
-        toast.error(t("panel.toasts.codexThreadRollbackEditIncomplete"));
-      } else {
-        toast.error(
-          t(
-            isRollbackMode
-              ? "panel.toasts.codexThreadRollbackEditFailedWithError"
-              : "panel.toasts.codexThreadEditFailedWithError",
-            {
-              error: String(error),
-            },
-          ),
-        );
-      }
+      toast.error(
+        t("panel.toasts.codexThreadEditFailedWithError", {
+          error: String(error),
+        }),
+      );
     } finally {
       setEditingMessageBusy(false);
     }
@@ -3281,8 +3113,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     messages,
     recordSubmittedInput,
     restoreComposerFromEditDraft,
-    rollbackCodexThread,
-    rollbackCodexThreadInPlace,
+    forkCodexThreadDroppingTurns,
     sendPreparedTurn,
     streaming,
     t,
@@ -3290,15 +3121,9 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   ]);
   const canEditUserMessages = canEditActiveThreadMessages;
   const editingMessageId = editingMessageDraft?.messageId ?? null;
-  const editingMode = editingMessageDraft?.mode ?? null;
   const editingDraftText = editingMessageDraft?.text ?? "";
-  const editingRollbackTurns =
-    editingMessageDraft
-      ? computeRollbackTurnsForEditedMessage(messages, editingMessageDraft.messageId)
-      : null;
   const editingBusy = editingMessageBusy;
   const handleStartEdit = startEditingUserMessage;
-  const handleStartRollback = startRollbackUserMessage;
   const handleChangeEditText = changeEditingMessageText;
   const handleRemoveEditAttachment = removeEditingMessageAttachment;
   const handleCancelEdit = cancelEditingUserMessage;
@@ -4807,7 +4632,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     });
 
     const rollbackStartedAt = performance.now();
-    const rolledBackThread = await rollbackCodexThread(
+    const rolledBackThread = await forkCodexThreadDroppingTurns(
       activeThread.id,
       numTurns,
       profileOperationId,
@@ -6515,13 +6340,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                         workspaceRootPath={getMessageWorkspaceRootPath(message)}
                         canEditUserMessages={canEditUserMessages}
                         editingMessageId={editingMessageId}
-                        editingMode={editingMode}
                         editingDraftText={editingDraftText}
                         editingDraftAttachments={editingMessageDraft?.attachments ?? []}
-                        editingRollbackTurns={editingRollbackTurns}
                         editingBusy={editingBusy}
                         onStartEdit={handleStartEdit}
-                        onStartRollback={handleStartRollback}
                         onChangeEditText={handleChangeEditText}
                         onRemoveEditAttachment={handleRemoveEditAttachment}
                         onPasteEditAttachments={handleEditDraftPaste}

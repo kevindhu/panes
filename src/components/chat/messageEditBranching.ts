@@ -31,7 +31,7 @@ export function isEditableUserTurn(message: Message): boolean {
   return message.role === "user" && !messageHasSteerMarker(message) && text !== null;
 }
 
-export function computeRollbackTurnsForEditedMessage(
+export function computeDroppedTurnsForEditedMessage(
   messages: Message[],
   messageId: string,
 ): number | null {
