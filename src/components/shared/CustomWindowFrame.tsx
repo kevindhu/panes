@@ -1,7 +1,7 @@
 import { Dropdown } from "./Dropdown";
 import { cycleWorkspaceTerminalLayout } from "../../lib/workspacePaneNavigation";
 import { runEditMenuAction } from "../../lib/nativeEditActions";
-import { runAppZoomAction } from "../../lib/appZoom";
+import { getAppZoomMetrics, runAppZoomAction } from "../../lib/appZoom";
 import { useOnboardingStore } from "../../stores/onboardingStore";
 import { useUiStore } from "../../stores/uiStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
@@ -19,9 +19,11 @@ import {
 } from "../../lib/windowActions";
 import { handleDragDoubleClick, handleDragMouseDown } from "../../lib/windowDrag";
 import { CustomWindowResizeHandles } from "./CustomWindowResizeHandles";
+import { ZoomInvariantScaleProvider } from "./ZoomInvariantRegion";
 
 interface CustomWindowFrameProps {
   frameState: CustomWindowFrameState;
+  appZoomPercent?: number;
 }
 
 const MENU_SENTINEL = "__custom-window-menu__";
@@ -37,9 +39,13 @@ const MENU_TRIGGER_STYLE = {
   gap: 6,
 } as const;
 
-export function CustomWindowFrame({ frameState }: CustomWindowFrameProps) {
+export function CustomWindowFrame({
+  frameState,
+  appZoomPercent = 100,
+}: CustomWindowFrameProps) {
   const { t } = useTranslation(["app", "native"]);
   const showChrome = shouldShowCustomWindowChrome(frameState);
+  const { inverseFactor } = getAppZoomMetrics(appZoomPercent);
 
   const panesMenuOptions = [
     { value: "open-setup", label: t("app:sidebar.engineSetup") },
@@ -123,7 +129,7 @@ export function CustomWindowFrame({ frameState }: CustomWindowFrameProps) {
   }
 
   return (
-    <>
+    <ZoomInvariantScaleProvider scale={inverseFactor}>
       {showChrome && (
         <div
           className="linux-window-chrome"
@@ -198,6 +204,6 @@ export function CustomWindowFrame({ frameState }: CustomWindowFrameProps) {
         </div>
       )}
       <CustomWindowResizeHandles canResize={canCustomWindowResize(frameState)} />
-    </>
+    </ZoomInvariantScaleProvider>
   );
 }

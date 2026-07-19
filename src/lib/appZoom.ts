@@ -4,6 +4,11 @@ import { useUiStore } from "../stores/uiStore";
 
 export type AppZoomAction = "zoom-in" | "zoom-out" | "reset-zoom";
 
+export interface AppZoomMetrics {
+  factor: number;
+  inverseFactor: number;
+}
+
 export interface AppZoomShortcutEvent {
   key: string;
   code: string;
@@ -16,6 +21,27 @@ export interface AppZoomShortcutEvent {
 let requestedZoomPercent: number | null = null;
 let zoomFlushPromise: Promise<void> | null = null;
 let lastAppliedZoomPercent: number | null = null;
+
+export function getAppZoomMetrics(percent: number): AppZoomMetrics {
+  const factor = Number.isFinite(percent) && percent > 0 ? percent / 100 : 1;
+  return {
+    factor,
+    inverseFactor: 1 / factor,
+  };
+}
+
+function syncZoomCompensationVariables(percent: number): void {
+  if (typeof document === "undefined") {
+    return;
+  }
+
+  const { factor, inverseFactor } = getAppZoomMetrics(percent);
+  document.documentElement.style.setProperty("--app-zoom-factor", String(factor));
+  document.documentElement.style.setProperty(
+    "--app-zoom-inverse-factor",
+    String(inverseFactor),
+  );
+}
 
 export function resolveAppZoomShortcut(
   event: AppZoomShortcutEvent,
@@ -87,11 +113,14 @@ async function flushRequestedZoom(): Promise<void> {
     const percent = requestedZoomPercent;
     requestedZoomPercent = null;
     if (percent === lastAppliedZoomPercent) {
+      syncZoomCompensationVariables(percent);
       continue;
     }
 
-    await getCurrentWebview().setZoom(percent / 100);
+    const { factor } = getAppZoomMetrics(percent);
+    await getCurrentWebview().setZoom(factor);
     lastAppliedZoomPercent = percent;
+    syncZoomCompensationVariables(percent);
     appliedZoom = true;
   }
 

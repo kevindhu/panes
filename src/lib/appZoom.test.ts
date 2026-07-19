@@ -1,3 +1,5 @@
+// @vitest-environment jsdom
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockIsTauri = vi.hoisted(() => vi.fn());
@@ -38,6 +40,8 @@ describe("app zoom", () => {
     vi.clearAllMocks();
     mockIsTauri.mockReturnValue(true);
     mockSetZoom.mockResolvedValue(undefined);
+    document.documentElement.style.removeProperty("--app-zoom-factor");
+    document.documentElement.style.removeProperty("--app-zoom-inverse-factor");
   });
 
   it("recognizes primary keyboard and numpad zoom shortcuts", async () => {
@@ -86,6 +90,18 @@ describe("app zoom", () => {
     await applyAppZoomPercent(130);
 
     expect(mockSetZoom).toHaveBeenCalledWith(1.3);
+    expect(document.documentElement.style.getPropertyValue("--app-zoom-factor")).toBe("1.3");
+    expect(
+      Number(document.documentElement.style.getPropertyValue("--app-zoom-inverse-factor")),
+    ).toBeCloseTo(1 / 1.3);
+  });
+
+  it("normalizes invalid zoom metrics to the unscaled coordinate system", async () => {
+    const { getAppZoomMetrics } = await import("./appZoom");
+
+    expect(getAppZoomMetrics(80)).toEqual({ factor: 0.8, inverseFactor: 1.25 });
+    expect(getAppZoomMetrics(0)).toEqual({ factor: 1, inverseFactor: 1 });
+    expect(getAppZoomMetrics(Number.NaN)).toEqual({ factor: 1, inverseFactor: 1 });
   });
 
   it("coalesces rapid changes while preserving the newest zoom level", async () => {
