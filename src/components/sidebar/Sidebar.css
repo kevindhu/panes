@@ -16,7 +16,8 @@
   --sb-hover: rgba(0, 0, 0, 0.045);
   --sb-selected: #e6e6e6;
   --sb-selected-hover: #e2e2e2;
-  --sb-font-ui: 12px;
+  /* Keep routine sidebar copy just below the 13px workspace prose baseline. */
+  --sb-font-ui: 12.5px;
   --sb-font-supporting: 13px;
   --sb-font-caption: 11.5px;
   --sb-row-height: 28px;
