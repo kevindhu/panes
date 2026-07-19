@@ -1,5 +1,5 @@
 import { convertFileSrc, isTauri } from "@tauri-apps/api/core";
-import { resolveWorkspaceRelativeLocalImagePath } from "./localImageSources";
+import { resolveLocalImagePath } from "./localImageSources";
 
 export const MARKDOWN_LOCAL_IMAGE_PATH_ATTR = "data-panes-markdown-local-image-path";
 export const MARKDOWN_LOCAL_IMAGE_MIME_ATTR = "data-panes-markdown-local-image-mime";
@@ -41,7 +41,7 @@ export function resolveWorkspaceMarkdownImage(
   source: string,
   workspaceRootPath?: string | null,
 ): { filePath: string; mimeType: string | null; source: string } | null {
-  const filePath = resolveWorkspaceRelativeLocalImagePath(source, workspaceRootPath);
+  const filePath = resolveLocalImagePath(source, workspaceRootPath);
 
   if (!filePath) {
     return null;
@@ -65,7 +65,7 @@ export function rewriteMarkdownImageSources(
   html: string,
   workspaceRootPath?: string | null,
 ): string {
-  if (!workspaceRootPath?.trim() || typeof document === "undefined") {
+  if (typeof document === "undefined") {
     return html;
   }
 
