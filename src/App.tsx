@@ -41,6 +41,11 @@ import {
   planImplementationPromptLogOperationId,
 } from "./lib/planImplementationPromptState";
 import { runEditMenuAction } from "./lib/nativeEditActions";
+import {
+  isAppZoomAvailable,
+  resolveAppZoomShortcut,
+  runAppZoomAction,
+} from "./lib/appZoom";
 import { createAndActivateWorkspaceThread } from "./lib/newThreadActions";
 import {
   isThreadActivityVisible,
@@ -848,6 +853,28 @@ export function App() {
     return () => clearTimeout(timer);
   }, [checkForUpdate]);
 
+  // Capture zoom shortcuts before focused editors or terminals can consume
+  // them. In a regular browser we leave the event untouched so its native
+  // page-zoom behavior remains available.
+  useEffect(() => {
+    function onAppZoomKeyDown(event: KeyboardEvent) {
+      if (!isAppZoomAvailable()) {
+        return;
+      }
+      const action = resolveAppZoomShortcut(event);
+      if (!action) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      fireShortcut(action, () => runAppZoomAction(action));
+    }
+
+    window.addEventListener("keydown", onAppZoomKeyDown, true);
+    return () => window.removeEventListener("keydown", onAppZoomKeyDown, true);
+  }, []);
+
   // Handle app-level keyboard shortcuts via JavaScript keydown listeners.
   // On macOS, when a contenteditable element (CodeMirror editor) is focused,
   // WKWebView claims Cmd+key events for text formatting before they reach
@@ -1084,6 +1111,11 @@ export function App() {
             const wsId = useWorkspaceStore.getState().activeWorkspaceId;
             if (wsId) cycleWorkspaceTerminalLayout(wsId);
           });
+          break;
+        case "zoom-in":
+        case "zoom-out":
+        case "reset-zoom":
+          fireShortcut(action, () => runAppZoomAction(action));
           break;
         case "close-window": {
           void requestWindowClose();

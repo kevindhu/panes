@@ -71,7 +71,7 @@ describe("ThreeColumnLayout", () => {
       sidebarPinned: true,
       showGitPanel: true,
       showExplorer: true,
-      workspacePaneZoomPercent: 100,
+      appZoomPercent: 100,
       focusMode: false,
       focusModeSnapshot: null,
       activeView: "chat",

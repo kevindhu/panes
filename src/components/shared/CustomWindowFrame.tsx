@@ -1,6 +1,7 @@
 import { Dropdown } from "./Dropdown";
 import { cycleWorkspaceTerminalLayout } from "../../lib/workspacePaneNavigation";
 import { runEditMenuAction } from "../../lib/nativeEditActions";
+import { runAppZoomAction } from "../../lib/appZoom";
 import { useOnboardingStore } from "../../stores/onboardingStore";
 import { useUiStore } from "../../stores/uiStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
@@ -56,8 +57,11 @@ export function CustomWindowFrame({ frameState }: CustomWindowFrameProps) {
     { value: "toggle-sidebar", label: t("native:menu.toggleSidebar"), shortcut: "Ctrl+B" },
     { value: "toggle-git-panel", label: t("native:menu.toggleGitPanel"), shortcut: "Ctrl+Shift+B" },
     { value: "toggle-focus-mode", label: t("native:menu.toggleFocusMode"), shortcut: "Ctrl+Alt+F" },
-    { value: "toggle-fullscreen", label: t("native:menu.toggleFullscreen"), shortcut: "F11" },
-    { value: "toggle-search", label: t("native:menu.search"), shortcut: "Ctrl+Shift+F" },
+    { value: "zoom-in", label: t("native:menu.zoomIn"), shortcut: "Ctrl++", separatorBefore: true },
+    { value: "zoom-out", label: t("native:menu.zoomOut"), shortcut: "Ctrl+-" },
+    { value: "reset-zoom", label: t("native:menu.resetZoom"), shortcut: "Ctrl+0" },
+    { value: "toggle-fullscreen", label: t("native:menu.toggleFullscreen"), shortcut: "F11", separatorBefore: true },
+    { value: "toggle-search", label: t("native:menu.search"), shortcut: "Ctrl+Shift+F", separatorBefore: true },
     { value: "toggle-terminal", label: t("native:menu.toggleTerminal"), shortcut: "Ctrl+Shift+T" },
   ];
 
@@ -94,6 +98,11 @@ export function CustomWindowFrame({ frameState }: CustomWindowFrameProps) {
         return;
       case "toggle-focus-mode":
         useUiStore.getState().toggleFocusMode();
+        return;
+      case "zoom-in":
+      case "zoom-out":
+      case "reset-zoom":
+        runAppZoomAction(value);
         return;
       case "toggle-fullscreen":
         void toggleWindowFullscreen();
