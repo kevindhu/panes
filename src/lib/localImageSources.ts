@@ -35,6 +35,32 @@ function safeDecodePath(path: string): string {
   }
 }
 
+function isWindowsDriveAbsolutePath(path: string): boolean {
+  return /^[a-z]:[\\/]/i.test(path);
+}
+
+function isWindowsUncPath(path: string): boolean {
+  // Forward-slash `//host/path` sources stay browser URLs; canonical UNC paths
+  // use backslashes so they cannot collide with protocol-relative remote images.
+  return /^\\\\[^\\/]+[\\/]+[^\\/]+(?:[\\/]|$)/.test(path);
+}
+
+function normalizeAbsoluteWindowsImagePath(sourcePath: string): string | null {
+  const decodedPath = safeDecodePath(sourcePath);
+
+  if (isWindowsDriveAbsolutePath(decodedPath)) {
+    return decodedPath.replace(/\//g, "\\");
+  }
+
+  if (isWindowsUncPath(decodedPath)) {
+    return decodedPath
+      .replace(/\//g, "\\")
+      .replace(/^\\+/, "\\\\");
+  }
+
+  return null;
+}
+
 export function hasSupportedLocalImageExtension(sourcePath: string): boolean {
   const path = safeDecodePath(sourcePath).replace(/\\/g, "/");
   const filename = path.split("/").filter(Boolean).pop() ?? "";
@@ -74,6 +100,27 @@ export function isWorkspaceRelativeLocalImageSource(source: string): boolean {
   }
 
   return hasSupportedLocalImageExtension(splitLocalImageSource(trimmed).path);
+}
+
+export function isAbsoluteWindowsLocalImageSource(source: string): boolean {
+  const trimmed = source.trim();
+
+  if (!trimmed) {
+    return false;
+  }
+
+  const { path } = splitLocalImageSource(trimmed);
+  return (
+    normalizeAbsoluteWindowsImagePath(path) !== null &&
+    hasSupportedLocalImageExtension(path)
+  );
+}
+
+export function isLocalImageSource(source: string): boolean {
+  return (
+    isAbsoluteWindowsLocalImageSource(source) ||
+    isWorkspaceRelativeLocalImageSource(source)
+  );
 }
 
 function normalizeRelativePathParts(sourcePath: string): string[] | null {
@@ -129,4 +176,23 @@ export function resolveWorkspaceRelativeLocalImagePath(
   }
 
   return `${normalizedRoot}${separator}${parts.join(separator)}`;
+}
+
+export function resolveLocalImagePath(
+  source: string,
+  workspaceRootPath?: string | null,
+): string | null {
+  const trimmed = source.trim();
+
+  if (!trimmed) {
+    return null;
+  }
+
+  const { path } = splitLocalImageSource(trimmed);
+  const absolutePath = normalizeAbsoluteWindowsImagePath(path);
+  if (absolutePath && hasSupportedLocalImageExtension(path)) {
+    return absolutePath;
+  }
+
+  return resolveWorkspaceRelativeLocalImagePath(trimmed, workspaceRootPath);
 }

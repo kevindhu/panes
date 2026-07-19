@@ -342,22 +342,12 @@ export const ipc = {
       threadId,
       profileOperationId: profileOperationId ?? null,
     }),
-  rollbackCodexThread: (
+  forkCodexThreadDroppingTurns: (
     threadId: string,
     numTurns: number,
     profileOperationId?: string | null,
   ) =>
-    invoke<Thread>("rollback_codex_thread", {
-      threadId,
-      numTurns,
-      profileOperationId: profileOperationId ?? null,
-    }),
-  rollbackCodexThreadInPlace: (
-    threadId: string,
-    numTurns: number,
-    profileOperationId?: string | null,
-  ) =>
-    invoke<Thread>("rollback_codex_thread_in_place", {
+    invoke<Thread>("fork_codex_thread_dropping_turns", {
       threadId,
       numTurns,
       profileOperationId: profileOperationId ?? null,

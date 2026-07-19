@@ -64,6 +64,13 @@ function assertSourceContains(path, tokens) {
   }
 }
 
+function assertSourceOmits(path, tokens) {
+  const source = readFileSync(join(repoRoot, path), "utf8");
+  for (const token of tokens) {
+    assert(!source.includes(token), `${path} still contains deprecated token ${token}`);
+  }
+}
+
 function assertSourceMatches(path, patterns) {
   const source = readFileSync(join(repoRoot, path), "utf8");
   for (const [label, pattern] of patterns) {
@@ -152,7 +159,6 @@ try {
     "TurnStartParams.json",
     "TurnSteerParams.json",
     "ReviewStartParams.json",
-    "ThreadRollbackParams.json",
     "ThreadCompactStartParams.json",
     "FeedbackUploadParams.json",
     "ThreadInjectItemsParams.json",
@@ -180,7 +186,13 @@ try {
     }
   }
 
-  assertProperties(schemaRoot, "ThreadTurnsListParams.json", ["threadId", "cursor", "limit"]);
+  assertProperties(schemaRoot, "ThreadTurnsListParams.json", [
+    "threadId",
+    "cursor",
+    "limit",
+    "itemsView",
+  ]);
+  assertProperties(schemaRoot, "ThreadForkParams.json", ["lastTurnId"]);
   for (const file of [
     "ThreadStartParams.json",
     "ThreadResumeParams.json",
@@ -207,11 +219,14 @@ try {
   assertSourceContains("src-tauri/src/engines/codex.rs", [
     "THREAD_TURNS_LIST_METHODS",
     "thread/turns/list",
+    '"itemsView"',
     '"permissionProfile"',
     '"approvalsReviewer"',
+    '"lastTurnId"',
     "account/chatgptAuthTokens/refresh",
     "thread/realtime/transcriptdone",
   ]);
+  assertSourceOmits("src-tauri/src/engines/codex.rs", ["thread/rollback"]);
   assertSourceMatches("src-tauri/src/engines/codex.rs", [
     [
       "thread turns list is used for transcript import",

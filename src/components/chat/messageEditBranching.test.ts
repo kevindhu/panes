@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Message } from "../../types";
 import {
-  computeRollbackTurnsForEditedMessage,
+  computeDroppedTurnsForEditedMessage,
   extractEditableMessageContext,
   isEditableUserTurn,
   mergeUniqueChatAttachments,
@@ -59,7 +59,7 @@ function createAssistantMessage(id: string, content: string): Message {
 }
 
 describe("messageEditBranching", () => {
-  it("computes a rollback depth of one for the latest user turn", () => {
+  it("drops one turn when editing the latest user turn", () => {
     const messages = [
       createUserMessage("user-1", "First"),
       createAssistantMessage("assistant-1", "Reply"),
@@ -67,10 +67,10 @@ describe("messageEditBranching", () => {
       createAssistantMessage("assistant-2", "Reply"),
     ];
 
-    expect(computeRollbackTurnsForEditedMessage(messages, "user-2")).toBe(1);
+    expect(computeDroppedTurnsForEditedMessage(messages, "user-2")).toBe(1);
   });
 
-  it("computes rollback depth from a middle user turn through the tail", () => {
+  it("computes dropped turns from a middle user turn through the tail", () => {
     const messages = [
       createUserMessage("user-1", "First"),
       createAssistantMessage("assistant-1", "Reply"),
@@ -80,10 +80,10 @@ describe("messageEditBranching", () => {
       createAssistantMessage("assistant-3", "Reply"),
     ];
 
-    expect(computeRollbackTurnsForEditedMessage(messages, "user-2")).toBe(2);
+    expect(computeDroppedTurnsForEditedMessage(messages, "user-2")).toBe(2);
   });
 
-  it("ignores steer messages when computing rollback depth", () => {
+  it("ignores steer messages when computing dropped turns", () => {
     const messages = [
       createUserMessage("user-1", "First"),
       createAssistantMessage("assistant-1", "Reply"),
@@ -94,8 +94,8 @@ describe("messageEditBranching", () => {
     ];
 
     expect(isEditableUserTurn(messages[2])).toBe(false);
-    expect(computeRollbackTurnsForEditedMessage(messages, "user-1")).toBe(2);
-    expect(computeRollbackTurnsForEditedMessage(messages, "steer-1")).toBeNull();
+    expect(computeDroppedTurnsForEditedMessage(messages, "user-1")).toBe(2);
+    expect(computeDroppedTurnsForEditedMessage(messages, "steer-1")).toBeNull();
   });
 
   it("extracts editable text, attachments, and plan mode from a user message", () => {
