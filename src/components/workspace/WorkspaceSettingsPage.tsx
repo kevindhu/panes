@@ -8,6 +8,7 @@ import {
   GitBranch,
   Info,
   Link,
+  Pencil,
   Play,
   RefreshCw,
 } from "lucide-react";
@@ -16,6 +17,7 @@ import { formatShortDate } from "../../lib/formatters";
 import { handleDragDoubleClick, handleDragMouseDown } from "../../lib/windowDrag";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
 import { useUiStore } from "../../stores/uiStore";
+import { useFileStore } from "../../stores/fileStore";
 import { toast } from "../../stores/toastStore";
 import { Dropdown } from "../shared/Dropdown";
 import { WorkspaceStartupSection } from "./WorkspaceStartupSection";
@@ -36,6 +38,10 @@ export function WorkspaceSettingsPage() {
   const storeSetGitActive = useWorkspaceStore((s) => s.setRepoGitActive);
   const storeSetAllTrust = useWorkspaceStore((s) => s.setAllReposTrustLevel);
   const storeRescan = useWorkspaceStore((s) => s.rescanWorkspace);
+  const storeChangeDirectory = useWorkspaceStore((s) => s.changeWorkspaceDirectory);
+  const retargetWorkspaceTabs = useFileStore(
+    (s) => s.retargetTabsAfterWorkspaceDirectoryChange,
+  );
   const settingsWorkspaceId = useUiStore((s) => s.settingsWorkspaceId);
   const setActiveView = useUiStore((s) => s.setActiveView);
 
@@ -46,6 +52,7 @@ export function WorkspaceSettingsPage() {
   const [depthDraft, setDepthDraft] = useState("");
   const [depthSaving, setDepthSaving] = useState(false);
   const [depthError, setDepthError] = useState<string | null>(null);
+  const [pathSaving, setPathSaving] = useState(false);
   const [localRepos, setLocalRepos] = useState<Repo[] | null>(null);
   const [reposLoading, setReposLoading] = useState(false);
   const [remotesRepo, setRemotesRepo] = useState<Repo | null>(null);
@@ -205,6 +212,31 @@ export function WorkspaceSettingsPage() {
     }
   }
 
+  async function changeWorkspaceDirectory() {
+    if (!workspace) return;
+    setPathSaving(true);
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: workspace.rootPath,
+        title: t("general.chooseDirectory"),
+      });
+      if (typeof selected !== "string" || selected === workspace.rootPath) return;
+
+      const updated = await storeChangeDirectory(workspace.id, selected);
+      if (!updated) return;
+      retargetWorkspaceTabs(workspace.id, workspace.rootPath, updated.rootPath);
+      if (!isActive) setLocalRepos(await ipc.getRepos(workspace.id));
+      toast.success(t("toasts.directoryChanged"));
+    } catch {
+      toast.error(t("toasts.changeDirectoryFailed"));
+    } finally {
+      setPathSaving(false);
+    }
+  }
+
   return (
     <>
     <div className="wsp-root">
@@ -279,7 +311,17 @@ export function WorkspaceSettingsPage() {
                       <button
                         type="button"
                         className="ws-prop-btn"
+                        onClick={() => void changeWorkspaceDirectory()}
+                        disabled={pathSaving}
+                      >
+                        <Pencil size={10} />
+                        {t("actions.edit")}
+                      </button>
+                      <button
+                        type="button"
+                        className="ws-prop-btn"
                         onClick={() => void revealWorkspace()}
+                        disabled={pathSaving}
                       >
                         <FolderOpen size={11} />
                         {t("actions.reveal")}

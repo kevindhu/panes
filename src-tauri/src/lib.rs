@@ -196,6 +196,7 @@ pub fn run() {
             commands::chat::get_action_output,
             commands::chat::search_messages,
             commands::workspace::open_workspace,
+            commands::workspace::retarget_workspace,
             commands::workspace::list_workspaces,
             commands::workspace::set_workspace_order,
             commands::workspace::list_archived_workspaces,

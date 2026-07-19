@@ -4,6 +4,7 @@
   },
   "actions": {
     "back": "Back",
+    "edit": "Edit",
     "reveal": "Reveal",
     "rescan": "Rescan"
   },
@@ -20,7 +21,8 @@
   "general": {
     "workspaceFallback": "Workspace",
     "name": "Name",
-    "path": "Path"
+    "path": "Path",
+    "chooseDirectory": "Choose a new workspace folder"
   },
   "scanning": {
     "depth": "Depth",
@@ -223,6 +225,8 @@
     "updateTrustFailed": "Failed to update trust level.",
     "toggleVisibilityFailed": "Failed to toggle visibility.",
     "updateTrustLevelsFailed": "Failed to update trust levels.",
+    "directoryChanged": "Workspace directory updated.",
+    "changeDirectoryFailed": "Failed to update workspace directory.",
     "revealFailed": "Failed to reveal workspace in the file manager."
   },
   "more": {
