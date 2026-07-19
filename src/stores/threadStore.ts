@@ -48,12 +48,7 @@ interface ThreadState {
   removeThread: (threadId: string) => Promise<void>;
   restoreThread: (threadId: string) => Promise<void>;
   forkCodexThread: (threadId: string, profileOperationId?: string | null) => Promise<Thread | null>;
-  rollbackCodexThread: (
-    threadId: string,
-    numTurns: number,
-    profileOperationId?: string | null,
-  ) => Promise<Thread | null>;
-  rollbackCodexThreadInPlace: (
+  forkCodexThreadDroppingTurns: (
     threadId: string,
     numTurns: number,
     profileOperationId?: string | null,
@@ -501,21 +496,21 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       return null;
     }
   },
-  rollbackCodexThread: async (threadId, numTurns, profileOperationId) => {
+  forkCodexThreadDroppingTurns: async (threadId, numTurns, profileOperationId) => {
     set({ loading: true, error: undefined });
     try {
-      const rolledBack = await ipc.rollbackCodexThread(
+      const boundedFork = await ipc.forkCodexThreadDroppingTurns(
         threadId,
         numTurns,
         profileOperationId ?? null,
       );
-      localStorage.setItem(LAST_THREAD_KEY, rolledBack.id);
+      localStorage.setItem(LAST_THREAD_KEY, boundedFork.id);
       set((state) => {
-        const workspaceId = rolledBack.workspaceId;
+        const workspaceId = boundedFork.workspaceId;
         const workspaceThreads = state.threadsByWorkspace[workspaceId] ?? [];
         const nextWorkspaceThreads = [
-          rolledBack,
-          ...workspaceThreads.filter((thread) => thread.id !== rolledBack.id),
+          boundedFork,
+          ...workspaceThreads.filter((thread) => thread.id !== boundedFork.id),
         ];
         const threadsByWorkspace = mergeWorkspaceThreads(
           state.threadsByWorkspace,
@@ -526,45 +521,11 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
         return {
           threadsByWorkspace,
           threads: flattenThreadsByWorkspace(threadsByWorkspace),
-          activeThreadId: rolledBack.id,
+          activeThreadId: boundedFork.id,
           loading: false,
         };
       });
-      return rolledBack;
-    } catch (error) {
-      set({ loading: false, error: String(error) });
-      return null;
-    }
-  },
-  rollbackCodexThreadInPlace: async (threadId, numTurns, profileOperationId) => {
-    set({ loading: true, error: undefined });
-    try {
-      const rolledBack = await ipc.rollbackCodexThreadInPlace(
-        threadId,
-        numTurns,
-        profileOperationId ?? null,
-      );
-      localStorage.setItem(LAST_THREAD_KEY, rolledBack.id);
-      set((state) => {
-        const workspaceId = rolledBack.workspaceId;
-        const workspaceThreads = state.threadsByWorkspace[workspaceId] ?? [];
-        const nextWorkspaceThreads = workspaceThreads.map((thread) =>
-          thread.id === rolledBack.id ? rolledBack : thread,
-        );
-        const threadsByWorkspace = mergeWorkspaceThreads(
-          state.threadsByWorkspace,
-          workspaceId,
-          nextWorkspaceThreads,
-        );
-
-        return {
-          threadsByWorkspace,
-          threads: flattenThreadsByWorkspace(threadsByWorkspace),
-          activeThreadId: state.activeThreadId === rolledBack.id ? rolledBack.id : state.activeThreadId,
-          loading: false,
-        };
-      });
-      return rolledBack;
+      return boundedFork;
     } catch (error) {
       set({ loading: false, error: String(error) });
       return null;

@@ -2153,10 +2153,10 @@ export function CommandPalette({ open, onClose }: Props) {
       const numTurns = Number.parseInt(subFlow.value, 10);
       if (!Number.isFinite(numTurns) || numTurns < 1) return;
       onClose();
-      const { activeThreadId, rollbackCodexThread } = useThreadStore.getState();
+      const { activeThreadId, forkCodexThreadDroppingTurns } = useThreadStore.getState();
       if (!activeThreadId) return;
       try {
-        const rolled = await rollbackCodexThread(activeThreadId, numTurns);
+        const rolled = await forkCodexThreadDroppingTurns(activeThreadId, numTurns);
         if (rolled) {
           await activateThreadContext(rolled);
           toast.success(t("commandPalette.toasts.codexRolledBack", { count: numTurns }));

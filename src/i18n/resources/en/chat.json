@@ -358,14 +358,9 @@
     "messageActions": {
       "copy": "Copy message",
       "edit": "Edit message",
-      "rollback": "Rollback message",
       "save": "Save and branch",
-      "saveRollback": "Save and rollback",
       "cancel": "Cancel",
-      "branching": "Branching...",
-      "rollingBack": "Rolling back...",
-      "rollbackWarning_one": "This rewinds the current thread and removes the latest {{count}} turn before resending your edited message. It does not undo filesystem changes.",
-      "rollbackWarning_other": "This rewinds the current thread and removes the latest {{count}} turns before resending your edited message. It does not undo filesystem changes."
+      "branching": "Branching..."
     },
     "placeholders": {
       "plan": "Describe what you want to plan...",
@@ -416,9 +411,6 @@
       "codexThreadRollbackFailed": "Failed to rollback the active Codex thread.",
       "codexThreadEditFailed": "Failed to branch from the selected user message.",
       "codexThreadEditFailedWithError": "Failed to branch from the selected user message: {{error}}",
-      "codexThreadRollbackEditFailed": "Failed to rollback the current thread from the selected user message.",
-      "codexThreadRollbackEditFailedWithError": "Failed to rollback the current thread from the selected user message: {{error}}",
-      "codexThreadRollbackEditIncomplete": "Rolled back the current thread, but failed to submit the edited message. The thread remains rewound.",
       "codexThreadCompactFailed": "Failed to start Codex thread compaction.",
       "codexThreadResumeUnavailable": "Select a workspace and Codex model before resuming a remote thread.",
       "codexThreadResumeFailed": "Failed to attach the selected Codex thread.",
