@@ -127,11 +127,14 @@ const chatState = vi.hoisted(() => ({
 
 const uiState = vi.hoisted(() => ({
   sidebarPinned: true,
+  toggleSidebar: vi.fn(),
   toggleSidebarPin: vi.fn(),
   activeView: "harnesses" as "chat" | "harnesses" | "workspace-settings",
   setActiveView: vi.fn((view: "chat" | "harnesses" | "workspace-settings") => {
     uiState.activeView = view;
   }),
+  settingsWorkspaceId: null as string | null,
+  settingsWorkspaceSection: "general" as "general" | "repos" | "startup",
   openWorkspaceSettings: vi.fn(),
   openCommandPalette: vi.fn(),
 }));
@@ -315,6 +318,8 @@ describe("Sidebar thread context menu", () => {
     threadPlanModeState.threadModes = {};
     uiState.sidebarPinned = true;
     uiState.activeView = "harnesses";
+    uiState.settingsWorkspaceId = null;
+    uiState.settingsWorkspaceSection = "general";
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
@@ -537,6 +542,46 @@ describe("Sidebar thread context menu", () => {
 
     expect(findThreadRow("Codex conversation")?.querySelector(".sb-thread-running-indicator"))
       .toBeNull();
+  });
+
+  it("opens startup automations for the active repository", async () => {
+    uiState.activeView = "chat";
+    await renderSidebar();
+
+    const automationsButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent?.includes("app:sidebar.automations"),
+    );
+
+    await act(async () => {
+      automationsButton?.click();
+    });
+
+    expect(uiState.openWorkspaceSettings).toHaveBeenCalledWith("ws-1", "startup");
+  });
+
+  it("keeps archived items behind the repository filter", async () => {
+    workspaceState.archivedWorkspaces = [workspaceTwo];
+    await renderSidebar();
+
+    expect(container.querySelector(".sb-archive-panel")).toBeNull();
+    const archivedFilter = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="app:sidebar.showArchived"]',
+    );
+
+    await act(async () => {
+      archivedFilter?.click();
+    });
+
+    expect(container.querySelector(".sb-archive-panel")?.textContent).toContain(
+      workspaceTwo.name,
+    );
+  });
+
+  it("marks only the selected thread as the current page", async () => {
+    await renderSidebar();
+
+    expect(findThreadRow("Claude conversation")?.getAttribute("aria-current")).toBe("page");
+    expect(findThreadRow("Codex conversation")?.hasAttribute("aria-current")).toBe(false);
   });
 
   async function renderSidebar() {

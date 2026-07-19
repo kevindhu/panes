@@ -16,6 +16,7 @@ const GIT_PANEL_SIZE_KEY = "panes:git-panel-size";
 const MIN_SIDEBAR = 160;
 const MAX_SIDEBAR = 380;
 const DEFAULT_SIDEBAR = 220;
+const COLLAPSED_SIDEBAR_WIDTH = 46;
 const MIN_GIT_PANEL_SIZE = 18;
 const MAX_GIT_PANEL_SIZE = 40;
 const DEFAULT_GIT_PANEL_SIZE = 26;
@@ -75,6 +76,22 @@ export function ThreeColumnLayout() {
       // Ignore storage failures in non-browser/test environments.
     }
   }, [sidebarWidth]);
+
+  useEffect(() => {
+    const chromeSidebarWidth = showSidebar
+      ? sidebarPinned
+        ? sidebarWidth
+        : COLLAPSED_SIDEBAR_WIDTH
+      : 0;
+    document.documentElement.style.setProperty(
+      "--sidebar-current-width",
+      `${chromeSidebarWidth}px`,
+    );
+
+    return () => {
+      document.documentElement.style.removeProperty("--sidebar-current-width");
+    };
+  }, [showSidebar, sidebarPinned, sidebarWidth]);
 
   useEffect(() => {
     try {

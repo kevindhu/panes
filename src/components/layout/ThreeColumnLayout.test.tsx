@@ -76,6 +76,7 @@ describe("ThreeColumnLayout", () => {
       focusModeSnapshot: null,
       activeView: "chat",
       settingsWorkspaceId: null,
+      settingsWorkspaceSection: "general",
       commandPaletteOpen: false,
       commandPaletteLaunch: {
         variant: "general",
