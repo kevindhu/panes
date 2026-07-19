@@ -36,6 +36,8 @@ import {
   Power,
   RotateCcw,
   Minimize2,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 import { ipc, writeCommandToNewSession } from "../../lib/ipc";
 import {
@@ -76,6 +78,7 @@ import { useHarnessStore } from "../../stores/harnessStore";
 import { canToggleKeepAwake, useKeepAwakeStore } from "../../stores/keepAwakeStore";
 import { toast } from "../../stores/toastStore";
 import { activateThreadContext } from "../../lib/threadActivation";
+import { runAppZoomAction } from "../../lib/appZoom";
 import type { FileTreeEntry, GitBranch, GitStash, GitStatus, HarnessInfo, Repo, SearchResult, Thread, Workspace } from "../../types";
 
 const FILE_SEARCH_RESULT_LIMIT = 80;
@@ -308,6 +311,42 @@ export function getStaticCommands(
     shortcut: "\u2318\u2325F",
     action: ({ close }) => {
       useUiStore.getState().toggleFocusMode();
+      close();
+    },
+  },
+  {
+    id: "zoom-in",
+    label: t("commandPalette.commands.zoomIn"),
+    icon: ZoomIn,
+    group: "layout",
+    keywords: ["zoom", "in", "scale", "larger", "magnify"],
+    shortcut: "\u2318+",
+    action: ({ close }) => {
+      runAppZoomAction("zoom-in");
+      close();
+    },
+  },
+  {
+    id: "zoom-out",
+    label: t("commandPalette.commands.zoomOut"),
+    icon: ZoomOut,
+    group: "layout",
+    keywords: ["zoom", "out", "scale", "smaller"],
+    shortcut: "\u2318-",
+    action: ({ close }) => {
+      runAppZoomAction("zoom-out");
+      close();
+    },
+  },
+  {
+    id: "reset-zoom",
+    label: t("commandPalette.commands.resetZoom"),
+    icon: RotateCcw,
+    group: "layout",
+    keywords: ["zoom", "reset", "actual", "size", "100"],
+    shortcut: "\u23180",
+    action: ({ close }) => {
+      runAppZoomAction("reset-zoom");
       close();
     },
   },

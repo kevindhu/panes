@@ -7,11 +7,12 @@ import {
 const SIDEBAR_PINNED_KEY = "panes:sidebarPinned";
 const GIT_PANEL_VISIBLE_KEY = "panes:gitPanelVisible";
 const EXPLORER_OPEN_KEY = "panes:explorerOpen";
-const WORKSPACE_PANE_ZOOM_PERCENT_KEY = "panes:workspacePaneZoomPercent";
-const DEFAULT_WORKSPACE_PANE_ZOOM_PERCENT = 100;
-const MIN_WORKSPACE_PANE_ZOOM_PERCENT = 70;
-const MAX_WORKSPACE_PANE_ZOOM_PERCENT = 200;
-const WORKSPACE_PANE_ZOOM_STEP_PERCENT = 10;
+const APP_ZOOM_PERCENT_KEY = "panes:appZoomPercent";
+const LEGACY_WORKSPACE_PANE_ZOOM_PERCENT_KEY = "panes:workspacePaneZoomPercent";
+const DEFAULT_APP_ZOOM_PERCENT = 100;
+const MIN_APP_ZOOM_PERCENT = 70;
+const MAX_APP_ZOOM_PERCENT = 200;
+const APP_ZOOM_STEP_PERCENT = 10;
 
 interface MessageFocusTarget {
   threadId: string;
@@ -27,21 +28,43 @@ interface FocusModeSnapshot {
 type ActiveView = "chat" | "harnesses" | "workspace-settings";
 export type WorkspaceSettingsSection = "general" | "repos" | "startup";
 
-function clampWorkspacePaneZoomPercent(value: number): number {
+function clampAppZoomPercent(value: number): number {
   if (!Number.isFinite(value)) {
-    return DEFAULT_WORKSPACE_PANE_ZOOM_PERCENT;
+    return DEFAULT_APP_ZOOM_PERCENT;
   }
   return Math.min(
-    MAX_WORKSPACE_PANE_ZOOM_PERCENT,
-    Math.max(MIN_WORKSPACE_PANE_ZOOM_PERCENT, Math.round(value)),
+    MAX_APP_ZOOM_PERCENT,
+    Math.max(MIN_APP_ZOOM_PERCENT, Math.round(value)),
   );
 }
 
-function persistWorkspacePaneZoomPercent(value: number) {
+function persistAppZoomPercent(value: number) {
   try {
-    localStorage.setItem(WORKSPACE_PANE_ZOOM_PERCENT_KEY, String(value));
+    localStorage.setItem(APP_ZOOM_PERCENT_KEY, String(value));
   } catch {
     // Ignore storage failures in non-browser/test environments.
+  }
+}
+
+function readSavedAppZoomPercent(): string | null {
+  try {
+    const saved = localStorage.getItem(APP_ZOOM_PERCENT_KEY);
+    if (saved !== null) {
+      return saved;
+    }
+
+    // Preserve the user's previous middle-pane zoom when upgrading it to
+    // whole-app zoom, then retire the old storage key.
+    const legacy = localStorage.getItem(LEGACY_WORKSPACE_PANE_ZOOM_PERCENT_KEY);
+    if (legacy === null) {
+      return null;
+    }
+    const migrated = clampAppZoomPercent(Number.parseInt(legacy, 10));
+    localStorage.setItem(APP_ZOOM_PERCENT_KEY, String(migrated));
+    localStorage.removeItem(LEGACY_WORKSPACE_PANE_ZOOM_PERCENT_KEY);
+    return String(migrated);
+  } catch {
+    return null;
   }
 }
 
@@ -58,7 +81,7 @@ interface UiState {
   sidebarPinned: boolean;
   showGitPanel: boolean;
   showExplorer: boolean;
-  workspacePaneZoomPercent: number;
+  appZoomPercent: number;
   focusMode: boolean;
   focusModeSnapshot: FocusModeSnapshot | null;
   activeView: ActiveView;
@@ -76,10 +99,10 @@ interface UiState {
   setGitPanelVisible: (visible: boolean) => void;
   toggleExplorer: () => void;
   setExplorerOpen: (open: boolean) => void;
-  setWorkspacePaneZoomPercent: (percent: number) => void;
-  increaseWorkspacePaneZoom: () => void;
-  decreaseWorkspacePaneZoom: () => void;
-  resetWorkspacePaneZoom: () => void;
+  setAppZoomPercent: (percent: number) => void;
+  increaseAppZoom: () => void;
+  decreaseAppZoom: () => void;
+  resetAppZoom: () => void;
   setFocusMode: (enabled: boolean) => void;
   toggleFocusMode: () => void;
   setActiveView: (view: ActiveView) => void;
@@ -115,23 +138,17 @@ const savedExplorerOpen = (() => {
   }
 })();
 
-const savedWorkspacePaneZoomPercent = (() => {
-  try {
-    return localStorage.getItem(WORKSPACE_PANE_ZOOM_PERCENT_KEY);
-  } catch {
-    return null;
-  }
-})();
+const savedAppZoomPercent = readSavedAppZoomPercent();
 
 export const useUiStore = create<UiState>((set) => ({
   showSidebar: true,
   sidebarPinned: savedPinned !== null ? savedPinned === "true" : true,
   showGitPanel: savedGitPanelVisible !== null ? savedGitPanelVisible === "true" : true,
   showExplorer: savedExplorerOpen !== null ? savedExplorerOpen === "true" : true,
-  workspacePaneZoomPercent: clampWorkspacePaneZoomPercent(
-    savedWorkspacePaneZoomPercent == null
-      ? DEFAULT_WORKSPACE_PANE_ZOOM_PERCENT
-      : Number.parseInt(savedWorkspacePaneZoomPercent, 10),
+  appZoomPercent: clampAppZoomPercent(
+    savedAppZoomPercent == null
+      ? DEFAULT_APP_ZOOM_PERCENT
+      : Number.parseInt(savedAppZoomPercent, 10),
   ),
   focusMode: false,
   focusModeSnapshot: null,
@@ -201,44 +218,44 @@ export const useUiStore = create<UiState>((set) => ({
     }
     set({ showExplorer: open });
   },
-  setWorkspacePaneZoomPercent: (percent) =>
+  setAppZoomPercent: (percent) =>
     set((state) => {
-      const next = clampWorkspacePaneZoomPercent(percent);
-      if (next === state.workspacePaneZoomPercent) {
+      const next = clampAppZoomPercent(percent);
+      if (next === state.appZoomPercent) {
         return state;
       }
-      persistWorkspacePaneZoomPercent(next);
-      return { workspacePaneZoomPercent: next };
+      persistAppZoomPercent(next);
+      return { appZoomPercent: next };
     }),
-  increaseWorkspacePaneZoom: () =>
+  increaseAppZoom: () =>
     set((state) => {
-      const next = clampWorkspacePaneZoomPercent(
-        state.workspacePaneZoomPercent + WORKSPACE_PANE_ZOOM_STEP_PERCENT,
+      const next = clampAppZoomPercent(
+        state.appZoomPercent + APP_ZOOM_STEP_PERCENT,
       );
-      if (next === state.workspacePaneZoomPercent) {
+      if (next === state.appZoomPercent) {
         return state;
       }
-      persistWorkspacePaneZoomPercent(next);
-      return { workspacePaneZoomPercent: next };
+      persistAppZoomPercent(next);
+      return { appZoomPercent: next };
     }),
-  decreaseWorkspacePaneZoom: () =>
+  decreaseAppZoom: () =>
     set((state) => {
-      const next = clampWorkspacePaneZoomPercent(
-        state.workspacePaneZoomPercent - WORKSPACE_PANE_ZOOM_STEP_PERCENT,
+      const next = clampAppZoomPercent(
+        state.appZoomPercent - APP_ZOOM_STEP_PERCENT,
       );
-      if (next === state.workspacePaneZoomPercent) {
+      if (next === state.appZoomPercent) {
         return state;
       }
-      persistWorkspacePaneZoomPercent(next);
-      return { workspacePaneZoomPercent: next };
+      persistAppZoomPercent(next);
+      return { appZoomPercent: next };
     }),
-  resetWorkspacePaneZoom: () =>
+  resetAppZoom: () =>
     set((state) => {
-      if (state.workspacePaneZoomPercent === DEFAULT_WORKSPACE_PANE_ZOOM_PERCENT) {
+      if (state.appZoomPercent === DEFAULT_APP_ZOOM_PERCENT) {
         return state;
       }
-      persistWorkspacePaneZoomPercent(DEFAULT_WORKSPACE_PANE_ZOOM_PERCENT);
-      return { workspacePaneZoomPercent: DEFAULT_WORKSPACE_PANE_ZOOM_PERCENT };
+      persistAppZoomPercent(DEFAULT_APP_ZOOM_PERCENT);
+      return { appZoomPercent: DEFAULT_APP_ZOOM_PERCENT };
     }),
   setFocusMode: (enabled) =>
     set((state) => {

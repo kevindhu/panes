@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback, useContext, useLayoutEffect } from "react";
-import type { CSSProperties, ReactNode } from "react";
+import { Fragment, type CSSProperties, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Check, ChevronDown, ChevronRight } from "lucide-react";
 import {
@@ -12,6 +12,7 @@ export interface DropdownOption {
   label: string;
   icon?: ReactNode;
   shortcut?: string;
+  separatorBefore?: boolean;
 }
 
 export interface DropdownGroup {
@@ -73,6 +74,7 @@ export function Dropdown({
 
   const totalItems = options.length + (groups?.length ?? 0);
   const hasGroups = groups && groups.length > 0;
+  const optionDividerCount = options.filter((option) => option.separatorBefore).length;
 
   const toggle = useCallback(() => {
     if (disabled) return;
@@ -84,7 +86,8 @@ export function Dropdown({
     if (!open || !triggerRef.current) return;
 
     const rect = triggerRef.current.getBoundingClientRect();
-    const estimatedMenuHeight = totalItems * 32 + 8 + (hasGroups ? 9 : 0);
+    const estimatedMenuHeight = totalItems * 32 + 8 + (hasGroups ? 9 : 0)
+      + optionDividerCount * 9;
     const spaceBelow = window.innerHeight - rect.bottom;
     const goUp = spaceBelow < estimatedMenuHeight && rect.top > spaceBelow;
 
@@ -93,7 +96,7 @@ export function Dropdown({
       left: rect.left,
       direction: goUp ? "top" : "bottom",
     });
-  }, [open, totalItems, hasGroups]);
+  }, [open, totalItems, hasGroups, optionDividerCount]);
 
   useEffect(() => {
     if (!open) return;
@@ -212,24 +215,26 @@ export function Dropdown({
           {options.map((option) => {
             const isSelected = option.value === value;
             return (
-              <button
-                key={option.value}
-                type="button"
-                className={`dropdown-item ${isSelected ? "dropdown-item-selected" : ""}`}
-                onClick={() => handleSelect(option.value)}
-                onMouseEnter={handleItemEnter}
-              >
-                {option.icon && (
-                  <span className="dropdown-item-icon">{option.icon}</span>
-                )}
-                <span className="dropdown-item-label">{option.label}</span>
-                {option.shortcut && (
-                  <span className="dropdown-item-shortcut">{option.shortcut}</span>
-                )}
-                {isSelected && (
-                  <Check size={12} className="dropdown-item-check" />
-                )}
-              </button>
+              <Fragment key={option.value}>
+                {option.separatorBefore && <div className="dropdown-divider" />}
+                <button
+                  type="button"
+                  className={`dropdown-item ${isSelected ? "dropdown-item-selected" : ""}`}
+                  onClick={() => handleSelect(option.value)}
+                  onMouseEnter={handleItemEnter}
+                >
+                  {option.icon && (
+                    <span className="dropdown-item-icon">{option.icon}</span>
+                  )}
+                  <span className="dropdown-item-label">{option.label}</span>
+                  {option.shortcut && (
+                    <span className="dropdown-item-shortcut">{option.shortcut}</span>
+                  )}
+                  {isSelected && (
+                    <Check size={12} className="dropdown-item-check" />
+                  )}
+                </button>
+              </Fragment>
             );
           })}
 
@@ -283,23 +288,25 @@ export function Dropdown({
             {groups[activeGroup].options.map((option) => {
               const isSelected = option.value === value;
               return (
-                <button
-                  key={option.value}
-                  type="button"
-                  className={`dropdown-item ${isSelected ? "dropdown-item-selected" : ""}`}
-                  onClick={() => handleSelect(option.value)}
-                >
-                  {option.icon && (
-                    <span className="dropdown-item-icon">{option.icon}</span>
-                  )}
-                  <span className="dropdown-item-label">{option.label}</span>
-                  {option.shortcut && (
-                    <span className="dropdown-item-shortcut">{option.shortcut}</span>
-                  )}
-                  {isSelected && (
-                    <Check size={12} className="dropdown-item-check" />
-                  )}
-                </button>
+                <Fragment key={option.value}>
+                  {option.separatorBefore && <div className="dropdown-divider" />}
+                  <button
+                    type="button"
+                    className={`dropdown-item ${isSelected ? "dropdown-item-selected" : ""}`}
+                    onClick={() => handleSelect(option.value)}
+                  >
+                    {option.icon && (
+                      <span className="dropdown-item-icon">{option.icon}</span>
+                    )}
+                    <span className="dropdown-item-label">{option.label}</span>
+                    {option.shortcut && (
+                      <span className="dropdown-item-shortcut">{option.shortcut}</span>
+                    )}
+                    {isSelected && (
+                      <Check size={12} className="dropdown-item-check" />
+                    )}
+                  </button>
+                </Fragment>
               );
             })}
           </div>,

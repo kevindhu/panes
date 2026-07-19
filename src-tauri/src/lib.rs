@@ -165,9 +165,9 @@ pub fn run() {
                 let id = event.id().as_ref();
                 match id {
                     "toggle-sidebar" | "toggle-git-panel" | "toggle-focus-mode"
-                    | "toggle-fullscreen" | "toggle-search" | "toggle-terminal"
-                    | "close-window" | "edit-undo" | "edit-redo" | "edit-cut" | "edit-copy"
-                    | "edit-paste" | "edit-select-all" => {
+                    | "toggle-fullscreen" | "toggle-search" | "toggle-terminal" | "zoom-in"
+                    | "zoom-out" | "reset-zoom" | "close-window" | "edit-undo" | "edit-redo"
+                    | "edit-cut" | "edit-copy" | "edit-paste" | "edit-select-all" => {
                         let _ = handle.emit("menu-action", id);
                     }
                     _ => {}
@@ -960,6 +960,27 @@ fn build_app_menu(handle: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> 
             true,
             Some("CmdOrCtrl+Alt+F"),
         )?;
+        let zoom_in = MenuItem::with_id(
+            handle,
+            "zoom-in",
+            strings.zoom_in,
+            true,
+            Some("CmdOrCtrl+Equal"),
+        )?;
+        let zoom_out = MenuItem::with_id(
+            handle,
+            "zoom-out",
+            strings.zoom_out,
+            true,
+            Some("CmdOrCtrl+Minus"),
+        )?;
+        let reset_zoom = MenuItem::with_id(
+            handle,
+            "reset-zoom",
+            strings.reset_zoom,
+            true,
+            Some("CmdOrCtrl+0"),
+        )?;
         let toggle_fullscreen = MenuItem::with_id(
             handle,
             "toggle-fullscreen",
@@ -985,6 +1006,11 @@ fn build_app_menu(handle: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> 
             .item(&toggle_sidebar)
             .item(&toggle_git_panel)
             .item(&toggle_focus_mode)
+            .separator()
+            .item(&zoom_in)
+            .item(&zoom_out)
+            .item(&reset_zoom)
+            .separator()
             .item(&toggle_fullscreen)
             .separator()
             .item(&toggle_search)
