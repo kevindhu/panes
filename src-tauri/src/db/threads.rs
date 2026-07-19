@@ -69,6 +69,7 @@ pub fn list_threads_for_workspace(
     db: &Database,
     workspace_id: &str,
 ) -> anyhow::Result<Vec<ThreadDto>> {
+    reconcile_stale_running_thread_statuses(db, None, Some(workspace_id))?;
     let conn = db.connect()?;
     let mut stmt = conn.prepare(
     "SELECT id, workspace_id, repo_id, engine_id, model_id, engine_thread_id, engine_metadata_json,
@@ -309,6 +310,78 @@ fn thread_manual_title_locked(metadata: Option<&serde_json::Value>) -> bool {
         .and_then(|object| object.get("manualTitle"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
+}
+
+/// Repairs a running thread row when its persisted transcript already has a
+/// terminal assistant message. The decision and update share one SQLite
+/// statement, so a newer streaming placeholder that is already committed
+/// cannot slip between a separate read and write.
+///
+/// A pending Codex sync is kept in metadata, but it does not make an
+/// unverified running status authoritative. The one exception is the typed
+/// flag written after a full engine snapshot confirms an active remote turn;
+/// that status remains running until the engine reports it finished.
+pub fn reconcile_stale_running_thread_status_from_transcript(
+    db: &Database,
+    thread_id: &str,
+) -> anyhow::Result<bool> {
+    Ok(reconcile_stale_running_thread_statuses(db, Some(thread_id), None)? > 0)
+}
+
+fn reconcile_stale_running_thread_statuses(
+    db: &Database,
+    thread_id: Option<&str>,
+    workspace_id: Option<&str>,
+) -> anyhow::Result<usize> {
+    let conn = db.connect()?;
+    let changed = conn
+        .execute(
+            "UPDATE threads
+             SET status = (
+               SELECT CASE m.status
+                 WHEN 'completed' THEN 'completed'
+                 WHEN 'error' THEN 'error'
+                 WHEN 'interrupted' THEN 'idle'
+               END
+               FROM messages m
+               WHERE m.thread_id = threads.id
+                 AND m.role = 'assistant'
+               ORDER BY m.created_at DESC, m.rowid DESC
+               LIMIT 1
+             )
+             WHERE (?1 IS NULL OR id = ?1)
+               AND (?2 IS NULL OR workspace_id = ?2)
+               AND status IN ('streaming', 'awaiting_approval')
+               AND NOT (
+                 engine_id = 'codex'
+                 AND COALESCE(
+                   json_extract(
+                     CASE
+                       WHEN json_valid(engine_metadata_json) THEN engine_metadata_json
+                       ELSE '{}'
+                     END,
+                     ?3
+                   ),
+                   0
+                 ) = 1
+               )
+               AND (
+                 SELECT m.status
+                 FROM messages m
+                 WHERE m.thread_id = threads.id
+                   AND m.role = 'assistant'
+                 ORDER BY m.created_at DESC, m.rowid DESC
+                 LIMIT 1
+               ) IN ('completed', 'error', 'interrupted')",
+            params![
+                thread_id,
+                workspace_id,
+                format!("$.{}", crate::codex_thread_metadata::REMOTE_TURN_ACTIVE_KEY),
+            ],
+        )
+        .context("failed to reconcile stale running thread status from transcript")?;
+
+    Ok(changed)
 }
 
 pub fn reconcile_runtime_state(db: &Database) -> anyhow::Result<RuntimeRecoveryReport> {
@@ -602,20 +675,191 @@ mod tests {
     }
 
     #[test]
+    fn transcript_reconciliation_durably_repairs_stale_running_rows() {
+        let cases = [
+            (
+                crate::models::MessageStatusDto::Completed,
+                ThreadStatusDto::Completed,
+            ),
+            (
+                crate::models::MessageStatusDto::Interrupted,
+                ThreadStatusDto::Idle,
+            ),
+            (
+                crate::models::MessageStatusDto::Error,
+                ThreadStatusDto::Error,
+            ),
+        ];
+
+        for (message_status, expected_thread_status) in cases {
+            let db = test_db();
+            let thread = test_thread(&db, "Stale running status");
+            let assistant = messages::insert_assistant_placeholder(
+                &db,
+                &thread.id,
+                Some("codex"),
+                Some("gpt-5.3-codex"),
+                Some("low"),
+            )
+            .unwrap();
+            messages::complete_assistant_message(
+                &db,
+                &assistant.id,
+                message_status,
+                None,
+                Some("gpt-5.3-codex"),
+            )
+            .unwrap();
+            update_thread_status(&db, &thread.id, ThreadStatusDto::Streaming).unwrap();
+
+            assert!(
+                reconcile_stale_running_thread_status_from_transcript(&db, &thread.id).unwrap()
+            );
+            assert_eq!(
+                get_thread(&db, &thread.id).unwrap().unwrap().status,
+                expected_thread_status
+            );
+            assert!(
+                !reconcile_stale_running_thread_status_from_transcript(&db, &thread.id).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_reconciliation_preserves_open_and_engine_confirmed_remote_turns() {
+        let db = test_db();
+        let open_thread = test_thread(&db, "Open turn");
+        messages::insert_assistant_placeholder(
+            &db,
+            &open_thread.id,
+            Some("codex"),
+            Some("gpt-5.3-codex"),
+            Some("low"),
+        )
+        .unwrap();
+        update_thread_status(&db, &open_thread.id, ThreadStatusDto::Streaming).unwrap();
+
+        assert!(
+            !reconcile_stale_running_thread_status_from_transcript(&db, &open_thread.id).unwrap()
+        );
+        assert_eq!(
+            get_thread(&db, &open_thread.id).unwrap().unwrap().status,
+            ThreadStatusDto::Streaming
+        );
+
+        let remote_thread = test_thread(&db, "Remote active turn");
+        let assistant = messages::insert_assistant_placeholder(
+            &db,
+            &remote_thread.id,
+            Some("codex"),
+            Some("gpt-5.3-codex"),
+            Some("low"),
+        )
+        .unwrap();
+        messages::complete_assistant_message(
+            &db,
+            &assistant.id,
+            crate::models::MessageStatusDto::Completed,
+            None,
+            Some("gpt-5.3-codex"),
+        )
+        .unwrap();
+        update_engine_metadata(
+            &db,
+            &remote_thread.id,
+            &json!({ "codexSyncRequired": true }),
+        )
+        .unwrap();
+        update_thread_status(&db, &remote_thread.id, ThreadStatusDto::Streaming).unwrap();
+
+        assert!(
+            reconcile_stale_running_thread_status_from_transcript(&db, &remote_thread.id).unwrap()
+        );
+        let reconciled = get_thread(&db, &remote_thread.id).unwrap().unwrap();
+        assert_eq!(reconciled.status, ThreadStatusDto::Completed);
+        assert_eq!(
+            reconciled
+                .engine_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("codexSyncRequired"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+
+        let confirmed_remote_thread = test_thread(&db, "Confirmed remote active turn");
+        let confirmed_assistant = messages::insert_assistant_placeholder(
+            &db,
+            &confirmed_remote_thread.id,
+            Some("codex"),
+            Some("gpt-5.3-codex"),
+            Some("low"),
+        )
+        .unwrap();
+        messages::complete_assistant_message(
+            &db,
+            &confirmed_assistant.id,
+            crate::models::MessageStatusDto::Completed,
+            None,
+            Some("gpt-5.3-codex"),
+        )
+        .unwrap();
+        update_engine_metadata(
+            &db,
+            &confirmed_remote_thread.id,
+            &json!({
+                "codexRemoteTurnActive": true,
+            }),
+        )
+        .unwrap();
+        update_thread_status(&db, &confirmed_remote_thread.id, ThreadStatusDto::Streaming).unwrap();
+
+        assert!(!reconcile_stale_running_thread_status_from_transcript(
+            &db,
+            &confirmed_remote_thread.id,
+        )
+        .unwrap());
+        assert_eq!(
+            get_thread(&db, &confirmed_remote_thread.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            ThreadStatusDto::Streaming
+        );
+    }
+
+    #[test]
     fn list_threads_for_workspace_includes_engine_backed_threads_without_messages() {
         let db = test_db();
         let visible = test_thread(&db, "Remote");
         let hidden = test_thread(&db, "Hidden");
         set_engine_thread_id(&db, &visible.id, "codex-thread-123").unwrap();
+        let assistant = messages::insert_assistant_placeholder(
+            &db,
+            &visible.id,
+            Some("codex"),
+            Some("gpt-5.3-codex"),
+            Some("low"),
+        )
+        .unwrap();
+        messages::complete_assistant_message(
+            &db,
+            &assistant.id,
+            crate::models::MessageStatusDto::Completed,
+            None,
+            Some("gpt-5.3-codex"),
+        )
+        .unwrap();
+        update_thread_status(&db, &visible.id, ThreadStatusDto::Streaming).unwrap();
 
         let listed = list_threads_for_workspace(&db, &visible.workspace_id).unwrap();
-        let listed_ids = listed
-            .into_iter()
-            .map(|thread| thread.id)
-            .collect::<Vec<_>>();
-
-        assert!(listed_ids.contains(&visible.id));
-        assert!(!listed_ids.contains(&hidden.id));
+        assert_eq!(
+            listed
+                .iter()
+                .find(|thread| thread.id == visible.id)
+                .map(|thread| &thread.status),
+            Some(&ThreadStatusDto::Completed)
+        );
+        assert!(!listed.iter().any(|thread| thread.id == hidden.id));
     }
 
     #[test]

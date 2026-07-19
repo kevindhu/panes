@@ -544,6 +544,27 @@ describe("Sidebar thread context menu", () => {
       .toBeNull();
   });
 
+  it("keeps a healthy completed active thread bound when it is reselected", async () => {
+    threadState.threads = [codexThread, claudeThread];
+    threadState.activeThreadId = codexThread.id;
+    chatState.threadId = codexThread.id;
+    chatState.status = "completed";
+    chatState.streaming = false;
+
+    await renderSidebar();
+    const row = findThreadRow("Codex conversation");
+
+    await act(async () => {
+      row?.click();
+      await Promise.resolve();
+    });
+
+    expect(chatState.setActiveThread).toHaveBeenCalledWith(codexThread.id);
+    expect(chatState.setActiveThread).not.toHaveBeenCalledWith(codexThread.id, {
+      forceReload: true,
+    });
+  });
+
   it("opens startup automations for the active repository", async () => {
     uiState.activeView = "chat";
     await renderSidebar();
@@ -583,6 +604,42 @@ describe("Sidebar thread context menu", () => {
     expect(findThreadRow("Claude conversation")?.getAttribute("aria-current")).toBe("page");
     expect(findThreadRow("Codex conversation")?.hasAttribute("aria-current")).toBe(false);
   });
+
+  it.each([
+    {
+      staleProjection: "thread cache",
+      threadStatus: "streaming" as const,
+      chatStatus: "completed" as const,
+      chatStreaming: false,
+    },
+    {
+      staleProjection: "bound chat",
+      threadStatus: "completed" as const,
+      chatStatus: "streaming" as const,
+      chatStreaming: true,
+    },
+  ])(
+    "force-reloads an active thread when its $staleProjection still looks active",
+    async ({ threadStatus, chatStatus, chatStreaming }) => {
+      threadState.threads = [{ ...codexThread, status: threadStatus }, claudeThread];
+      threadState.activeThreadId = codexThread.id;
+      chatState.threadId = codexThread.id;
+      chatState.status = chatStatus;
+      chatState.streaming = chatStreaming;
+
+      await renderSidebar();
+      const row = findThreadRow("Codex conversation");
+
+      await act(async () => {
+        row?.click();
+        await Promise.resolve();
+      });
+
+      expect(chatState.setActiveThread).toHaveBeenCalledWith(codexThread.id, {
+        forceReload: true,
+      });
+    },
+  );
 
   async function renderSidebar() {
     await act(async () => {

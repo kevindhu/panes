@@ -1,4 +1,5 @@
 import type { Thread } from "../types";
+import { isCodexThreadSyncRequired } from "./codexThreadRuntime";
 
 export function hasCodexTranscriptForNativeTools(
   thread: Thread | null | undefined,
@@ -11,7 +12,7 @@ export function hasCodexTranscriptForNativeTools(
     return true;
   }
 
-  return thread.engineMetadata?.codexSyncRequired !== true && thread.messageCount > 0;
+  return !isCodexThreadSyncRequired(thread) && thread.messageCount > 0;
 }
 
 export function hasCodexLocalHistoryForMessageEditing(
@@ -19,7 +20,7 @@ export function hasCodexLocalHistoryForMessageEditing(
 ): boolean {
   return (
     hasCodexTranscriptForNativeTools(thread) &&
-    thread?.engineMetadata?.codexSyncRequired !== true
+    !isCodexThreadSyncRequired(thread)
   );
 }
 
