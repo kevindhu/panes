@@ -64,6 +64,7 @@ import {
   type WorkspaceDragRowRect,
 } from "./workspaceDragSort";
 import type { Thread, Workspace } from "../../types";
+import "./Sidebar.css";
 
 interface ProjectGroup {
   workspace: Workspace;
@@ -1067,7 +1068,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                       <div className="sb-no-threads">{t("app:sidebar.noThreads")}</div>
                     ) : (
                       <>
-                        {visibleThreads.map((thread, i) => {
+                        {visibleThreads.map((thread) => {
                           const isActive = thread.id === activeThreadId;
                           const isRunning = isThreadRunning(thread);
                           const threadLabel = getThreadLabel(thread);
@@ -1083,9 +1084,8 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                               key={thread.id}
                               role="button"
                               tabIndex={0}
-                              className={`sb-thread sb-thread-animate ${isActive ? "sb-thread-active" : ""}${hasNotification ? " sb-thread-notified" : ""}${hasPendingApprovalNotification ? " sb-thread-pending-approval" : ""}`}
+                              className={`sb-thread ${isActive ? "sb-thread-active" : ""}${hasNotification ? " sb-thread-notified" : ""}`}
                               aria-current={isActive ? "page" : undefined}
-                              style={{ animationDelay: `${i * 20}ms` }}
                               onClick={() => void onSelectThread(thread)}
                               onContextMenu={(event) => onThreadContextMenu(event, thread, isRunning)}
                               onKeyDown={(e) => {
