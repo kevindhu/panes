@@ -32,6 +32,7 @@ interface WorkspaceState {
   setRepoTrustLevel: (repoId: string, trustLevel: TrustLevel) => Promise<void>;
   setAllReposTrustLevel: (trustLevel: TrustLevel) => Promise<void>;
   rescanWorkspace: (workspaceId: string, scanDepth?: number) => Promise<Workspace | null>;
+  changeWorkspaceDirectory: (workspaceId: string, path: string) => Promise<Workspace | null>;
 }
 
 const LAST_WORKSPACE_KEY = "panes:lastActiveWorkspaceId";
@@ -420,6 +421,28 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         ),
         archivedWorkspaces: state.archivedWorkspaces.filter(
           (item) => item.id !== updatedWorkspace.id,
+        ),
+      }));
+
+      if (get().activeWorkspaceId === workspaceId) {
+        await get().loadRepos(workspaceId);
+      }
+
+      return updatedWorkspace;
+    } catch (error) {
+      set({ error: String(error) });
+      throw error;
+    }
+  },
+  changeWorkspaceDirectory: async (workspaceId, path) => {
+    const workspace = get().workspaces.find((item) => item.id === workspaceId);
+    if (!workspace) return null;
+
+    try {
+      const updatedWorkspace = await ipc.retargetWorkspace(workspaceId, path);
+      set((state) => ({
+        workspaces: state.workspaces.map((item) =>
+          item.id === workspaceId ? updatedWorkspace : item
         ),
       }));
 

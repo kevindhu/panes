@@ -106,6 +106,8 @@ export const ipc = {
       path,
       scanDepth: scanDepth ?? null,
     }),
+  retargetWorkspace: (workspaceId: string, path: string) =>
+    invoke<Workspace>("retarget_workspace", { workspaceId, path }),
   archiveWorkspace: (workspaceId: string) => invoke<void>("archive_workspace", { workspaceId }),
   restoreWorkspace: (workspaceId: string) => invoke<Workspace>("restore_workspace", { workspaceId }),
   deleteWorkspace: (workspaceId: string) => invoke<void>("delete_workspace", { workspaceId }),

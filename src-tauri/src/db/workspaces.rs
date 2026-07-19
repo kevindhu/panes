@@ -64,6 +64,102 @@ pub fn upsert_workspace(
     get_workspace_by_root(&conn, &canonical)
 }
 
+pub fn retarget_workspace(
+    db: &Database,
+    workspace_id: &str,
+    root_path: &str,
+) -> anyhow::Result<WorkspaceDto> {
+    let canonical_path = path_utils::canonicalize_path(Path::new(root_path))
+        .with_context(|| format!("failed to resolve workspace directory '{root_path}'"))?;
+    if !canonical_path.is_dir() {
+        anyhow::bail!("workspace path is not a directory: {root_path}");
+    }
+
+    let canonical = canonical_path.to_string_lossy().to_string();
+    let legacy_canonical = path_utils::legacy_windows_verbatim_path(&canonical_path)
+        .filter(|legacy| legacy != &canonical);
+    let mut conn = db.connect()?;
+
+    let existing = if let Some(id) = find_workspace_id_by_root(&conn, &canonical)? {
+        Some(id)
+    } else if let Some(legacy_canonical) = legacy_canonical.as_deref() {
+        find_workspace_id_by_root(&conn, legacy_canonical)?
+    } else {
+        None
+    };
+
+    if existing.as_deref().is_some_and(|id| id != workspace_id) {
+        anyhow::bail!("directory is already used by another workspace: {canonical}");
+    }
+
+    let previous_root = conn
+        .query_row(
+            "SELECT root_path FROM workspaces WHERE id = ?1",
+            params![workspace_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .context("failed to load current workspace directory")?
+        .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))?;
+
+    let tx = conn
+        .transaction()
+        .context("failed to start workspace directory transaction")?;
+    let affected = tx
+        .execute(
+            "UPDATE workspaces
+             SET root_path = ?2,
+                 last_opened_at = datetime('now')
+             WHERE id = ?1",
+            params![workspace_id, canonical],
+        )
+        .context("failed to update workspace directory")?;
+
+    if affected == 0 {
+        anyhow::bail!("workspace not found: {workspace_id}");
+    }
+
+    let repo_paths = {
+        let mut stmt = tx
+            .prepare("SELECT id, path FROM repos WHERE workspace_id = ?1")
+            .context("failed to prepare workspace repository paths")?;
+        let rows = stmt
+            .query_map(params![workspace_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .context("failed to load workspace repository paths")?;
+        let mut paths = Vec::new();
+        for row in rows {
+            paths.push(row.context("failed to decode workspace repository path")?);
+        }
+        paths
+    };
+
+    for (repo_id, repo_path) in repo_paths {
+        let Ok(relative_path) = Path::new(&repo_path).strip_prefix(Path::new(&previous_root))
+        else {
+            continue;
+        };
+        let rebased_path = if relative_path.as_os_str().is_empty() {
+            canonical.clone()
+        } else {
+            path_utils::normalize_windows_path(canonical_path.join(relative_path))
+                .to_string_lossy()
+                .to_string()
+        };
+        tx.execute(
+            "UPDATE repos SET path = ?2 WHERE id = ?1",
+            params![repo_id, rebased_path],
+        )
+        .context("failed to retarget workspace repository path")?;
+    }
+
+    tx.commit()
+        .context("failed to commit workspace directory update")?;
+
+    get_workspace_by_id(&conn, workspace_id)
+}
+
 pub fn list_workspaces(db: &Database) -> anyhow::Result<Vec<WorkspaceDto>> {
     let conn = db.connect()?;
     let mut stmt = conn.prepare(
@@ -537,6 +633,79 @@ mod tests {
 
         assert_eq!(created.id, reopened.id);
         assert_eq!(reopened.scan_depth, 7);
+    }
+
+    #[test]
+    fn retarget_workspace_preserves_identity_and_settings() {
+        let db = test_db();
+        let old_root = std::env::temp_dir().join(format!("panes-workspace-old-{}", Uuid::new_v4()));
+        let new_root = std::env::temp_dir().join(format!("panes-workspace-new-{}", Uuid::new_v4()));
+        fs::create_dir_all(&old_root).expect("failed to create old workspace root");
+        fs::create_dir_all(&new_root).expect("failed to create new workspace root");
+
+        let created = upsert_workspace(&db, old_root.to_string_lossy().as_ref(), Some(7))
+            .expect("failed to create workspace");
+        set_workspace_startup_preset_json(&db, &created.id, Some(r#"{"version":1}"#))
+            .expect("failed to set startup preset");
+        let repo = crate::db::repos::upsert_repo(
+            &db,
+            &created.id,
+            "repo",
+            old_root.to_string_lossy().as_ref(),
+            "main",
+            true,
+        )
+        .expect("failed to create workspace repo");
+        crate::db::repos::set_repo_trust_level(
+            &db,
+            &repo.id,
+            crate::models::TrustLevelDto::Trusted,
+        )
+        .expect("failed to set repo trust");
+
+        let updated = retarget_workspace(&db, &created.id, new_root.to_string_lossy().as_ref())
+            .expect("failed to retarget workspace");
+
+        assert_eq!(updated.id, created.id);
+        assert_eq!(updated.name, created.name);
+        assert_eq!(updated.scan_depth, 7);
+        assert_eq!(
+            updated.root_path,
+            path_utils::canonicalize_path(&new_root)
+                .expect("failed to canonicalize new root")
+                .to_string_lossy()
+        );
+        assert_eq!(
+            get_workspace_startup_preset_json(&db, &created.id)
+                .expect("failed to read startup preset")
+                .as_deref(),
+            Some(r#"{"version":1}"#),
+        );
+        let repos =
+            crate::db::repos::get_repos(&db, &created.id).expect("failed to read retargeted repos");
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].id, repo.id);
+        assert_eq!(repos[0].path, updated.root_path);
+        assert_eq!(repos[0].trust_level, crate::models::TrustLevelDto::Trusted);
+    }
+
+    #[test]
+    fn retarget_workspace_rejects_a_directory_used_by_another_workspace() {
+        let db = test_db();
+        let root_a = std::env::temp_dir().join(format!("panes-workspace-a-{}", Uuid::new_v4()));
+        let root_b = std::env::temp_dir().join(format!("panes-workspace-b-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root_a).expect("failed to create workspace a root");
+        fs::create_dir_all(&root_b).expect("failed to create workspace b root");
+
+        let workspace_a =
+            upsert_workspace(&db, root_a.to_string_lossy().as_ref(), None).expect("create a");
+        upsert_workspace(&db, root_b.to_string_lossy().as_ref(), None).expect("create b");
+
+        let error = retarget_workspace(&db, &workspace_a.id, root_b.to_string_lossy().as_ref())
+            .expect_err("duplicate directory should fail");
+        assert!(error
+            .to_string()
+            .contains("directory is already used by another workspace"));
     }
 
     #[test]

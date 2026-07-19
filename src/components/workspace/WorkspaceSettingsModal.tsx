@@ -7,6 +7,7 @@ import {
   GitBranch,
   Info,
   Link,
+  Pencil,
   Play,
   RefreshCw,
   X,
@@ -14,6 +15,7 @@ import {
 import { ipc } from "../../lib/ipc";
 import { formatShortDate } from "../../lib/formatters";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
+import { useFileStore } from "../../stores/fileStore";
 import { toast } from "../../stores/toastStore";
 import { Dropdown } from "../shared/Dropdown";
 import { WorkspaceStartupSection } from "./WorkspaceStartupSection";
@@ -42,6 +44,10 @@ export function WorkspaceSettingsModal({
   const storeSetGitActive = useWorkspaceStore((s) => s.setRepoGitActive);
   const storeSetAllTrust = useWorkspaceStore((s) => s.setAllReposTrustLevel);
   const storeRescan = useWorkspaceStore((s) => s.rescanWorkspace);
+  const storeChangeDirectory = useWorkspaceStore((s) => s.changeWorkspaceDirectory);
+  const retargetWorkspaceTabs = useFileStore(
+    (s) => s.retargetTabsAfterWorkspaceDirectoryChange,
+  );
 
   const currentWorkspace =
     workspaces.find((candidate) => candidate.id === workspace.id) ?? workspace;
@@ -52,6 +58,7 @@ export function WorkspaceSettingsModal({
   const [depthDraft, setDepthDraft] = useState(String(currentWorkspace.scanDepth));
   const [depthSaving, setDepthSaving] = useState(false);
   const [depthError, setDepthError] = useState<string | null>(null);
+  const [pathSaving, setPathSaving] = useState(false);
   const [localRepos, setLocalRepos] = useState<Repo[] | null>(null);
   const [reposLoading, setReposLoading] = useState(false);
   const [remotesRepo, setRemotesRepo] = useState<Repo | null>(null);
@@ -191,6 +198,34 @@ export function WorkspaceSettingsModal({
     }
   }
 
+  async function changeWorkspaceDirectory() {
+    setPathSaving(true);
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: currentWorkspace.rootPath,
+        title: t("general.chooseDirectory"),
+      });
+      if (typeof selected !== "string" || selected === currentWorkspace.rootPath) return;
+
+      const updated = await storeChangeDirectory(currentWorkspace.id, selected);
+      if (!updated) return;
+      retargetWorkspaceTabs(
+        currentWorkspace.id,
+        currentWorkspace.rootPath,
+        updated.rootPath,
+      );
+      if (!isActive) setLocalRepos(await ipc.getRepos(currentWorkspace.id));
+      toast.success(t("toasts.directoryChanged"));
+    } catch {
+      toast.error(t("toasts.changeDirectoryFailed"));
+    } finally {
+      setPathSaving(false);
+    }
+  }
+
   const name =
     currentWorkspace.name || currentWorkspace.rootPath.split("/").pop() || t("general.workspaceFallback");
 
@@ -271,7 +306,17 @@ export function WorkspaceSettingsModal({
                     <button
                       type="button"
                       className="ws-prop-btn"
+                      onClick={() => void changeWorkspaceDirectory()}
+                      disabled={pathSaving}
+                    >
+                      <Pencil size={10} />
+                      {t("actions.edit")}
+                    </button>
+                    <button
+                      type="button"
+                      className="ws-prop-btn"
                       onClick={() => void revealWorkspace()}
+                      disabled={pathSaving}
                     >
                       <FolderOpen size={11} />
                       {t("actions.reveal")}

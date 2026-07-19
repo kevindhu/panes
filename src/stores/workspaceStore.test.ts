@@ -7,6 +7,7 @@ const mockIpc = vi.hoisted(() => ({
   listArchivedWorkspaces: vi.fn(),
   listWorkspaces: vi.fn(),
   openWorkspace: vi.fn(),
+  retargetWorkspace: vi.fn(),
   setWorkspaceOrder: vi.fn(),
 }));
 
@@ -281,6 +282,56 @@ describe("workspaceStore.rescanWorkspace", () => {
     expect(result).toEqual(updatedWorkspace);
     expect(useWorkspaceStore.getState().repos).toEqual(repos);
     expect(useWorkspaceStore.getState().workspaces[0]).toEqual(updatedWorkspace);
+  });
+});
+
+describe("workspaceStore.changeWorkspaceDirectory", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal("localStorage", {
+      getItem: vi.fn(() => null),
+      setItem: vi.fn(),
+      removeItem: vi.fn(),
+      clear: vi.fn(),
+    });
+
+    useWorkspaceStore.setState({
+      workspaces: [],
+      archivedWorkspaces: [],
+      activeWorkspaceId: null,
+      repos: [],
+      activeRepoId: null,
+      reposLoading: false,
+      loading: false,
+      error: undefined,
+    });
+
+    mockIpc.getRepos.mockResolvedValue([]);
+  });
+
+  it("retargets the existing workspace and reloads its repositories", async () => {
+    const workspace = makeWorkspace("ws-active", "/workspace/old");
+    const updatedWorkspace = { ...workspace, rootPath: "/workspace/new" };
+    const repos = [makeRepo("repo-a", workspace.id, "/workspace/new/repo-a")];
+    mockIpc.retargetWorkspace.mockResolvedValue(updatedWorkspace);
+    mockIpc.getRepos.mockResolvedValue(repos);
+    useWorkspaceStore.setState({
+      workspaces: [workspace],
+      activeWorkspaceId: workspace.id,
+    });
+
+    const result = await useWorkspaceStore
+      .getState()
+      .changeWorkspaceDirectory(workspace.id, updatedWorkspace.rootPath);
+
+    expect(mockIpc.retargetWorkspace).toHaveBeenCalledWith(
+      workspace.id,
+      updatedWorkspace.rootPath,
+    );
+    expect(mockIpc.getRepos).toHaveBeenCalledWith(workspace.id);
+    expect(result).toEqual(updatedWorkspace);
+    expect(useWorkspaceStore.getState().workspaces).toEqual([updatedWorkspace]);
+    expect(useWorkspaceStore.getState().repos).toEqual(repos);
   });
 });
 

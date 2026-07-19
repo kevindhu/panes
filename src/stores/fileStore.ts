@@ -194,6 +194,11 @@ interface FileStoreState {
     oldPath: string,
     newPath: string,
   ) => void;
+  retargetTabsAfterWorkspaceDirectoryChange: (
+    workspaceId: string,
+    oldRootPath: string,
+    newRootPath: string,
+  ) => void;
   saveTab: (tabId: string) => Promise<void>;
 }
 
@@ -477,6 +482,61 @@ export const useFileStore = create<FileStoreState>((set, get) => ({
                 workspaceState.activeRepoId,
               )
             : null;
+        const resolvedGitRepoPath = nextGitRepoPath ?? ownership?.repo.path ?? null;
+        const resolvedGitFilePath = resolvedGitRepoPath
+          ? resolveRelativePathWithinRoot(nextAbsolutePath, resolvedGitRepoPath)
+          : ownership?.filePath ?? null;
+
+        return {
+          ...tab,
+          rootPath: nextRootPath,
+          absolutePath: nextAbsolutePath,
+          filePath: nextFilePath,
+          fileName: nextFilePath.split("/").pop() ?? nextFilePath,
+          gitRepoPath: resolvedGitRepoPath,
+          gitFilePath:
+            resolvedGitFilePath && resolvedGitFilePath.length > 0
+              ? resolvedGitFilePath
+              : null,
+        };
+      }),
+    }));
+  },
+
+  retargetTabsAfterWorkspaceDirectoryChange: (workspaceId, oldRootPath, newRootPath) => {
+    const workspaceState = useWorkspaceStore.getState();
+
+    set((state) => ({
+      tabs: state.tabs.map((tab) => {
+        if (tab.workspaceId !== workspaceId) {
+          return tab;
+        }
+
+        const nextAbsolutePath = remapAbsolutePathForRename(
+          tab.absolutePath,
+          oldRootPath,
+          newRootPath,
+        );
+        if (!nextAbsolutePath) {
+          return tab;
+        }
+
+        const nextRootPath =
+          remapAbsolutePathForRename(tab.rootPath, oldRootPath, newRootPath) ?? tab.rootPath;
+        const nextGitRepoPath = tab.gitRepoPath
+          ? remapAbsolutePathForRename(tab.gitRepoPath, oldRootPath, newRootPath) ??
+            tab.gitRepoPath
+          : null;
+        const nextFilePath = resolveRelativePathWithinRoot(nextAbsolutePath, nextRootPath);
+        if (nextFilePath === null) {
+          return tab;
+        }
+
+        const ownership = resolveOwningRepoForAbsolutePath(
+          nextAbsolutePath,
+          workspaceState.repos,
+          workspaceState.activeRepoId,
+        );
         const resolvedGitRepoPath = nextGitRepoPath ?? ownership?.repo.path ?? null;
         const resolvedGitFilePath = resolvedGitRepoPath
           ? resolveRelativePathWithinRoot(nextAbsolutePath, resolvedGitRepoPath)

@@ -82,6 +82,44 @@ pub async fn set_workspace_order(
 }
 
 #[tauri::command]
+pub async fn retarget_workspace(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    path: String,
+) -> Result<WorkspaceDto, String> {
+    let file_tree_cache = state.file_tree_cache.clone();
+    run_db(state.db.clone(), move |db| {
+        let previous = load_workspace(db, &workspace_id)?;
+        let workspace = db::workspaces::retarget_workspace(db, &workspace_id, &path)?;
+        let repos =
+            multi_repo::scan_git_repositories(&workspace.root_path, workspace.scan_depth as usize)?;
+        let repo_paths = repos
+            .iter()
+            .map(|repo| repo.path.clone())
+            .collect::<Vec<_>>();
+        db::repos::reconcile_workspace_repos(db, &workspace.id, &repo_paths)?;
+        let selection_configured =
+            db::workspaces::is_git_repo_selection_configured(db, &workspace.id)?;
+
+        for repo in repos {
+            let _ = db::repos::upsert_repo(
+                db,
+                &workspace.id,
+                &repo.name,
+                &repo.path,
+                &repo.default_branch,
+                !selection_configured,
+            );
+        }
+
+        file_tree_cache.invalidate_workspace(&previous.root_path);
+        file_tree_cache.invalidate_workspace(&workspace.root_path);
+        Ok(workspace)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn list_archived_workspaces(
     state: State<'_, AppState>,
 ) -> Result<Vec<WorkspaceDto>, String> {
