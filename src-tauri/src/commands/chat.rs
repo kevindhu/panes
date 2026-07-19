@@ -2099,7 +2099,9 @@ pub async fn get_thread_messages(
     thread_id: String,
 ) -> Result<Vec<MessageDto>, String> {
     run_db(state.db.clone(), move |db| {
-        db::messages::get_thread_messages(db, &thread_id)
+        let messages = db::messages::get_thread_messages(db, &thread_id)?;
+        db::threads::reconcile_stale_running_thread_status_from_transcript(db, &thread_id)?;
+        Ok(messages)
     })
     .await
 }
@@ -2115,7 +2117,14 @@ pub async fn get_thread_messages_window(
     let clamped_limit = requested_limit.clamp(1, MESSAGE_WINDOW_MAX_LIMIT);
 
     run_db(state.db.clone(), move |db| {
-        db::messages::get_thread_messages_window(db, &thread_id, cursor.as_ref(), clamped_limit)
+        let window = db::messages::get_thread_messages_window(
+            db,
+            &thread_id,
+            cursor.as_ref(),
+            clamped_limit,
+        )?;
+        db::threads::reconcile_stale_running_thread_status_from_transcript(db, &thread_id)?;
+        Ok(window)
     })
     .await
 }
@@ -2243,6 +2252,7 @@ fn clone_codex_review_metadata(existing: Option<&Value>, model_id: &str) -> Opti
     object.remove("codexThreadActiveFlags");
     object.remove("codexSyncRequired");
     object.remove("codexSyncReason");
+    object.remove(crate::codex_thread_metadata::REMOTE_TURN_ACTIVE_KEY);
     object.insert(
         "lastModelId".to_string(),
         Value::String(model_id.to_string()),
@@ -2779,7 +2789,10 @@ async fn run_turn(
 
     let latest_thread = run_db(state.db.clone(), {
         let thread_id = thread.id.clone();
-        move |db| db::threads::get_thread(db, &thread_id)
+        move |db| {
+            db::threads::reconcile_stale_running_thread_status_from_transcript(db, &thread_id)?;
+            db::threads::get_thread(db, &thread_id)
+        }
     })
     .await
     .unwrap_or_else(|error| {
@@ -3386,7 +3399,13 @@ async fn run_codex_review_turn(
 
     let latest_review_thread = run_db(state.db.clone(), {
         let review_thread_id = review_thread.id.clone();
-        move |db| db::threads::get_thread(db, &review_thread_id)
+        move |db| {
+            db::threads::reconcile_stale_running_thread_status_from_transcript(
+                db,
+                &review_thread_id,
+            )?;
+            db::threads::get_thread(db, &review_thread_id)
+        }
     })
     .await
     .unwrap_or_else(|error| {
@@ -5673,6 +5692,7 @@ mod tests {
                 "codexThreadActiveFlags": ["waitingOnApproval"],
                 "codexSyncRequired": true,
                 "codexSyncReason": "stale",
+                "codexRemoteTurnActive": true,
                 "serviceTier": "fast",
             })),
             "gpt-5.4",
@@ -5685,6 +5705,10 @@ mod tests {
         assert_eq!(metadata.get("codexThreadActiveFlags"), None);
         assert_eq!(metadata.get("codexSyncRequired"), None);
         assert_eq!(metadata.get("codexSyncReason"), None);
+        assert_eq!(
+            metadata.get(crate::codex_thread_metadata::REMOTE_TURN_ACTIVE_KEY),
+            None
+        );
         assert_eq!(
             metadata.get("serviceTier"),
             Some(&serde_json::json!("fast"))

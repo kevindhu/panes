@@ -9,6 +9,10 @@ import {
   disarmPlanImplementationPrompt,
 } from "../lib/planImplementationPromptState";
 import { recordPerfMetric } from "../lib/perfTelemetry";
+import {
+  hasConfirmedCodexRemoteTurn,
+  isCodexThreadSyncRequired,
+} from "../lib/codexThreadRuntime";
 import { useThreadStore } from "./threadStore";
 import { useThreadPlanModeStore } from "./threadPlanModeStore";
 import { toast } from "./toastStore";
@@ -119,6 +123,7 @@ const MAX_FULLY_HYDRATED_MESSAGES = 80;
 const ACTION_OUTPUT_MAX_CHARS = 80_000;
 const ACTION_OUTPUT_TRIM_TARGET_CHARS = 48_000;
 const ACTION_OUTPUT_MAX_CHUNKS = 160;
+const MAX_QUEUED_TURN_FINISHED_EVENTS_PER_THREAD = 8;
 
 interface PendingTurnMeta {
   turnEngineId?: string | null;
@@ -140,6 +145,8 @@ interface AssistantMessageTarget {
 
 const pendingTurnMetaByThread = new Map<string, PendingTurnMeta>();
 const inflightActionOutputHydration = new Map<string, Promise<void>>();
+const bindingSeqByThread = new Map<string, number>();
+const queuedTurnFinishedEventsByThread = new Map<string, ChatTurnFinishedEvent[]>();
 
 function pendingTurnMatchesFinishedEvent(
   pendingTurn: PendingTurnMeta,
@@ -172,10 +179,174 @@ function assistantMessageMatchesFinishedEvent(
   return message.id === event.assistantMessageId;
 }
 
+interface TurnFinishedProjection {
+  messageStatus: Message["status"];
+  runtimeStatus: ThreadStatus;
+  turnStatus: TurnStatusState;
+}
+
+function projectTurnFinishedEvent(event: ChatTurnFinishedEvent): TurnFinishedProjection {
+  const messageStatus: Message["status"] =
+    event.status === "error"
+      ? "error"
+      : event.status === "interrupted"
+        ? "interrupted"
+        : "completed";
+  const turnStatus: TurnStatusState =
+    event.status === "error"
+      ? "failed"
+      : event.status === "interrupted"
+        ? "interrupted"
+        : "completed";
+  const runtimeStatus: ThreadStatus =
+    event.status === "error"
+      ? "error"
+      : event.status === "interrupted"
+        ? "idle"
+        : "completed";
+
+  return { messageStatus, runtimeStatus, turnStatus };
+}
+
+function applyTurnFinishedEventToMessages(
+  messages: Message[],
+  event: ChatTurnFinishedEvent,
+): { matched: boolean; messages: Message[] } {
+  let assistantIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].role === "assistant") {
+      assistantIndex = index;
+      break;
+    }
+  }
+
+  if (assistantIndex < 0) {
+    return { matched: false, messages };
+  }
+
+  const assistant = messages[assistantIndex];
+  if (
+    !assistantMessageMatchesFinishedEvent(assistant, event) ||
+    messages.slice(assistantIndex + 1).some((message) => message.role === "user")
+  ) {
+    return { matched: false, messages };
+  }
+
+  const { messageStatus, turnStatus } = projectTurnFinishedEvent(event);
+  let nextAssistant = assistant;
+  if (assistant.status === "streaming") {
+    const source = turnStatusSourceFromBlocks(assistant.blocks);
+    const terminalizedBlocks = terminalizeUnresolvedTurnBlocks(
+      assistant.blocks ?? [],
+      turnStatus,
+      source,
+    ) ?? [];
+    const blocks = upsertNoticeBlock(
+      terminalizedBlocks,
+      buildTurnStatusNotice(terminalizedBlocks, {
+        state: turnStatus,
+        source,
+      }),
+    );
+    nextAssistant = {
+      ...assistant,
+      status: messageStatus,
+      blocks,
+    };
+  } else if (assistant.status !== messageStatus) {
+    nextAssistant = {
+      ...assistant,
+      status: messageStatus,
+    };
+  }
+
+  if (nextAssistant === assistant) {
+    return { matched: true, messages };
+  }
+
+  return {
+    matched: true,
+    messages: [
+      ...messages.slice(0, assistantIndex),
+      nextAssistant,
+      ...messages.slice(assistantIndex + 1),
+    ],
+  };
+}
+
+function applyAcceptedTurnFinishedToBoundChat(event: ChatTurnFinishedEvent): boolean {
+  const { runtimeStatus } = projectTurnFinishedEvent(event);
+  let applied = false;
+
+  useChatStore.setState((state) => {
+    if (state.threadId !== event.threadId) {
+      return state;
+    }
+
+    const terminalized = applyTurnFinishedEventToMessages(state.messages, event);
+    if (!terminalized.matched) {
+      return state;
+    }
+    applied = true;
+    if (
+      terminalized.messages === state.messages &&
+      state.status === runtimeStatus &&
+      !state.streaming
+    ) {
+      return state;
+    }
+
+    return {
+      ...state,
+      messages: terminalized.messages,
+      status: runtimeStatus,
+      streaming: false,
+    };
+  });
+
+  return applied;
+}
+
+function queueTurnFinishedEventForBinding(event: ChatTurnFinishedEvent): void {
+  if (!bindingSeqByThread.has(event.threadId)) {
+    return;
+  }
+
+  const queued = queuedTurnFinishedEventsByThread.get(event.threadId) ?? [];
+  queued.push(event);
+  if (queued.length > MAX_QUEUED_TURN_FINISHED_EVENTS_PER_THREAD) {
+    queued.splice(0, queued.length - MAX_QUEUED_TURN_FINISHED_EVENTS_PER_THREAD);
+  }
+  queuedTurnFinishedEventsByThread.set(event.threadId, queued);
+}
+
+function replayQueuedTurnFinishedEvents(
+  threadId: string,
+  messages: Message[],
+): Message[] {
+  const queued = queuedTurnFinishedEventsByThread.get(threadId);
+  queuedTurnFinishedEventsByThread.delete(threadId);
+  if (!queued?.length) {
+    return messages;
+  }
+
+  let nextMessages = messages;
+  for (const event of queued) {
+    const terminalized = applyTurnFinishedEventToMessages(nextMessages, event);
+    if (terminalized.matched) {
+      nextMessages = terminalized.messages;
+    }
+  }
+  return nextMessages;
+}
+
 /**
  * Accepts a terminal event only when it still describes the current turn for
- * its thread. A newer turn can start after the backend releases its turn lock
- * but before the older global completion event reaches the frontend.
+ * its thread, then applies it as a backstop to the bound chat. A newer turn can
+ * start after the backend releases its turn lock but before the older global
+ * completion event reaches the frontend, while a listener can also be briefly
+ * replaced during navigation. The identity checks prevent the former and the
+ * terminal application closes the latter gap.
  */
 export function acceptTurnFinishedRuntimeEvent(
   event: ChatTurnFinishedEvent,
@@ -197,29 +368,27 @@ export function acceptTurnFinishedRuntimeEvent(
       return false;
     }
     pendingTurnMetaByThread.delete(event.threadId);
-    return true;
-  }
-
-  const chatState = useChatStore.getState();
-  if (chatState.threadId === event.threadId) {
-    const latestAssistant = [...chatState.messages]
-      .reverse()
-      .find((message) => message.role === "assistant");
-    if (
-      latestAssistant &&
-      !assistantMessageMatchesFinishedEvent(latestAssistant, event) &&
-      (latestAssistant.status === "streaming" ||
-        Boolean(latestAssistant.clientTurnId && event.clientTurnId))
-    ) {
-      return false;
+  } else {
+    const chatState = useChatStore.getState();
+    if (chatState.threadId === event.threadId) {
+      const latestAssistant = [...chatState.messages]
+        .reverse()
+        .find((message) => message.role === "assistant");
+      if (
+        latestAssistant &&
+        !assistantMessageMatchesFinishedEvent(latestAssistant, event) &&
+        (latestAssistant.status === "streaming" ||
+          Boolean(latestAssistant.clientTurnId && event.clientTurnId))
+      ) {
+        return false;
+      }
     }
   }
 
+  if (!applyAcceptedTurnFinishedToBoundChat(event)) {
+    queueTurnFinishedEventForBinding(event);
+  }
   return true;
-}
-
-function isCodexThreadSyncRequired(metadata: Record<string, unknown> | undefined): boolean {
-  return metadata?.codexSyncRequired === true;
 }
 
 function normalizeContextUsageCacheInteger(value: unknown): number | null {
@@ -351,6 +520,8 @@ function syncThreadContextUsageCache(threadId: string, usage: ContextUsage | nul
 export function resetUsageLimitCachesForTests(): void {
   lastKnownCodexAccountUsageWindows = null;
   pendingTurnMetaByThread.clear();
+  bindingSeqByThread.clear();
+  queuedTurnFinishedEventsByThread.clear();
 }
 
 function isThreadTurnActive(status: ThreadStatus): boolean {
@@ -1077,8 +1248,20 @@ function resolveActiveStreamingMessageIds(messages: Message[], threadId: string)
   return activeMessageIds;
 }
 
-function shouldPreferCurrentStreamingMessage(current: Message, loaded: Message): boolean {
-  if (current.role !== "assistant" || current.status !== "streaming") {
+function shouldPreferCurrentMessageDuringBind(current: Message, loaded: Message): boolean {
+  if (current.role !== "assistant") {
+    return false;
+  }
+
+  // A terminal event can arrive after the message query resolves but before
+  // the replacement listener is installed. A message never legitimately
+  // transitions from terminal back to streaming, so the newer in-memory
+  // terminal state must win over that stale query result.
+  if (current.status !== "streaming" && loaded.status === "streaming") {
+    return true;
+  }
+
+  if (current.status !== "streaming" || loaded.status !== "streaming") {
     return false;
   }
 
@@ -1112,7 +1295,7 @@ function hasPersistedUserForCurrentOptimisticUser(
   return loadedAssistantIndex > 0 && mergedMessages[loadedAssistantIndex - 1]?.role === "user";
 }
 
-function mergeLoadedMessagesWithActiveStreamingMessages(
+function mergeLoadedMessagesWithCurrentRuntimeMessages(
   loadedMessages: Message[],
   currentMessages: Message[],
   threadId: string,
@@ -1122,10 +1305,6 @@ function mergeLoadedMessagesWithActiveStreamingMessages(
   }
 
   const activeMessageIds = resolveActiveStreamingMessageIds(currentMessages, threadId);
-  if (activeMessageIds.size === 0) {
-    return loadedMessages;
-  }
-
   const mergedMessages = [...loadedMessages];
   const loadedIndexById = new Map<string, number>();
   const loadedAssistantIndexByClientTurnId = new Map<string, number>();
@@ -1141,7 +1320,7 @@ function mergeLoadedMessagesWithActiveStreamingMessages(
     const loadedIndex = loadedIndexById.get(currentMessage.id);
     if (loadedIndex !== undefined) {
       const loadedMessage = mergedMessages[loadedIndex];
-      if (shouldPreferCurrentStreamingMessage(currentMessage, loadedMessage)) {
+      if (shouldPreferCurrentMessageDuringBind(currentMessage, loadedMessage)) {
         mergedMessages[loadedIndex] = currentMessage;
       }
       continue;
@@ -1159,7 +1338,7 @@ function mergeLoadedMessagesWithActiveStreamingMessages(
     }
 
     const loadedAssistant = mergedMessages[loadedAssistantIndex];
-    if (shouldPreferCurrentStreamingMessage(currentMessage, loadedAssistant)) {
+    if (shouldPreferCurrentMessageDuringBind(currentMessage, loadedAssistant)) {
       loadedIndexById.delete(loadedAssistant.id);
       mergedMessages[loadedAssistantIndex] = currentMessage;
       loadedIndexById.set(currentMessage.id, loadedAssistantIndex);
@@ -1470,8 +1649,7 @@ function threadHasConfirmedRemoteTurn(thread: Thread | undefined): boolean {
   return Boolean(
     thread &&
       isThreadTurnActive(thread.status) &&
-      thread.engineMetadata?.codexSyncRequired === true &&
-      thread.engineMetadata?.codexSyncReason === "remote thread has an active turn",
+      hasConfirmedCodexRemoteTurn(thread),
   );
 }
 
@@ -2721,6 +2899,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     activeThreadBindSeq += 1;
     const bindSeq = activeThreadBindSeq;
+    if (threadId) {
+      bindingSeqByThread.set(threadId, bindSeq);
+    }
 
     if (currentThreadId && currentThreadId !== threadId) {
       useThreadStore
@@ -2734,7 +2915,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (currentUnlisten) {
       currentUnlisten();
     }
-    if (currentThreadId && get().streaming) {
+    if (currentThreadId && currentThreadId !== threadId && get().streaming) {
       cleanupBackgroundListener(currentThreadId);
       let backgroundTurnFinished = false;
       listenThreadEvents(currentThreadId, (event) => {
@@ -2809,7 +2990,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       const threadState = useThreadStore.getState();
       let activeThread = threadState.threads.find((thread) => thread.id === threadId);
-      if (activeThread?.engineId === "codex" && isCodexThreadSyncRequired(activeThread.engineMetadata)) {
+      if (isCodexThreadSyncRequired(activeThread)) {
         try {
           const syncedThread = await ipc.syncThreadFromEngine(threadId);
           threadState.applyThreadUpdateLocal(syncedThread);
@@ -2856,6 +3037,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       const flushQueuedStreamEvents = () => {
         if (streamFlushInProgress) {
+          return;
+        }
+        // Listener registration can synchronously deliver events before this
+        // thread becomes the bound chat. Keep those events queued so the
+        // loaded snapshot and the subscription form one ordered handoff.
+        if (bindSeq !== activeThreadBindSeq || get().threadId !== threadId) {
           return;
         }
         if (streamFlushTimer !== null) {
@@ -3030,17 +3217,30 @@ export const useChatStore = create<ChatState>((set, get) => ({
         return;
       }
 
+      messages = replayQueuedTurnFinishedEvents(threadId, messages);
       const currentState = get();
-      if (currentState.threadId === threadId && currentState.streaming) {
-        if (currentState.unlisten) {
+      if (currentState.threadId === threadId) {
+        const hasSupersedingListener = Boolean(
+          currentState.unlisten && currentState.unlisten !== currentUnlisten,
+        );
+        if (hasSupersedingListener) {
           unlisten();
         }
         const mergedMessages = applyHydrationWindow(
-          mergeLoadedMessagesWithActiveStreamingMessages(
+          mergeLoadedMessagesWithCurrentRuntimeMessages(
             messages,
             currentState.messages,
             threadId,
           ),
+        );
+        const latestThreadForMerge =
+          useThreadStore
+            .getState()
+            .threads.find((candidate) => candidate.id === threadId) ?? activeThread;
+        const mergedRuntimeState = resolveBoundThreadRuntimeState(
+          threadId,
+          latestThreadForMerge,
+          mergedMessages,
         );
         set({
           messages: mergedMessages,
@@ -3048,9 +3248,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
           hasOlderMessages: olderCursor !== null,
           loadingOlderMessages: false,
           olderLoadBlockedUntil: 0,
-          unlisten: currentState.unlisten ?? unlisten,
+          unlisten: hasSupersedingListener ? currentState.unlisten : unlisten,
           error: undefined,
+          status: mergedRuntimeState.status,
+          streaming: mergedRuntimeState.streaming,
+          usageLimits:
+            latestThreadForMerge?.engineId === "codex"
+              ? mergeUsageLimits(
+                  contextUsageFromThreadMetadata(latestThreadForMerge.engineMetadata),
+                  lastKnownCodexAccountUsageWindows,
+                )
+              : null,
         });
+        useThreadStore
+          .getState()
+          .setThreadStatusLocal(threadId, mergedRuntimeState.status);
+        flushQueuedStreamEvents();
         return;
       }
 
@@ -3086,6 +3299,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       useThreadStore
         .getState()
         .setThreadStatusLocal(threadId, boundRuntimeState.status);
+      flushQueuedStreamEvents();
     } catch (error) {
       if (bindSeq !== activeThreadBindSeq) {
         return;
@@ -3100,6 +3314,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
         usageLimits: null,
         error: String(error),
       });
+    } finally {
+      if (bindingSeqByThread.get(threadId) === bindSeq) {
+        bindingSeqByThread.delete(threadId);
+        queuedTurnFinishedEventsByThread.delete(threadId);
+      }
     }
   },
   loadOlderMessages: async () => {

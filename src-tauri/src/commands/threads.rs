@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use tauri::{Emitter, State};
 
 use crate::{
+    codex_thread_metadata::{self, REMOTE_TURN_ACTIVE_SYNC_REASON},
     db,
     engines::validate_engine_sandbox_mode,
     engines::CodexRemoteThreadSummary,
@@ -759,6 +760,9 @@ fn build_codex_remote_thread_metadata(thread: &CodexRemoteThreadSummary, model_i
         true,
         Some("remote_thread_attached"),
     );
+    // The remote-list summary is advisory. Only the full sync snapshot is
+    // allowed to assert that a remote turn is still active.
+    codex_thread_metadata::set_confirmed_remote_turn(&mut metadata, false);
 
     if let Some(object) = metadata.as_object_mut() {
         object.insert("lastModelId".to_string(), json!(model_id));
@@ -1330,14 +1334,15 @@ pub async fn sync_thread_from_engine(
     }
 
     let sync_required = !has_local_turn && has_active_remote_turn;
-    let metadata = merge_codex_runtime_metadata(
+    let mut metadata = merge_codex_runtime_metadata(
         thread.engine_metadata.clone(),
         snapshot.raw_status.as_deref(),
         &snapshot.active_flags,
         snapshot.preview.as_deref(),
         sync_required,
-        sync_required.then_some("remote thread has an active turn"),
+        sync_required.then_some(REMOTE_TURN_ACTIVE_SYNC_REASON),
     );
+    codex_thread_metadata::set_confirmed_remote_turn(&mut metadata, has_active_remote_turn);
     let metadata = mark_codex_transcript_imported(metadata, should_import_messages);
     let next_status = resolve_codex_sync_thread_status(&snapshot, has_local_turn);
 
@@ -2577,14 +2582,18 @@ fn clone_codex_branch_metadata(
         object.insert("codexTranscriptImported".to_string(), json!(true));
     }
 
-    merge_codex_runtime_metadata(
+    let mut metadata = merge_codex_runtime_metadata(
         Some(metadata),
         raw_status,
         active_flags,
         preview,
         sync_required,
         sync_reason,
-    )
+    );
+    // A branch starts a distinct engine thread. Do not inherit the source
+    // thread's confirmed-active bit before the branch receives a full sync.
+    codex_thread_metadata::set_confirmed_remote_turn(&mut metadata, false);
+    metadata
 }
 
 fn codex_transcript_imported(metadata: Option<&Value>) -> bool {
@@ -3781,6 +3790,10 @@ mod tests {
         assert_eq!(metadata.get("codexPreview"), Some(&json!("Preview line")));
         assert_eq!(metadata.get("codexSyncRequired"), Some(&json!(true)));
         assert_eq!(
+            metadata.get(codex_thread_metadata::REMOTE_TURN_ACTIVE_KEY),
+            Some(&json!(false))
+        );
+        assert_eq!(
             metadata.get("codexSyncReason"),
             Some(&json!("remote_thread_attached"))
         );
@@ -3965,6 +3978,7 @@ mod tests {
                 "codexThreadStatus": "active",
                 "codexThreadActiveFlags": ["waitingOnApproval"],
                 "codexSyncRequired": false,
+                "codexRemoteTurnActive": true,
                 "serviceTier": "fast",
             })),
             "gpt-5.4",
@@ -3985,6 +3999,10 @@ mod tests {
             Some(&json!(["waitingOnApproval"]))
         );
         assert_eq!(metadata.get("codexSyncRequired"), Some(&json!(true)));
+        assert_eq!(
+            metadata.get(codex_thread_metadata::REMOTE_TURN_ACTIVE_KEY),
+            Some(&json!(false))
+        );
         assert_eq!(
             metadata.get("codexSyncReason"),
             Some(&json!("branch_thread_requires_sync"))

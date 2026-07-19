@@ -129,6 +129,7 @@ impl Database {
         ensure_repo_columns(&conn)?;
         ensure_workspace_startup_columns(&conn)?;
         ensure_runtime_columns(&conn)?;
+        migrate_codex_remote_turn_metadata(&conn)?;
         ensure_messages_audit_columns(&conn)?;
         ensure_approval_response_columns(&conn)?;
         repair_normalized_workspace_and_repo_paths(&mut conn)?;
@@ -268,6 +269,35 @@ fn ensure_messages_audit_columns(conn: &Connection) -> anyhow::Result<()> {
         .context("failed to add messages.turn_reasoning_effort column")?;
     }
 
+    Ok(())
+}
+
+fn migrate_codex_remote_turn_metadata(conn: &Connection) -> anyhow::Result<()> {
+    let active_path = format!("$.{}", crate::codex_thread_metadata::REMOTE_TURN_ACTIVE_KEY,);
+    conn.execute(
+        "UPDATE threads
+         SET engine_metadata_json = json_set(
+           engine_metadata_json,
+           ?1,
+           json('true'),
+           '$.codexSyncReason',
+           ?2
+         )
+         WHERE engine_id = 'codex'
+           AND json_valid(engine_metadata_json)
+           AND json_type(engine_metadata_json) = 'object'
+           AND COALESCE(
+             json_extract(engine_metadata_json, '$.codexSyncRequired'),
+             0
+           ) = 1
+           AND json_extract(engine_metadata_json, '$.codexSyncReason') = ?3",
+        params![
+            active_path,
+            crate::codex_thread_metadata::REMOTE_TURN_ACTIVE_SYNC_REASON,
+            crate::codex_thread_metadata::LEGACY_REMOTE_TURN_ACTIVE_SYNC_REASON,
+        ],
+    )
+    .context("failed to migrate legacy Codex remote turn metadata")?;
     Ok(())
 }
 
@@ -775,6 +805,81 @@ mod tests {
         };
         db.run_migrations().expect("failed to initialize test db");
         db
+    }
+
+    #[test]
+    fn migrations_promote_legacy_remote_turn_reason_to_typed_metadata() {
+        let db = test_db();
+        let conn = Connection::open(&db.path).expect("failed to open raw sqlite db");
+        conn.execute(
+            "INSERT INTO workspaces (
+                id, name, root_path, scan_depth, created_at, last_opened_at,
+                git_repo_selection_configured
+             ) VALUES ('ws-codex-metadata', 'repo', '/workspace', 3,
+                       '2026-01-01 00:00:00', '2026-01-01 00:00:00', 0)",
+            [],
+        )
+        .expect("failed to insert migration test workspace");
+        conn.execute(
+            "INSERT INTO threads (
+                id, workspace_id, engine_id, model_id, title, status,
+                engine_metadata_json, created_at, last_activity_at
+             ) VALUES
+               ('legacy-active', 'ws-codex-metadata', 'codex', 'gpt-5', 'active', 'streaming',
+                ?1, '2026-01-01 00:00:00', '2026-01-01 00:00:00'),
+               ('other-reason', 'ws-codex-metadata', 'codex', 'gpt-5', 'other', 'idle',
+                ?2, '2026-01-01 00:00:00', '2026-01-01 00:00:00'),
+               ('legacy-reason-only', 'ws-codex-metadata', 'codex', 'gpt-5', 'reason only', 'idle',
+                ?3, '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
+            params![
+                r#"{"codexSyncRequired":true,"codexSyncReason":"remote thread has an active turn"}"#,
+                r#"{"codexSyncRequired":true,"codexSyncReason":"runtime_active_status_requires_sync"}"#,
+                r#"{"codexSyncRequired":false,"codexSyncReason":"remote thread has an active turn"}"#,
+            ],
+        )
+        .expect("failed to insert migration test threads");
+        drop(conn);
+
+        db.run_migrations()
+            .expect("failed to migrate legacy Codex metadata");
+        db.run_migrations()
+            .expect("Codex metadata migration should be idempotent");
+
+        let legacy = threads::get_thread(&db, "legacy-active")
+            .expect("failed to read migrated thread")
+            .expect("migrated thread should exist")
+            .engine_metadata
+            .expect("migrated metadata should exist");
+        assert_eq!(
+            legacy.get(crate::codex_thread_metadata::REMOTE_TURN_ACTIVE_KEY),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            legacy.get("codexSyncReason"),
+            Some(&serde_json::json!(
+                crate::codex_thread_metadata::REMOTE_TURN_ACTIVE_SYNC_REASON
+            ))
+        );
+
+        let unrelated = threads::get_thread(&db, "other-reason")
+            .expect("failed to read unrelated thread")
+            .expect("unrelated thread should exist")
+            .engine_metadata
+            .expect("unrelated metadata should exist");
+        assert_eq!(
+            unrelated.get(crate::codex_thread_metadata::REMOTE_TURN_ACTIVE_KEY),
+            None
+        );
+
+        let reason_only = threads::get_thread(&db, "legacy-reason-only")
+            .expect("failed to read reason-only thread")
+            .expect("reason-only thread should exist")
+            .engine_metadata
+            .expect("reason-only metadata should exist");
+        assert_eq!(
+            reason_only.get(crate::codex_thread_metadata::REMOTE_TURN_ACTIVE_KEY),
+            None
+        );
     }
 
     #[test]

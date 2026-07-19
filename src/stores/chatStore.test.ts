@@ -213,6 +213,45 @@ describe("chatStore send", () => {
     await expect(sendPromise).resolves.toBe(true);
   });
 
+  it("uses the accepted global completion as a backstop when the bound listener missed it", () => {
+    useChatStore.setState({
+      threadId: "thread-1",
+      messages: [
+        {
+          id: "assistant-message-id",
+          threadId: "thread-1",
+          role: "assistant",
+          clientTurnId: "client-turn-id",
+          blocks: [{ type: "text", content: "Finished work" }],
+          status: "streaming",
+          schemaVersion: 1,
+          createdAt: new Date().toISOString(),
+        },
+      ],
+      status: "streaming",
+      streaming: true,
+    });
+
+    expect(acceptTurnFinishedRuntimeEvent(makeTurnFinishedEvent())).toBe(true);
+
+    expect(useChatStore.getState()).toMatchObject({
+      status: "completed",
+      streaming: false,
+    });
+    expect(useChatStore.getState().messages[0]).toMatchObject({
+      id: "assistant-message-id",
+      status: "completed",
+      blocks: expect.arrayContaining([
+        expect.objectContaining({
+          type: "notice",
+          kind: "turn_status",
+          status: "completed",
+          title: "Turn completed",
+        }),
+      ]),
+    });
+  });
+
   it("rejects an older terminal event after a newer turn has started", async () => {
     mockIpc.sendMessage.mockResolvedValueOnce("assistant-a");
     await expect(useChatStore.getState().send("turn a")).resolves.toBe(true);
@@ -2328,6 +2367,40 @@ describe("chatStore send", () => {
     },
   );
 
+  it("keeps a fully synced active remote turn running over older terminal history", async () => {
+    const thread = {
+      ...makeThread("thread-1", "streaming"),
+      engineMetadata: {
+        codexSyncRequired: true,
+        codexRemoteTurnActive: true,
+      },
+    };
+    seedThreads(thread);
+    mockIpc.syncThreadFromEngine.mockResolvedValueOnce(thread);
+    mockIpc.getThreadMessagesWindow.mockResolvedValueOnce({
+      messages: [
+        {
+          id: "previous-assistant",
+          threadId: "thread-1",
+          role: "assistant",
+          blocks: [{ type: "text", content: "Previous response" }],
+          status: "completed",
+          schemaVersion: 1,
+          createdAt: "2026-07-10T09:00:00.000Z",
+        },
+      ],
+      nextCursor: null,
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    expect(mockIpc.syncThreadFromEngine).toHaveBeenCalledWith("thread-1");
+    expect(useChatStore.getState()).toMatchObject({
+      status: "streaming",
+      streaming: true,
+    });
+  });
+
   it("reconciles a completed transcript over a stale streaming cache on project re-entry", async () => {
     const thread = makeThread("thread-1", "streaming");
     seedThreads(thread);
@@ -2365,6 +2438,360 @@ describe("chatStore send", () => {
     expect(
       useThreadStore.getState().threads.find((item) => item.id === "thread-1")?.status,
     ).toBe("completed");
+  });
+
+  it("force-reloads the same bound thread and lets a persisted terminal message win", async () => {
+    const thread = makeThread("thread-1", "streaming");
+    seedThreads(thread);
+    const staleUnlisten = vi.fn();
+    const freshUnlisten = vi.fn();
+    useChatStore.setState({
+      threadId: "thread-1",
+      messages: [
+        {
+          id: "assistant-completed-turn",
+          threadId: "thread-1",
+          role: "assistant",
+          blocks: [{ type: "text", content: "Stale streamed content" }],
+          status: "streaming",
+          schemaVersion: 1,
+          createdAt: "2026-07-10T09:11:42.000Z",
+        },
+      ],
+      status: "streaming",
+      streaming: true,
+      unlisten: staleUnlisten,
+    });
+    mockIpc.getThreadMessagesWindow.mockResolvedValueOnce({
+      messages: [
+        {
+          id: "assistant-completed-turn",
+          threadId: "thread-1",
+          role: "assistant",
+          blocks: [
+            { type: "text", content: "Final persisted response" },
+            {
+              type: "notice",
+              kind: "turn_status",
+              level: "info",
+              title: "Turn completed",
+              message: "The turn reached a terminal completion.",
+              status: "completed",
+            },
+          ],
+          status: "completed",
+          schemaVersion: 1,
+          createdAt: "2026-07-10T09:11:42.000Z",
+        },
+      ],
+      nextCursor: null,
+    });
+    mockListenThreadEvents.mockResolvedValueOnce(freshUnlisten);
+
+    await useChatStore
+      .getState()
+      .setActiveThread("thread-1", { forceReload: true });
+
+    expect(staleUnlisten).toHaveBeenCalledTimes(1);
+    expect(freshUnlisten).not.toHaveBeenCalled();
+    expect(useChatStore.getState()).toMatchObject({
+      status: "completed",
+      streaming: false,
+    });
+    const activeUnlisten = useChatStore.getState().unlisten;
+    expect(activeUnlisten).toBeTypeOf("function");
+    expect(activeUnlisten).not.toBe(staleUnlisten);
+    expect(useChatStore.getState().messages.at(-1)).toMatchObject({
+      id: "assistant-completed-turn",
+      status: "completed",
+    });
+    expect(
+      useThreadStore.getState().threads.find((item) => item.id === "thread-1")?.status,
+    ).toBe("completed");
+    activeUnlisten?.();
+    expect(freshUnlisten).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not resurrect a turn that finishes between reload and listener replacement", async () => {
+    const thread = makeThread("thread-1", "streaming");
+    seedThreads(thread);
+    const staleUnlisten = vi.fn();
+    const freshUnlisten = vi.fn();
+    useChatStore.setState({
+      threadId: "thread-1",
+      messages: [
+        {
+          id: "assistant-message-id",
+          threadId: "thread-1",
+          role: "assistant",
+          clientTurnId: "client-turn-id",
+          blocks: [{ type: "text", content: "Finishing now" }],
+          status: "streaming",
+          schemaVersion: 1,
+          createdAt: "2026-07-10T09:11:42.000Z",
+        },
+      ],
+      status: "streaming",
+      streaming: true,
+      unlisten: staleUnlisten,
+    });
+    mockIpc.getThreadMessagesWindow.mockResolvedValueOnce({
+      messages: [
+        {
+          id: "assistant-message-id",
+          threadId: "thread-1",
+          role: "assistant",
+          clientTurnId: "client-turn-id",
+          blocks: [{ type: "text", content: "Finishing now" }],
+          status: "streaming",
+          schemaVersion: 1,
+          createdAt: "2026-07-10T09:11:42.000Z",
+        },
+      ],
+      nextCursor: null,
+    });
+    mockListenThreadEvents.mockImplementationOnce(async () => {
+      expect(acceptTurnFinishedRuntimeEvent(makeTurnFinishedEvent())).toBe(true);
+      return freshUnlisten;
+    });
+
+    await useChatStore
+      .getState()
+      .setActiveThread("thread-1", { forceReload: true });
+
+    expect(staleUnlisten).toHaveBeenCalledTimes(1);
+    expect(useChatStore.getState()).toMatchObject({
+      status: "completed",
+      streaming: false,
+    });
+    expect(useChatStore.getState().messages.at(-1)).toMatchObject({
+      id: "assistant-message-id",
+      status: "completed",
+      blocks: expect.arrayContaining([
+        expect.objectContaining({ kind: "turn_status", status: "completed" }),
+      ]),
+    });
+    useChatStore.getState().unlisten?.();
+    expect(freshUnlisten).toHaveBeenCalledTimes(1);
+  });
+
+  it("replays a terminal event that arrives while switching to another thread", async () => {
+    const threadOne = makeThread("thread-1", "completed");
+    const threadTwo = makeThread("thread-2", "streaming");
+    seedThreads(threadOne, threadTwo);
+    const freshUnlisten = vi.fn();
+    mockIpc.getThreadMessagesWindow.mockResolvedValueOnce({
+      messages: [
+        {
+          id: "assistant-b",
+          threadId: "thread-2",
+          role: "assistant",
+          clientTurnId: "turn-b",
+          blocks: [{ type: "text", content: "Finishing in the background" }],
+          status: "streaming",
+          schemaVersion: 1,
+          createdAt: "2026-07-10T09:11:42.000Z",
+        },
+      ],
+      nextCursor: null,
+    });
+    mockListenThreadEvents.mockImplementationOnce(async (threadId) => {
+      expect(threadId).toBe("thread-2");
+      expect(useChatStore.getState().threadId).toBe("thread-1");
+      expect(
+        acceptTurnFinishedRuntimeEvent(
+          makeTurnFinishedEvent({
+            threadId: "thread-2",
+            assistantMessageId: "assistant-b",
+            clientTurnId: "turn-b",
+          }),
+        ),
+      ).toBe(true);
+      useThreadStore.getState().setThreadStatusLocal("thread-2", "completed");
+      return freshUnlisten;
+    });
+
+    await useChatStore.getState().setActiveThread("thread-2");
+
+    expect(useChatStore.getState()).toMatchObject({
+      threadId: "thread-2",
+      status: "completed",
+      streaming: false,
+    });
+    expect(useChatStore.getState().messages.at(-1)).toMatchObject({
+      id: "assistant-b",
+      status: "completed",
+      blocks: expect.arrayContaining([
+        expect.objectContaining({ kind: "turn_status", status: "completed" }),
+      ]),
+    });
+    expect(
+      useThreadStore.getState().threads.find((thread) => thread.id === "thread-2")?.status,
+    ).toBe("completed");
+  });
+
+  it("ignores a stale queued completion when a newer turn is in the loaded snapshot", async () => {
+    const threadOne = makeThread("thread-1", "completed");
+    const threadTwo = makeThread("thread-2", "streaming");
+    seedThreads(threadOne, threadTwo);
+    mockIpc.getThreadMessagesWindow.mockResolvedValueOnce({
+      messages: [
+        {
+          id: "assistant-old",
+          threadId: "thread-2",
+          role: "assistant",
+          clientTurnId: "turn-old",
+          blocks: [{ type: "text", content: "Old turn" }],
+          status: "streaming",
+          schemaVersion: 1,
+          createdAt: "2026-07-10T09:00:00.000Z",
+        },
+        {
+          id: "user-new",
+          threadId: "thread-2",
+          role: "user",
+          blocks: [{ type: "text", content: "New turn" }],
+          status: "completed",
+          schemaVersion: 1,
+          createdAt: "2026-07-10T09:01:00.000Z",
+        },
+        {
+          id: "assistant-new",
+          threadId: "thread-2",
+          role: "assistant",
+          clientTurnId: "turn-new",
+          blocks: [{ type: "text", content: "Still working" }],
+          status: "streaming",
+          schemaVersion: 1,
+          createdAt: "2026-07-10T09:01:01.000Z",
+        },
+      ],
+      nextCursor: null,
+    });
+    mockListenThreadEvents.mockImplementationOnce(async () => {
+      expect(
+        acceptTurnFinishedRuntimeEvent(
+          makeTurnFinishedEvent({
+            threadId: "thread-2",
+            assistantMessageId: "assistant-old",
+            clientTurnId: "turn-old",
+          }),
+        ),
+      ).toBe(true);
+      return () => {};
+    });
+
+    await useChatStore.getState().setActiveThread("thread-2");
+
+    expect(useChatStore.getState()).toMatchObject({
+      threadId: "thread-2",
+      status: "streaming",
+      streaming: true,
+    });
+    expect(useChatStore.getState().messages.at(-1)).toMatchObject({
+      id: "assistant-new",
+      status: "streaming",
+    });
+  });
+
+  it("replays per-thread stream events delivered during cross-thread listener binding", async () => {
+    const threadOne = makeThread("thread-1", "completed");
+    const threadTwo = makeThread("thread-2", "streaming");
+    seedThreads(threadOne, threadTwo);
+    mockIpc.getThreadMessagesWindow.mockResolvedValueOnce({
+      messages: [
+        {
+          id: "assistant-b",
+          threadId: "thread-2",
+          role: "assistant",
+          blocks: [{ type: "text", content: "Almost done" }],
+          status: "streaming",
+          schemaVersion: 1,
+          createdAt: "2026-07-10T09:11:42.000Z",
+        },
+      ],
+      nextCursor: null,
+    });
+    mockListenThreadEvents.mockImplementationOnce(async (_threadId, onEvent) => {
+      expect(useChatStore.getState().threadId).toBe("thread-1");
+      onEvent({
+        type: "TurnCompleted",
+        status: "completed",
+        diagnostics: { source: "engine" },
+      });
+      return () => {};
+    });
+
+    await useChatStore.getState().setActiveThread("thread-2");
+
+    expect(useChatStore.getState()).toMatchObject({
+      threadId: "thread-2",
+      status: "completed",
+      streaming: false,
+    });
+    expect(useChatStore.getState().messages.at(-1)).toMatchObject({
+      id: "assistant-b",
+      status: "completed",
+      blocks: expect.arrayContaining([
+        expect.objectContaining({ kind: "turn_status", status: "completed" }),
+      ]),
+    });
+  });
+
+  it("force-reloads the same bound thread without ending a genuinely open turn", async () => {
+    const thread = makeThread("thread-1", "streaming");
+    seedThreads(thread);
+    const staleUnlisten = vi.fn();
+    const freshUnlisten = vi.fn();
+    useChatStore.setState({
+      threadId: "thread-1",
+      messages: [
+        {
+          id: "assistant-open-turn",
+          threadId: "thread-1",
+          role: "assistant",
+          blocks: [{ type: "text", content: "Newest live content" }],
+          status: "streaming",
+          schemaVersion: 1,
+          createdAt: "2026-07-10T09:11:42.000Z",
+        },
+      ],
+      status: "streaming",
+      streaming: true,
+      unlisten: staleUnlisten,
+    });
+    mockIpc.getThreadMessagesWindow.mockResolvedValueOnce({
+      messages: [
+        {
+          id: "assistant-open-turn",
+          threadId: "thread-1",
+          role: "assistant",
+          blocks: [],
+          status: "streaming",
+          schemaVersion: 1,
+          createdAt: "2026-07-10T09:11:42.000Z",
+        },
+      ],
+      nextCursor: null,
+    });
+    mockListenThreadEvents.mockResolvedValueOnce(freshUnlisten);
+
+    await useChatStore
+      .getState()
+      .setActiveThread("thread-1", { forceReload: true });
+
+    expect(staleUnlisten).toHaveBeenCalledTimes(1);
+    expect(useChatStore.getState()).toMatchObject({
+      status: "streaming",
+      streaming: true,
+    });
+    expect(useChatStore.getState().messages.at(-1)).toMatchObject({
+      id: "assistant-open-turn",
+      status: "streaming",
+      blocks: [{ type: "text", content: "Newest live content" }],
+    });
+    useChatStore.getState().unlisten?.();
+    expect(freshUnlisten).toHaveBeenCalledTimes(1);
   });
 
   it("preserves a genuinely pending local turn when re-entry only loads older terminal history", async () => {

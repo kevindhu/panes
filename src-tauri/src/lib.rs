@@ -1,3 +1,4 @@
+mod codex_thread_metadata;
 mod commands;
 mod config;
 mod db;
@@ -31,7 +32,9 @@ use git::repo::FileTreeCache;
 use git::watcher::GitWatcherManager;
 #[cfg(target_os = "macos")]
 use locale::native_strings;
-use models::{EngineRuntimeUpdatedDto, RuntimeToastDto, ThreadDto, ThreadStatusDto};
+use models::{
+    EngineRuntimeUpdatedDto, MessageStatusDto, RuntimeToastDto, ThreadDto, ThreadStatusDto,
+};
 use power::KeepAwakeManager;
 use state::{AppState, TurnManager};
 #[cfg(target_os = "macos")]
@@ -707,29 +710,89 @@ async fn apply_codex_runtime_thread_update(
     .ok()??;
 
     let has_local_turn = state.turns.get(&thread.id).await.is_some();
-    let next_status = map_codex_runtime_status_to_local(raw_status, active_flags, has_local_turn);
-    let metadata = merge_codex_runtime_metadata(
-        thread.engine_metadata.clone(),
-        raw_status,
-        active_flags,
-        preview,
-        sync_required,
-        sync_reason,
-    );
-
     run_db(state.db.clone(), {
         let thread_id = thread.id.clone();
         let title = title.map(str::to_string);
-        let metadata = metadata.clone();
-        let next_status = next_status.clone();
+        let raw_status = raw_status.map(str::to_string);
+        let active_flags = active_flags.to_vec();
+        let preview = preview.map(str::to_string);
+        let sync_reason = sync_reason.map(str::to_string);
         move |db| {
-            db::threads::update_thread_runtime_snapshot(
+            // Re-read both the thread and its transcript immediately before
+            // applying the runtime summary. This avoids merging metadata or
+            // status from an earlier snapshot after a turn has just finished.
+            let current_thread = db::threads::get_thread(db, &thread_id)?
+                .ok_or_else(|| anyhow::anyhow!("thread not found: {thread_id}"))?;
+            let latest_assistant =
+                db::messages::get_latest_assistant_identity_and_status(db, &thread_id)?;
+            let had_confirmed_remote_turn = codex_thread_metadata::has_confirmed_remote_turn(
+                current_thread.engine_metadata.as_ref(),
+            );
+            let status_update = resolve_codex_runtime_status_update(
+                raw_status.as_deref(),
+                &active_flags,
+                has_local_turn,
+                latest_assistant.as_ref().map(|(_, status)| status),
+                &current_thread.status,
+                had_confirmed_remote_turn,
+            );
+            let effective_sync_required = status_update.sync_required.or(sync_required);
+            let effective_sync_reason = if status_update.sync_required.is_some() {
+                status_update.sync_reason
+            } else {
+                sync_reason.as_deref()
+            };
+            let mut metadata = merge_codex_runtime_metadata(
+                current_thread.engine_metadata,
+                raw_status.as_deref(),
+                &active_flags,
+                preview.as_deref(),
+                effective_sync_required,
+                effective_sync_reason,
+            );
+            if let Some(active) = status_update.confirmed_remote_turn_active {
+                codex_thread_metadata::set_confirmed_remote_turn(&mut metadata, active);
+            }
+            let updated = db::threads::update_thread_runtime_snapshot(
                 db,
                 &thread_id,
                 title.as_deref(),
-                next_status,
+                status_update.status,
                 Some(&metadata),
-            )
+            )?;
+
+            // The opposite race is also possible: a newer assistant can start
+            // or finish after the summary read but before this write. Runtime
+            // data for the previous transcript must not overwrite that newer
+            // message's exact state.
+            let latest_assistant_after =
+                db::messages::get_latest_assistant_identity_and_status(db, &thread_id)?;
+            if latest_assistant_after != latest_assistant {
+                let Some((_, latest_status)) = latest_assistant_after else {
+                    return Ok(updated);
+                };
+                db::threads::update_thread_status(
+                    db,
+                    &thread_id,
+                    thread_status_from_message_status(&latest_status),
+                )?;
+                return db::threads::get_thread(db, &thread_id)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "thread not found after newer transcript reconciliation: {thread_id}"
+                    )
+                });
+            }
+
+            // Close the remaining read/write race: if terminal transcript
+            // persistence won while the runtime update was being applied, the
+            // single-statement reconciliation restores the terminal status.
+            if db::threads::reconcile_stale_running_thread_status_from_transcript(db, &thread_id)? {
+                return db::threads::get_thread(db, &thread_id)?.ok_or_else(|| {
+                    anyhow::anyhow!("thread not found after transcript reconciliation: {thread_id}")
+                });
+            }
+
+            Ok(updated)
         }
     })
     .await
@@ -853,29 +916,256 @@ fn merge_codex_runtime_metadata(
     metadata
 }
 
-fn map_codex_runtime_status_to_local(
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CodexRuntimeStatusUpdate {
+    status: Option<ThreadStatusDto>,
+    sync_required: Option<bool>,
+    sync_reason: Option<&'static str>,
+    confirmed_remote_turn_active: Option<bool>,
+}
+
+fn thread_status_from_message_status(status: &MessageStatusDto) -> ThreadStatusDto {
+    match status {
+        MessageStatusDto::Completed => ThreadStatusDto::Completed,
+        MessageStatusDto::Interrupted => ThreadStatusDto::Idle,
+        MessageStatusDto::Error => ThreadStatusDto::Error,
+        MessageStatusDto::Streaming => ThreadStatusDto::Streaming,
+    }
+}
+
+fn terminal_thread_status_from_message(
+    status: Option<&MessageStatusDto>,
+) -> Option<ThreadStatusDto> {
+    status.and_then(|status| match status {
+        MessageStatusDto::Streaming => None,
+        status => Some(thread_status_from_message_status(status)),
+    })
+}
+
+fn resolve_codex_runtime_status_update(
     raw_status: Option<&str>,
     active_flags: &[String],
     has_local_turn: bool,
-) -> Option<ThreadStatusDto> {
+    latest_assistant_status: Option<&MessageStatusDto>,
+    current_thread_status: &ThreadStatusDto,
+    had_confirmed_remote_turn: bool,
+) -> CodexRuntimeStatusUpdate {
     if has_local_turn {
-        return None;
+        return CodexRuntimeStatusUpdate::default();
     }
 
+    let terminal_transcript_status = terminal_thread_status_from_message(latest_assistant_status);
     match raw_status.map(str::trim).filter(|value| !value.is_empty()) {
-        Some("systemError") => Some(ThreadStatusDto::Error),
-        Some("idle") | Some("notLoaded") => Some(ThreadStatusDto::Idle),
-        Some("active") => {
-            if active_flags
-                .iter()
-                .any(|flag| matches!(flag.as_str(), "waitingOnApproval" | "waitingOnUserInput"))
-            {
-                Some(ThreadStatusDto::AwaitingApproval)
+        Some("systemError") => CodexRuntimeStatusUpdate {
+            status: Some(ThreadStatusDto::Error),
+            sync_required: Some(false),
+            sync_reason: None,
+            confirmed_remote_turn_active: Some(false),
+        },
+        Some("idle") | Some("notLoaded") => {
+            if matches!(latest_assistant_status, Some(MessageStatusDto::Streaming)) {
+                CodexRuntimeStatusUpdate {
+                    status: Some(ThreadStatusDto::Streaming),
+                    sync_required: Some(true),
+                    sync_reason: Some("runtime_idle_with_open_transcript"),
+                    confirmed_remote_turn_active: Some(false),
+                }
+            } else if had_confirmed_remote_turn {
+                CodexRuntimeStatusUpdate {
+                    status: terminal_transcript_status.or(Some(ThreadStatusDto::Idle)),
+                    sync_required: Some(true),
+                    sync_reason: Some("runtime_remote_turn_finished_requires_sync"),
+                    confirmed_remote_turn_active: Some(false),
+                }
             } else {
-                Some(ThreadStatusDto::Streaming)
+                CodexRuntimeStatusUpdate {
+                    status: terminal_transcript_status.or(Some(ThreadStatusDto::Idle)),
+                    sync_required: Some(false),
+                    sync_reason: None,
+                    confirmed_remote_turn_active: Some(false),
+                }
             }
         }
-        _ => None,
+        Some("active") => {
+            let transcript_is_streaming =
+                matches!(latest_assistant_status, Some(MessageStatusDto::Streaming));
+            let status = if let Some(terminal_status) = terminal_transcript_status {
+                // A late generic `active` snapshot must never resurrect a turn
+                // whose persisted assistant message is already terminal.
+                Some(terminal_status)
+            } else if transcript_is_streaming
+                && active_flags
+                    .iter()
+                    .any(|flag| matches!(flag.as_str(), "waitingOnApproval" | "waitingOnUserInput"))
+            {
+                Some(ThreadStatusDto::AwaitingApproval)
+            } else if transcript_is_streaming {
+                Some(ThreadStatusDto::Streaming)
+            } else {
+                // A generic active summary without an open local transcript is
+                // only a request to sync. Never preserve an old running row
+                // while that remote state is still unverified.
+                Some(match current_thread_status {
+                    ThreadStatusDto::Streaming | ThreadStatusDto::AwaitingApproval => {
+                        ThreadStatusDto::Idle
+                    }
+                    status => status.clone(),
+                })
+            };
+
+            CodexRuntimeStatusUpdate {
+                status,
+                sync_required: Some(true),
+                sync_reason: Some("runtime_active_status_requires_sync"),
+                // Runtime summaries can preserve a prior full-snapshot
+                // confirmation, but cannot establish one on their own.
+                confirmed_remote_turn_active: Some(had_confirmed_remote_turn),
+            }
+        }
+        _ => CodexRuntimeStatusUpdate::default(),
+    }
+}
+
+#[cfg(test)]
+mod codex_runtime_status_tests {
+    use super::*;
+
+    #[test]
+    fn late_active_snapshot_cannot_resurrect_terminal_transcript() {
+        let completed = resolve_codex_runtime_status_update(
+            Some("active"),
+            &[],
+            false,
+            Some(&MessageStatusDto::Completed),
+            &ThreadStatusDto::Streaming,
+            false,
+        );
+        assert_eq!(completed.status, Some(ThreadStatusDto::Completed));
+        assert_eq!(completed.sync_required, Some(true));
+        assert_eq!(completed.confirmed_remote_turn_active, Some(false));
+
+        let interrupted = resolve_codex_runtime_status_update(
+            Some("active"),
+            &["waitingOnApproval".to_string()],
+            false,
+            Some(&MessageStatusDto::Interrupted),
+            &ThreadStatusDto::AwaitingApproval,
+            false,
+        );
+        assert_eq!(interrupted.status, Some(ThreadStatusDto::Idle));
+        assert_eq!(interrupted.sync_required, Some(true));
+    }
+
+    #[test]
+    fn active_snapshot_requires_streaming_transcript_evidence_before_showing_progress() {
+        let unverified = resolve_codex_runtime_status_update(
+            Some("active"),
+            &[],
+            false,
+            None,
+            &ThreadStatusDto::Streaming,
+            false,
+        );
+        assert_eq!(unverified.status, Some(ThreadStatusDto::Idle));
+        assert_eq!(unverified.sync_required, Some(true));
+        assert_eq!(unverified.confirmed_remote_turn_active, Some(false));
+
+        let previously_completed = resolve_codex_runtime_status_update(
+            Some("active"),
+            &[],
+            false,
+            None,
+            &ThreadStatusDto::Completed,
+            false,
+        );
+        assert_eq!(
+            previously_completed.status,
+            Some(ThreadStatusDto::Completed)
+        );
+
+        let streaming = resolve_codex_runtime_status_update(
+            Some("active"),
+            &[],
+            false,
+            Some(&MessageStatusDto::Streaming),
+            &ThreadStatusDto::Idle,
+            false,
+        );
+        assert_eq!(streaming.status, Some(ThreadStatusDto::Streaming));
+
+        let awaiting = resolve_codex_runtime_status_update(
+            Some("active"),
+            &["waitingOnUserInput".to_string()],
+            false,
+            Some(&MessageStatusDto::Streaming),
+            &ThreadStatusDto::Idle,
+            false,
+        );
+        assert_eq!(awaiting.status, Some(ThreadStatusDto::AwaitingApproval));
+    }
+
+    #[test]
+    fn local_turn_and_idle_runtime_updates_preserve_authoritative_evidence() {
+        assert_eq!(
+            resolve_codex_runtime_status_update(
+                Some("active"),
+                &[],
+                true,
+                Some(&MessageStatusDto::Completed),
+                &ThreadStatusDto::Streaming,
+                false,
+            ),
+            CodexRuntimeStatusUpdate::default()
+        );
+
+        let completed = resolve_codex_runtime_status_update(
+            Some("idle"),
+            &[],
+            false,
+            Some(&MessageStatusDto::Completed),
+            &ThreadStatusDto::Streaming,
+            false,
+        );
+        assert_eq!(completed.status, Some(ThreadStatusDto::Completed));
+        assert_eq!(completed.sync_required, Some(false));
+
+        let remote_finished = resolve_codex_runtime_status_update(
+            Some("idle"),
+            &[],
+            false,
+            Some(&MessageStatusDto::Completed),
+            &ThreadStatusDto::Streaming,
+            true,
+        );
+        assert_eq!(remote_finished.status, Some(ThreadStatusDto::Completed));
+        assert_eq!(remote_finished.sync_required, Some(true));
+        assert_eq!(remote_finished.confirmed_remote_turn_active, Some(false));
+        assert_eq!(
+            remote_finished.sync_reason,
+            Some("runtime_remote_turn_finished_requires_sync")
+        );
+
+        let open_transcript = resolve_codex_runtime_status_update(
+            Some("idle"),
+            &[],
+            false,
+            Some(&MessageStatusDto::Streaming),
+            &ThreadStatusDto::Streaming,
+            false,
+        );
+        assert_eq!(open_transcript.status, Some(ThreadStatusDto::Streaming));
+        assert_eq!(open_transcript.sync_required, Some(true));
+        assert_eq!(open_transcript.confirmed_remote_turn_active, Some(false));
+
+        let still_active = resolve_codex_runtime_status_update(
+            Some("active"),
+            &[],
+            false,
+            None,
+            &ThreadStatusDto::Completed,
+            true,
+        );
+        assert_eq!(still_active.confirmed_remote_turn_active, Some(true));
     }
 }
 

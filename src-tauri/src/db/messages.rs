@@ -442,6 +442,28 @@ pub fn get_thread_messages(db: &Database, thread_id: &str) -> anyhow::Result<Vec
     Ok(out)
 }
 
+pub fn get_latest_assistant_identity_and_status(
+    db: &Database,
+    thread_id: &str,
+) -> anyhow::Result<Option<(String, MessageStatusDto)>> {
+    let conn = db.connect()?;
+    let assistant = conn
+        .query_row(
+            "SELECT id, status
+             FROM messages
+             WHERE thread_id = ?1
+               AND role = 'assistant'
+             ORDER BY created_at DESC, rowid DESC
+             LIMIT 1",
+            params![thread_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .context("failed to inspect latest assistant message status")?;
+
+    Ok(assistant.map(|(id, status)| (id, MessageStatusDto::from_str(&status))))
+}
+
 pub fn get_thread_messages_window(
     db: &Database,
     thread_id: &str,

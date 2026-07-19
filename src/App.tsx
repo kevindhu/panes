@@ -40,6 +40,7 @@ import {
   isPlanImplementationPromptArmed,
   planImplementationPromptLogOperationId,
 } from "./lib/planImplementationPromptState";
+import { isCodexThreadSyncRequired } from "./lib/codexThreadRuntime";
 import { runEditMenuAction } from "./lib/nativeEditActions";
 import {
   isAppZoomAvailable,
@@ -81,10 +82,6 @@ function fireShortcut(id: string, action: () => void) {
 async function createNewWorkspaceThread() {
   const { activeWorkspaceId } = useWorkspaceStore.getState();
   await createAndActivateWorkspaceThread(activeWorkspaceId);
-}
-
-function isCodexSyncRequired(thread: Thread | null | undefined): boolean {
-  return thread?.engineId === "codex" && thread.engineMetadata?.codexSyncRequired === true;
 }
 
 function showRuntimeToast(runtimeToast?: RuntimeToast) {
@@ -666,31 +663,89 @@ export function App() {
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    void listenThreadUpdated(async ({ workspaceId, thread }) => {
+    const syncingCodexThreadIds = new Set<string>();
+    const threadUpdateVersions = new Map<string, number>();
+    const latestThreadUpdates = new Map<string, Thread>();
+
+    const refreshWorkspaceThreads = (workspaceId: string) => {
+      void refreshThreads(workspaceId);
+      void refreshArchivedThreads(workspaceId);
+    };
+
+    const syncCodexThread = async (threadId: string, workspaceId: string) => {
+      if (syncingCodexThreadIds.has(threadId)) {
+        return;
+      }
+
+      syncingCodexThreadIds.add(threadId);
+      try {
+        while (!disposed) {
+          const syncVersion = threadUpdateVersions.get(threadId) ?? 0;
+          let syncedThread: Thread;
+          try {
+            syncedThread = await ipc.syncThreadFromEngine(threadId);
+          } catch (error) {
+            console.warn(`Failed to sync Codex thread ${threadId}:`, error);
+            refreshWorkspaceThreads(workspaceId);
+            return;
+          }
+
+          if (disposed) {
+            return;
+          }
+
+          // A newer runtime event makes this snapshot stale. Retry only when
+          // that newer event still asks for a sync; otherwise its locally
+          // applied terminal state already supersedes this result.
+          if ((threadUpdateVersions.get(threadId) ?? 0) !== syncVersion) {
+            if (isCodexThreadSyncRequired(latestThreadUpdates.get(threadId))) {
+              continue;
+            }
+            return;
+          }
+
+          if (useThreadStore.getState().applyThreadUpdateLocal(syncedThread)) {
+            await notifyThreadNeedsAttention(syncedThread);
+          } else {
+            refreshWorkspaceThreads(workspaceId);
+          }
+
+          // Notifications can yield long enough for another thread event to
+          // arrive. Do not strand a newer sync request behind this one.
+          if (
+            (threadUpdateVersions.get(threadId) ?? 0) !== syncVersion &&
+            isCodexThreadSyncRequired(latestThreadUpdates.get(threadId))
+          ) {
+            continue;
+          }
+          return;
+        }
+      } finally {
+        syncingCodexThreadIds.delete(threadId);
+      }
+    };
+
+    void listenThreadUpdated(async ({ threadId, workspaceId, thread }) => {
+      const updateVersion = (threadUpdateVersions.get(threadId) ?? 0) + 1;
+      threadUpdateVersions.set(threadId, updateVersion);
       if (thread) {
+        latestThreadUpdates.set(threadId, thread);
         const applied = applyThreadUpdateLocal(thread);
         await notifyThreadNeedsAttention(thread);
-        const activeThreadId = useThreadStore.getState().activeThreadId;
-        if (thread.id === activeThreadId && isCodexSyncRequired(thread)) {
-          try {
-            const syncedThread = await ipc.syncThreadFromEngine(thread.id);
-            if (useThreadStore.getState().applyThreadUpdateLocal(syncedThread)) {
-              await notifyThreadNeedsAttention(syncedThread);
-              return;
-            }
-          } catch (error) {
-            console.warn(`Failed to sync active Codex thread ${thread.id}:`, error);
-          }
-          void refreshThreads(workspaceId);
-          void refreshArchivedThreads(workspaceId);
+        if ((threadUpdateVersions.get(threadId) ?? 0) !== updateVersion) {
+          return;
+        }
+        if (isCodexThreadSyncRequired(thread)) {
+          await syncCodexThread(thread.id, workspaceId);
           return;
         }
         if (applied) {
           return;
         }
+      } else {
+        latestThreadUpdates.delete(threadId);
       }
-      void refreshThreads(workspaceId);
-      void refreshArchivedThreads(workspaceId);
+      refreshWorkspaceThreads(workspaceId);
     }).then((fn) => {
       if (disposed) {
         fn();

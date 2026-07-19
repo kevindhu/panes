@@ -641,7 +641,20 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
       rememberCurrentNavigationLocation();
     }
     if (activeView !== "chat") setActiveView("chat");
-    await activateThreadContext(thread);
+    const selectedThreadMayHaveStaleRunningState =
+      thread.id === activeThreadId &&
+      (
+        isRunningThreadStatus(thread.status) ||
+        (
+          boundChatThreadId === thread.id &&
+          (boundChatStreaming || isRunningThreadStatus(boundChatStatus))
+        )
+      );
+    await activateThreadContext(thread, {
+      // Re-read only when one of the two local status projections still looks
+      // active. Healthy completed threads keep their existing listener.
+      forceChatReload: selectedThreadMayHaveStaleRunningState,
+    });
   }
 
   async function onSelectProject(wsId: string) {
