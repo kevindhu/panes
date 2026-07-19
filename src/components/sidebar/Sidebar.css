@@ -22,6 +22,8 @@
   --sb-font-caption: 11.5px;
   --sb-row-height: 28px;
   --sb-project-row-height: 29px;
+  --sb-toolbar-height: 22px;
+  --sb-rail-toolbar-height: 38px;
   font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
 }
@@ -40,7 +42,7 @@
 
 /* Window toolbar */
 .sb-toolbar {
-  height: 22px;
+  height: var(--sb-toolbar-height);
   padding: 0 4px;
   display: flex;
   align-items: center;
@@ -752,11 +754,11 @@
 
 .sb-rail-toolbar {
   width: 100%;
-  height: 38px;
+  height: var(--sb-rail-toolbar-height);
   display: flex;
   align-items: center;
   justify-content: center;
-  flex: 0 0 38px;
+  flex: 0 0 var(--sb-rail-toolbar-height);
 }
 
 .sb-rail-mac-titlebar .sb-rail-toolbar {

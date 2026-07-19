@@ -64,6 +64,9 @@
   --panel-header-height: 48px;
   --linux-forehead-height: 36px;
   --linux-window-control-size: 28px;
+  /* Native WebView zoom is countered only by explicit app-chrome regions. */
+  --app-zoom-factor: 1;
+  --app-zoom-inverse-factor: 1;
 
   /* Transitions */
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
@@ -129,11 +132,40 @@ button, input, textarea, select {
 }
 
 .app-shell-custom-frame {
-  --content-top-margin: var(--linux-forehead-height);
+  --content-top-margin: calc(
+    var(--linux-forehead-height) * var(--app-zoom-inverse-factor)
+  );
 }
 
 .app-shell-custom-frame-fullscreen {
   --content-top-margin: 0px;
+}
+
+/*
+ * A flow-safe boundary for app chrome nested inside zoomable content. The
+ * outer slot reserves a constant number of physical pixels; the inner surface
+ * counter-scales the WebView zoom while still spanning its zoomed parent.
+ */
+.zoom-invariant-flow-slot {
+  position: relative;
+  width: 100%;
+  height: calc(
+    var(--zoom-invariant-region-height) * var(--app-zoom-inverse-factor)
+  );
+  flex: 0 0 calc(
+    var(--zoom-invariant-region-height) * var(--app-zoom-inverse-factor)
+  );
+  overflow: visible;
+}
+
+.zoom-invariant-flow-content {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: calc(100% * var(--app-zoom-factor));
+  height: var(--zoom-invariant-region-height);
+  transform: scale(var(--app-zoom-inverse-factor));
+  transform-origin: top left;
 }
 
 /* Ambient Background */
@@ -289,17 +321,21 @@ button, input, textarea, select {
 
 .linux-window-chrome {
   height: var(--linux-forehead-height);
+  width: calc(100% * var(--app-zoom-factor));
   display: flex;
   align-items: center;
   padding: 0 12px 0 10px;
-  padding-left: calc(var(--sidebar-current-width, 0px) + 8px);
+  padding-left: calc(
+    (var(--sidebar-current-width, 0px) * var(--app-zoom-factor)) + 8px
+  );
   background: transparent;
   position: absolute;
   top: 0;
   left: 0;
-  right: 0;
   z-index: 70;
   pointer-events: none;
+  transform: scale(var(--app-zoom-inverse-factor));
+  transform-origin: top left;
 }
 
 .linux-window-chrome-menus {
@@ -429,16 +465,16 @@ button, input, textarea, select {
 
 .linux-window-resize-handle-north,
 .linux-window-resize-handle-south {
-  left: 10px;
-  right: 10px;
-  height: 4px;
+  left: calc(10px * var(--app-zoom-inverse-factor));
+  right: calc(10px * var(--app-zoom-inverse-factor));
+  height: calc(4px * var(--app-zoom-inverse-factor));
 }
 
 .linux-window-resize-handle-east,
 .linux-window-resize-handle-west {
-  top: 10px;
-  bottom: 10px;
-  width: 4px;
+  top: calc(10px * var(--app-zoom-inverse-factor));
+  bottom: calc(10px * var(--app-zoom-inverse-factor));
+  width: calc(4px * var(--app-zoom-inverse-factor));
 }
 
 .linux-window-resize-handle-north {
@@ -465,8 +501,8 @@ button, input, textarea, select {
 .linux-window-resize-handle-north-east,
 .linux-window-resize-handle-south-west,
 .linux-window-resize-handle-south-east {
-  width: 10px;
-  height: 10px;
+  width: calc(10px * var(--app-zoom-inverse-factor));
+  height: calc(10px * var(--app-zoom-inverse-factor));
 }
 
 .linux-window-resize-handle-north-west {
@@ -1030,6 +1066,10 @@ button, input, textarea, select {
   border: 1px solid var(--border-active);
   box-shadow: 0 14px 32px rgba(31, 35, 40, 0.14), 0 0 0 1px rgba(31, 35, 40, 0.04);
   animation: dropdown-in var(--duration-fast) var(--ease-out) both;
+}
+
+.dropdown-menu-portal {
+  z-index: 10001;
 }
 
 @keyframes dropdown-in {

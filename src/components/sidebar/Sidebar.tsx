@@ -46,7 +46,7 @@ import { canUseNativeCodexHistoryTools } from "../../lib/codexThreadCapabilities
 import { ipc } from "../../lib/ipc";
 import { formatRelativeTime } from "../../lib/formatters";
 import { activateThreadContext } from "../../lib/threadActivation";
-import { isMacDesktop } from "../../lib/windowActions";
+import { isMacDesktop, usesCustomWindowFrame } from "../../lib/windowActions";
 import {
   emitTerminalAcceleratedRenderingChanged,
   getTerminalAcceleratedRenderingPreferenceVersion,
@@ -56,6 +56,7 @@ import { createAndActivateWorkspaceThread } from "../../lib/newThreadActions";
 import { getActionMenuPosition } from "../git/actionMenuPosition";
 import { UpdateDialog } from "../onboarding/UpdateDialog";
 import { ConfirmDialog } from "../shared/ConfirmDialog";
+import { ZoomInvariantFlowRegion } from "../shared/ZoomInvariantRegion";
 import { WorkspaceMoreMenu } from "../workspace/WorkspaceMoreMenu";
 import { normalizeSidebarCollapsedState } from "./sidebarCollapseState";
 import {
@@ -861,7 +862,9 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
 
   return (
     <div className={`sb${isMacDesktop() ? " sb-mac-titlebar" : ""}`}>
-      <div
+      <ZoomInvariantFlowRegion
+        enabled={usesCustomWindowFrame()}
+        regionHeight="var(--sb-toolbar-height)"
         className="sb-toolbar"
         onMouseDown={handleDragMouseDown}
         onDoubleClick={handleDragDoubleClick}
@@ -897,7 +900,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
             <ArrowRight size={16} />
           </button>
         </div>
-      </div>
+      </ZoomInvariantFlowRegion>
 
       <nav className="sb-primary-nav" aria-label={t("app:sidebar.agents")}>
         <button
@@ -1625,7 +1628,9 @@ function CollapsedRail({
         transition: "opacity 150ms var(--ease-out)",
       }}
     >
-      <div
+      <ZoomInvariantFlowRegion
+        enabled={usesCustomWindowFrame()}
+        regionHeight="var(--sb-rail-toolbar-height)"
         className="sb-rail-toolbar"
         onMouseDown={handleDragMouseDown}
         onDoubleClick={handleDragDoubleClick}
@@ -1639,7 +1644,7 @@ function CollapsedRail({
         >
           <PanelLeftOpen size={18} strokeWidth={1.55} />
         </button>
-      </div>
+      </ZoomInvariantFlowRegion>
 
       <div className="sb-rail-nav">
         <button

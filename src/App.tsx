@@ -482,6 +482,7 @@ export function App() {
   const startupRestorePending = useThreadStore((s) => s.startupRestorePending);
   const setStartupRestorePending = useThreadStore((s) => s.setStartupRestorePending);
   const commandPaletteOpen = useUiStore((s) => s.commandPaletteOpen);
+  const appZoomPercent = useUiStore((s) => s.appZoomPercent);
   const activeView = useUiStore((s) => s.activeView);
   const closeCommandPalette = useUiStore((s) => s.closeCommandPalette);
   const checkForUpdate = useUpdateStore((s) => s.checkForUpdate);
@@ -1209,7 +1210,12 @@ export function App() {
         customWindowFrameState.isMaximized ? " app-shell-custom-frame-maximized" : ""
       }${customWindowFrameState.isFullscreen ? " app-shell-custom-frame-fullscreen" : ""}`}
     >
-      {customWindowFrame && <CustomWindowFrame frameState={customWindowFrameState} />}
+      {customWindowFrame && (
+        <CustomWindowFrame
+          frameState={customWindowFrameState}
+          appZoomPercent={appZoomPercent}
+        />
+      )}
       <div className="app-shell-body">
         <ThreeColumnLayout />
       </div>

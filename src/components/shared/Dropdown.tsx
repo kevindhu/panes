@@ -6,6 +6,7 @@ import {
   closeGitFlyoutIfFocusLeft,
   GitFlyoutContext,
 } from "../../lib/gitFlyoutRegion";
+import { useZoomInvariantScale } from "./ZoomInvariantRegion";
 
 export interface DropdownOption {
   value: string;
@@ -63,6 +64,8 @@ export function Dropdown({
   const [submenuPos, setSubmenuPos] = useState<SubmenuPosition>({ top: 0, left: 0 });
   const groupLeaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const gitFlyoutContext = useContext(GitFlyoutContext);
+  const portalScale = useZoomInvariantScale();
+  const portalGap = 4 * portalScale;
 
   const allOptions = [
     ...options,
@@ -86,17 +89,18 @@ export function Dropdown({
     if (!open || !triggerRef.current) return;
 
     const rect = triggerRef.current.getBoundingClientRect();
-    const estimatedMenuHeight = totalItems * 32 + 8 + (hasGroups ? 9 : 0)
-      + optionDividerCount * 9;
+    const estimatedMenuHeight = (
+      totalItems * 32 + 8 + (hasGroups ? 9 : 0) + optionDividerCount * 9
+    ) * portalScale;
     const spaceBelow = window.innerHeight - rect.bottom;
     const goUp = spaceBelow < estimatedMenuHeight && rect.top > spaceBelow;
 
     setPos({
-      top: goUp ? rect.top - 4 : rect.bottom + 4,
+      top: goUp ? rect.top - portalGap : rect.bottom + portalGap,
       left: rect.left,
       direction: goUp ? "top" : "bottom",
     });
-  }, [open, totalItems, hasGroups, optionDividerCount]);
+  }, [open, totalItems, hasGroups, optionDividerCount, portalGap, portalScale]);
 
   useEffect(() => {
     if (!open) return;
@@ -152,14 +156,14 @@ export function Dropdown({
     const itemRect = e.currentTarget.getBoundingClientRect();
     if (menuRect) {
       const group = groups?.[groupIndex];
-      const submenuHeight = (group?.options.length ?? 0) * 32 + 8;
+      const submenuHeight = ((group?.options.length ?? 0) * 32 + 8) * portalScale;
       let top = itemRect.top;
-      if (top + submenuHeight > window.innerHeight - 8) {
-        top = window.innerHeight - submenuHeight - 8;
+      if (top + submenuHeight > window.innerHeight - 8 * portalScale) {
+        top = window.innerHeight - submenuHeight - 8 * portalScale;
       }
-      let left = menuRect.right + 4;
-      if (left + 180 > window.innerWidth) {
-        left = menuRect.left - 184;
+      let left = menuRect.right + portalGap;
+      if (left + 180 * portalScale > window.innerWidth) {
+        left = menuRect.left - 184 * portalScale;
       }
       setSubmenuPos({ top, left });
     }
@@ -195,97 +199,29 @@ export function Dropdown({
   const menu = open
     ? createPortal(
         <div
-          ref={menuRef}
-          className="dropdown-menu"
-          data-git-flyout-region={gitFlyoutContext ? "true" : undefined}
+          className="dropdown-menu-portal"
           style={{
             position: "fixed",
             left: pos.left,
             ...(pos.direction === "bottom"
               ? { top: pos.top }
               : { bottom: window.innerHeight - pos.top }),
+            transform: `scale(${portalScale})`,
+            transformOrigin: pos.direction === "bottom" ? "top left" : "bottom left",
           }}
-          onMouseEnter={() => gitFlyoutContext?.openFlyout()}
-          onMouseLeave={() => gitFlyoutContext?.scheduleClose(150)}
-          onFocusCapture={() => gitFlyoutContext?.openFlyout()}
-          onBlurCapture={(event) =>
-            closeGitFlyoutIfFocusLeft(gitFlyoutContext, event.relatedTarget)
-          }
         >
-          {options.map((option) => {
-            const isSelected = option.value === value;
-            return (
-              <Fragment key={option.value}>
-                {option.separatorBefore && <div className="dropdown-divider" />}
-                <button
-                  type="button"
-                  className={`dropdown-item ${isSelected ? "dropdown-item-selected" : ""}`}
-                  onClick={() => handleSelect(option.value)}
-                  onMouseEnter={handleItemEnter}
-                >
-                  {option.icon && (
-                    <span className="dropdown-item-icon">{option.icon}</span>
-                  )}
-                  <span className="dropdown-item-label">{option.label}</span>
-                  {option.shortcut && (
-                    <span className="dropdown-item-shortcut">{option.shortcut}</span>
-                  )}
-                  {isSelected && (
-                    <Check size={12} className="dropdown-item-check" />
-                  )}
-                </button>
-              </Fragment>
-            );
-          })}
-
-          {hasGroups && (
-            <>
-              <div className="dropdown-divider" />
-              {groups.map((group, i) => (
-                <button
-                  key={group.label}
-                  type="button"
-                  className={`dropdown-item ${activeGroup === i ? "dropdown-item-active" : ""}`}
-                  onMouseEnter={(e) => handleGroupEnter(i, e)}
-                  onMouseLeave={handleGroupLeave}
-                >
-                  <span className="dropdown-item-label">{group.label}</span>
-                  <ChevronRight size={12} style={{ opacity: 0.5, flexShrink: 0 }} />
-                </button>
-              ))}
-            </>
-          )}
-        </div>,
-        document.body,
-      )
-    : null;
-
-  const submenu =
-    open && activeGroup !== null && groups?.[activeGroup]
-      ? createPortal(
           <div
-            ref={submenuRef}
+            ref={menuRef}
             className="dropdown-menu"
             data-git-flyout-region={gitFlyoutContext ? "true" : undefined}
-            style={{
-              position: "fixed",
-              top: submenuPos.top,
-              left: submenuPos.left,
-            }}
-            onMouseEnter={() => {
-              gitFlyoutContext?.openFlyout();
-              handleSubmenuEnter();
-            }}
-            onMouseLeave={() => {
-              gitFlyoutContext?.scheduleClose(150);
-              handleSubmenuLeave();
-            }}
+            onMouseEnter={() => gitFlyoutContext?.openFlyout()}
+            onMouseLeave={() => gitFlyoutContext?.scheduleClose(150)}
             onFocusCapture={() => gitFlyoutContext?.openFlyout()}
             onBlurCapture={(event) =>
               closeGitFlyoutIfFocusLeft(gitFlyoutContext, event.relatedTarget)
             }
           >
-            {groups[activeGroup].options.map((option) => {
+            {options.map((option) => {
               const isSelected = option.value === value;
               return (
                 <Fragment key={option.value}>
@@ -294,6 +230,7 @@ export function Dropdown({
                     type="button"
                     className={`dropdown-item ${isSelected ? "dropdown-item-selected" : ""}`}
                     onClick={() => handleSelect(option.value)}
+                    onMouseEnter={handleItemEnter}
                   >
                     {option.icon && (
                       <span className="dropdown-item-icon">{option.icon}</span>
@@ -309,6 +246,85 @@ export function Dropdown({
                 </Fragment>
               );
             })}
+
+            {hasGroups && (
+              <>
+                <div className="dropdown-divider" />
+                {groups.map((group, i) => (
+                  <button
+                    key={group.label}
+                    type="button"
+                    className={`dropdown-item ${activeGroup === i ? "dropdown-item-active" : ""}`}
+                    onMouseEnter={(e) => handleGroupEnter(i, e)}
+                    onMouseLeave={handleGroupLeave}
+                  >
+                    <span className="dropdown-item-label">{group.label}</span>
+                    <ChevronRight size={12} style={{ opacity: 0.5, flexShrink: 0 }} />
+                  </button>
+                ))}
+              </>
+            )}
+          </div>
+        </div>,
+        document.body,
+      )
+    : null;
+
+  const submenu =
+    open && activeGroup !== null && groups?.[activeGroup]
+      ? createPortal(
+          <div
+            className="dropdown-menu-portal"
+            style={{
+              position: "fixed",
+              top: submenuPos.top,
+              left: submenuPos.left,
+              transform: `scale(${portalScale})`,
+              transformOrigin: "top left",
+            }}
+          >
+            <div
+              ref={submenuRef}
+              className="dropdown-menu"
+              data-git-flyout-region={gitFlyoutContext ? "true" : undefined}
+              onMouseEnter={() => {
+                gitFlyoutContext?.openFlyout();
+                handleSubmenuEnter();
+              }}
+              onMouseLeave={() => {
+                gitFlyoutContext?.scheduleClose(150);
+                handleSubmenuLeave();
+              }}
+              onFocusCapture={() => gitFlyoutContext?.openFlyout()}
+              onBlurCapture={(event) =>
+                closeGitFlyoutIfFocusLeft(gitFlyoutContext, event.relatedTarget)
+              }
+            >
+              {groups[activeGroup].options.map((option) => {
+                const isSelected = option.value === value;
+                return (
+                  <Fragment key={option.value}>
+                    {option.separatorBefore && <div className="dropdown-divider" />}
+                    <button
+                      type="button"
+                      className={`dropdown-item ${isSelected ? "dropdown-item-selected" : ""}`}
+                      onClick={() => handleSelect(option.value)}
+                    >
+                      {option.icon && (
+                        <span className="dropdown-item-icon">{option.icon}</span>
+                      )}
+                      <span className="dropdown-item-label">{option.label}</span>
+                      {option.shortcut && (
+                        <span className="dropdown-item-shortcut">{option.shortcut}</span>
+                      )}
+                      {isSelected && (
+                        <Check size={12} className="dropdown-item-check" />
+                      )}
+                    </button>
+                  </Fragment>
+                );
+              })}
+            </div>
           </div>,
           document.body,
         )

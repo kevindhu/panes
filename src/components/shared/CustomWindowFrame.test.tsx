@@ -80,4 +80,13 @@ describe("CustomWindowFrame", () => {
 
     expect(maximizeButtonProps).not.toBeNull();
   });
+
+  it("provides the inverse app zoom to frame-owned portals", () => {
+    const tree = CustomWindowFrame({
+      frameState: { isFullscreen: false, isMaximized: false },
+      appZoomPercent: 125,
+    });
+
+    expect(tree.props.scale).toBe(0.8);
+  });
 });
