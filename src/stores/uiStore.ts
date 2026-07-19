@@ -25,6 +25,7 @@ interface FocusModeSnapshot {
 }
 
 type ActiveView = "chat" | "harnesses" | "workspace-settings";
+export type WorkspaceSettingsSection = "general" | "repos" | "startup";
 
 function clampWorkspacePaneZoomPercent(value: number): number {
   if (!Number.isFinite(value)) {
@@ -62,6 +63,7 @@ interface UiState {
   focusModeSnapshot: FocusModeSnapshot | null;
   activeView: ActiveView;
   settingsWorkspaceId: string | null;
+  settingsWorkspaceSection: WorkspaceSettingsSection;
   commandPaletteOpen: boolean;
   commandPaletteLaunch: CommandPaletteLaunchState;
   messageFocusTarget: MessageFocusTarget | null;
@@ -81,7 +83,10 @@ interface UiState {
   setFocusMode: (enabled: boolean) => void;
   toggleFocusMode: () => void;
   setActiveView: (view: ActiveView) => void;
-  openWorkspaceSettings: (workspaceId: string) => void;
+  openWorkspaceSettings: (
+    workspaceId: string,
+    section?: WorkspaceSettingsSection,
+  ) => void;
   setMessageFocusTarget: (target: { threadId: string; messageId: string }) => void;
   clearMessageFocusTarget: () => void;
 }
@@ -134,6 +139,7 @@ export const useUiStore = create<UiState>((set) => ({
   commandPaletteLaunch: COMMAND_PALETTE_DEFAULT_LAUNCH,
   activeView: "chat",
   settingsWorkspaceId: null,
+  settingsWorkspaceSection: "general",
   messageFocusTarget: null,
   openCommandPalette: (launch) =>
     set({
@@ -296,8 +302,12 @@ export const useUiStore = create<UiState>((set) => ({
       });
     }
   },
-  openWorkspaceSettings: (workspaceId) => {
-    set({ activeView: "workspace-settings", settingsWorkspaceId: workspaceId });
+  openWorkspaceSettings: (workspaceId, section = "general") => {
+    set({
+      activeView: "workspace-settings",
+      settingsWorkspaceId: workspaceId,
+      settingsWorkspaceSection: section,
+    });
   },
   setMessageFocusTarget: (target) =>
     set({

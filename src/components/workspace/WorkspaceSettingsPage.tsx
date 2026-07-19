@@ -24,8 +24,6 @@ import { WorkspaceStartupSection } from "./WorkspaceStartupSection";
 import { GitRemotesView } from "../git/GitRemotesView";
 import type { Repo, TrustLevel } from "../../types";
 
-type Section = "general" | "repos" | "startup";
-
 const MIN_SCAN_DEPTH = 0;
 const MAX_SCAN_DEPTH = 12;
 
@@ -43,12 +41,13 @@ export function WorkspaceSettingsPage() {
     (s) => s.retargetTabsAfterWorkspaceDirectoryChange,
   );
   const settingsWorkspaceId = useUiStore((s) => s.settingsWorkspaceId);
+  const section = useUiStore((s) => s.settingsWorkspaceSection);
+  const openWorkspaceSettings = useUiStore((s) => s.openWorkspaceSettings);
   const setActiveView = useUiStore((s) => s.setActiveView);
 
   const workspace = workspaces.find((w) => w.id === settingsWorkspaceId) ?? null;
   const isActive = workspace?.id === activeWorkspaceId;
 
-  const [section, setSection] = useState<Section>("general");
   const [depthDraft, setDepthDraft] = useState("");
   const [depthSaving, setDepthSaving] = useState(false);
   const [depthError, setDepthError] = useState<string | null>(null);
@@ -265,7 +264,7 @@ export function WorkspaceSettingsPage() {
             <button
               type="button"
               className={`wsp-nav-item ${section === "general" ? "wsp-nav-active" : ""}`}
-              onClick={() => setSection("general")}
+              onClick={() => openWorkspaceSettings(workspace.id, "general")}
             >
               <Info size={13} />
               {t("nav.general")}
@@ -273,7 +272,7 @@ export function WorkspaceSettingsPage() {
             <button
               type="button"
               className={`wsp-nav-item ${section === "repos" ? "wsp-nav-active" : ""}`}
-              onClick={() => setSection("repos")}
+              onClick={() => openWorkspaceSettings(workspace.id, "repos")}
             >
               <GitBranch size={13} />
               {t("nav.repositories")}
@@ -284,7 +283,7 @@ export function WorkspaceSettingsPage() {
             <button
               type="button"
               className={`wsp-nav-item ${section === "startup" ? "wsp-nav-active" : ""}`}
-              onClick={() => setSection("startup")}
+              onClick={() => openWorkspaceSettings(workspace.id, "startup")}
             >
               <Play size={13} />
               {t("nav.startup")}

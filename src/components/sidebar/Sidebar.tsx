@@ -3,31 +3,34 @@ import { createPortal } from "react-dom";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useTranslation } from "react-i18next";
 import {
-  Command,
-  Plus,
-  FolderGit2,
+  ArrowLeft,
+  ArrowRight,
+  Blocks,
+  Bot,
+  Folder,
+  FolderOpen,
+  FolderPlus,
   MessageSquare,
   GitBranch,
-  ChevronDown,
-  ChevronRight,
   Archive,
   RotateCcw,
   Settings,
-  PanelLeftClose,
+  PanelLeft,
   PanelLeftOpen,
   Search,
-  Terminal,
   Check,
   Rocket,
   RefreshCw,
   PillBottle,
   BellRing,
+  ListFilter,
   ListChecks,
+  Send,
 } from "lucide-react";
 import { useChatStore } from "../../stores/chatStore";
 import { useThreadStore } from "../../stores/threadStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
-import { useUiStore } from "../../stores/uiStore";
+import { useUiStore, type WorkspaceSettingsSection } from "../../stores/uiStore";
 import { useOnboardingStore } from "../../stores/onboardingStore";
 import { useUpdateStore } from "../../stores/updateStore";
 import { canToggleKeepAwake, useKeepAwakeStore } from "../../stores/keepAwakeStore";
@@ -43,6 +46,7 @@ import { canUseNativeCodexHistoryTools } from "../../lib/codexThreadCapabilities
 import { ipc } from "../../lib/ipc";
 import { formatRelativeTime } from "../../lib/formatters";
 import { activateThreadContext } from "../../lib/threadActivation";
+import { isMacDesktop } from "../../lib/windowActions";
 import {
   emitTerminalAcceleratedRenderingChanged,
   getTerminalAcceleratedRenderingPreferenceVersion,
@@ -60,6 +64,7 @@ import {
   type WorkspaceDragRowRect,
 } from "./workspaceDragSort";
 import type { Thread, Workspace } from "../../types";
+import "./Sidebar.css";
 
 interface ProjectGroup {
   workspace: Workspace;
@@ -80,6 +85,16 @@ interface WorkspaceDragState {
   startY: number;
   dragging: boolean;
   orderedIds: string[];
+}
+
+type SidebarView = "chat" | "harnesses" | "workspace-settings";
+
+interface SidebarNavigationLocation {
+  view: SidebarView;
+  workspaceId: string | null;
+  threadId: string | null;
+  settingsWorkspaceId: string | null;
+  settingsSection: WorkspaceSettingsSection;
 }
 
 const MAX_VISIBLE_THREADS = 8;
@@ -107,6 +122,17 @@ function readLegacyDefaultScanDepth(): number | undefined {
 
 function areStringArraysEqual(left: string[], right: string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function areSidebarLocationsEqual(
+  left: SidebarNavigationLocation,
+  right: SidebarNavigationLocation,
+): boolean {
+  return left.view === right.view
+    && left.workspaceId === right.workspaceId
+    && left.threadId === right.threadId
+    && left.settingsWorkspaceId === right.settingsWorkspaceId
+    && left.settingsSection === right.settingsSection;
 }
 
 /* ─────────────────────────────────────────────────────
@@ -139,10 +165,11 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
     refreshArchivedThreads,
   } = useThreadStore();
   const openOnboarding = useOnboardingStore((state) => state.openOnboarding);
-  const sidebarPinned = useUiStore((state) => state.sidebarPinned);
-  const toggleSidebarPin = useUiStore((state) => state.toggleSidebarPin);
+  const toggleSidebar = useUiStore((state) => state.toggleSidebar);
   const activeView = useUiStore((state) => state.activeView);
   const setActiveView = useUiStore((state) => state.setActiveView);
+  const settingsWorkspaceId = useUiStore((state) => state.settingsWorkspaceId);
+  const settingsWorkspaceSection = useUiStore((state) => state.settingsWorkspaceSection);
   const openWorkspaceSettings = useUiStore((state) => state.openWorkspaceSettings);
   const openCommandPalette = useUiStore((state) => state.openCommandPalette);
   const boundChatThreadId = useChatStore((s) => s.threadId);
@@ -192,6 +219,9 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   );
   const [showAll, setShowAll] = useState<Record<string, boolean>>({});
   const [archivedOpen, setArchivedOpen] = useState(false);
+  const [navigationBackStack, setNavigationBackStack] = useState<SidebarNavigationLocation[]>([]);
+  const [navigationForwardStack, setNavigationForwardStack] = useState<SidebarNavigationLocation[]>([]);
+  const [navigationBusy, setNavigationBusy] = useState(false);
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
   const [archiveWorkspacePrompt, setArchiveWorkspacePrompt] = useState<{
     workspace: Workspace;
@@ -521,20 +551,104 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
     void refreshArchivedThreads(activeWorkspaceId);
   }, [activeWorkspaceId, refreshArchivedThreads]);
 
+  function getCurrentNavigationLocation(): SidebarNavigationLocation {
+    return {
+      view: activeView,
+      workspaceId: activeWorkspaceId,
+      threadId: activeThreadId,
+      settingsWorkspaceId,
+      settingsSection: settingsWorkspaceSection,
+    };
+  }
+
+  function rememberCurrentNavigationLocation() {
+    const current = getCurrentNavigationLocation();
+    setNavigationBackStack((previous) => {
+      const last = previous.at(-1);
+      if (last && areSidebarLocationsEqual(last, current)) {
+        return previous;
+      }
+      return [...previous, current].slice(-40);
+    });
+    setNavigationForwardStack([]);
+  }
+
+  async function restoreNavigationLocation(location: SidebarNavigationLocation) {
+    closeThreadContextMenu();
+    closeSettingsMenu();
+
+    const targetThread = location.threadId
+      ? threads.find((thread) => thread.id === location.threadId)
+      : null;
+    const targetWorkspace = location.workspaceId
+      ? workspaces.find((workspace) => workspace.id === location.workspaceId)
+      : null;
+
+    if (targetThread) {
+      await activateThreadContext(targetThread);
+    } else if (targetWorkspace) {
+      await activateThreadContext(null);
+      await setActiveWorkspace(targetWorkspace.id);
+    }
+
+    if (location.view === "workspace-settings") {
+      const settingsTarget = workspaces.find(
+        (workspace) => workspace.id === location.settingsWorkspaceId,
+      ) ?? targetWorkspace;
+      if (settingsTarget) {
+        openWorkspaceSettings(settingsTarget.id, location.settingsSection);
+        return;
+      }
+    }
+
+    setActiveView(location.view === "workspace-settings" ? "chat" : location.view);
+  }
+
+  async function navigateHistory(direction: "back" | "forward") {
+    if (navigationBusy) return;
+    const target = direction === "back"
+      ? navigationBackStack.at(-1)
+      : navigationForwardStack[0];
+    if (!target) return;
+
+    const current = getCurrentNavigationLocation();
+    if (direction === "back") {
+      setNavigationBackStack((previous) => previous.slice(0, -1));
+      setNavigationForwardStack((previous) => [current, ...previous].slice(0, 40));
+    } else {
+      setNavigationForwardStack((previous) => previous.slice(1));
+      setNavigationBackStack((previous) => [...previous, current].slice(-40));
+    }
+
+    setNavigationBusy(true);
+    try {
+      await restoreNavigationLocation(target);
+    } finally {
+      setNavigationBusy(false);
+    }
+  }
+
   async function onOpenFolder() {
     const selected = await open({ directory: true, multiple: false });
     if (!selected || Array.isArray(selected)) return;
+    rememberCurrentNavigationLocation();
     await openWorkspace(selected, readLegacyDefaultScanDepth());
   }
 
   async function onSelectThread(thread: Thread) {
     closeThreadContextMenu();
+    if (thread.id !== activeThreadId || activeView !== "chat") {
+      rememberCurrentNavigationLocation();
+    }
     if (activeView !== "chat") setActiveView("chat");
     await activateThreadContext(thread);
   }
 
   async function onSelectProject(wsId: string) {
     closeThreadContextMenu();
+    if (wsId !== activeWorkspaceId || activeView !== "chat") {
+      rememberCurrentNavigationLocation();
+    }
     if (activeView !== "chat") setActiveView("chat");
     setCollapsed(
       Object.fromEntries(projects.map((p) => [p.workspace.id, p.workspace.id !== wsId]))
@@ -546,7 +660,21 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   async function onCreateProjectThread(project: Workspace) {
     const createdThreadId = await createAndActivateWorkspaceThread(project.id);
     if (!createdThreadId) return;
+    rememberCurrentNavigationLocation();
     setCollapsed((prev) => ({ ...prev, [project.id]: false }));
+  }
+
+  function navigateToWorkspaceSettings(
+    workspaceId: string,
+    section: WorkspaceSettingsSection = "general",
+  ) {
+    const alreadyOpen = activeView === "workspace-settings"
+      && settingsWorkspaceId === workspaceId
+      && settingsWorkspaceSection === section;
+    if (!alreadyOpen) {
+      rememberCurrentNavigationLocation();
+    }
+    openWorkspaceSettings(workspaceId, section);
   }
 
   function onDeleteWorkspace(project: Workspace) {
@@ -719,97 +847,119 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
     : false;
 
   return (
-    <div
-      style={{
-        height: "100%",
-        display: "flex",
-        flexDirection: "column",
-        background: "inherit",
-        minWidth: 0,
-        minHeight: 0,
-        overflow: "hidden",
-      }}
-    >
-      {/* ── Drag region ── */}
+    <div className={`sb${isMacDesktop() ? " sb-mac-titlebar" : ""}`}>
       <div
+        className="sb-toolbar"
         onMouseDown={handleDragMouseDown}
         onDoubleClick={handleDragDoubleClick}
-        style={{ height: 34, flexShrink: 0 }}
-      />
-
-      {/* ── Nav items ── */}
-      <div style={{ padding: "0 8px 4px", flexShrink: 0 }}>
-        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-          {/* New thread */}
+      >
+        <button
+          type="button"
+          className="sb-toolbar-btn no-drag"
+          onClick={onPin ?? toggleSidebar}
+          title={onPin ? t("app:sidebar.pin") : t("app:sidebar.hide")}
+          aria-label={onPin ? t("app:sidebar.pin") : t("app:sidebar.hide")}
+        >
+          <PanelLeft size={15} />
+        </button>
+        <div className="sb-toolbar-history no-drag">
           <button
             type="button"
-            className="sb-nav-item"
-            onClick={() => {
-              const activeProject = projects.find(
-                (p) => p.workspace.id === activeWorkspaceId,
-              );
-              if (activeProject) {
-                void onCreateProjectThread(activeProject.workspace);
-              }
-            }}
+            className="sb-toolbar-btn"
+            disabled={navigationBusy || navigationBackStack.length === 0}
+            onClick={() => void navigateHistory("back")}
+            title={t("app:sidebar.back")}
+            aria-label={t("app:sidebar.back")}
           >
-            <Plus size={16} strokeWidth={1.5} style={{ flexShrink: 0 }} />
-            {t("app:sidebar.newThread")}
-            <span className="sb-nav-item-shortcut">⌘⇧N</span>
+            <ArrowLeft size={16} />
           </button>
-
-          {/* Commands — general command palette */}
           <button
             type="button"
-            className="sb-nav-item"
-            onClick={() => openCommandPalette()}
+            className="sb-toolbar-btn"
+            disabled={navigationBusy || navigationForwardStack.length === 0}
+            onClick={() => void navigateHistory("forward")}
+            title={t("app:sidebar.forward")}
+            aria-label={t("app:sidebar.forward")}
           >
-            <Command size={16} strokeWidth={1.5} style={{ flexShrink: 0 }} />
-            {t("app:commandPalette.group.commands")}
-            <span className="sb-nav-item-shortcut">⌘K</span>
-          </button>
-
-          {/* Search workspace */}
-          <button
-            type="button"
-            className="sb-nav-item"
-            onClick={() => openCommandPalette({ variant: "search", initialQuery: "?" })}
-          >
-            <Search size={16} strokeWidth={1.5} style={{ flexShrink: 0 }} />
-            {t("app:sidebar.search")}
-            <span className="sb-nav-item-shortcut">⌘⇧F</span>
-          </button>
-
-          {/* Agents */}
-          <button
-            type="button"
-            className={`sb-nav-item${activeView === "harnesses" ? " sb-nav-item-active" : ""}`}
-            onClick={() => setActiveView(activeView === "harnesses" ? "chat" : "harnesses")}
-          >
-            <Terminal size={16} strokeWidth={1.5} style={{ flexShrink: 0 }} />
-            {t("app:sidebar.agents")}
+            <ArrowRight size={16} />
           </button>
         </div>
       </div>
 
-      {/* ── Scrollable content ── */}
-      <div
-        ref={workspaceScrollRef}
-        style={{ flex: 1, minHeight: 0, overflow: "auto", paddingBottom: 4, borderTop: "1px solid rgba(31, 35, 40, 0.06)", marginTop: 4 }}
-      >
+      <nav className="sb-primary-nav" aria-label={t("app:sidebar.agents")}>
+        <button
+          type="button"
+          className="sb-nav-item"
+          disabled={!activeWorkspaceId}
+          onClick={() => {
+            const activeProject = projects.find(
+              (project) => project.workspace.id === activeWorkspaceId,
+            );
+            if (activeProject) {
+              void onCreateProjectThread(activeProject.workspace);
+            }
+          }}
+        >
+          <Send size={15} strokeWidth={1.55} aria-hidden="true" />
+          <span>{t("app:sidebar.newThread")}</span>
+        </button>
+        <button
+          type="button"
+          className="sb-nav-item"
+          onClick={() => openCommandPalette({ variant: "search", initialQuery: "?" })}
+        >
+          <Search size={15} strokeWidth={1.55} aria-hidden="true" />
+          <span>{t("app:sidebar.search")}</span>
+        </button>
+        <button
+          type="button"
+          className={`sb-nav-item${activeView === "workspace-settings" && settingsWorkspaceSection === "startup" ? " sb-nav-item-active" : ""}`}
+          disabled={!activeWorkspaceId}
+          onClick={() => {
+            if (!activeWorkspaceId) return;
+            navigateToWorkspaceSettings(activeWorkspaceId, "startup");
+          }}
+        >
+          <Bot size={15} strokeWidth={1.55} aria-hidden="true" />
+          <span>{t("app:sidebar.automations")}</span>
+        </button>
+        <button
+          type="button"
+          className={`sb-nav-item${activeView === "harnesses" ? " sb-nav-item-active" : ""}`}
+          onClick={() => {
+            rememberCurrentNavigationLocation();
+            setActiveView(activeView === "harnesses" ? "chat" : "harnesses");
+          }}
+        >
+          <Blocks size={15} strokeWidth={1.55} aria-hidden="true" />
+          <span>{t("app:sidebar.customize")}</span>
+        </button>
+      </nav>
+
+      <div ref={workspaceScrollRef} className="sb-scroll">
         <div className="sb-section-label">
-          <span>{t("app:sidebar.workspaces")}</span>
-          <button
-            type="button"
-            className="sb-add-project-btn"
-            title={t("app:sidebar.openWorkspace")}
-            onClick={() => {
-              if (activeView !== "chat") setActiveView("chat");
-              void onOpenFolder();
-            }}
-          >
-            <Plus size={12} strokeWidth={2.2} />
-          </button>
+          <span>{t("app:sidebar.repositories")}</span>
+          <span className="sb-section-actions">
+            <button
+              type="button"
+              className={`sb-section-action${archivedOpen ? " sb-section-action-active" : ""}`}
+              title={t(archivedOpen ? "app:sidebar.hideArchived" : "app:sidebar.showArchived")}
+              aria-label={t(archivedOpen ? "app:sidebar.hideArchived" : "app:sidebar.showArchived")}
+              aria-pressed={archivedOpen}
+              onClick={() => setArchivedOpen((current) => !current)}
+            >
+              <ListFilter size={14} strokeWidth={1.5} />
+            </button>
+            <button
+              type="button"
+              className="sb-section-action"
+              title={t("app:sidebar.openWorkspace")}
+              aria-label={t("app:sidebar.openWorkspace")}
+              onClick={() => void onOpenFolder()}
+            >
+              <FolderPlus size={15} strokeWidth={1.5} />
+            </button>
+          </span>
         </div>
 
         {projects.length === 0 ? (
@@ -843,8 +993,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
             return (
               <div
                 key={project.workspace.id}
-                className={`sb-project-group${isDraggingProject ? " sb-project-group-dragging" : ""}`}
-                style={{ marginBottom: 2 }}
+                className={`sb-project-group${!isCollapsed ? " sb-project-group-expanded" : ""}${isDraggingProject ? " sb-project-group-dragging" : ""}`}
               >
                 {/* Workspace header */}
                 <button
@@ -872,17 +1021,10 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                   }}
                 >
                   {isCollapsed ? (
-                    <ChevronRight size={12} style={{ flexShrink: 0, opacity: 0.4 }} />
+                    <Folder size={15} strokeWidth={1.55} aria-hidden="true" />
                   ) : (
-                    <ChevronDown size={12} style={{ flexShrink: 0, opacity: 0.4 }} />
+                    <FolderOpen size={15} strokeWidth={1.55} aria-hidden="true" />
                   )}
-                  <FolderGit2
-                    size={14}
-                    style={{
-                      flexShrink: 0,
-                      color: isActiveProject ? "var(--accent)" : "var(--text-3)",
-                    }}
-                  />
                   <span className="sb-project-name">{projectName}</span>
 
                   <span className="sb-project-trailing">
@@ -908,14 +1050,10 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                       >
                         {workspaceNotificationCount > 9 ? "9+" : workspaceNotificationCount}
                       </span>
-                    ) : project.threads.length > 0 && (
-                      <span className="sb-project-count">
-                        {project.threads.length}
-                      </span>
-                    )}
+                    ) : null}
                     <WorkspaceMoreMenu
                       workspace={project.workspace}
-                      onOpenSettings={() => openWorkspaceSettings(project.workspace.id)}
+                      onOpenSettings={() => navigateToWorkspaceSettings(project.workspace.id)}
                       onArchive={() => onDeleteWorkspace(project.workspace)}
                     />
                   </span>
@@ -930,7 +1068,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                       <div className="sb-no-threads">{t("app:sidebar.noThreads")}</div>
                     ) : (
                       <>
-                        {visibleThreads.map((thread, i) => {
+                        {visibleThreads.map((thread) => {
                           const isActive = thread.id === activeThreadId;
                           const isRunning = isThreadRunning(thread);
                           const threadLabel = getThreadLabel(thread);
@@ -946,8 +1084,8 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                               key={thread.id}
                               role="button"
                               tabIndex={0}
-                              className={`sb-thread sb-thread-animate ${isActive ? "sb-thread-active" : ""}${hasNotification ? " sb-thread-notified" : ""}${hasPendingApprovalNotification ? " sb-thread-pending-approval" : ""}`}
-                              style={{ animationDelay: `${i * 20}ms` }}
+                              className={`sb-thread ${isActive ? "sb-thread-active" : ""}${hasNotification ? " sb-thread-notified" : ""}`}
+                              aria-current={isActive ? "page" : undefined}
                               onClick={() => void onSelectThread(thread)}
                               onContextMenu={(event) => onThreadContextMenu(event, thread, isRunning)}
                               onKeyDown={(e) => {
@@ -957,7 +1095,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                                 }
                               }}
                             >
-                              <span className="sb-thread-title">
+                              <span className="sb-thread-status">
                                 {isRunning && (
                                   <span
                                     className="sb-thread-running-indicator"
@@ -997,6 +1135,8 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                                     )}
                                   />
                                 )}
+                              </span>
+                              <span className="sb-thread-title">
                                 <span
                                   className="sb-thread-title-label"
                                   title={threadLabel}
@@ -1054,40 +1194,17 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
           })
         )}
 
-        {/* Archived section */}
-        <div style={{ marginTop: 8, borderTop: "1px solid rgba(31, 35, 40, 0.06)", paddingTop: 4 }}>
-          <button
-            type="button"
-            className="sb-archived-toggle"
-            onClick={() => setArchivedOpen((c) => !c)}
-          >
-            {archivedOpen ? (
-              <ChevronDown size={11} style={{ flexShrink: 0, opacity: 0.6 }} />
-            ) : (
-              <ChevronRight size={11} style={{ flexShrink: 0, opacity: 0.6 }} />
-            )}
-            <Archive size={11} style={{ flexShrink: 0, opacity: 0.6 }} />
-            <span style={{ flex: 1, textAlign: "left" }}>{t("app:sidebar.archived")}</span>
-            <span className="sb-project-count" style={{ fontSize: 11 }}>
-              {archivedWorkspaces.length + archivedThreads.length}
-            </span>
-          </button>
-
-          {archivedOpen && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 2, paddingBottom: 4 }}>
+        {archivedOpen && (
+          <section className="sb-archive-panel">
+            <div className="sb-archive-heading">
+              <span>{t("app:sidebar.archived")}</span>
+              <span>{archivedWorkspaces.length + archivedThreads.length}</span>
+            </div>
+            <div className="sb-archive-list">
               {archivedWorkspaces.map((workspace) => (
                 <div key={workspace.id} className="sb-archived-item">
-                  <FolderGit2 size={12} style={{ flexShrink: 0, color: "var(--text-3)" }} />
-                  <span
-                    style={{
-                      flex: 1,
-                      minWidth: 0,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                    }}
-                    title={workspace.name || workspace.rootPath}
-                  >
+                  <Folder size={16} strokeWidth={1.5} aria-hidden="true" />
+                  <span className="sb-archived-label" title={workspace.name || workspace.rootPath}>
                     {getWorkspaceLabel(workspace)}
                   </span>
                   <button
@@ -1103,17 +1220,8 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
 
               {archivedThreads.map((thread) => (
                 <div key={thread.id} className="sb-archived-item">
-                  <MessageSquare size={12} style={{ flexShrink: 0, color: "var(--text-3)" }} />
-                  <span
-                    style={{
-                      flex: 1,
-                      minWidth: 0,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                    }}
-                    title={getThreadLabel(thread)}
-                  >
+                  <MessageSquare size={15} strokeWidth={1.5} aria-hidden="true" />
+                  <span className="sb-archived-label" title={getThreadLabel(thread)}>
                     {getThreadLabel(thread)}
                   </span>
                   <button
@@ -1131,16 +1239,41 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                 <div className="sb-no-threads">{t("app:sidebar.nothingArchived")}</div>
               )}
             </div>
-          )}
-        </div>
+          </section>
+        )}
       </div>
 
       {/* ── Footer ── */}
       <div className="sb-footer">
+        <div className="sb-footer-identity">
+          <span className="sb-footer-mark" aria-hidden="true">
+            <svg viewBox="0 0 32 32" fill="none">
+              <rect x="5.5" y="10.5" width="16" height="16" />
+              <rect x="10.5" y="5.5" width="16" height="16" />
+              <rect x="8" y="8" width="16" height="16" />
+              <rect className="sb-footer-mark-core" x="13" y="13" width="6" height="6" />
+            </svg>
+          </span>
+          <span className="sb-footer-copy">
+            <span className="sb-footer-title">Panes</span>
+            <span className="sb-footer-subtitle">{t("app:sidebar.localAgents")}</span>
+          </span>
+        </div>
+        {hasUpdate && (
+          <button
+            type="button"
+            className="sb-update-btn"
+            onClick={() => setUpdateDialogOpen(true)}
+          >
+            {t("app:sidebar.update")}
+          </button>
+        )}
         <button
           ref={settingsTriggerRef}
           type="button"
           className="sb-settings-btn"
+          title={t("app:sidebar.settings")}
+          aria-label={t("app:sidebar.settings")}
           onClick={() => {
             if (settingsMenuOpen) {
               closeSettingsMenu();
@@ -1148,25 +1281,15 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
             }
             const rect = settingsTriggerRef.current?.getBoundingClientRect();
             if (rect) {
-              setSettingsMenuPos({ top: rect.top - 4, left: rect.left });
+              setSettingsMenuPos({
+                top: rect.top - 4,
+                left: Math.max(8, rect.right - 260),
+              });
             }
             setSettingsMenuOpen(true);
           }}
         >
-          <span style={{ position: "relative", display: "inline-flex" }}>
-            <Settings size={14} style={{ opacity: 0.5 }} />
-            {hasUpdate && <span className="sb-update-dot" />}
-          </span>
-          {t("app:sidebar.settings")}
-        </button>
-        <button
-          type="button"
-          className="shell-pin-btn"
-          onClick={onPin ?? toggleSidebarPin}
-          title={sidebarPinned ? t("app:sidebar.unpin") : t("app:sidebar.pin")}
-          aria-label={sidebarPinned ? t("app:sidebar.unpin") : t("app:sidebar.pin")}
-        >
-          {sidebarPinned ? <PanelLeftClose size={14} /> : <PanelLeftOpen size={14} />}
+          <Settings size={14} strokeWidth={1.55} />
         </button>
       </div>
 
@@ -1460,6 +1583,8 @@ function CollapsedRail({
   const hasUpdate = useUpdateStore((s) => s.status === "available" && !s.snoozed);
   const activeView = useUiStore((s) => s.activeView);
   const setActiveView = useUiStore((s) => s.setActiveView);
+  const toggleSidebarPin = useUiStore((s) => s.toggleSidebarPin);
+  const openWorkspaceSettings = useUiStore((s) => s.openWorkspaceSettings);
   const openCommandPalette = useUiStore((s) => s.openCommandPalette);
   const threadNotificationsByThreadId = useThreadNotificationStore((s) => s.notificationsByThreadId);
 
@@ -1479,7 +1604,7 @@ function CollapsedRail({
 
   return (
     <div
-      className="sb-rail"
+      className={`sb-rail${isMacDesktop() ? " sb-rail-mac-titlebar" : ""}`}
       onMouseEnter={onHoverStart}
       onMouseLeave={onHoverEnd}
       style={{
@@ -1487,92 +1612,66 @@ function CollapsedRail({
         transition: "opacity 150ms var(--ease-out)",
       }}
     >
-      {/* Drag region + logo — 74px to clear macOS traffic lights */}
       <div
+        className="sb-rail-toolbar"
         onMouseDown={handleDragMouseDown}
         onDoubleClick={handleDragDoubleClick}
-        style={{
-          height: 74,
-          width: "100%",
-          flexShrink: 0,
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "center",
-          justifyContent: "flex-end",
-          paddingBottom: 4,
-        }}
       >
+        <button
+          type="button"
+          className="sb-rail-btn no-drag"
+          onClick={toggleSidebarPin}
+          title={t("sidebar.pin")}
+          aria-label={t("sidebar.pin")}
+        >
+          <PanelLeftOpen size={18} strokeWidth={1.55} />
+        </button>
+      </div>
+
+      <div className="sb-rail-nav">
         <button
           type="button"
           className="sb-rail-btn no-drag"
           onClick={() => void onNewThread()}
           disabled={!activeWorkspaceId}
           title={t("sidebar.newThread")}
-          style={{
-            opacity: activeWorkspaceId ? 1 : 0.45,
-            border: "none",
-            background: "transparent",
-          }}
         >
-          <svg viewBox="0 0 140 140" fill="none" xmlns="http://www.w3.org/2000/svg" width="20" height="20">
-            <rect x="10" y="36" width="94" height="94" stroke="white" strokeWidth="6"/>
-            <rect x="36" y="10" width="94" height="94" stroke="white" strokeWidth="6"/>
-            <rect x="23" y="23" width="94" height="94" stroke="white" strokeWidth="6"/>
-            <rect x="50" y="50" width="40" height="40" fill="#0969DA"/>
-          </svg>
-        </button>
-      </div>
-
-      <div className="sb-rail-divider" />
-
-      {/* Nav icons — Commands, Search, Agents */}
-      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, flexShrink: 0 }}>
-        <button
-          type="button"
-          className="sb-rail-btn no-drag"
-          onClick={() => openCommandPalette()}
-          title={t("sidebar.commands", "Commands")}
-          style={{ border: "none", background: "transparent" }}
-        >
-          <Command size={16} strokeWidth={1.5} />
+          <Send size={18} strokeWidth={1.6} />
         </button>
         <button
           type="button"
           className="sb-rail-btn no-drag"
           onClick={() => openCommandPalette({ variant: "search", initialQuery: "?" })}
           title={t("sidebar.search")}
-          style={{ border: "none", background: "transparent" }}
         >
-          <Search size={16} strokeWidth={1.5} />
+          <Search size={18} strokeWidth={1.6} />
+        </button>
+        <button
+          type="button"
+          className="sb-rail-btn no-drag"
+          disabled={!activeWorkspaceId}
+          onClick={() => {
+            if (activeWorkspaceId) {
+              openWorkspaceSettings(activeWorkspaceId, "startup");
+            }
+          }}
+          title={t("sidebar.automations")}
+        >
+          <Bot size={18} strokeWidth={1.6} />
         </button>
         <button
           type="button"
           className={`sb-rail-btn no-drag ${activeView === "harnesses" ? "sb-rail-btn-active" : ""}`}
           onClick={() => setActiveView(activeView === "harnesses" ? "chat" : "harnesses")}
-          title={t("sidebar.agents")}
-          style={{ border: "none", background: "transparent" }}
+          title={t("sidebar.customize")}
         >
-          <Terminal size={16} strokeWidth={1.5} />
+          <Blocks size={18} strokeWidth={1.6} />
         </button>
       </div>
 
-      <div className="sb-rail-divider" />
-
-      {/* Project icons */}
-      <div
-        style={{
-          flex: 1,
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "center",
-          gap: 2,
-          paddingTop: 4,
-          overflow: "auto",
-        }}
-      >
+      <div className="sb-rail-projects">
         {projects.map((ws) => {
           const isActive = ws.id === activeWorkspaceId;
-          const name = ws.name || ws.rootPath.split("/").pop() || "P";
           const notificationCount = countWorkspaceThreadNotifications(
             threadNotificationsByThreadId,
             ws.id,
@@ -1592,15 +1691,11 @@ function CollapsedRail({
                 void onSelectRailWorkspace(ws.id);
               }}
             >
-              <span
-                style={{
-                  fontSize: 11,
-                  fontWeight: 600,
-                  letterSpacing: "-0.02em",
-                }}
-              >
-                {name.charAt(0).toUpperCase()}
-              </span>
+              {isActive ? (
+                <FolderOpen size={18} strokeWidth={1.55} />
+              ) : (
+                <Folder size={18} strokeWidth={1.55} />
+              )}
               {notificationCount > 0 && (
                 <span
                   className={`sb-rail-notification-badge${pendingApprovalCount > 0 ? " sb-rail-notification-badge-pending-approval" : ""}`}
@@ -1629,16 +1724,14 @@ function CollapsedRail({
         })}
       </div>
 
-      <div className="sb-rail-divider" />
-
-      {/* Settings at bottom */}
       <button
         type="button"
         className="sb-rail-btn"
-        title={t("sidebar.settings")}
+        title={t("sidebar.pin")}
+        onClick={toggleSidebarPin}
         style={{ marginBottom: 8 }}
       >
-        <Settings size={15} />
+        <Settings size={18} strokeWidth={1.55} />
         {hasUpdate && <span className="sb-update-dot" />}
       </button>
     </div>
