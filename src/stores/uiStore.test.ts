@@ -32,7 +32,7 @@ describe("uiStore focus mode", () => {
       sidebarPinned: true,
       showGitPanel: initialState.showGitPanel,
       showExplorer: initialState.showExplorer,
-      workspacePaneZoomPercent: initialState.workspacePaneZoomPercent,
+      appZoomPercent: initialState.appZoomPercent,
       focusMode: initialState.focusMode,
       focusModeSnapshot: initialState.focusModeSnapshot,
       activeView: "chat",
@@ -171,28 +171,37 @@ describe("uiStore focus mode", () => {
     expect(useUiStore.getState().showExplorer).toBe(false);
   });
 
-  it("increments and decrements workspace pane zoom in fixed steps", () => {
+  it("increments and decrements app zoom in fixed steps", () => {
     const state = useUiStore.getState();
 
-    state.increaseWorkspacePaneZoom();
-    expect(useUiStore.getState().workspacePaneZoomPercent).toBe(110);
+    state.increaseAppZoom();
+    expect(useUiStore.getState().appZoomPercent).toBe(110);
 
-    state.decreaseWorkspacePaneZoom();
-    state.decreaseWorkspacePaneZoom();
-    expect(useUiStore.getState().workspacePaneZoomPercent).toBe(90);
+    state.decreaseAppZoom();
+    state.decreaseAppZoom();
+    expect(useUiStore.getState().appZoomPercent).toBe(90);
   });
 
-  it("persists workspace pane zoom changes and reset", () => {
+  it("persists app zoom changes and reset", () => {
     const storage = globalThis.localStorage as unknown as ReturnType<typeof createStorageStub>;
     const state = useUiStore.getState();
 
-    state.setWorkspacePaneZoomPercent(999);
-    expect(useUiStore.getState().workspacePaneZoomPercent).toBe(200);
-    expect(storage.setItem).toHaveBeenCalledWith("panes:workspacePaneZoomPercent", "200");
+    state.setAppZoomPercent(999);
+    expect(useUiStore.getState().appZoomPercent).toBe(200);
+    expect(storage.setItem).toHaveBeenCalledWith("panes:appZoomPercent", "200");
 
-    state.resetWorkspacePaneZoom();
-    expect(useUiStore.getState().workspacePaneZoomPercent).toBe(100);
-    expect(storage.setItem).toHaveBeenCalledWith("panes:workspacePaneZoomPercent", "100");
+    state.resetAppZoom();
+    expect(useUiStore.getState().appZoomPercent).toBe(100);
+    expect(storage.setItem).toHaveBeenCalledWith("panes:appZoomPercent", "100");
+  });
+
+  it("migrates the previous middle-pane zoom preference to whole-app zoom", async () => {
+    await loadStore({ "panes:workspacePaneZoomPercent": "130" });
+    const storage = globalThis.localStorage as unknown as ReturnType<typeof createStorageStub>;
+
+    expect(useUiStore.getState().appZoomPercent).toBe(130);
+    expect(storage.setItem).toHaveBeenCalledWith("panes:appZoomPercent", "130");
+    expect(storage.removeItem).toHaveBeenCalledWith("panes:workspacePaneZoomPercent");
   });
 
   it("opens the command palette with structured launch defaults", () => {
