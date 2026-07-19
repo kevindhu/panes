@@ -145,6 +145,78 @@ describe("MarkdownContent local images", () => {
     expect(mockCreateObjectURL).toHaveBeenCalledTimes(1);
   });
 
+  it("loads absolute sibling images through the native preview pipeline", async () => {
+    await act(async () => {
+      root.render(
+        <MarkdownContent
+          content="![translated](<C:/Users/dev/Downloads/translated panels/page 07.png>)"
+          workspaceRootPath={"C:\\Users\\dev\\Downloads\\current-project"}
+        />,
+      );
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const button = container.querySelector(".markdown-local-image-button") as HTMLButtonElement | null;
+    const image = container.querySelector(".markdown-local-image-thumbnail") as HTMLImageElement | null;
+    const absolutePath = "C:\\Users\\dev\\Downloads\\translated panels\\page 07.png";
+    expect(button?.getAttribute("data-panes-markdown-local-image-path")).toBe(absolutePath);
+    expect(image?.getAttribute("src")).toBe("blob:mock-preview");
+    expect(mockConvertFileSrc).toHaveBeenCalledWith(absolutePath);
+    expect(mockReadAttachmentPreview).toHaveBeenCalledWith(absolutePath, "image/png");
+  });
+
+  it("loads UNC images without requiring a workspace root", async () => {
+    const uncPath = String.raw`\\media-server\translations\translated page.webp`;
+
+    await act(async () => {
+      root.render(
+        <MarkdownContent
+          content={String.raw`![translated](<\\media-server\translations\translated page.webp>)`}
+        />,
+      );
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(
+      container.querySelector(".markdown-local-image-button")?.getAttribute(
+        "data-panes-markdown-local-image-path",
+      ),
+    ).toBe(uncPath);
+    expect(container.querySelector(".markdown-local-image-thumbnail")?.getAttribute("src")).toBe(
+      "blob:mock-preview",
+    );
+    expect(mockReadAttachmentPreview).toHaveBeenCalledWith(uncPath, "image/webp");
+  });
+
+  it("does not route remote images through native attachment previews", async () => {
+    await act(async () => {
+      root.render(
+        <MarkdownContent
+          content={[
+            "![remote](https://cdn.example.com/page.png)",
+            "![protocol-relative](//cdn.example.com/page.webp)",
+          ].join(" ")}
+          workspaceRootPath={"C:\\repo"}
+        />,
+      );
+    });
+
+    const images = Array.from(container.querySelectorAll("img"));
+    expect(images.map((image) => image.getAttribute("src"))).toEqual([
+      "https://cdn.example.com/page.png",
+      "//cdn.example.com/page.webp",
+    ]);
+    expect(container.querySelector(".markdown-local-image-button")).toBeNull();
+    expect(mockReadAttachmentPreview).not.toHaveBeenCalled();
+    expect(mockConvertFileSrc).not.toHaveBeenCalled();
+  });
+
   it("sizes the thumbnail frame to the image aspect ratio", async () => {
     await act(async () => {
       root.render(
@@ -251,6 +323,43 @@ describe("MarkdownContent local images", () => {
     expect(remountedButton?.style.getPropertyValue("--markdown-local-image-frame-width")).toBe("110px");
     expect(remountedButton?.style.getPropertyValue("--markdown-local-image-aspect")).toBe("360 / 720");
     expect(mockReadAttachmentPreview).toHaveBeenCalledTimes(1);
+  });
+
+  it("reloads an absolute image preview after transient preview state is cleared", async () => {
+    const content = "![translated](C:/Users/dev/sibling/translated.png)";
+    const absolutePath = "C:\\Users\\dev\\sibling\\translated.png";
+
+    await act(async () => {
+      root.render(<MarkdownContent content={content} workspaceRootPath={"C:\\Users\\dev\\repo"} />);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector(".markdown-local-image-thumbnail")?.getAttribute("src")).toBe(
+      "blob:mock-preview",
+    );
+
+    await act(async () => {
+      root.render(<div />);
+    });
+    resetAttachmentImageCachesForTests();
+    await act(async () => {
+      root.render(<MarkdownContent content={content} workspaceRootPath={"C:\\Users\\dev\\repo"} />);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(
+      container.querySelector(".markdown-local-image-button")?.getAttribute(
+        "data-panes-markdown-local-image-path",
+      ),
+    ).toBe(absolutePath);
+    expect(container.querySelector(".markdown-local-image-thumbnail")?.getAttribute("src")).toBe(
+      "blob:mock-preview",
+    );
+    expect(mockReadAttachmentPreview).toHaveBeenCalledTimes(2);
   });
 
   it("still converts relative images when Tauri asset detection is unavailable", async () => {

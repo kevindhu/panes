@@ -7,7 +7,7 @@ import {
   isLocalFileLinkSyntax,
   trimLinkText,
 } from "../lib/localFileLinkPatterns";
-import { isWorkspaceRelativeLocalImageSource } from "../lib/localImageSources";
+import { isLocalImageSource } from "../lib/localImageSources";
 
 interface FenceToken {
   placeholder: string;
@@ -28,6 +28,7 @@ interface IndentInfo {
 const SAFE_HTML_TAG_RE = /<(br|hr)\s*\/?>/gi;
 const RAW_HTML_FRAGMENT_RE =
   /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<![a-z][^>]*>|<\?[\s\S]*?\?>|<\/[a-z][a-z0-9-]*\s*>|<[a-z][a-z0-9-]*(?:\s+(?:"[^"]*"|'[^']*'|[^"'<>])*)?\s*\/?>/gi;
+const MARKDOWN_IMAGE_UNC_PREFIX_RE = /(!\[(?:\\.|[^\]\\\r\n])*\]\(\s*<?)\\{2,}/g;
 
 function escapeHtmlFragment(input: string): string {
   return input
@@ -59,6 +60,13 @@ function escapeNonFenceHtml(input: string): string {
   return escaped;
 }
 
+function preserveUncImageDestinationPrefixes(markdown: string): string {
+  // CommonMark consumes one slash from a leading `\\server` pair as a
+  // backslash escape. Percent-encode the pair before parsing so the native
+  // image resolver receives the canonical UNC prefix.
+  return markdown.replace(MARKDOWN_IMAGE_UNC_PREFIX_RE, "$1%5C%5C");
+}
+
 function sanitizeUrl(url: string, attrName: string): string {
   const trimmed = url.trim();
   if (!trimmed) {
@@ -69,7 +77,7 @@ function sanitizeUrl(url: string, attrName: string): string {
     return trimmed;
   }
 
-  if (attrName.toLowerCase() === "src" && isWorkspaceRelativeLocalImageSource(trimmed)) {
+  if (attrName.toLowerCase() === "src" && isLocalImageSource(trimmed)) {
     return trimmed;
   }
 
@@ -354,7 +362,7 @@ function tokenizeFences(markdown: string): { source: string; fences: FenceToken[
 
 export function renderMarkdownToHtml(markdown: string): string {
   const { source, fences } = tokenizeFences(markdown);
-  const html = micromark(source, {
+  const html = micromark(preserveUncImageDestinationPrefixes(source), {
     extensions: [gfm()],
     htmlExtensions: [gfmHtml()],
     allowDangerousHtml: true,

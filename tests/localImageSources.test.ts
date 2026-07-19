@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  isAbsoluteWindowsLocalImageSource,
+  isLocalImageSource,
   isWorkspaceRelativeLocalImageSource,
+  resolveLocalImagePath,
   resolveWorkspaceRelativeLocalImagePath,
 } from "../src/lib/localImageSources";
 
@@ -12,6 +15,27 @@ describe("local image sources", () => {
     expect(isWorkspaceRelativeLocalImageSource("https://example.com/page.png")).toBe(false);
     expect(isWorkspaceRelativeLocalImageSource("file:///repo/page.png")).toBe(false);
     expect(isWorkspaceRelativeLocalImageSource("C:/repo/page.png")).toBe(false);
+  });
+
+  it("recognizes absolute Windows drive and canonical UNC image sources", () => {
+    expect(isAbsoluteWindowsLocalImageSource("C:/repo/translated%20pages/page.PNG")).toBe(true);
+    expect(isAbsoluteWindowsLocalImageSource(String.raw`C:\repo\page.webp?cache=1`)).toBe(true);
+    expect(
+      isAbsoluteWindowsLocalImageSource(String.raw`\\media-server\translations\page 11.png`),
+    ).toBe(true);
+    expect(
+      isAbsoluteWindowsLocalImageSource("%5C%5Cmedia-server%5Ctranslations%5Cpage%2011.png"),
+    ).toBe(true);
+    expect(isAbsoluteWindowsLocalImageSource("C:relative/page.png")).toBe(false);
+    expect(isAbsoluteWindowsLocalImageSource("C:/repo/notes.md")).toBe(false);
+  });
+
+  it("does not mistake remote or protocol-relative images for local paths", () => {
+    expect(isLocalImageSource("https://cdn.example.com/page.png")).toBe(false);
+    expect(isLocalImageSource("http://cdn.example.com/page.png")).toBe(false);
+    expect(isLocalImageSource("//cdn.example.com/page.png")).toBe(false);
+    expect(isLocalImageSource("blob:https://example.com/id")).toBe(false);
+    expect(isLocalImageSource("data:image/png;base64,YWJj")).toBe(false);
   });
 
   it("resolves relative image sources inside the workspace root", () => {
@@ -32,5 +56,23 @@ describe("local image sources", () => {
   it("rejects relative image sources that escape the workspace root", () => {
     expect(resolveWorkspaceRelativeLocalImagePath("../secret.png", "/home/dev/repo")).toBeNull();
     expect(resolveWorkspaceRelativeLocalImagePath("../../secret.png", "C:\\repo")).toBeNull();
+  });
+
+  it("resolves absolute paths independently of the current workspace", () => {
+    expect(
+      resolveLocalImagePath(
+        "C:/Users/dev/Downloads/translated%20panels/page.png?cache=1",
+        "C:\\Users\\dev\\PROJECTS\\current-repo",
+      ),
+    ).toBe("C:\\Users\\dev\\Downloads\\translated panels\\page.png");
+    expect(
+      resolveLocalImagePath("C:%5CUsers%5Cdev%5CDownloads%5Cpage%2007.png", null),
+    ).toBe("C:\\Users\\dev\\Downloads\\page 07.png");
+    expect(
+      resolveLocalImagePath(
+        "%5C%5Cmedia-server%5Ctranslations%5Ctranslated%20page.webp",
+        null,
+      ),
+    ).toBe(String.raw`\\media-server\translations\translated page.webp`);
   });
 });

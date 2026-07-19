@@ -85,6 +85,27 @@ describe("renderMarkdownToHtml", () => {
     expect(html).not.toContain('src="file:///repo/secret.png"');
   });
 
+  it("preserves absolute Windows drive and UNC image sources for native resolution", () => {
+    const html = renderMarkdownToHtml([
+      "![drive](<C:/Users/dev/translated panels/page.png>)",
+      String.raw`![drive-backslash](<C:\Users\dev\translated.webp>)`,
+      String.raw`![network](<\\media-server\translations\page.webp>)`,
+    ].join(" "));
+
+    expect(html).toContain('src="C:/Users/dev/translated%20panels/page.png"');
+    expect(html).toContain('src="C:%5CUsers%5Cdev%5Ctranslated.webp"');
+    expect(html).toContain('src="%5C%5Cmedia-server%5Ctranslations%5Cpage.webp"');
+  });
+
+  it("leaves remote and protocol-relative image sources on the browser path", () => {
+    const html = renderMarkdownToHtml(
+      "![remote](https://cdn.example.com/page.png) ![protocol-relative](//cdn.example.com/page.webp)",
+    );
+
+    expect(html).toContain('src="https://cdn.example.com/page.png"');
+    expect(html).toContain('src="//cdn.example.com/page.webp"');
+  });
+
   it("preserves safe workspace-relative image sources", () => {
     const html = renderMarkdownToHtml(
       "![page](screenshots/page.png) ![other](./images/other.webp?cache=1)",
