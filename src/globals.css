@@ -3579,6 +3579,11 @@ button, input, textarea, select {
 
 /* ── Sidebar ── */
 .sb {
+  /* Keep the classic sidebar only subtly larger than the workspace surface. */
+  --sb-font-prominent: 13.5px;
+  --sb-font-row: 13.25px;
+  --sb-font-supporting: 11.5px;
+  --sb-font-caption: 10.5px;
   height: 100%;
   min-height: 0;
   display: flex;
@@ -3737,7 +3742,7 @@ button, input, textarea, select {
 /* Sidebar nav items (top action rows) */
 .sb-nav-item {
   width: 100%;
-  padding: 6px 12px;
+  padding: 4px 10px;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -3745,7 +3750,7 @@ button, input, textarea, select {
   background: transparent;
   border: none;
   color: var(--text-2);
-  font-size: 16px;
+  font-size: var(--sb-font-prominent);
   cursor: pointer;
   transition: background var(--duration-fast) var(--ease-out),
               color var(--duration-fast) var(--ease-out);
@@ -3764,18 +3769,18 @@ button, input, textarea, select {
 
 .sb-nav-item-shortcut {
   margin-left: auto;
-  font-size: 13px;
+  font-size: var(--sb-font-supporting);
   color: var(--text-3);
 }
 
 /* Section headers */
 .sb-section-label {
-  font-size: 12px;
+  font-size: var(--sb-font-caption);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.1em;
   color: var(--text-3);
-  padding: 8px 16px 6px 16px;
+  padding: 7px 12px 5px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -3814,7 +3819,7 @@ button, input, textarea, select {
 
 .sb-project {
   width: 100%;
-  padding: 7px 12px 7px 12px;
+  padding: 5px 10px;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -3864,7 +3869,7 @@ button, input, textarea, select {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 16px;
+  font-size: var(--sb-font-prominent);
   font-weight: 500;
   text-align: left;
   -webkit-user-select: none;
@@ -3883,7 +3888,7 @@ button, input, textarea, select {
 }
 
 .sb-project-count {
-  font-size: 12px;
+  font-size: var(--sb-font-caption);
   font-weight: 500;
   min-width: 20px;
   height: 20px;
@@ -3906,7 +3911,7 @@ button, input, textarea, select {
   border-radius: 99px;
   background: var(--accent);
   color: white;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 700;
   line-height: 1;
   font-variant-numeric: tabular-nums;
@@ -3967,7 +3972,7 @@ button, input, textarea, select {
 /* Thread row */
 .sb-thread {
   width: 100%;
-  padding: 5px 8px;
+  padding: 4px 8px;
   display: flex;
   align-items: center;
   gap: 4px;
@@ -4014,7 +4019,7 @@ button, input, textarea, select {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 15px;
+  font-size: var(--sb-font-row);
   font-weight: 400;
 }
 
@@ -4086,7 +4091,7 @@ button, input, textarea, select {
 }
 
 .sb-thread-time {
-  font-size: 12px;
+  font-size: var(--sb-font-caption);
   color: var(--text-3);
   font-variant-numeric: tabular-nums;
   opacity: 1;
@@ -4132,7 +4137,7 @@ button, input, textarea, select {
 /* New thread button (expanded) */
 .sb-new-thread-btn {
   width: 100%;
-  padding: 8px 16px;
+  padding: 6px 12px;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -4140,7 +4145,7 @@ button, input, textarea, select {
   background: rgba(9, 105, 218, 0.06);
   border: 1px solid rgba(9, 105, 218, 0.12);
   color: var(--accent);
-  font-size: 15px;
+  font-size: var(--sb-font-prominent);
   font-weight: 500;
   cursor: pointer;
   transition: all var(--duration-fast) var(--ease-out);
@@ -4156,7 +4161,7 @@ button, input, textarea, select {
 /* Open project button */
 .sb-open-project-btn {
   width: 100%;
-  padding: 7px 16px;
+  padding: 6px 12px;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -4164,7 +4169,7 @@ button, input, textarea, select {
   background: transparent;
   border: 1px solid var(--border);
   color: var(--text-2);
-  font-size: 14px;
+  font-size: var(--sb-font-row);
   cursor: pointer;
   transition: all var(--duration-fast) var(--ease-out);
   margin: 0 12px;
@@ -4188,10 +4193,10 @@ button, input, textarea, select {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 8px 16px;
+  padding: 6px 12px;
   cursor: pointer;
   color: var(--text-3);
-  font-size: 14px;
+  font-size: var(--sb-font-row);
   transition: color var(--duration-fast) var(--ease-out);
 }
 
@@ -4203,8 +4208,8 @@ button, input, textarea, select {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 5px 12px 5px 38px;
-  font-size: 14px;
+  padding: 4px 10px 4px 34px;
+  font-size: var(--sb-font-row);
   color: var(--text-2);
   border-radius: var(--radius-sm);
 }
@@ -4241,7 +4246,7 @@ button, input, textarea, select {
   align-items: center;
   gap: 8px;
   padding: 6px 4px;
-  font-size: 15px;
+  font-size: var(--sb-font-row);
   color: var(--text-3);
   cursor: pointer;
   width: 100%;
@@ -4336,7 +4341,7 @@ button, input, textarea, select {
 /* Show more link */
 .sb-show-more {
   padding: 4px 8px;
-  font-size: 13px;
+  font-size: var(--sb-font-supporting);
   color: var(--text-3);
   cursor: pointer;
   transition: color var(--duration-fast) var(--ease-out);
@@ -4368,13 +4373,13 @@ button, input, textarea, select {
   padding: 24px 16px;
   text-align: center;
   color: var(--text-3);
-  font-size: 14px;
+  font-size: 12.5px;
   line-height: 1.6;
 }
 
 .sb-no-threads {
   padding: 4px 8px;
-  font-size: 13.5px;
+  font-size: var(--sb-font-supporting);
   color: var(--text-3);
   font-style: italic;
 }
