@@ -113,6 +113,9 @@ fn read_json_hex_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) ->
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum EngineEvent {
+    CodexNativeEvent {
+        event: CodexNativeEvent,
+    },
     TurnStarted {
         client_turn_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -190,6 +193,39 @@ pub enum TurnCompletionStatus {
     Completed,
     Interrupted,
     Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexNativeEvent {
+    pub source_sequence: u64,
+    pub observed_at_ms: i64,
+    pub event_kind: CodexNativeEventKind,
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub native_thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_turn_id: Option<String>,
+    pub params_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexNativeEventKind {
+    Request,
+    Notification,
+    Response,
+}
+
+impl CodexNativeEventKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Notification => "notification",
+            Self::Response => "response",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -82,6 +82,7 @@ fn initialize_app_state() -> anyhow::Result<AppState> {
         keep_awake,
         turns: Arc::new(TurnManager::default()),
         file_tree_cache: Arc::new(FileTreeCache::new()),
+        pending_forks: Arc::new(crate::state::PendingForkManager::default()),
     })
 }
 

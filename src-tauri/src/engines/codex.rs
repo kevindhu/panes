@@ -7292,6 +7292,7 @@ fn engine_event_kind(event: &EngineEvent) -> &'static str {
         EngineEvent::ModelRerouted { .. } => "ModelRerouted",
         EngineEvent::Notice { .. } => "Notice",
         EngineEvent::Error { .. } => "Error",
+        EngineEvent::CodexNativeEvent { .. } => "CodexNativeEvent",
     }
 }
 

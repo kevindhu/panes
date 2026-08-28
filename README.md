@@ -9,7 +9,6 @@
 </p>
 
 <p align="center">
-  <a href="https://panesade.com">Website</a> &bull;
   <a href="#features">Features</a> &bull;
   <a href="#getting-started">Getting Started</a> &bull;
   <a href="#development">Development</a> &bull;
@@ -28,46 +27,32 @@
 
 ---
 
-Panes wraps a native desktop UI around external coding agents, git, terminal workflows, and lightweight file editing. It gives developers one place to chat with agents, inspect diffs, approve actions, manage multi-repo work, and keep an audit trail of what happened.
-
-Panes is not a full IDE, but it does ship with a built-in multi-tab editor for quick review and edits without leaving the app.
+Panes is a local-first desktop client for Codex. It keeps workspaces, threads, streaming output, approvals, attachments, and searchable history in one native window while Codex performs the coding work.
 
 ## Features
 
-### Chat & Agents
+### Codex chat
 
 - Streaming chat with structured content blocks for text, thinking, actions, diffs, approvals, attachments, and usage updates
-- Codex chat integration via `codex app-server`
-- Claude chat integration via a Claude Agent SDK sidecar
-- Plan mode, attachments, reasoning effort controls, per-thread approval/network overrides, and Codex-specific sandbox-mode overrides
+- Direct integration with `codex app-server`
+- Plan mode, steering, attachments, skills, apps, model and reasoning controls, and per-thread execution settings
+- Interactive approval and tool-input flows, including structured questions and dynamic tool responses
 - Global FTS message search with keyboard navigation
 - Windowed message loading and lazy hydration for long threads/action output
 
-### Git
+### Workspaces and threads
 
-- Multi-repo awareness with per-repo active toggles and trust levels
-- Changes, diff, stage, unstage, discard, commit, and soft reset
-- Branch management with pagination and search
-- Commit history, stash operations, worktree management, and remote management
-- Repo initialization flow from the UI
-- Filesystem watching plus cached/truncated file-tree scanning for large repos
+- Local workspace and repository context with configurable trust levels
+- Thread creation, rename, archive, restore, branching, rollback, and compaction
+- Codex transcript synchronization and persistent SQLite history
+- Workspace and thread navigation in a focused sidebar
 
-### Terminal & Harnesses
+### Desktop UX
 
-- Native PTY terminal powered by xterm.js + WebGL
-- Terminal groups, split panes, draggable resize, and broadcast mode
-- Session replay/resume and renderer diagnostics
-- Harness detection, install, and launch flows for Codex CLI, Claude Code, Gemini CLI, Kiro, OpenCode, Kilo Code, and Factory Droid
-- Multi-launch mode that can fan out one session per harness, optionally with one git worktree per session
-
-### Editor & Desktop UX
-
-- Multi-tab CodeMirror editor with dirty tracking, save, and external-modification warnings
-- Built-in find/replace (`Cmd+F`, `Cmd+H`) and editor toggle (`Cmd+E`)
-- Command palette for commands, files, threads, workspaces, harnesses, and git actions
-- Setup wizard for Node.js and Codex requirements, plus Git detection
-- Update dialog with download/install flow
-- Crash recovery, toast notifications, and session persistence
+- Native workspace and attachment pickers
+- Markdown, syntax highlighting, diffs, local file links, and image previews
+- App-wide zoom, native window controls, desktop completion notifications, and toast feedback
+- Codex setup guidance and in-app update installation
 
 ## Getting Started
 
@@ -109,7 +94,7 @@ Maintainers can find the tap/release automation setup in [docs/homebrew-distribu
 
 Download the latest `*-setup.exe` installer from [GitHub Releases](https://github.com/kevindhu/panes/releases/latest) and run it. Later updates are delivered in-app through the Tauri updater.
 
-For this Windows release, the validated scope is installer, updater, startup, and bundled-runtime compatibility. It does not guarantee that Codex and Claude are fully validated end to end through the in-app chat flow yet, so expect some rough edges there.
+For this Windows release, the validated scope is installer, updater, startup, and Codex runtime compatibility.
 
 ### Install on Linux
 
@@ -141,28 +126,6 @@ pnpm install
 pnpm tauri:dev
 ```
 
-### Codex Terminal Notifications
-
-Panes can surface Codex terminal notifications after a one-time install from `Agent notifications` in the app settings. That writes a `notify = [...]` command into your Codex user config that points back to Panes.
-
-Codex currently passes a single JSON payload to the configured `notify` program. `panes codex-notify` handles the current `agent-turn-complete` payload, extracts the last assistant message, and routes it back to the owning Panes terminal session so Panes can show both desktop and in-app terminal notifications.
-
-This only works inside terminals launched by Panes, because the installed command relies on `PANES_NOTIFY_ADDR`, `PANES_NOTIFY_TOKEN`, `PANES_WORKSPACE_ID`, and `PANES_SESSION_ID`.
-
-### Claude Terminal Notifications
-
-Panes can surface Claude terminal notifications after a one-time install from `Agent notifications` in the app settings. That merges Panes-managed hook commands into your Claude user settings without removing existing hooks.
-
-That hook bridge currently handles Claude `Notification`, `Stop`, `StopFailure`, `SessionStart`, and `SessionEnd` events, routing them back to the owning Panes terminal session so Panes can show desktop and in-app notifications and clear stale state when a Claude session starts or ends.
-
-This only works inside terminals launched by Panes, because the installed hook command depends on the Panes terminal session environment.
-
-### Generic OSC Terminal Notifications
-
-Panes also listens for common desktop-notification OSC sequences emitted directly by programs running inside a Panes terminal session. These work without any Claude or Codex setup. The backend currently recognizes `OSC 9`, `OSC 777;notify;...`, and `OSC 99` notification payloads before terminal replay is recorded, so live notifications do not fire again when a terminal session is resumed.
-
-`OSC 9;4` progress reports are intentionally left alone and are not treated as notifications.
-
 ### Production Build
 
 ```bash
@@ -170,8 +133,6 @@ pnpm tauri:build
 ```
 
 Common bundle artifacts include macOS DMGs/app archives, Linux DEB/AppImage outputs, and Windows NSIS installers, depending on platform and target.
-
-Git is recommended for the repo-management features, but the app can still launch without it.
 
 ## Development
 
@@ -184,7 +145,7 @@ pnpm build              # frontend production build
 pnpm test               # Vitest suite
 pnpm typecheck          # TypeScript no-emit check
 
-pnpm build:desktop          # build frontend + bundled sidecar assets, not native app bundles
+pnpm build:desktop          # build frontend assets, not native app bundles
 pnpm prune:artifacts:check  # inspect generated artifacts that are safe to remove
 pnpm prune:artifacts        # remove repo-local generated artifacts like src-tauri/target
 pnpm prune:artifacts:stale:check  # inspect stale Rust/Tauri artifacts older than 7 days
@@ -226,9 +187,7 @@ User-facing frontend copy is managed with `i18next`/`react-i18next`. Treat resou
 
 ## Architecture
 
-Panes uses a React + Zustand frontend running inside a Tauri shell, with a Rust backend that owns persistence, engine orchestration, git operations, terminal management, and filesystem-safe file access.
-
-The app currently exposes Codex and Claude as chat engines. Codex talks to `codex app-server`; Claude is bridged through the bundled Claude runtime sidecar.
+Panes uses a React + Zustand frontend running inside a Tauri shell. The Rust backend owns persistence, Codex app-server orchestration, workspace metadata, attachment access, desktop notifications, updates, and power management.
 
 ### Stack
 
@@ -236,14 +195,12 @@ The app currently exposes Codex and Claude as chat engines. Codex talks to `code
 |---|---|
 | Desktop framework | Tauri v2 |
 | Frontend | React 19 + TypeScript 5.5 + Vite 6 |
-| Styling | Tailwind CSS 4 |
+| Styling | CSS |
 | State management | Zustand 5 |
 | Markdown | micromark + highlight.js |
-| Diff | diff2html + custom parser |
-| File editor | CodeMirror 6 |
-| Terminal | xterm.js + portable-pty |
+| Diff | Custom parser and renderer |
 | Database | SQLite + FTS5 |
-| Git | `git2` + CLI helpers |
+| Agent runtime | Codex app-server |
 
 ## Contributing
 

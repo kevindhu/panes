@@ -1191,6 +1191,104 @@ struct CodexForkPoint {
     turns_after: u32,
 }
 
+/// Metadata key marking a branch whose engine-level Codex fork has not completed yet.
+const ENGINE_FORK_PENDING_KEY: &str = "engineForkPending";
+/// The source engine thread id the deferred fork must branch from.
+const ENGINE_FORK_SOURCE_KEY: &str = "engineForkSourceEngineThreadId";
+/// Optional explicit turn id to fork at (supplied by the message-edit branch flow).
+const ENGINE_FORK_LAST_TURN_KEY: &str = "engineForkLastTurnId";
+/// Optional number of trailing turns to drop when resolving the fork point.
+const ENGINE_FORK_TURNS_AFTER_KEY: &str = "engineForkTurnsAfter";
+
+/// Everything the deferred background fork needs to materialize the engine thread for a
+/// branch, captured from the source thread at branch-creation time.
+#[derive(Clone, Debug, PartialEq)]
+struct EngineForkIntent {
+    source_engine_thread_id: String,
+    last_turn_id: Option<String>,
+    turns_after: Option<u32>,
+}
+
+pub fn is_engine_fork_pending(metadata: Option<&Value>) -> bool {
+    metadata
+        .and_then(|value| value.get(ENGINE_FORK_PENDING_KEY))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn engine_fork_intent(metadata: Option<&Value>) -> Option<EngineForkIntent> {
+    let metadata = metadata?;
+    if !metadata
+        .get(ENGINE_FORK_PENDING_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let source_engine_thread_id = metadata
+        .get(ENGINE_FORK_SOURCE_KEY)
+        .and_then(Value::as_str)
+        .map(str::to_string)?;
+    let last_turn_id = metadata
+        .get(ENGINE_FORK_LAST_TURN_KEY)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let turns_after = metadata
+        .get(ENGINE_FORK_TURNS_AFTER_KEY)
+        .and_then(Value::as_u64)
+        .map(|value| value as u32);
+    Some(EngineForkIntent {
+        source_engine_thread_id,
+        last_turn_id,
+        turns_after,
+    })
+}
+
+/// Records the fork intent onto a branch's metadata so the engine thread can be
+/// materialized later (in the background, or on first use of the branch).
+fn mark_engine_fork_pending(mut metadata: Value, intent: &EngineForkIntent) -> Value {
+    if !metadata.is_object() {
+        metadata = json!({});
+    }
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert(ENGINE_FORK_PENDING_KEY.to_string(), json!(true));
+        object.insert(
+            ENGINE_FORK_SOURCE_KEY.to_string(),
+            json!(intent.source_engine_thread_id),
+        );
+        match intent.last_turn_id.as_deref() {
+            Some(last_turn_id) => {
+                object.insert(ENGINE_FORK_LAST_TURN_KEY.to_string(), json!(last_turn_id));
+            }
+            None => {
+                object.remove(ENGINE_FORK_LAST_TURN_KEY);
+            }
+        }
+        match intent.turns_after {
+            Some(turns_after) => {
+                object.insert(ENGINE_FORK_TURNS_AFTER_KEY.to_string(), json!(turns_after));
+            }
+            None => {
+                object.remove(ENGINE_FORK_TURNS_AFTER_KEY);
+            }
+        }
+    }
+    metadata
+}
+
+/// Removes all deferred-fork bookkeeping once the engine thread has been attached.
+fn clear_engine_fork_pending(mut metadata: Value) -> Value {
+    if let Some(object) = metadata.as_object_mut() {
+        object.remove(ENGINE_FORK_PENDING_KEY);
+        object.remove(ENGINE_FORK_SOURCE_KEY);
+        object.remove(ENGINE_FORK_LAST_TURN_KEY);
+        object.remove(ENGINE_FORK_TURNS_AFTER_KEY);
+    }
+    metadata
+}
+
 #[tauri::command]
 pub async fn fork_codex_thread(
     state: State<'_, AppState>,
@@ -1277,11 +1375,19 @@ async fn fork_codex_thread_inner(
         );
         return Err("native fork is only available for Codex threads".to_string());
     }
+    // Forking from a branch whose own engine thread has not been materialized yet
+    // requires that source fork to complete first, so we can read its engine thread id.
+    let thread = if is_engine_fork_pending(thread.engine_metadata.as_ref()) {
+        resolve_pending_engine_fork(state, &thread.id).await?
+    } else {
+        thread
+    };
     let engine_thread_id = thread
         .engine_thread_id
         .clone()
         .ok_or_else(|| "Codex thread has not been initialized yet".to_string())?;
-    let (last_turn_id, rollback_turns) = if let Some(fork_point) = fork_point {
+
+    let (last_turn_id, turns_after, rollback_turns) = if let Some(fork_point) = fork_point {
         let validate_cutoff_started_at = Instant::now();
         run_db(db.clone(), {
             let thread_id = thread.id.clone();
@@ -1298,83 +1404,29 @@ async fn fork_codex_thread_inner(
                 fork_point.turns_after
             )),
         );
-
-        let last_turn_id = match fork_point.last_turn_id {
-            Some(last_turn_id) => last_turn_id,
-            None => {
-                let resolve_turn_started_at = Instant::now();
-                let resolved = state
-                    .engines
-                    .resolve_codex_fork_turn_id(&engine_thread_id, fork_point.turns_after)
-                    .await
-                    .map_err(err_to_string)?;
-                log_branch_profile_step(
-                    profile_operation_id,
-                    "backend.fork.resolve_turn_id.done",
-                    Some(format!(
-                        "elapsed_ms={}; turns_after={}",
-                        format_elapsed_ms(resolve_turn_started_at),
-                        fork_point.turns_after
-                    )),
-                );
-                resolved
-            }
-        };
         (
-            Some(last_turn_id),
+            fork_point.last_turn_id,
+            Some(fork_point.turns_after),
             (fork_point.turns_after > 0).then_some(fork_point.turns_after),
         )
     } else {
-        (None, None)
+        (None, None, None)
     };
 
-    let build_context_started_at = Instant::now();
-    let (cwd, model_id, sandbox) = build_codex_branch_context(state, &thread).await?;
-    log_branch_profile_step(
-        profile_operation_id,
-        "backend.fork.build_context.done",
-        Some(format!(
-            "elapsed_ms={}; model_id={}; cwd={}",
-            format_elapsed_ms(build_context_started_at),
-            model_id,
-            cwd
-        )),
-    );
-
-    let remote_fork_started_at = Instant::now();
-    let forked = state
-        .engines
-        .fork_codex_thread(
-            &engine_thread_id,
-            &cwd,
-            &model_id,
-            last_turn_id.as_deref(),
-            sandbox,
-        )
-        .await
-        .map_err(err_to_string)?;
-    log_branch_profile_step(
-        profile_operation_id,
-        "backend.fork.remote_fork.done",
-        Some(format!(
-            "elapsed_ms={}; source_engine_thread_id={}; forked_engine_thread_id={}; model_id={}",
-            format_elapsed_ms(remote_fork_started_at),
-            engine_thread_id,
-            forked.engine_thread_id,
-            forked.model_id
-        )),
-    );
-
+    // The slow part — codex `thread/fork` spins up a whole new session (re-initializing
+    // MCP servers and auth), taking many seconds. Instead of blocking the fork command on
+    // it, create the local branch immediately with the fork recorded as pending, then
+    // materialize the engine thread in the background (and lazily on first use).
+    let intent = EngineForkIntent {
+        source_engine_thread_id: engine_thread_id,
+        last_turn_id,
+        turns_after,
+    };
     let create_branch_started_at = Instant::now();
-    let created = create_codex_branch_thread(
+    let created = create_pending_codex_branch_thread(
         state,
         &thread,
-        &forked.engine_thread_id,
-        &forked.model_id,
-        forked.title.as_deref(),
-        forked.preview.as_deref(),
-        forked.raw_status.as_deref(),
-        &forked.active_flags,
+        &intent,
         rollback_turns,
         profile_operation_id,
     )
@@ -1389,7 +1441,104 @@ async fn fork_codex_thread_inner(
             format_elapsed_ms(total_started_at)
         )),
     );
+
+    // Best-effort prefetch so the engine thread is usually ready before the user sends.
+    spawn_engine_fork_prefetch(state.clone(), created.id.clone());
+
     Ok(created)
+}
+
+/// Materializes the engine-level Codex thread for a branch created with a pending fork.
+///
+/// Runs at most once per branch across all racing callers (the background prefetch and
+/// any first use of the branch) via the shared [`crate::state::PendingForkManager`] cell.
+/// On success the branch is durably updated with its engine thread id and cleared of the
+/// pending markers; the returned [`ThreadDto`] reflects that state. If no fork is pending
+/// (already materialized, or not a branch), the current thread is returned unchanged.
+pub async fn resolve_pending_engine_fork(
+    state: &AppState,
+    thread_id: &str,
+) -> Result<ThreadDto, String> {
+    let cell = state.pending_forks.cell(thread_id).await;
+    let result = cell
+        .get_or_try_init(|| async {
+            let thread = run_db(state.db.clone(), {
+                let thread_id = thread_id.to_string();
+                move |db| db::threads::get_thread(db, &thread_id)
+            })
+            .await?
+            .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+
+            match engine_fork_intent(thread.engine_metadata.as_ref()) {
+                Some(intent) => perform_engine_fork(state, &thread, &intent).await,
+                // Nothing pending: another caller already materialized it, or this thread
+                // was never a deferred branch. Return whatever is persisted.
+                None => Ok(thread),
+            }
+        })
+        .await
+        .cloned();
+
+    if result.is_ok() {
+        state.pending_forks.forget(thread_id).await;
+    }
+    result
+}
+
+/// Executes the codex `thread/fork` and persists the resulting engine thread onto the
+/// branch, clearing the pending markers. This is the slow (~10s) step; it is only ever
+/// reached from [`resolve_pending_engine_fork`].
+async fn perform_engine_fork(
+    state: &AppState,
+    branch: &ThreadDto,
+    intent: &EngineForkIntent,
+) -> Result<ThreadDto, String> {
+    let last_turn_id = match intent.last_turn_id.clone() {
+        Some(last_turn_id) => Some(last_turn_id),
+        None => match intent.turns_after {
+            Some(turns_after) if turns_after > 0 => Some(
+                state
+                    .engines
+                    .resolve_codex_fork_turn_id(&intent.source_engine_thread_id, turns_after)
+                    .await
+                    .map_err(err_to_string)?,
+            ),
+            _ => None,
+        },
+    };
+
+    let (cwd, model_id, sandbox) = build_codex_branch_context(state, branch).await?;
+
+    let remote_fork_started_at = Instant::now();
+    let forked = state
+        .engines
+        .fork_codex_thread(
+            &intent.source_engine_thread_id,
+            &cwd,
+            &model_id,
+            last_turn_id.as_deref(),
+            sandbox,
+        )
+        .await
+        .map_err(err_to_string)?;
+    log::info!(
+        "materialized deferred codex fork for thread {} in {}ms (engine_thread_id={})",
+        branch.id,
+        format_elapsed_ms(remote_fork_started_at),
+        forked.engine_thread_id,
+    );
+
+    attach_forked_engine_to_branch(state, branch, &forked).await
+}
+
+/// Fires off the background prefetch that materializes a branch's engine thread. Errors
+/// are swallowed — the fork will simply be retried on first use of the branch.
+fn spawn_engine_fork_prefetch(state: AppState, thread_id: String) {
+    tokio::spawn(async move {
+        if let Err(error) = resolve_pending_engine_fork(&state, &thread_id).await {
+            log::warn!("background codex fork prefetch for thread {thread_id} failed: {error}");
+        }
+    });
 }
 
 #[tauri::command]
@@ -1456,6 +1605,13 @@ pub async fn rollback_codex_thread(
         );
         return Err("native rollback is only available for Codex threads".to_string());
     }
+    // A branch whose deferred fork has not completed has no engine thread to roll back
+    // yet; materialize it first.
+    let thread = if is_engine_fork_pending(thread.engine_metadata.as_ref()) {
+        resolve_pending_engine_fork(state.inner(), &thread.id).await?
+    } else {
+        thread
+    };
     let engine_thread_id = thread
         .engine_thread_id
         .clone()
@@ -2094,27 +2250,26 @@ async fn build_codex_branch_context(
     ))
 }
 
-async fn create_codex_branch_thread(
+/// Creates the local branch thread immediately, cloning the source transcript, and
+/// records the engine-level fork as pending so it can be materialized later. Does no
+/// engine/network work, so it returns in a few milliseconds.
+async fn create_pending_codex_branch_thread(
     state: &AppState,
     source_thread: &ThreadDto,
-    engine_thread_id: &str,
-    model_id: &str,
-    title: Option<&str>,
-    preview: Option<&str>,
-    raw_status: Option<&str>,
-    active_flags: &[String],
+    intent: &EngineForkIntent,
     rollback_turns: Option<u32>,
     profile_operation_id: Option<&str>,
 ) -> Result<ThreadDto, String> {
     let profile_operation_id = profile_operation_id.map(str::to_string);
     let total_started_at = Instant::now();
+    let model_id = thread_last_model_id(source_thread.engine_metadata.as_ref())
+        .unwrap_or_else(|| source_thread.model_id.clone());
     log_branch_profile_step(
         profile_operation_id.as_deref(),
         "backend.branch.create_local.start",
         Some(format!(
-            "source_thread_id={}; engine_thread_id={}; model_id={}; rollback_turns={}",
+            "source_thread_id={}; model_id={}; rollback_turns={}; pending_fork=true",
             source_thread.id,
-            engine_thread_id,
             model_id,
             rollback_turns
                 .map(|value| value.to_string())
@@ -2136,12 +2291,8 @@ async fn create_codex_branch_thread(
     let db = state.db.clone();
     run_db(db.clone(), {
         let source_thread = source_thread.clone();
-        let engine_thread_id = engine_thread_id.to_string();
-        let model_id = model_id.to_string();
-        let title = title.map(str::to_string);
-        let preview = preview.map(str::to_string);
-        let raw_status = raw_status.map(str::to_string);
-        let active_flags = active_flags.to_vec();
+        let model_id = model_id.clone();
+        let intent = intent.clone();
         let profile_operation_id = profile_operation_id.clone();
         move |db| {
             let clone_local_history = should_clone_local_branch_history(&source_thread);
@@ -2152,7 +2303,7 @@ async fn create_codex_branch_thread(
                 source_thread.repo_id.as_deref(),
                 &source_thread.engine_id,
                 &model_id,
-                title.as_deref().unwrap_or(&source_thread.title),
+                &source_thread.title,
             )?;
             log_branch_profile_step(
                 profile_operation_id.as_deref(),
@@ -2161,18 +2312,6 @@ async fn create_codex_branch_thread(
                     "elapsed_ms={}; created_thread_id={}",
                     format_elapsed_ms(create_thread_started_at),
                     created.id
-                )),
-            );
-            let set_engine_thread_id_started_at = Instant::now();
-            db::threads::set_engine_thread_id(db, &created.id, &engine_thread_id)?;
-            log_branch_profile_step(
-                profile_operation_id.as_deref(),
-                "backend.branch.db_set_engine_thread_id.done",
-                Some(format!(
-                    "elapsed_ms={}; created_thread_id={}; engine_thread_id={}",
-                    format_elapsed_ms(set_engine_thread_id_started_at),
-                    created.id,
-                    engine_thread_id
                 )),
             );
             if clone_local_history {
@@ -2206,34 +2345,24 @@ async fn create_codex_branch_thread(
                     )),
                 );
             }
-            let refresh_stats_started_at = Instant::now();
             db::threads::refresh_thread_message_stats(db, &created.id)?;
-            log_branch_profile_step(
-                profile_operation_id.as_deref(),
-                "backend.branch.db_refresh_stats.done",
-                Some(format!(
-                    "elapsed_ms={}; created_thread_id={}",
-                    format_elapsed_ms(refresh_stats_started_at),
-                    created.id
-                )),
-            );
 
             let metadata = clone_codex_branch_metadata(
                 source_thread.engine_metadata.as_ref(),
                 &model_id,
-                raw_status.as_deref(),
-                &active_flags,
-                preview.as_deref(),
+                None,
+                &[],
+                None,
                 !clone_local_history,
                 (!clone_local_history).then_some("branch_thread_requires_sync"),
             );
-            let next_status =
-                map_codex_thread_status_to_local(raw_status.as_deref(), &active_flags, false);
+            let metadata = mark_engine_fork_pending(metadata, &intent);
+            let next_status = map_codex_thread_status_to_local(None, &[], false);
             let update_snapshot_started_at = Instant::now();
             let updated = db::threads::update_thread_runtime_snapshot(
                 db,
                 &created.id,
-                title.as_deref(),
+                None,
                 next_status,
                 Some(&metadata),
             )?;
@@ -2247,6 +2376,59 @@ async fn create_codex_branch_thread(
                     format_elapsed_ms(total_started_at)
                 )),
             );
+            Ok(updated)
+        }
+    })
+    .await
+}
+
+/// Attaches a freshly-forked engine thread to an existing pending branch, clearing the
+/// deferred-fork markers and applying the forked runtime snapshot.
+async fn attach_forked_engine_to_branch(
+    state: &AppState,
+    branch: &ThreadDto,
+    forked: &crate::engines::codex::CodexForkedThread,
+) -> Result<ThreadDto, String> {
+    let db = state.db.clone();
+    run_db(db, {
+        let branch = branch.clone();
+        let forked_engine_thread_id = forked.engine_thread_id.clone();
+        let forked_model_id = forked.model_id.clone();
+        let title = forked.title.clone();
+        let preview = forked.preview.clone();
+        let raw_status = forked.raw_status.clone();
+        let active_flags = forked.active_flags.clone();
+        move |db| {
+            db::threads::set_engine_thread_id(db, &branch.id, &forked_engine_thread_id)?;
+
+            let mut metadata = clear_engine_fork_pending(
+                branch.engine_metadata.clone().unwrap_or_else(|| json!({})),
+            );
+            if let Some(object) = metadata.as_object_mut() {
+                object.insert("lastModelId".to_string(), json!(forked_model_id));
+                object.insert("codexTranscriptImported".to_string(), json!(true));
+            }
+            let mut metadata = merge_codex_runtime_metadata(
+                Some(metadata),
+                raw_status.as_deref(),
+                &active_flags,
+                preview.as_deref(),
+                false,
+                None,
+            );
+            // A branch starts a distinct engine thread; do not inherit a confirmed-active
+            // bit before the branch receives a full sync.
+            codex_thread_metadata::set_confirmed_remote_turn(&mut metadata, false);
+
+            let next_status =
+                map_codex_thread_status_to_local(raw_status.as_deref(), &active_flags, false);
+            let updated = db::threads::update_thread_runtime_snapshot(
+                db,
+                &branch.id,
+                title.as_deref(),
+                next_status,
+                Some(&metadata),
+            )?;
             Ok(updated)
         }
     })
@@ -3071,6 +3253,7 @@ mod tests {
             keep_awake: Arc::new(KeepAwakeManager::new()),
             turns: Arc::new(TurnManager::default()),
             file_tree_cache: Arc::new(FileTreeCache::new()),
+            pending_forks: Arc::new(crate::state::PendingForkManager::default()),
         }
     }
 
@@ -3632,22 +3815,95 @@ mod tests {
             "codexTranscriptImported": false,
         }));
 
-        let error = create_codex_branch_thread(
-            &state,
-            &thread,
-            "engine-thread-branch",
-            "gpt-5.4",
-            Some("Fork"),
-            None,
-            Some("idle"),
-            &[],
-            None,
-            None,
-        )
-        .await
-        .expect_err("expected branch creation to reject missing local transcript");
+        let intent = EngineForkIntent {
+            source_engine_thread_id: "engine-thread-source".to_string(),
+            last_turn_id: None,
+            turns_after: None,
+        };
+        let error = create_pending_codex_branch_thread(&state, &thread, &intent, None, None)
+            .await
+            .expect_err("expected branch creation to reject missing local transcript");
 
         assert!(error.contains("locally mirrored transcript"));
+    }
+
+    #[test]
+    fn engine_fork_intent_round_trips_through_metadata() {
+        let intent = EngineForkIntent {
+            source_engine_thread_id: "engine-source".to_string(),
+            last_turn_id: Some("turn-7".to_string()),
+            turns_after: Some(2),
+        };
+        let metadata = mark_engine_fork_pending(json!({ "lastModelId": "gpt-5.4" }), &intent);
+
+        assert!(is_engine_fork_pending(Some(&metadata)));
+        assert_eq!(engine_fork_intent(Some(&metadata)), Some(intent));
+        // Unrelated metadata is preserved.
+        assert_eq!(metadata.get("lastModelId"), Some(&json!("gpt-5.4")));
+
+        let cleared = clear_engine_fork_pending(metadata);
+        assert!(!is_engine_fork_pending(Some(&cleared)));
+        assert_eq!(engine_fork_intent(Some(&cleared)), None);
+        assert_eq!(cleared.get("lastModelId"), Some(&json!("gpt-5.4")));
+    }
+
+    #[test]
+    fn engine_fork_intent_ignores_pending_flag_without_source() {
+        // A pending flag with no recorded source engine id cannot be acted on.
+        let metadata = json!({ "engineForkPending": true });
+        assert!(is_engine_fork_pending(Some(&metadata)));
+        assert_eq!(engine_fork_intent(Some(&metadata)), None);
+    }
+
+    #[tokio::test]
+    async fn create_pending_codex_branch_thread_marks_fork_and_clones_history() {
+        let state = test_app_state();
+        let source = test_thread(&state, "codex", "gpt-5.4");
+        let imported = [
+            ("user", "First"),
+            ("assistant", "Reply 1"),
+            ("user", "Second"),
+            ("assistant", "Reply 2"),
+        ]
+        .into_iter()
+        .map(|(role, content)| db::messages::ImportedMessageRecord {
+            role: role.to_string(),
+            content: Some(content.to_string()),
+            blocks: json!([{ "type": "text", "content": content }]),
+            status: MessageStatusDto::Completed,
+            native_turn_id: None,
+            turn_engine_id: Some("codex".to_string()),
+            turn_model_id: Some("gpt-5.4".to_string()),
+            turn_reasoning_effort: None,
+            token_input: u64::from(role == "user"),
+            token_output: u64::from(role == "assistant"),
+            created_at: None,
+        })
+        .collect::<Vec<_>>();
+        db::messages::replace_thread_messages(&state.db, &source.id, &imported)
+            .expect("expected source messages to be inserted");
+        let source = db::threads::get_thread(&state.db, &source.id)
+            .expect("get source thread")
+            .expect("source thread exists");
+
+        let intent = EngineForkIntent {
+            source_engine_thread_id: "engine-source".to_string(),
+            last_turn_id: None,
+            turns_after: None,
+        };
+        let branch = create_pending_codex_branch_thread(&state, &source, &intent, None, None)
+            .await
+            .expect("expected pending branch creation to succeed");
+
+        // The branch has no engine thread yet, but the fork intent is recorded.
+        assert!(branch.engine_thread_id.is_none());
+        assert!(is_engine_fork_pending(branch.engine_metadata.as_ref()));
+        assert_eq!(
+            engine_fork_intent(branch.engine_metadata.as_ref()),
+            Some(intent)
+        );
+        // The transcript was cloned locally so the branch is immediately readable.
+        assert_eq!(branch.message_count, 4);
     }
 
     #[test]

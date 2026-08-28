@@ -8,6 +8,7 @@ import {
   ListChecks,
   LoaderCircle,
   Paperclip,
+  RotateCcw,
   Send,
   Settings2,
   Square,
@@ -25,9 +26,17 @@ import {
   type KeyboardEvent,
 } from "react";
 import { buildCodexInputItems } from "../chat/codexInputItems";
-import { computeTurnsAfterAssistantMessage } from "../chat/messageEditBranching";
+import {
+  computeDroppedTurnsForEditedMessage,
+  computeTurnsAfterAssistantMessage,
+  extractEditableMessageContext,
+  isEditableUserTurn,
+} from "../chat/messageEditBranching";
 import { resolveReasoningEffortForModel } from "../chat/reasoningEffort";
-import { canUseNativeCodexHistoryTools } from "../../lib/codexThreadCapabilities";
+import {
+  canEditCodexMessageHistory,
+  canUseNativeCodexHistoryTools,
+} from "../../lib/codexThreadCapabilities";
 import { createAndActivateWorkspaceThread } from "../../lib/newThreadActions";
 import { activateThreadContext } from "../../lib/threadActivation";
 import { ipc } from "../../lib/codexIpc";
@@ -94,6 +103,7 @@ export function CodexChat() {
   const [reasoningEffort, setReasoningEffort] = useState<string | null>(null);
   const [policyOpen, setPolicyOpen] = useState(false);
   const [forkingMessageId, setForkingMessageId] = useState<string | null>(null);
+  const [rollingBackMessageId, setRollingBackMessageId] = useState<string | null>(null);
   const [referenceCatalog, setReferenceCatalog] = useState<{ skills: CodexSkill[]; apps: CodexApp[] } | null>(null);
 
   const activeWorkspaceId = useWorkspaceStore((state) => state.activeWorkspaceId);
@@ -102,6 +112,7 @@ export function CodexChat() {
   const activeThread = useThreadStore((state) => state.threads.find((item) => item.id === state.activeThreadId) ?? null);
   const applyThreadUpdateLocal = useThreadStore((state) => state.applyThreadUpdateLocal);
   const forkCodexThreadAtTurn = useThreadStore((state) => state.forkCodexThreadAtTurn);
+  const rollbackCodexThread = useThreadStore((state) => state.rollbackCodexThread);
   const renameThread = useThreadStore((state) => state.renameThread);
   const engine = useEngineStore((state) => state.engines.find((item) => item.id === "codex") ?? null);
   const messages = useChatStore((state) => state.messages);
@@ -129,6 +140,7 @@ export function CodexChat() {
     ? threadModes[activeThreadId] === "plan"
     : Boolean(activeWorkspaceId && newThreadModes[activeWorkspaceId] === "plan");
   const canForkMessages = canUseNativeCodexHistoryTools(activeThread, streaming);
+  const canRollbackMessages = canEditCodexMessageHistory(activeThread, streaming);
 
   useEffect(() => {
     const preferredModel = readMetadataString(activeThread, "lastModelId") ?? activeThread?.modelId;
@@ -144,6 +156,7 @@ export function CodexChat() {
 
   useEffect(() => {
     setForkingMessageId(null);
+    setRollingBackMessageId(null);
   }, [activeThreadId]);
 
   useEffect(() => {
@@ -169,6 +182,7 @@ export function CodexChat() {
       !activeThread ||
       !canForkMessages ||
       forkingMessageId !== null ||
+      rollingBackMessageId !== null ||
       message.role !== "assistant" ||
       message.status === "streaming"
     ) {
@@ -198,7 +212,62 @@ export function CodexChat() {
     } finally {
       setForkingMessageId((current) => (current === message.id ? null : current));
     }
-  }, [activeThread, canForkMessages, forkingMessageId, forkCodexThreadAtTurn, messages]);
+  }, [activeThread, canForkMessages, forkingMessageId, forkCodexThreadAtTurn, messages, rollingBackMessageId]);
+
+  const rollbackToMessage = useCallback(async (message: Message) => {
+    if (
+      !activeThread ||
+      !canRollbackMessages ||
+      forkingMessageId !== null ||
+      rollingBackMessageId !== null ||
+      !isEditableUserTurn(message)
+    ) {
+      return;
+    }
+
+    const context = extractEditableMessageContext(message);
+    const numTurns = computeDroppedTurnsForEditedMessage(messages, message.id);
+    if (!context || !numTurns) {
+      toast.error("Could not identify the Codex turn to roll back.");
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Roll back to before this message? This removes ${numTurns} ${numTurns === 1 ? "turn" : "turns"} from the chat history and does not undo file changes.`,
+    );
+    if (!confirmed) return;
+
+    setRollingBackMessageId(message.id);
+    try {
+      const rolledBack = await rollbackCodexThread(activeThread.id, numTurns);
+      if (!rolledBack) {
+        throw new Error(useThreadStore.getState().error ?? "Codex did not return the rolled-back thread.");
+      }
+
+      await activateThreadContext(rolledBack, { forceChatReload: true });
+      setInput(context.text);
+      setAttachments(context.attachments);
+      if (activeThreadId) {
+        setThreadMode(activeThreadId, context.planMode ? "plan" : "default");
+      }
+      nearBottomRef.current = true;
+      requestAnimationFrame(() => textareaRef.current?.focus());
+      toast.success("Rolled back conversation. Edit the restored message and send when ready.");
+    } catch (rollbackError) {
+      toast.error(`Could not roll back to this message: ${String(rollbackError)}`);
+    } finally {
+      setRollingBackMessageId((current) => (current === message.id ? null : current));
+    }
+  }, [
+    activeThread,
+    activeThreadId,
+    canRollbackMessages,
+    forkingMessageId,
+    messages,
+    rollbackCodexThread,
+    rollingBackMessageId,
+    setThreadMode,
+  ]);
 
   function setPlanMode(enabled: boolean) {
     if (activeThreadId) setThreadMode(activeThreadId, enabled ? "plan" : "default");
@@ -366,12 +435,31 @@ export function CodexChat() {
             message.role === "assistant" &&
             message.status !== "streaming" &&
             canForkMessages;
+          const canRollbackMessage =
+            message.role === "user" &&
+            canRollbackMessages &&
+            isEditableUserTurn(message);
           const isForkingMessage = forkingMessageId === message.id;
+          const isRollingBackMessage = rollingBackMessageId === message.id;
           return (
             <article key={message.id} className={`codex-message ${message.role}`} data-message-id={message.id}>
               <div className="codex-message-label">
                 {message.role === "user" ? "You" : "Codex"}
                 {message.role === "user" && <CopyMessageButton text={copyText} />}
+                {canRollbackMessage && (
+                  <button
+                    className="codex-rollback-message"
+                    type="button"
+                    title={isRollingBackMessage ? "Rolling back conversation" : "Roll back to here"}
+                    aria-label={isRollingBackMessage ? "Rolling back conversation" : "Roll back to here"}
+                    disabled={forkingMessageId !== null || rollingBackMessageId !== null}
+                    onClick={() => void rollbackToMessage(message)}
+                  >
+                    {isRollingBackMessage
+                      ? <LoaderCircle size={12} className="codex-spin" />
+                      : <RotateCcw size={12} />}
+                  </button>
+                )}
               </div>
               <Suspense fallback={<div className="codex-loading">Rendering…</div>}>
                 <MessageBlocks
@@ -392,7 +480,7 @@ export function CodexChat() {
                       type="button"
                       title={isForkingMessage ? "Forking conversation" : "Fork from here"}
                       aria-label={isForkingMessage ? "Forking conversation" : "Fork from here"}
-                      disabled={forkingMessageId !== null}
+                      disabled={forkingMessageId !== null || rollingBackMessageId !== null}
                       onClick={() => void forkFromMessage(message)}
                     >
                       {isForkingMessage

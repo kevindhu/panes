@@ -13,6 +13,7 @@ use rusqlite::{params, Connection, Transaction};
 use crate::{path_utils, runtime_env};
 
 pub mod actions;
+pub mod codex_transcript;
 pub mod messages;
 pub mod repos;
 pub mod threads;
@@ -125,6 +126,8 @@ impl Database {
         enable_wal_mode(&conn)?;
         conn.execute_batch(include_str!("migrations/001_initial.sql"))
             .context("failed to apply migrations")?;
+        conn.execute_batch(include_str!("migrations/002_codex_transcript.sql"))
+            .context("failed to apply Codex transcript migration")?;
         ensure_archived_columns(&conn)?;
         ensure_workspace_sort_order_column(&conn)?;
         ensure_workspace_git_columns(&conn)?;

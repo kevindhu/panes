@@ -85,8 +85,10 @@ button { color: inherit; }
 .codex-message.user { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; }
 .codex-message.assistant { padding: 0 2px; }
 .codex-message-label { height: 20px; display: flex; align-items: center; gap: 5px; color: var(--text-3); font-size: 9px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
-.codex-copy-message { width: 22px; height: 20px; display: grid; place-items: center; border: 0; background: transparent; opacity: 0; }
-.codex-message:hover .codex-copy-message { opacity: .65; }
+.codex-copy-message, .codex-rollback-message { width: 22px; height: 20px; display: grid; place-items: center; border: 0; border-radius: 5px; background: transparent; color: var(--text-3); opacity: 0; }
+.codex-message:hover .codex-copy-message, .codex-message:hover .codex-rollback-message, .codex-message:focus-within .codex-copy-message, .codex-message:focus-within .codex-rollback-message { opacity: .65; }
+.codex-rollback-message:hover:not(:disabled) { background: var(--surface-hover); color: var(--text-1); opacity: 1; }
+.codex-rollback-message:disabled { opacity: .45; }
 .codex-message-actions { min-height: 24px; display: flex; align-items: center; gap: 2px; margin-top: 3px; opacity: 0; pointer-events: none; transform: translateY(-2px); transition: opacity var(--duration-fast) var(--ease-out), transform var(--duration-fast) var(--ease-out); }
 .codex-message:hover .codex-message-actions, .codex-message:focus-within .codex-message-actions { opacity: 1; pointer-events: auto; transform: translateY(0); }
 .codex-message-actions .codex-copy-message, .codex-fork-message { width: 24px; height: 22px; display: grid; place-items: center; border: 0; border-radius: 5px; background: transparent; color: var(--text-3); opacity: .72; }

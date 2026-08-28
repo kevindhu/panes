@@ -1183,6 +1183,13 @@ pub async fn send_message(
     })
     .await?
     .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+    // Branch threads defer their (slow) engine-level Codex fork until first use. Ensure the
+    // engine thread is materialized before the turn starts; the background prefetch has
+    // usually already done this, so this is normally instant.
+    if crate::commands::threads::is_engine_fork_pending(thread.engine_metadata.as_ref()) {
+        thread =
+            crate::commands::threads::resolve_pending_engine_fork(state.inner(), &thread.id).await?;
+    }
     let requested_model_id = model_id
         .as_deref()
         .map(str::trim)
@@ -4729,6 +4736,7 @@ fn apply_event_to_blocks(
             }
         }
         EngineEvent::UsageLimitsUpdated { .. } => {}
+        EngineEvent::CodexNativeEvent { .. } => {}
     }
 
     progress
@@ -5440,6 +5448,7 @@ mod tests {
             keep_awake: Arc::new(KeepAwakeManager::new()),
             turns: Arc::new(TurnManager::default()),
             file_tree_cache: Arc::new(FileTreeCache::new()),
+            pending_forks: Arc::new(crate::state::PendingForkManager::default()),
         }
     }
 
