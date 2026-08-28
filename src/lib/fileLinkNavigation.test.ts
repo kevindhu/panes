@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockOpenExternal = vi.hoisted(() => vi.fn());
+const mockDispatchEvent = vi.hoisted(() => vi.fn());
 const mockOpenFileAtLocation = vi.hoisted(() => vi.fn());
 const mockSetLayoutMode = vi.hoisted(() => vi.fn());
 const mockEnsureWorkspace = vi.hoisted(() => vi.fn());
@@ -100,6 +101,7 @@ import {
 describe("fileLinkNavigation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubGlobal("window", { dispatchEvent: mockDispatchEvent });
     mockWorkspaceState.activeWorkspaceId = "ws-1";
     mockWorkspaceState.activeRepoId = "repo-1";
     mockWorkspaceState.workspaces = [
@@ -365,15 +367,14 @@ describe("fileLinkNavigation", () => {
       navigateLinkTarget("/workspace/apps/app/src/main.ts#L12C4", { shiftKey: true }),
     ).resolves.toBe("internal");
 
-    expect(mockOpenFileAtLocation).toHaveBeenCalledWith(
-      "/workspace/apps/app",
-      "src/main.ts",
-      { line: 12, column: 4 },
-    );
-    expect(mockShowSurface).toHaveBeenCalledWith("ws-1", "editor");
-    expect(mockSetActiveView).toHaveBeenCalledWith("chat");
-    expect(mockSetExplorerOpen).toHaveBeenCalledWith(false);
-    expect(mockSetLayoutMode).not.toHaveBeenCalled();
+    const event = mockDispatchEvent.mock.calls[0]?.[0] as CustomEvent;
+    expect(event.type).toBe("codex-open-file");
+    expect(event.detail).toEqual({
+      rootPath: "/workspace/apps/app",
+      filePath: "src/main.ts",
+      line: 12,
+      column: 4,
+    });
   });
 
   it("opens repo-relative local links against the active repo on shift-click", async () => {
@@ -381,14 +382,14 @@ describe("fileLinkNavigation", () => {
       navigateLinkTarget("src/main.ts:12:4", { shiftKey: true }),
     ).resolves.toBe("internal");
 
-    expect(mockOpenFileAtLocation).toHaveBeenCalledWith(
-      "/workspace/apps/app",
-      "src/main.ts",
-      { line: 12, column: 4 },
-    );
-    expect(mockShowSurface).toHaveBeenCalledWith("ws-1", "editor");
-    expect(mockSetExplorerOpen).toHaveBeenCalledWith(false);
-    expect(mockSetLayoutMode).not.toHaveBeenCalled();
+    const event = mockDispatchEvent.mock.calls[0]?.[0] as CustomEvent;
+    expect(event.type).toBe("codex-open-file");
+    expect(event.detail).toEqual({
+      rootPath: "/workspace/apps/app",
+      filePath: "src/main.ts",
+      line: 12,
+      column: 4,
+    });
   });
 
   it("opens external links through the shell only on shift-click", async () => {

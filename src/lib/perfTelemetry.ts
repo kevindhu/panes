@@ -6,6 +6,9 @@ type PerfMetricName =
   | "chat.stream.events_per_sec"
   | "chat.render.commit.ms"
   | "chat.markdown.worker.ms"
+  | "chat.image.asset_prepare.ms"
+  | "chat.image.viewer_first_pixel.ms"
+  | "chat.image.viewer_full_decode.ms"
   | "git.refresh.ms"
   | "git.file_diff.ms";
 
@@ -33,6 +36,9 @@ const PERF_BUDGETS: Record<PerfMetricName, number> = {
   "chat.stream.events_per_sec": 450,
   "chat.render.commit.ms": 16,
   "chat.markdown.worker.ms": 28,
+  "chat.image.asset_prepare.ms": 50,
+  "chat.image.viewer_first_pixel.ms": 50,
+  "chat.image.viewer_full_decode.ms": 250,
   "git.refresh.ms": 350,
   "git.file_diff.ms": 250,
 };

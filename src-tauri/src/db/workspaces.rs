@@ -787,11 +787,9 @@ mod tests {
             upsert_workspace(&db, root_b.to_string_lossy().as_ref(), None).expect("create b");
         archive_workspace(&db, &workspace_b.id).expect("archive b");
 
-        let duplicate_error = set_workspace_order(
-            &db,
-            &[workspace_a.id.clone(), workspace_a.id.clone()],
-        )
-        .expect_err("duplicate order should fail");
+        let duplicate_error =
+            set_workspace_order(&db, &[workspace_a.id.clone(), workspace_a.id.clone()])
+                .expect_err("duplicate order should fail");
         assert!(duplicate_error
             .to_string()
             .contains("workspace order contains a duplicate workspace"));
@@ -828,7 +826,10 @@ mod tests {
             .into_iter()
             .map(|workspace| workspace.id)
             .collect::<Vec<_>>();
-        assert_eq!(ids_after_reopen, vec![workspace_a.id.clone(), workspace_b.id.clone()]);
+        assert_eq!(
+            ids_after_reopen,
+            vec![workspace_a.id.clone(), workspace_b.id.clone()]
+        );
 
         let workspace_c =
             upsert_workspace(&db, root_c.to_string_lossy().as_ref(), None).expect("create c");
@@ -839,7 +840,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             ids_after_new,
-            vec![workspace_c.id.clone(), workspace_a.id.clone(), workspace_b.id.clone()]
+            vec![
+                workspace_c.id.clone(),
+                workspace_a.id.clone(),
+                workspace_b.id.clone()
+            ]
         );
 
         archive_workspace(&db, &workspace_a.id).expect("archive a");

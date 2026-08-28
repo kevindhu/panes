@@ -11,8 +11,10 @@ import {
   type SyntheticEvent,
 } from "react";
 import {
-  getCachedAttachmentPreviewObjectUrl,
-  loadAttachmentPreviewObjectUrl,
+  getCachedAttachmentImageAssetUrl,
+  getCachedAttachmentImageFallbackUrl,
+  loadAttachmentImageAssetUrl,
+  loadAttachmentImageFallbackUrl,
 } from "../../lib/attachmentImages";
 import { recordPerfMetric } from "../../lib/perfTelemetry";
 import {
@@ -306,23 +308,25 @@ function MarkdownLocalImage({ filePath, mimeType, alt }: MarkdownLocalImageProps
   const thumbnailOptions = getThumbnailPreviewOptions();
   const frameCacheKey = getMarkdownLocalImageFrameCacheKey(filePath, mimeType);
   const [thumbnailSrc, setThumbnailSrc] = useState<string | null>(() => (
-    getCachedAttachmentPreviewObjectUrl(filePath, mimeType, thumbnailOptions) ?? null
+    getCachedAttachmentImageAssetUrl(filePath, mimeType, thumbnailOptions)
+      ?? getCachedAttachmentImageFallbackUrl(filePath, mimeType)
+      ?? null
+  ));
+  const [fullSrc, setFullSrc] = useState<string | null>(() => (
+    getCachedAttachmentImageAssetUrl(filePath, mimeType) ?? null
   ));
   const [thumbnailFrame, setThumbnailFrame] = useState<MarkdownLocalImageFrame | null>(() => (
     markdownLocalImageFrameCache.get(frameCacheKey) ?? null
   ));
   const [thumbnailFailed, setThumbnailFailed] = useState(false);
   const [viewerOpen, setViewerOpen] = useState(false);
-  const [viewerSrc, setViewerSrc] = useState<string | null>(() => (
-    getCachedAttachmentPreviewObjectUrl(filePath, mimeType) ?? null
-  ));
 
   useEffect(() => {
     let disposed = false;
     setThumbnailFailed(false);
     setThumbnailFrame(markdownLocalImageFrameCache.get(frameCacheKey) ?? null);
 
-    const cachedThumbnail = getCachedAttachmentPreviewObjectUrl(filePath, mimeType, thumbnailOptions);
+    const cachedThumbnail = getCachedAttachmentImageAssetUrl(filePath, mimeType, thumbnailOptions);
     if (cachedThumbnail !== undefined) {
       setThumbnailSrc(cachedThumbnail);
       setThumbnailFailed(!cachedThumbnail);
@@ -332,7 +336,7 @@ function MarkdownLocalImage({ filePath, mimeType, alt }: MarkdownLocalImageProps
     }
 
     setThumbnailSrc(null);
-    void loadAttachmentPreviewObjectUrl(filePath, mimeType, thumbnailOptions)
+    void loadAttachmentImageAssetUrl(filePath, mimeType, thumbnailOptions)
       .then((nextThumbnailSrc) => {
         if (disposed) {
           return;
@@ -343,7 +347,25 @@ function MarkdownLocalImage({ filePath, mimeType, alt }: MarkdownLocalImageProps
       .catch(() => {
         if (!disposed) {
           setThumbnailSrc(null);
-          setThumbnailFailed(true);
+          const cachedFallback = getCachedAttachmentImageFallbackUrl(filePath, mimeType);
+          if (cachedFallback) {
+            setThumbnailSrc(cachedFallback);
+            setFullSrc(null);
+            return;
+          }
+          void loadAttachmentImageFallbackUrl(filePath, mimeType)
+            .then((fallbackSrc) => {
+              if (!disposed) {
+                setThumbnailSrc(fallbackSrc);
+                setFullSrc(null);
+                setThumbnailFailed(!fallbackSrc);
+              }
+            })
+            .catch(() => {
+              if (!disposed) {
+                setThumbnailFailed(true);
+              }
+            });
         }
       });
 
@@ -353,24 +375,53 @@ function MarkdownLocalImage({ filePath, mimeType, alt }: MarkdownLocalImageProps
   }, [filePath, frameCacheKey, mimeType]);
 
   useEffect(() => {
-    setViewerSrc(getCachedAttachmentPreviewObjectUrl(filePath, mimeType) ?? null);
+    let disposed = false;
+    const cachedFullSrc = getCachedAttachmentImageAssetUrl(filePath, mimeType);
+    setFullSrc(cachedFullSrc ?? null);
+    if (cachedFullSrc === undefined) {
+      void loadAttachmentImageAssetUrl(filePath, mimeType)
+        .then((nextFullSrc) => {
+          if (!disposed) {
+            setFullSrc(nextFullSrc);
+          }
+        })
+        .catch(() => {
+          if (!disposed) {
+            setFullSrc(null);
+          }
+        });
+    }
+    return () => {
+      disposed = true;
+    };
   }, [filePath, mimeType]);
 
-  const requestViewerPreview = useCallback(async (): Promise<string | null> => {
-    const cachedPreview = getCachedAttachmentPreviewObjectUrl(filePath, mimeType);
-    if (cachedPreview !== undefined) {
-      setViewerSrc(cachedPreview);
-      return cachedPreview;
+  const requestViewerFallback = useCallback(async (): Promise<string | null> => {
+    const cachedFallback = getCachedAttachmentImageFallbackUrl(filePath, mimeType);
+    if (cachedFallback !== undefined) {
+      if (cachedFallback) {
+        setThumbnailSrc(cachedFallback);
+        setFullSrc(null);
+      }
+      return cachedFallback;
     }
-
-    const previewSrc = await loadAttachmentPreviewObjectUrl(filePath, mimeType);
-    setViewerSrc(previewSrc);
-    return previewSrc;
+    const fallbackSrc = await loadAttachmentImageFallbackUrl(filePath, mimeType);
+    if (fallbackSrc) {
+      setThumbnailSrc(fallbackSrc);
+      setFullSrc(null);
+    }
+    return fallbackSrc;
   }, [filePath, mimeType]);
 
   function openViewer() {
     setViewerOpen(true);
-    void requestViewerPreview().catch(() => {});
+  }
+
+  function handleThumbnailError() {
+    setFullSrc(null);
+    void requestViewerFallback()
+      .then((fallbackSrc) => setThumbnailFailed(!fallbackSrc))
+      .catch(() => setThumbnailFailed(true));
   }
 
   function handleThumbnailLoad(event: SyntheticEvent<HTMLImageElement>) {
@@ -413,7 +464,7 @@ function MarkdownLocalImage({ filePath, mimeType, alt }: MarkdownLocalImageProps
             draggable={false}
             decoding="async"
             onLoad={handleThumbnailLoad}
-            onError={() => setThumbnailFailed(true)}
+            onError={handleThumbnailError}
           />
         ) : (
           <span className="markdown-local-image-placeholder">
@@ -427,9 +478,9 @@ function MarkdownLocalImage({ filePath, mimeType, alt }: MarkdownLocalImageProps
           filePath={filePath}
           fileName={fileName}
           mimeType={mimeType}
-          originalSrc={null}
-          previewSrc={viewerSrc ?? thumbnailSrc}
-          requestPreview={requestViewerPreview}
+          originalSrc={fullSrc}
+          previewSrc={thumbnailSrc}
+          requestPreview={requestViewerFallback}
           onClose={() => setViewerOpen(false)}
         />
       )}

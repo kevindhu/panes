@@ -1,3 +1,2 @@
 packages:
   - .
-  - src-tauri/src/sidecars/claude_agent

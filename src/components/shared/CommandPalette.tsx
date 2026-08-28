@@ -2192,12 +2192,12 @@ export function CommandPalette({ open, onClose }: Props) {
       const numTurns = Number.parseInt(subFlow.value, 10);
       if (!Number.isFinite(numTurns) || numTurns < 1) return;
       onClose();
-      const { activeThreadId, forkCodexThreadDroppingTurns } = useThreadStore.getState();
+      const { activeThreadId, rollbackCodexThread } = useThreadStore.getState();
       if (!activeThreadId) return;
       try {
-        const rolled = await forkCodexThreadDroppingTurns(activeThreadId, numTurns);
+        const rolled = await rollbackCodexThread(activeThreadId, numTurns);
         if (rolled) {
-          await activateThreadContext(rolled);
+          await activateThreadContext(rolled, { forceChatReload: true });
           toast.success(t("commandPalette.toasts.codexRolledBack", { count: numTurns }));
         }
       } catch (err) {

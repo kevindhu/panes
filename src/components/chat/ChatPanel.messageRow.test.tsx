@@ -5,9 +5,13 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Message } from "../../types";
 
-const mockReadAttachmentPreview = vi.hoisted(() =>
-  vi.fn(async () => null as { mimeType: string; dataBase64: string } | null),
-);
+const mockPrepareAttachmentImageAsset = vi.hoisted(() => vi.fn(async (
+  filePath: string,
+  mimeType?: string | null,
+) => ({ filePath, mimeType: mimeType ?? "image/png", version: "v1" })));
+const mockReadAttachmentImageBytes = vi.hoisted(() => vi.fn(async () => (
+  new ArrayBuffer(0)
+)));
 const mockConvertFileSrc = vi.hoisted(() => vi.fn((filePath: string) => `asset://${filePath}`));
 const mockIsTauri = vi.hoisted(() => vi.fn(() => true));
 
@@ -31,7 +35,8 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 vi.mock("../../lib/ipc", () => ({
   ipc: {
-    readAttachmentPreview: mockReadAttachmentPreview,
+    prepareAttachmentImageAsset: mockPrepareAttachmentImageAsset,
+    readAttachmentImageBytes: mockReadAttachmentImageBytes,
     appendBranchProfileLog: vi.fn(async () => undefined),
   },
 }));
@@ -143,11 +148,14 @@ describe("MessageRowView editing attachments", () => {
           assistantLabel=""
           assistantEngineId="codex"
           canEditUserMessages
+          canForkAssistantMessages={false}
+          forkingMessageId={null}
           editingMessageId="user-1"
           editingDraftText="Please revise this"
           editingDraftAttachments={attachments}
           editingBusy={false}
           onStartEdit={vi.fn()}
+          onForkMessage={vi.fn()}
           onChangeEditText={vi.fn()}
           onRemoveEditAttachment={(attachmentId) =>
             setAttachments((current) =>
@@ -193,11 +201,14 @@ describe("MessageRowView editing attachments", () => {
           assistantLabel=""
           assistantEngineId="codex"
           canEditUserMessages
+          canForkAssistantMessages={false}
+          forkingMessageId={null}
           editingMessageId="user-1"
           editingDraftText="Please revise this"
           editingDraftAttachments={[]}
           editingBusy={false}
           onStartEdit={vi.fn()}
+          onForkMessage={vi.fn()}
           onChangeEditText={vi.fn()}
           onRemoveEditAttachment={vi.fn()}
           onPasteEditAttachments={onPasteEditAttachments}
@@ -237,20 +248,25 @@ describe("MessageRowView editing attachments", () => {
   });
 
   it("shows task duration at the bottom of completed assistant messages", async () => {
+    const message = createAssistantMessage();
+    const onForkMessage = vi.fn();
     await act(async () => {
       root.render(
         <MessageRowView
-          message={createAssistantMessage()}
+          message={message}
           index={0}
           isHighlighted={false}
           assistantLabel=""
           assistantEngineId="codex"
           canEditUserMessages
+          canForkAssistantMessages
+          forkingMessageId={null}
           editingMessageId={null}
           editingDraftText=""
           editingDraftAttachments={[]}
           editingBusy={false}
           onStartEdit={vi.fn()}
+          onForkMessage={onForkMessage}
           onChangeEditText={vi.fn()}
           onRemoveEditAttachment={vi.fn()}
           onPasteEditAttachments={vi.fn()}
@@ -263,6 +279,15 @@ describe("MessageRowView editing attachments", () => {
     });
 
     expect(container.textContent).toContain("Task took 2m 3s.");
+    const forkButton = container.querySelector(
+      '[aria-label="panel.messageActions.fork"]',
+    ) as HTMLButtonElement | null;
+    expect(forkButton).not.toBeNull();
+
+    await act(async () => {
+      forkButton?.click();
+    });
+    expect(onForkMessage).toHaveBeenCalledWith(message);
   });
 });
 describe("shouldVirtualizeMessages", () => {

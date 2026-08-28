@@ -1,8 +1,9 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
-    path::Path,
-    time::{Duration, Instant},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use anyhow::Context;
@@ -11,8 +12,9 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, value::RawValue, Value};
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 use tokio::fs as tokio_fs;
+use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -670,9 +672,10 @@ pub struct ChatAttachmentPayload {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AttachmentPreviewPayload {
+pub struct PreparedAttachmentImageAssetPayload {
+    pub file_path: String,
     pub mime_type: String,
-    pub data_base64: String,
+    pub version: String,
 }
 
 #[tauri::command]
@@ -724,39 +727,94 @@ pub async fn save_pasted_image_attachment(
 }
 
 #[tauri::command]
-pub async fn read_attachment_preview(
+pub async fn prepare_attachment_image_asset(
+    app: tauri::AppHandle,
     file_path: String,
     mime_type: Option<String>,
-) -> Result<Option<AttachmentPreviewPayload>, String> {
-    let file_path = file_path.trim().to_string();
-    if file_path.is_empty() {
-        return Ok(None);
-    }
-
-    let Some(preview_mime_type) =
-        normalize_image_preview_mime_type(&file_path, mime_type.as_deref())
-    else {
-        return Ok(None);
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+) -> Result<PreparedAttachmentImageAssetPayload, String> {
+    let (source_path, source_mime_type, metadata) =
+        validate_attachment_image_file(&file_path, mime_type.as_deref()).await?;
+    let source_version = attachment_asset_version(&metadata);
+    let thumbnail_bounds = match (max_width, max_height) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => {
+            Some((width.min(2_048), height.min(2_048)))
+        }
+        _ => None,
     };
 
-    let metadata = tokio_fs::metadata(&file_path)
-        .await
-        .map_err(|error| format!("failed to read attachment metadata: {error}"))?;
-    if !metadata.is_file() {
-        return Ok(None);
-    }
-    if metadata.len() > MAX_PASTED_IMAGE_ATTACHMENT_BYTES as u64 {
-        return Ok(None);
-    }
+    let (asset_path, asset_mime_type, version) = if let Some((max_width, max_height)) =
+        thumbnail_bounds
+    {
+        let cache_dir = runtime_env::app_data_dir()
+            .join("cache")
+            .join("image-thumbnails");
+        tokio_fs::create_dir_all(&cache_dir)
+            .await
+            .map_err(|error| format!("failed to create image thumbnail cache: {error}"))?;
 
+        let source_path_for_thumbnail = source_path.clone();
+        let source_mime_for_thumbnail = source_mime_type.clone();
+        let source_version_for_thumbnail = source_version.clone();
+        let thumbnail = tokio::task::spawn_blocking(move || {
+            prepare_cached_attachment_thumbnail(
+                &source_path_for_thumbnail,
+                &source_mime_for_thumbnail,
+                &source_version_for_thumbnail,
+                &cache_dir,
+                max_width,
+                max_height,
+            )
+        })
+        .await
+        .map_err(|error| format!("failed to join image thumbnail task: {error}"))?;
+
+        match thumbnail {
+            Ok(Some(thumbnail_path)) => {
+                let thumbnail_metadata = std::fs::metadata(&thumbnail_path)
+                    .map_err(|error| format!("failed to read cached image thumbnail: {error}"))?;
+                (
+                    thumbnail_path,
+                    "image/png".to_string(),
+                    attachment_asset_version(&thumbnail_metadata),
+                )
+            }
+            Ok(None) => (source_path, source_mime_type, source_version),
+            Err(error) => {
+                log::warn!(
+                    "failed to prepare thumbnail for `{}`; using original image: {error}",
+                    source_path.display()
+                );
+                (source_path, source_mime_type, source_version)
+            }
+        }
+    } else {
+        (source_path, source_mime_type, source_version)
+    };
+
+    app.asset_protocol_scope()
+        .allow_file(&asset_path)
+        .map_err(|error| format!("failed to authorize attachment image asset: {error}"))?;
+
+    Ok(PreparedAttachmentImageAssetPayload {
+        file_path: asset_path.to_string_lossy().into_owned(),
+        mime_type: asset_mime_type,
+        version,
+    })
+}
+
+#[tauri::command]
+pub async fn read_attachment_image_bytes(
+    file_path: String,
+    mime_type: Option<String>,
+) -> Result<tauri::ipc::Response, String> {
+    let (file_path, _, _) =
+        validate_attachment_image_file(&file_path, mime_type.as_deref()).await?;
     let bytes = tokio_fs::read(&file_path)
         .await
-        .map_err(|error| format!("failed to read attachment preview: {error}"))?;
-
-    Ok(Some(AttachmentPreviewPayload {
-        mime_type: preview_mime_type,
-        data_base64: BASE64.encode(bytes),
-    }))
+        .map_err(|error| format!("failed to read attachment image: {error}"))?;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 #[tauri::command]
@@ -817,6 +875,193 @@ fn normalize_image_preview_mime_type(file_path: &str, mime_type: Option<&str>) -
         .and_then(|value| value.to_str())?
         .to_lowercase();
     image_mime_type_for_extension(&extension).map(ToOwned::to_owned)
+}
+
+async fn validate_attachment_image_file(
+    file_path: &str,
+    mime_type: Option<&str>,
+) -> Result<(PathBuf, String, std::fs::Metadata), String> {
+    let normalized_file_path = file_path.trim();
+    if normalized_file_path.is_empty() {
+        return Err("Attachment path is empty.".to_string());
+    }
+
+    let canonical_path = tokio_fs::canonicalize(normalized_file_path)
+        .await
+        .map(normalize_canonical_asset_path)
+        .map_err(|error| format!("failed to resolve attachment image path: {error}"))?;
+    let resolved_mime_type = attachment_image_mime_type(&canonical_path, mime_type)
+        .ok_or_else(|| "Attachment is not a supported image.".to_string())?;
+    let metadata = tokio_fs::metadata(&canonical_path)
+        .await
+        .map_err(|error| format!("failed to read attachment image metadata: {error}"))?;
+    if !metadata.is_file() {
+        return Err("Attachment image path does not point to a file.".to_string());
+    }
+    if metadata.len() == 0 {
+        return Err("Attachment image is empty.".to_string());
+    }
+    if metadata.len() > MAX_PASTED_IMAGE_ATTACHMENT_BYTES as u64 {
+        return Err("Attachment image exceeds the 10 MB preview limit.".to_string());
+    }
+    validate_attachment_image_signature(&canonical_path, &resolved_mime_type).await?;
+
+    Ok((canonical_path, resolved_mime_type, metadata))
+}
+
+fn attachment_image_mime_type(
+    file_path: &Path,
+    fallback_mime_type: Option<&str>,
+) -> Option<String> {
+    let extension = file_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase);
+    let extension_mime_type = extension.as_deref().and_then(image_mime_type_for_extension);
+    extension_mime_type.map(ToOwned::to_owned).or_else(|| {
+        let normalized = fallback_mime_type?.trim().to_lowercase();
+        matches!(
+            normalized.as_str(),
+            "image/png"
+                | "image/jpeg"
+                | "image/jpg"
+                | "image/gif"
+                | "image/webp"
+                | "image/bmp"
+                | "image/tiff"
+                | "image/svg+xml"
+        )
+        .then(|| {
+            if normalized == "image/jpg" {
+                "image/jpeg".to_string()
+            } else {
+                normalized
+            }
+        })
+    })
+}
+
+async fn validate_attachment_image_signature(
+    file_path: &Path,
+    mime_type: &str,
+) -> Result<(), String> {
+    let mut file = tokio_fs::File::open(file_path)
+        .await
+        .map_err(|error| format!("failed to inspect attachment image: {error}"))?;
+    let mut header = vec![0_u8; 8_192];
+    let read = file
+        .read(&mut header)
+        .await
+        .map_err(|error| format!("failed to inspect attachment image: {error}"))?;
+    header.truncate(read);
+
+    let signature_matches = match mime_type {
+        "image/png" => header.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => header.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/gif" => header.starts_with(b"GIF87a") || header.starts_with(b"GIF89a"),
+        "image/webp" => {
+            header.len() >= 12 && header.starts_with(b"RIFF") && &header[8..12] == b"WEBP"
+        }
+        "image/bmp" => header.starts_with(b"BM"),
+        "image/tiff" => {
+            header.starts_with(b"II*\0")
+                || header.starts_with(b"MM\0*")
+                || header.starts_with(b"II+\0")
+                || header.starts_with(b"MM\0+")
+        }
+        "image/svg+xml" => String::from_utf8_lossy(&header)
+            .to_ascii_lowercase()
+            .contains("<svg"),
+        _ => false,
+    };
+
+    if signature_matches {
+        Ok(())
+    } else {
+        Err("Attachment file contents do not match a supported image format.".to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_canonical_asset_path(path: PathBuf) -> PathBuf {
+    let value = path.to_string_lossy();
+    if let Some(unc_path) = value.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{unc_path}"));
+    }
+    if let Some(drive_path) = value.strip_prefix(r"\\?\") {
+        return PathBuf::from(drive_path);
+    }
+    path
+}
+
+#[cfg(not(target_os = "windows"))]
+fn normalize_canonical_asset_path(path: PathBuf) -> PathBuf {
+    path
+}
+
+fn attachment_asset_version(metadata: &std::fs::Metadata) -> String {
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{:x}-{modified_nanos:x}", metadata.len())
+}
+
+fn prepare_cached_attachment_thumbnail(
+    source_path: &Path,
+    source_mime_type: &str,
+    source_version: &str,
+    cache_dir: &Path,
+    max_width: u32,
+    max_height: u32,
+) -> Result<Option<PathBuf>, String> {
+    if source_mime_type == "image/svg+xml" {
+        return Ok(None);
+    }
+
+    let mut hasher = DefaultHasher::new();
+    source_path.hash(&mut hasher);
+    source_version.hash(&mut hasher);
+    max_width.hash(&mut hasher);
+    max_height.hash(&mut hasher);
+    let cache_path = cache_dir.join(format!("{:016x}.png", hasher.finish()));
+    if cache_path.is_file() {
+        return Ok(Some(cache_path));
+    }
+
+    let image = image::ImageReader::open(source_path)
+        .map_err(|error| format!("failed to open image: {error}"))?
+        .with_guessed_format()
+        .map_err(|error| format!("failed to detect image format: {error}"))?
+        .decode()
+        .map_err(|error| format!("failed to decode image: {error}"))?;
+    if image.width() <= max_width && image.height() <= max_height {
+        return Ok(None);
+    }
+
+    let thumbnail = image.thumbnail(max_width, max_height);
+    let temporary_path = cache_dir.join(format!(
+        ".{:016x}-{}.tmp.png",
+        hasher.finish(),
+        Uuid::new_v4().simple()
+    ));
+    thumbnail
+        .save_with_format(&temporary_path, image::ImageFormat::Png)
+        .map_err(|error| format!("failed to encode image thumbnail: {error}"))?;
+
+    match std::fs::rename(&temporary_path, &cache_path) {
+        Ok(()) => Ok(Some(cache_path)),
+        Err(_) if cache_path.is_file() => {
+            let _ = std::fs::remove_file(&temporary_path);
+            Ok(Some(cache_path))
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary_path);
+            Err(format!("failed to cache image thumbnail: {error}"))
+        }
+    }
 }
 
 fn image_mime_type_for_extension(extension: &str) -> Option<&'static str> {
@@ -1023,20 +1268,9 @@ pub async fn send_message(
         configured_reasoning_effort.clone()
     };
     let sandbox_mode_override = thread_sandbox_mode(thread.engine_metadata.as_ref())?;
-    let supports_panes_sandbox = thread.engine_id != "opencode";
-    let sandbox_mode = if supports_panes_sandbox {
-        Some(sandbox_mode_override.clone().unwrap_or_else(|| {
-            default_sandbox_mode_for_engine(thread.engine_id.as_str()).to_string()
-        }))
-    } else {
-        if sandbox_mode_override.is_some() {
-            log::warn!(
-                "ignoring sandbox mode override on OpenCode thread {}",
-                thread.id
-            );
-        }
-        None
-    };
+    let sandbox_mode = Some(sandbox_mode_override.clone().unwrap_or_else(|| {
+        default_sandbox_mode_for_engine(thread.engine_id.as_str()).to_string()
+    }));
     let workspace_writable_roots = if selected_repo.is_some() {
         None
     } else {
@@ -1187,7 +1421,6 @@ pub async fn send_message(
         service_tier: thread_service_tier(thread.engine_metadata.as_ref()),
         personality,
         output_schema: thread_output_schema(thread.engine_metadata.as_ref()),
-        opencode_agent: thread_opencode_agent(thread.engine_metadata.as_ref()),
     };
 
     let engine_thread_id = state
@@ -2285,7 +2518,7 @@ async fn run_turn(
             initial_turn_model_id
         );
         log::info!("{message}");
-        crate::diagnostic_logs::append_codex_event_routing_log(&message);
+        let _ = crate::diagnostic_logs::append_codex_event_routing_log(&message);
     }
 
     let engines = state.engines.clone();
@@ -2326,6 +2559,7 @@ async fn run_turn(
 
     let initial_turn_started_event = EngineEvent::TurnStarted {
         client_turn_id: client_turn_id.clone(),
+        native_turn_id: None,
     };
     let initial_progress = process_stream_event(
         &app,
@@ -2934,6 +3168,7 @@ async fn run_codex_review_turn(
 
     let initial_turn_started_event = EngineEvent::TurnStarted {
         client_turn_id: None,
+        native_turn_id: None,
     };
     let initial_progress = process_stream_event(
         &app,
@@ -3642,6 +3877,26 @@ async fn process_stream_event(
     }
 
     match &normalized_event {
+        EngineEvent::TurnStarted {
+            native_turn_id: Some(native_turn_id),
+            ..
+        } => {
+            if let Err(error) = run_db(state.db.clone(), {
+                let assistant_message_id = assistant_message_id.to_string();
+                let native_turn_id = native_turn_id.clone();
+                move |db| {
+                    db::messages::update_assistant_native_turn_id(
+                        db,
+                        &assistant_message_id,
+                        &native_turn_id,
+                    )
+                }
+            })
+            .await
+            {
+                log::warn!("failed to persist Codex native turn id: {error}");
+            }
+        }
         EngineEvent::ActionStarted {
             action_id,
             engine_action_id,
@@ -4813,49 +5068,28 @@ fn aggregate_workspace_trust_level(repos: &[RepoDto]) -> TrustLevelDto {
 }
 
 fn approval_policy_for_engine_and_trust_level(
-    engine_id: &str,
+    _engine_id: &str,
     _trust_level: &TrustLevelDto,
 ) -> &'static str {
-    match engine_id {
-        "claude" => "trusted",
-        "opencode" => "allow",
-        _ => "never",
-    }
+    "never"
 }
 
 fn allow_network_for_trust_level(_trust_level: &TrustLevelDto) -> bool {
     true
 }
 
-fn default_sandbox_mode_for_engine(engine_id: &str) -> &'static str {
-    match engine_id {
-        "codex" => "danger-full-access",
-        _ => "workspace-write",
-    }
+fn default_sandbox_mode_for_engine(_engine_id: &str) -> &'static str {
+    "danger-full-access"
 }
 
 fn thread_approval_policy_override_value(
-    engine_id: &str,
+    _engine_id: &str,
     metadata: Option<&Value>,
 ) -> Result<Option<Value>, String> {
-    match engine_id {
-        "claude" => Ok(metadata
-            .and_then(|value| value.get("claudePermissionMode"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| matches!(*value, "trusted" | "standard" | "restricted"))
-            .map(|value| Value::String(value.to_string()))),
-        "opencode" => Ok(metadata
-            .and_then(|value| value.get("opencodePermissionMode"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| matches!(*value, "ask" | "allow" | "deny"))
-            .map(|value| Value::String(value.to_string()))),
-        _ => metadata
-            .and_then(|value| value.get("sandboxApprovalPolicy"))
-            .map(normalize_codex_approval_policy_value)
-            .transpose(),
-    }
+    metadata
+        .and_then(|value| value.get("sandboxApprovalPolicy"))
+        .map(normalize_codex_approval_policy_value)
+        .transpose()
 }
 
 fn thread_allow_network_override(metadata: Option<&Value>) -> Option<bool> {
@@ -5062,15 +5296,6 @@ fn thread_approvals_reviewer(metadata: Option<&Value>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn thread_opencode_agent(metadata: Option<&Value>) -> Option<String> {
-    metadata
-        .and_then(|value| value.get("opencodeAgent"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
 fn normalize_reasoning_effort_value(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -5195,12 +5420,10 @@ mod tests {
         config::app_config::AppConfig,
         db,
         engines::EngineManager,
-        git::{repo::FileTreeCache, watcher::GitWatcherManager},
+        file_tree::FileTreeCache,
         models::{EngineCapabilitiesDto, ReasoningEffortOptionDto},
         power::KeepAwakeManager,
         state::{AppState, TurnManager},
-        terminal::TerminalManager,
-        terminal_notifications::TerminalNotificationManager,
     };
     use rusqlite::params;
     use uuid::Uuid;
@@ -5213,11 +5436,7 @@ mod tests {
         AppState {
             db,
             config: Arc::new(AppConfig::default()),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             engines: Arc::new(EngineManager::new()),
-            git_watchers: Arc::new(GitWatcherManager::default()),
-            terminals: Arc::new(TerminalManager::default()),
-            notifications: Arc::new(TerminalNotificationManager::default()),
             keep_awake: Arc::new(KeepAwakeManager::new()),
             turns: Arc::new(TurnManager::default()),
             file_tree_cache: Arc::new(FileTreeCache::new()),
@@ -6107,6 +6326,83 @@ mod tests {
             pasted_image_extension("pasted-image-1.png", "image/heic"),
             None
         );
+    }
+
+    #[test]
+    fn cached_attachment_thumbnail_is_bounded_and_reused() {
+        let root = std::env::temp_dir().join(format!("panes-image-thumbnail-{}", Uuid::new_v4()));
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&cache_dir).expect("create thumbnail cache");
+        let source_path = root.join("source.png");
+        image::RgbaImage::from_pixel(120, 80, image::Rgba([12, 34, 56, 255]))
+            .save(&source_path)
+            .expect("save source image");
+        let metadata = fs::metadata(&source_path).expect("source metadata");
+        let version = attachment_asset_version(&metadata);
+
+        let first = prepare_cached_attachment_thumbnail(
+            &source_path,
+            "image/png",
+            &version,
+            &cache_dir,
+            30,
+            30,
+        )
+        .expect("prepare first thumbnail")
+        .expect("large source should produce a thumbnail");
+        let decoded = image::open(&first).expect("decode cached thumbnail");
+        assert!(decoded.width() <= 30);
+        assert!(decoded.height() <= 30);
+
+        let second = prepare_cached_attachment_thumbnail(
+            &source_path,
+            "image/png",
+            &version,
+            &cache_dir,
+            30,
+            30,
+        )
+        .expect("reuse cached thumbnail")
+        .expect("cached thumbnail should exist");
+        assert_eq!(first, second);
+
+        fs::remove_dir_all(&root).expect("remove thumbnail test directory");
+    }
+
+    #[test]
+    fn svg_thumbnail_preparation_uses_the_original_asset() {
+        let source_path = Path::new("example.svg");
+        let cache_dir = Path::new("unused-cache");
+        assert_eq!(
+            prepare_cached_attachment_thumbnail(
+                source_path,
+                "image/svg+xml",
+                "version",
+                cache_dir,
+                720,
+                440,
+            )
+            .expect("SVG thumbnail preparation should not fail"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_asset_validation_rejects_non_image_contents() {
+        let root = std::env::temp_dir().join(format!("panes-image-validation-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create image validation directory");
+        let fake_image = root.join("not-an-image.png");
+        fs::write(&fake_image, b"not actually a PNG").expect("write fake image");
+
+        let error = validate_attachment_image_file(
+            fake_image.to_string_lossy().as_ref(),
+            Some("image/png"),
+        )
+        .await
+        .expect_err("fake image should be rejected");
+        assert!(error.contains("do not match"));
+
+        fs::remove_dir_all(&root).expect("remove image validation directory");
     }
 
     #[test]

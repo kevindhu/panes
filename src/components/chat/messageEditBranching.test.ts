@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Message } from "../../types";
 import {
   computeDroppedTurnsForEditedMessage,
+  computeTurnsAfterAssistantMessage,
   extractEditableMessageContext,
   isEditableUserTurn,
   mergeUniqueChatAttachments,
@@ -96,6 +97,22 @@ describe("messageEditBranching", () => {
     expect(isEditableUserTurn(messages[2])).toBe(false);
     expect(computeDroppedTurnsForEditedMessage(messages, "user-1")).toBe(2);
     expect(computeDroppedTurnsForEditedMessage(messages, "steer-1")).toBeNull();
+  });
+
+  it("counts only later native turns when forking from an assistant response", () => {
+    const messages = [
+      createUserMessage("user-1", "First"),
+      createAssistantMessage("assistant-1", "Reply"),
+      createUserMessage("steer-1", "Follow this instead", { isSteer: true }),
+      createUserMessage("user-2", "Second"),
+      createAssistantMessage("assistant-2", "Reply"),
+      createUserMessage("user-3", "Third"),
+      createAssistantMessage("assistant-3", "Reply"),
+    ];
+
+    expect(computeTurnsAfterAssistantMessage(messages, "assistant-1")).toBe(2);
+    expect(computeTurnsAfterAssistantMessage(messages, "assistant-3")).toBe(0);
+    expect(computeTurnsAfterAssistantMessage(messages, "user-1")).toBeNull();
   });
 
   it("extracts editable text, attachments, and plan mode from a user message", () => {

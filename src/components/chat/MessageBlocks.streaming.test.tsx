@@ -5,9 +5,13 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ContentBlock } from "../../types";
 
-const mockReadAttachmentPreview = vi.hoisted(() =>
-  vi.fn(async () => null as { mimeType: string; dataBase64: string } | null),
-);
+const mockPrepareAttachmentImageAsset = vi.hoisted(() => vi.fn(async (
+  filePath: string,
+  mimeType?: string | null,
+) => ({ filePath, mimeType: mimeType ?? "image/png", version: "v1" })));
+const mockReadAttachmentImageBytes = vi.hoisted(() => vi.fn(async () => (
+  new ArrayBuffer(0)
+)));
 const mockConvertFileSrc = vi.hoisted(() => vi.fn((filePath: string) => `asset://${filePath}`));
 const mockIsTauri = vi.hoisted(() => vi.fn(() => true));
 
@@ -28,7 +32,8 @@ vi.mock("@tauri-apps/plugin-shell", () => ({
 
 vi.mock("../../lib/ipc", () => ({
   ipc: {
-    readAttachmentPreview: mockReadAttachmentPreview,
+    prepareAttachmentImageAsset: mockPrepareAttachmentImageAsset,
+    readAttachmentImageBytes: mockReadAttachmentImageBytes,
   },
 }));
 
@@ -96,6 +101,37 @@ describe("MessageBlocks streaming text", () => {
     const renderedMarkdown = container.querySelector("[data-markdown-streaming]");
     expect(renderedMarkdown?.getAttribute("data-markdown-streaming")).toBe("true");
     expect(container.textContent).toContain("Turn still open");
+    expect(container.querySelector("svg.animate-spin")).not.toBeNull();
+  });
+
+  it("does not render turn status for a completed user message", async () => {
+    const blocks: ContentBlock[] = [
+      { type: "text", content: "This is only the user prompt" },
+      {
+        type: "notice",
+        kind: "turn_status",
+        level: "info",
+        title: "Turn completed",
+        message: "The turn reached a terminal completion.",
+        status: "completed",
+      },
+    ];
+
+    await act(async () => {
+      root.render(
+        <MessageBlocks
+          blocks={blocks}
+          status="completed"
+          messageRole="user"
+          onApproval={vi.fn()}
+          onLoadActionOutput={vi.fn(async () => undefined)}
+        />,
+      );
+    });
+
+    expect(container.textContent).toContain("This is only the user prompt");
+    expect(container.textContent).not.toContain("Turn completed");
+    expect(container.textContent).not.toContain("terminal completion");
   });
 
   it.each([

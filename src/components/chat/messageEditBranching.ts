@@ -46,6 +46,25 @@ export function computeDroppedTurnsForEditedMessage(
   return userTurnIds.length - selectedIndex;
 }
 
+export function computeTurnsAfterAssistantMessage(
+  messages: Message[],
+  messageId: string,
+): number | null {
+  const selectedIndex = messages.findIndex((message) => message.id === messageId);
+  if (
+    selectedIndex < 0 ||
+    messages[selectedIndex].role !== "assistant" ||
+    messages[selectedIndex].status === "streaming"
+  ) {
+    return null;
+  }
+
+  return messages
+    .slice(selectedIndex + 1)
+    .filter((message) => message.role === "user" && !messageHasSteerMarker(message))
+    .length;
+}
+
 export interface EditableMessageContext {
   text: string;
   attachments: ChatAttachment[];

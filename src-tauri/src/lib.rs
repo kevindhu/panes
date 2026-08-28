@@ -4,8 +4,8 @@ mod config;
 mod db;
 mod diagnostic_logs;
 mod engines;
+mod file_tree;
 mod fs_ops;
-mod git;
 #[cfg(any(target_os = "linux", test))]
 mod linux_appimage;
 mod linux_webkit;
@@ -16,9 +16,6 @@ mod power;
 mod process_utils;
 mod runtime_env;
 mod state;
-mod terminal;
-mod terminal_notifications;
-mod workspace_startup;
 
 use std::sync::Arc;
 
@@ -28,8 +25,7 @@ use rusqlite::OptionalExtension;
 use config::app_config::AppConfig;
 use db::Database;
 use engines::{CodexRuntimeEvent, EngineManager};
-use git::repo::FileTreeCache;
-use git::watcher::GitWatcherManager;
+use file_tree::FileTreeCache;
 #[cfg(target_os = "macos")]
 use locale::native_strings;
 use models::{
@@ -39,19 +35,15 @@ use power::KeepAwakeManager;
 use state::{AppState, TurnManager};
 #[cfg(target_os = "macos")]
 use tauri::menu::{AboutMetadata, MenuItem, PredefinedMenuItem, SubmenuBuilder};
-use tauri::{image::Image, menu::Menu, Emitter, Manager, RunEvent, WebviewWindowBuilder};
-use terminal::TerminalManager;
-
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use tauri::image::Image;
+use tauri::{menu::Menu, Emitter, Manager, RunEvent, WebviewWindowBuilder};
 pub fn maybe_handle_cli_subcommand() -> anyhow::Result<bool> {
-    terminal_notifications::maybe_handle_cli_subcommand()
+    Ok(false)
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    env_logger::init();
-    linux_webkit::apply_webkit_display_workarounds();
-
-    let db = Database::init().expect("failed to initialize database");
+fn initialize_app_state() -> anyhow::Result<AppState> {
+    let db = Database::init().context("failed to initialize database")?;
     match db::threads::reconcile_runtime_state(&db) {
         Ok(report) => {
             if report.messages_marked_interrupted > 0 || report.thread_status_updates > 0 {
@@ -66,7 +58,8 @@ pub fn run() {
             log::warn!("runtime recovery failed, continuing startup: {error}");
         }
     }
-    let app_config = AppConfig::load_or_create().expect("failed to load config");
+
+    let app_config = AppConfig::load_or_create().context("failed to load config")?;
     let keep_awake = Arc::new(KeepAwakeManager::new());
     if let Err(error) = keep_awake.reclaim_stale_helpers() {
         log::warn!("failed to reclaim stale keep awake helper: {error}");
@@ -79,32 +72,46 @@ pub fn run() {
         }
     }
 
-    let _ =
-        db::workspaces::ensure_default_workspace(&db).expect("failed to ensure default workspace");
+    let _ = db::workspaces::ensure_default_workspace(&db)
+        .context("failed to ensure default workspace")?;
 
-    let app_state = AppState {
+    Ok(AppState {
         db,
         config: Arc::new(app_config),
-        config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         engines: Arc::new(EngineManager::new()),
-        git_watchers: Arc::new(GitWatcherManager::default()),
-        terminals: Arc::new(TerminalManager::default()),
-        notifications: Arc::new(terminal_notifications::TerminalNotificationManager::default()),
         keep_awake,
         turns: Arc::new(TurnManager::default()),
         file_tree_cache: Arc::new(FileTreeCache::new()),
-    };
+    })
+}
 
-    let app = tauri::Builder::default()
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    env_logger::init();
+    linux_webkit::apply_webkit_display_workarounds();
+
+    let builder = tauri::Builder::default();
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        }
+    }));
+
+    let app = builder
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .manage(app_state)
         .menu(build_app_menu)
         .setup(|app| {
+            // The single-instance plugin is registered before this setup
+            // callback, so a duplicate launch exits before touching SQLite.
+            let _ = app.manage(initialize_app_state()?);
+
             let main_window_config = app
                 .config()
                 .app
@@ -155,20 +162,12 @@ pub fn run() {
             });
 
             let handle = app.handle().clone();
-            let resource_dir = app.path().resource_dir().ok();
             let state = app.state::<AppState>().inner().clone();
-            if let Err(error) =
-                tauri::async_runtime::block_on(state.notifications.start(handle.clone()))
-            {
-                log::warn!("failed to start terminal notification ingress: {error}");
-            }
-            state.engines.set_resource_dir(resource_dir);
             tauri::async_runtime::spawn(run_codex_runtime_bridge(handle.clone(), state.clone()));
             app.on_menu_event(move |_app, event| {
                 let id = event.id().as_ref();
                 match id {
-                    "toggle-sidebar" | "toggle-git-panel" | "toggle-focus-mode"
-                    | "toggle-fullscreen" | "toggle-search" | "toggle-terminal" | "zoom-in"
+                    "toggle-sidebar" | "toggle-fullscreen" | "toggle-search" | "zoom-in"
                     | "zoom-out" | "reset-zoom" | "close-window" | "edit-undo" | "edit-redo"
                     | "edit-cut" | "edit-copy" | "edit-paste" | "edit-select-all" => {
                         let _ = handle.emit("menu-action", id);
@@ -186,7 +185,8 @@ pub fn run() {
             commands::power::get_helper_status,
             commands::power::register_keep_awake_helper,
             commands::chat::save_pasted_image_attachment,
-            commands::chat::read_attachment_preview,
+            commands::chat::prepare_attachment_image_asset,
+            commands::chat::read_attachment_image_bytes,
             commands::chat::copy_attachment_image_to_clipboard,
             commands::chat::send_message,
             commands::chat::start_codex_review,
@@ -205,64 +205,12 @@ pub fn run() {
             commands::workspace::list_archived_workspaces,
             commands::workspace::get_repos,
             commands::workspace::set_repo_trust_level,
-            commands::workspace::set_repo_git_active,
-            commands::workspace::set_workspace_git_active_repos,
-            commands::workspace::has_workspace_git_selection,
             commands::workspace::archive_workspace,
             commands::workspace::restore_workspace,
             commands::workspace::delete_workspace,
-            commands::workspace::get_workspace_startup_preset,
-            commands::workspace::normalize_workspace_startup_preset,
-            commands::workspace::serialize_workspace_startup_preset,
-            commands::workspace::normalize_workspace_startup_preset_raw,
-            commands::workspace::set_workspace_startup_preset,
-            commands::workspace::set_workspace_startup_preset_raw,
-            commands::workspace::clear_workspace_startup_preset,
-            commands::workspace::export_workspace_startup_preset,
             commands::workspace::list_workspace_dirs,
             commands::workspace::get_workspace_file_tree_page,
             commands::workspace::search_workspace_files,
-            commands::git::get_git_status,
-            commands::git::get_file_diff,
-            commands::git::get_git_file_compare,
-            commands::git::stage_files,
-            commands::git::unstage_files,
-            commands::git::discard_files,
-            commands::git::commit,
-            commands::git::soft_reset_last_commit,
-            commands::git::fetch_git,
-            commands::git::pull_git,
-            commands::git::push_git,
-            commands::git::list_git_branches,
-            commands::git::checkout_git_branch,
-            commands::git::create_git_branch,
-            commands::git::rename_git_branch,
-            commands::git::delete_git_branch,
-            commands::git::list_git_commits,
-            commands::git::get_commit_diff,
-            commands::git::list_git_stashes,
-            commands::git::push_git_stash,
-            commands::git::apply_git_stash,
-            commands::git::pop_git_stash,
-            commands::git::get_file_tree,
-            commands::git::get_file_tree_page,
-            commands::git::add_git_worktree,
-            commands::git::list_git_worktrees,
-            commands::git::remove_git_worktree,
-            commands::git::prune_git_worktrees,
-            commands::git::init_git_repo,
-            commands::git::list_git_remotes,
-            commands::git::add_git_remote,
-            commands::git::remove_git_remote,
-            commands::git::rename_git_remote,
-            commands::app::get_terminal_accelerated_rendering,
-            commands::app::set_terminal_accelerated_rendering,
-            commands::app::get_agent_notification_settings,
-            commands::app::set_chat_notifications_enabled,
-            commands::app::set_terminal_notifications_enabled,
-            commands::app::install_terminal_notification_integration_command,
-            commands::app::set_notification_sound,
-            commands::app::preview_notification_sound,
             commands::app::show_agent_notification,
             commands::files::list_dir,
             commands::files::read_file,
@@ -274,67 +222,43 @@ pub fn run() {
             commands::files::delete_path,
             commands::files::reveal_path,
             commands::files::open_path_with_default_app,
-            commands::git::watch_git_repo,
             commands::engines::list_engines,
             commands::engines::engine_health,
             commands::engines::prewarm_engine,
             commands::engines::list_codex_skills,
             commands::engines::list_codex_apps,
-            commands::engines::get_opencode_runtime_catalog,
             commands::engines::run_engine_check,
             commands::threads::list_threads,
             commands::threads::list_archived_threads,
             commands::threads::list_codex_remote_threads,
             commands::threads::attach_codex_remote_thread,
-            commands::threads::list_opencode_remote_sessions,
-            commands::threads::attach_opencode_remote_session,
             commands::threads::create_thread,
             commands::threads::rename_thread,
             commands::threads::confirm_workspace_thread,
             commands::threads::set_thread_reasoning_effort,
             commands::threads::set_thread_execution_policy,
             commands::threads::set_thread_codex_config,
-            commands::threads::set_thread_opencode_config,
             commands::threads::archive_thread,
             commands::threads::restore_thread,
             commands::threads::sync_thread_from_engine,
             commands::threads::refresh_thread_usage_limits,
             commands::threads::append_branch_profile_log,
             commands::threads::fork_codex_thread,
-            commands::threads::fork_codex_thread_dropping_turns,
+            commands::threads::fork_codex_thread_at_turn,
+            commands::threads::rollback_codex_thread,
             commands::threads::compact_codex_thread,
             commands::threads::delete_thread,
-            commands::terminal::terminal_create_session,
-            commands::terminal::terminal_write,
-            commands::terminal::terminal_write_bytes,
-            commands::terminal::terminal_resize,
-            commands::terminal::terminal_close_session,
-            commands::terminal::terminal_close_workspace_sessions,
-            commands::terminal::terminal_list_sessions,
-            commands::terminal::terminal_get_renderer_diagnostics,
-            commands::terminal::terminal_resume_session,
-            commands::terminal::terminal_drain_output,
-            commands::terminal::terminal_list_notifications,
-            commands::terminal::terminal_clear_notification,
-            commands::terminal::terminal_set_notification_focus,
-            commands::setup::check_dependencies,
-            commands::setup::install_dependency,
-            commands::harness::check_harnesses,
-            commands::harness::install_harness,
-            commands::harness::launch_harness,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
     app.run(|app_handle, event| match event {
         RunEvent::ExitRequested { .. } | RunEvent::Exit => {
-            let terminals = app_handle.state::<AppState>().terminals.clone();
             let keep_awake = app_handle.state::<AppState>().keep_awake.clone();
             tauri::async_runtime::block_on(async move {
                 if let Err(error) = keep_awake.shutdown().await {
                     log::warn!("failed to release keep awake on shutdown: {error}");
                 }
-                terminals.shutdown().await;
             });
         }
         _ => {}
@@ -1236,20 +1160,6 @@ fn build_app_menu(handle: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> 
             true,
             Some("CmdOrCtrl+B"),
         )?;
-        let toggle_git_panel = MenuItem::with_id(
-            handle,
-            "toggle-git-panel",
-            strings.toggle_git_panel,
-            true,
-            Some("CmdOrCtrl+Shift+B"),
-        )?;
-        let toggle_focus_mode = MenuItem::with_id(
-            handle,
-            "toggle-focus-mode",
-            strings.toggle_focus_mode,
-            true,
-            Some("CmdOrCtrl+Alt+F"),
-        )?;
         let zoom_in = MenuItem::with_id(
             handle,
             "zoom-in",
@@ -1285,17 +1195,8 @@ fn build_app_menu(handle: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> 
             true,
             Some("CmdOrCtrl+Shift+F"),
         )?;
-        let toggle_terminal = MenuItem::with_id(
-            handle,
-            "toggle-terminal",
-            strings.toggle_terminal,
-            true,
-            Some("CmdOrCtrl+Shift+T"),
-        )?;
         let view_menu = SubmenuBuilder::new(handle, strings.view_menu)
             .item(&toggle_sidebar)
-            .item(&toggle_git_panel)
-            .item(&toggle_focus_mode)
             .separator()
             .item(&zoom_in)
             .item(&zoom_out)
@@ -1304,8 +1205,6 @@ fn build_app_menu(handle: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> 
             .item(&toggle_fullscreen)
             .separator()
             .item(&toggle_search)
-            .separator()
-            .item(&toggle_terminal)
             .build()?;
 
         let close_window = MenuItem::with_id(

@@ -54,6 +54,7 @@ const THREAD_UNARCHIVE_METHODS: &[&str] = &["thread/unarchive"];
 const THREAD_SET_NAME_METHODS: &[&str] = &["thread/name/set"];
 const THREAD_LIST_METHODS: &[&str] = &["thread/list"];
 const THREAD_FORK_METHODS: &[&str] = &["thread/fork"];
+const THREAD_ROLLBACK_METHODS: &[&str] = &["thread/rollback"];
 const THREAD_COMPACT_START_METHODS: &[&str] = &["thread/compact/start"];
 const REVIEW_START_METHODS: &[&str] = &["review/start"];
 const EXPERIMENTAL_FEATURE_LIST_METHODS: &[&str] = &["experimentalFeature/list"];
@@ -1469,50 +1470,79 @@ impl CodexEngine {
         })
     }
 
-    pub async fn fork_thread_dropping_turns(
+    pub async fn rollback_thread(
         &self,
         engine_thread_id: &str,
-        cwd: &str,
-        model: &str,
         num_turns: u32,
-        sandbox: SandboxPolicy,
-    ) -> anyhow::Result<CodexForkedThread> {
+    ) -> anyhow::Result<ThreadSyncSnapshot> {
         if num_turns == 0 {
-            anyhow::bail!("bounded fork requires at least one turn to be dropped");
+            anyhow::bail!("rollback requires at least one turn");
         }
 
         let transport = self.ensure_ready_transport().await?;
-        let turns = self
-            .list_thread_turns(transport.as_ref(), engine_thread_id)
-            .await
-            .context("failed to resolve Codex history for bounded fork")?;
-        let last_turn_id = last_retained_turn_id(&turns, num_turns)?;
-
-        if let Some(last_turn_id) = last_turn_id {
-            return self
-                .fork_thread(engine_thread_id, cwd, model, Some(&last_turn_id), sandbox)
-                .await;
-        }
-
-        let started = <Self as Engine>::start_thread(
-            self,
-            ThreadScope::Repo {
-                repo_path: cwd.to_string(),
-            },
-            None,
-            model,
-            sandbox,
+        let rollback_params = serde_json::json!({
+            "threadId": engine_thread_id,
+            "numTurns": num_turns,
+        });
+        let response = match request_with_fallback(
+            transport.as_ref(),
+            THREAD_ROLLBACK_METHODS,
+            rollback_params.clone(),
+            DEFAULT_TIMEOUT,
         )
         .await
-        .context("failed to start an empty Codex thread for bounded fork")?;
+        {
+            Ok(response) => response,
+            Err(error) if is_thread_not_loaded_rpc_error(&error) => {
+                // Codex only accepts thread/rollback for a thread loaded in the current
+                // app-server process. Persisted threads can become unloaded independently of
+                // Panes, so resume the same thread in place and retry the native rollback.
+                log::info!(
+                    "resuming unloaded codex thread {engine_thread_id} before native rollback"
+                );
+                let resume_response = request_with_fallback(
+                    transport.as_ref(),
+                    THREAD_RESUME_METHODS,
+                    serde_json::json!({ "threadId": engine_thread_id }),
+                    DEFAULT_TIMEOUT,
+                )
+                .await
+                .context("failed to resume codex thread before rollback")?;
 
-        Ok(CodexForkedThread {
-            engine_thread_id: started.engine_thread_id,
-            model_id: model.to_string(),
-            title: None,
-            preview: None,
-            raw_status: Some("idle".to_string()),
-            active_flags: Vec::new(),
+                if let Some(resumed_thread_id) = extract_thread_id(&resume_response) {
+                    if resumed_thread_id != engine_thread_id {
+                        anyhow::bail!(
+                            "codex resumed thread {resumed_thread_id} instead of {engine_thread_id}"
+                        );
+                    }
+                }
+
+                if let Some(requested_runtime) = self.thread_runtime(engine_thread_id).await {
+                    let runtime =
+                        thread_runtime_from_resume_response(&resume_response, &requested_runtime);
+                    self.store_thread_runtime(engine_thread_id, runtime).await;
+                }
+
+                request_with_fallback(
+                    transport.as_ref(),
+                    THREAD_ROLLBACK_METHODS,
+                    rollback_params,
+                    DEFAULT_TIMEOUT,
+                )
+                .await
+                .context("failed to rollback codex thread after resuming it")?
+            }
+            Err(error) => return Err(error).context("failed to rollback codex thread"),
+        };
+
+        let turns = extract_turns_from_thread_read_response(&response);
+
+        Ok(ThreadSyncSnapshot {
+            title: extract_thread_title(&response),
+            preview: extract_thread_preview(&response),
+            raw_status: extract_thread_runtime_status_type(&response),
+            active_flags: extract_thread_runtime_active_flags(&response),
+            imported_messages: extract_imported_messages_from_turns(&turns),
         })
     }
 
@@ -2291,6 +2321,19 @@ impl CodexEngine {
             }
             Err(error) => Err(error).context("failed to list Codex thread turns"),
         }
+    }
+
+    pub async fn resolve_fork_turn_id(
+        &self,
+        engine_thread_id: &str,
+        turns_after: u32,
+    ) -> anyhow::Result<String> {
+        let transport = self.ensure_ready_transport().await?;
+        let turns = self
+            .list_thread_turns(transport.as_ref(), engine_thread_id)
+            .await
+            .context("failed to list Codex turns while resolving fork point")?;
+        resolve_fork_turn_id_from_turns(&turns, turns_after)
     }
 
     async fn list_thread_turns_via_thread_read(
@@ -4376,6 +4419,11 @@ async fn request_with_fallback(
     anyhow::bail!("all rpc methods failed: {}", errors.join(" | "))
 }
 
+fn is_thread_not_loaded_rpc_error(error: &anyhow::Error) -> bool {
+    let normalized = format!("{error:#}").to_ascii_lowercase();
+    normalized.contains("thread not found:") || normalized.contains("thread not loaded:")
+}
+
 fn scope_cwd(scope: &ThreadScope) -> String {
     match scope {
         ThreadScope::Repo { repo_path } => repo_path.to_string(),
@@ -4495,6 +4543,17 @@ fn build_thread_fork_params(
     insert_optional_string(&mut params, "serviceTier", sandbox.service_tier.as_deref());
     insert_optional_string(&mut params, "personality", sandbox.personality.as_deref());
     insert_optional_string(&mut params, "lastTurnId", last_turn_id);
+    // Panes clones its persisted transcript locally. Asking Codex to hydrate and
+    // return every historical turn makes thread/fork take seconds on long chats.
+    params.insert(
+        "excludeTurns".to_string(),
+        serde_json::Value::Bool(true),
+    );
+    // A durable Codex fork rewrites the complete parent rollout before it
+    // responds. Long threads can spend 10+ seconds duplicating that file.
+    // Panes already persists the branch transcript, so keep the native fork
+    // in the live app-server and avoid that synchronous history rewrite.
+    params.insert("ephemeral".to_string(), serde_json::Value::Bool(true));
     serde_json::Value::Object(params)
 }
 
@@ -4843,6 +4902,24 @@ fn extract_turn_id(value: &serde_json::Value) -> Option<String> {
     None
 }
 
+fn resolve_fork_turn_id_from_turns(
+    turns: &[serde_json::Value],
+    turns_after: u32,
+) -> anyhow::Result<String> {
+    let turns_after = usize::try_from(turns_after).unwrap_or(usize::MAX);
+    let target_index = turns
+        .len()
+        .checked_sub(turns_after.saturating_add(1))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot resolve a fork point with {turns_after} later turns from {} Codex turns",
+                turns.len()
+            )
+        })?;
+    extract_turn_id(&turns[target_index])
+        .ok_or_else(|| anyhow::anyhow!("Codex turn at fork point has no id"))
+}
+
 #[cfg(test)]
 fn extract_reconciled_turn_completion(
     value: &serde_json::Value,
@@ -5124,54 +5201,12 @@ fn extract_turns_from_thread_read_response(response: &serde_json::Value) -> Vec<
     Vec::new()
 }
 
-fn last_retained_turn_id(
-    turns: &[serde_json::Value],
-    num_turns: u32,
-) -> anyhow::Result<Option<String>> {
-    let turns_to_drop = usize::try_from(num_turns).unwrap_or(usize::MAX);
-    if turns_to_drop == 0 {
-        anyhow::bail!("bounded fork requires at least one turn to be dropped");
-    }
-    let user_turn_indexes = turns
-        .iter()
-        .enumerate()
-        .filter_map(|(index, turn)| turn_contains_user_message(turn).then_some(index))
-        .collect::<Vec<_>>();
-    if turns_to_drop > user_turn_indexes.len() {
-        anyhow::bail!(
-            "cannot drop {turns_to_drop} user turns from Codex history with only {} user turns",
-            user_turn_indexes.len()
-        );
-    }
-
-    let first_dropped_turn_index = user_turn_indexes[user_turn_indexes.len() - turns_to_drop];
-    let Some(last_retained_turn_index) = first_dropped_turn_index.checked_sub(1) else {
-        return Ok(None);
-    };
-
-    let retained_turn = &turns[last_retained_turn_index];
-    extract_any_string(retained_turn, &["id", "turnId", "turn_id"])
-        .map(Some)
-        .ok_or_else(|| {
-            anyhow::anyhow!("Codex turn at bounded fork cutoff is missing its server turn id")
-        })
-}
-
-fn turn_contains_user_message(turn: &serde_json::Value) -> bool {
-    turn.get("items")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| extract_any_string(item, &["type"]).as_deref() == Some("userMessage"))
-        })
-}
-
 fn extract_imported_messages_from_turns(turns: &[serde_json::Value]) -> Vec<ImportedThreadMessage> {
     let mut messages = Vec::new();
 
     for (turn_index, turn) in turns.iter().enumerate() {
         let turn_engine_id = extract_any_string(turn, &["id", "turnId", "turn_id"]);
+        let native_turn_id = turn_engine_id.clone();
         let turn_model_id = extract_any_string(turn, &["model", "modelId", "model_id"]);
         let turn_reasoning_effort =
             extract_any_string(turn, &["reasoningEffort", "reasoning_effort", "effort"]);
@@ -5306,6 +5341,7 @@ fn extract_imported_messages_from_turns(turns: &[serde_json::Value]) -> Vec<Impo
                     .filter(|value| !value.is_empty()),
                 blocks: serde_json::Value::Array(user_blocks),
                 status: "completed".to_string(),
+                native_turn_id: native_turn_id.clone(),
                 turn_engine_id: turn_engine_id.clone(),
                 turn_model_id: turn_model_id.clone(),
                 turn_reasoning_effort: turn_reasoning_effort.clone(),
@@ -5331,6 +5367,7 @@ fn extract_imported_messages_from_turns(turns: &[serde_json::Value]) -> Vec<Impo
                     .filter(|value| !value.is_empty()),
                 blocks: serde_json::Value::Array(assistant_blocks),
                 status,
+                native_turn_id,
                 turn_engine_id,
                 turn_model_id,
                 turn_reasoning_effort,
@@ -7193,7 +7230,7 @@ fn incoming_event_summary(
 }
 
 fn record_codex_event_routing_log(message: &str) {
-    crate::diagnostic_logs::append_codex_event_routing_log(message);
+    let _ = crate::diagnostic_logs::append_codex_event_routing_log(message);
 }
 
 fn log_codex_incoming_drop(
@@ -7628,7 +7665,6 @@ mod tests {
             service_tier: None,
             personality: None,
             output_schema: None,
-            opencode_agent: None,
         };
 
         let payload = sandbox_policy_to_json(&sandbox, false);
@@ -7659,7 +7695,6 @@ mod tests {
             service_tier: None,
             personality: None,
             output_schema: None,
-            opencode_agent: None,
         };
 
         assert_eq!(
@@ -7696,7 +7731,6 @@ mod tests {
             service_tier: None,
             personality: None,
             output_schema: None,
-            opencode_agent: None,
         };
 
         let params = build_thread_fork_params(
@@ -7710,40 +7744,40 @@ mod tests {
         );
 
         assert_eq!(params.get("lastTurnId"), Some(&json!("turn-2")));
+        assert_eq!(params.get("excludeTurns"), Some(&json!(true)));
+        assert_eq!(params.get("ephemeral"), Some(&json!(true)));
     }
 
     #[test]
-    fn bounded_fork_cutoff_selects_the_last_retained_turn() {
+    fn fork_turn_id_resolution_counts_backward_from_the_latest_turn() {
         let turns = vec![
-            json!({ "id": "turn-1", "items": [{ "type": "userMessage" }] }),
-            json!({ "id": "turn-2", "items": [{ "type": "userMessage" }] }),
-            json!({ "id": "turn-3", "items": [{ "type": "userMessage" }] }),
+            json!({ "id": "turn-1" }),
+            json!({ "id": "turn-2" }),
+            json!({ "id": "turn-3" }),
         ];
 
         assert_eq!(
-            last_retained_turn_id(&turns, 1).expect("cutoff should resolve"),
-            Some("turn-2".to_string())
+            resolve_fork_turn_id_from_turns(&turns, 0).unwrap(),
+            "turn-3"
         );
         assert_eq!(
-            last_retained_turn_id(&turns, 3).expect("dropping every turn should be valid"),
-            None
+            resolve_fork_turn_id_from_turns(&turns, 1).unwrap(),
+            "turn-2"
         );
-        assert!(last_retained_turn_id(&turns, 4).is_err());
+        assert!(resolve_fork_turn_id_from_turns(&turns, 3).is_err());
     }
 
     #[test]
-    fn bounded_fork_cutoff_uses_the_turn_immediately_before_the_edited_message() {
-        let turns = vec![
-            json!({ "id": "turn-1", "items": [{ "type": "userMessage" }] }),
-            json!({ "id": "compact-1", "items": [{ "type": "contextCompaction" }] }),
-            json!({ "id": "turn-2", "items": [{ "type": "userMessage" }] }),
-            json!({ "id": "turn-3", "items": [{ "type": "userMessage" }] }),
-        ];
-
-        assert_eq!(
-            last_retained_turn_id(&turns, 2).expect("cutoff should resolve"),
-            Some("compact-1".to_string())
-        );
+    fn rollback_retries_only_when_codex_reports_an_unloaded_thread() {
+        assert!(is_thread_not_loaded_rpc_error(&anyhow::anyhow!(
+            "all rpc methods failed: thread/rollback: rpc error -32600: thread not found: thread-1"
+        )));
+        assert!(is_thread_not_loaded_rpc_error(&anyhow::anyhow!(
+            "thread not loaded: thread-1"
+        )));
+        assert!(!is_thread_not_loaded_rpc_error(&anyhow::anyhow!(
+            "rollback already in progress for this thread"
+        )));
     }
 
     #[test]

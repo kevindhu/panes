@@ -11,29 +11,8 @@ const mockIpc = vi.hoisted(() => ({
   setWorkspaceOrder: vi.fn(),
 }));
 
-const mockTerminalStoreState = vi.hoisted(() => ({
-  prepareWorkspaceActivation: vi.fn(),
-}));
-
-const mockGitStoreState = vi.hoisted(() => ({
-  flushDrafts: vi.fn(),
-  loadDraftsForWorkspace: vi.fn(),
-}));
-
-vi.mock("../lib/ipc", () => ({
+vi.mock("../lib/codexIpc", () => ({
   ipc: mockIpc,
-}));
-
-vi.mock("./terminalStore", () => ({
-  useTerminalStore: {
-    getState: () => mockTerminalStoreState,
-  },
-}));
-
-vi.mock("./gitStore", () => ({
-  useGitStore: {
-    getState: () => mockGitStoreState,
-  },
 }));
 
 import { useWorkspaceStore } from "./workspaceStore";
@@ -90,7 +69,6 @@ describe("workspaceStore.removeWorkspace", () => {
       ...makeWorkspace(path, path),
       scanDepth: scanDepth ?? 3,
     }));
-    mockTerminalStoreState.prepareWorkspaceActivation.mockResolvedValue(undefined);
   });
 
   it("prepares the replacement workspace when archiving the active workspace", async () => {
@@ -113,7 +91,6 @@ describe("workspaceStore.removeWorkspace", () => {
     await useWorkspaceStore.getState().removeWorkspace(workspaceA.id);
 
     expect(mockIpc.archiveWorkspace).toHaveBeenCalledWith(workspaceA.id);
-    expect(mockTerminalStoreState.prepareWorkspaceActivation).toHaveBeenCalledWith(workspaceB.id);
     expect(mockIpc.getRepos).toHaveBeenCalledWith(workspaceB.id);
     expect(useWorkspaceStore.getState().activeWorkspaceId).toBe(workspaceB.id);
     expect(useWorkspaceStore.getState().repos).toEqual([repoB]);
@@ -144,7 +121,6 @@ describe("workspaceStore.openWorkspace", () => {
     mockIpc.getRepos.mockResolvedValue([]);
     mockIpc.listArchivedWorkspaces.mockResolvedValue([]);
     mockIpc.listWorkspaces.mockResolvedValue([]);
-    mockTerminalStoreState.prepareWorkspaceActivation.mockResolvedValue(undefined);
   });
 
   it("returns the opened workspace so callers can select it directly", async () => {
@@ -216,7 +192,6 @@ describe("workspaceStore.rescanWorkspace", () => {
     mockIpc.getRepos.mockResolvedValue([]);
     mockIpc.listArchivedWorkspaces.mockResolvedValue([]);
     mockIpc.listWorkspaces.mockResolvedValue([]);
-    mockTerminalStoreState.prepareWorkspaceActivation.mockResolvedValue(undefined);
   });
 
   it("updates the workspace scan depth without switching the active workspace", async () => {
@@ -364,7 +339,6 @@ describe("workspaceStore.loadWorkspaces", () => {
 
     mockIpc.getRepos.mockResolvedValue([]);
     mockIpc.listArchivedWorkspaces.mockResolvedValue([]);
-    mockTerminalStoreState.prepareWorkspaceActivation.mockResolvedValue(undefined);
   });
 
   it("falls back from a transient AppImage workspace to the next valid workspace", async () => {
@@ -377,9 +351,6 @@ describe("workspaceStore.loadWorkspaces", () => {
 
     await useWorkspaceStore.getState().loadWorkspaces();
 
-    expect(mockTerminalStoreState.prepareWorkspaceActivation).toHaveBeenCalledWith(
-      validWorkspace.id,
-    );
     expect(mockIpc.getRepos).toHaveBeenCalledWith(validWorkspace.id);
     expect(useWorkspaceStore.getState().activeWorkspaceId).toBe(validWorkspace.id);
     expect(useWorkspaceStore.getState().repos).toEqual([repo]);
@@ -411,7 +382,6 @@ describe("workspaceStore.reorderWorkspaces", () => {
     mockIpc.listWorkspaces.mockResolvedValue([]);
     mockIpc.listArchivedWorkspaces.mockResolvedValue([]);
     mockIpc.getRepos.mockResolvedValue([]);
-    mockTerminalStoreState.prepareWorkspaceActivation.mockResolvedValue(undefined);
   });
 
   it("optimistically reorders workspaces and persists the id order", async () => {

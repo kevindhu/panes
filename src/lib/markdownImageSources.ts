@@ -1,4 +1,3 @@
-import { convertFileSrc, isTauri } from "@tauri-apps/api/core";
 import { resolveLocalImagePath } from "./localImageSources";
 
 export const MARKDOWN_LOCAL_IMAGE_PATH_ATTR = "data-panes-markdown-local-image-path";
@@ -29,14 +28,6 @@ function guessImageMimeType(filePath: string): string | null {
   return IMAGE_MIME_TYPES_BY_EXTENSION[filename.slice(dotIndex + 1).toLowerCase()] ?? null;
 }
 
-function resolveTauriAssetSource(filePath: string, fallbackSource: string): string {
-  try {
-    return isTauri() ? convertFileSrc(filePath) : fallbackSource;
-  } catch {
-    return fallbackSource;
-  }
-}
-
 export function resolveWorkspaceMarkdownImage(
   source: string,
   workspaceRootPath?: string | null,
@@ -50,7 +41,7 @@ export function resolveWorkspaceMarkdownImage(
   return {
     filePath,
     mimeType: guessImageMimeType(filePath),
-    source: resolveTauriAssetSource(filePath, source),
+    source,
   };
 }
 

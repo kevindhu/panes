@@ -81,6 +81,7 @@ import { resolveEngineCapabilities } from "./engineCapabilities";
 import { buildCodexInputItems } from "./codexInputItems";
 import {
   computeDroppedTurnsForEditedMessage,
+  computeTurnsAfterAssistantMessage,
   extractEditableMessageContext,
   isEditableUserTurn,
   mergeUniqueChatAttachments,
@@ -1214,11 +1215,14 @@ interface MessageRowProps {
   assistantEngineId: string;
   workspaceRootPath?: string | null;
   canEditUserMessages: boolean;
+  canForkAssistantMessages: boolean;
+  forkingMessageId: string | null;
   editingMessageId: string | null;
   editingDraftText: string;
   editingDraftAttachments: ChatAttachment[];
   editingBusy: boolean;
   onStartEdit: (message: Message) => void;
+  onForkMessage: (message: Message) => void;
   onChangeEditText: (text: string) => void;
   onRemoveEditAttachment: (attachmentId: string) => void;
   onPasteEditAttachments: (files: File[]) => void;
@@ -1354,11 +1358,14 @@ export function MessageRowView({
   assistantEngineId,
   workspaceRootPath,
   canEditUserMessages,
+  canForkAssistantMessages,
+  forkingMessageId,
   editingMessageId,
   editingDraftText,
   editingDraftAttachments,
   editingBusy,
   onStartEdit,
+  onForkMessage,
   onChangeEditText,
   onRemoveEditAttachment,
   onPasteEditAttachments,
@@ -1412,6 +1419,9 @@ export function MessageRowView({
   const thinkingVariant = useThinkingVariant(showThinkingPlaceholder);
   const isEditingUserMessage = isUser && editingMessageId === message.id;
   const canEditThisMessage = canEditUserMessages && isEditableUserTurn(message);
+  const canForkThisMessage =
+    !isUser && canForkAssistantMessages && message.status !== "streaming";
+  const isForkingThisMessage = forkingMessageId === message.id;
   const displayedUserAttachments = useMemo(
     () =>
       isEditingUserMessage
@@ -1659,6 +1669,23 @@ export function MessageRowView({
               message={message}
               label={t("panel.messageActions.copy")}
             />
+            {canForkThisMessage && (
+              <MessageActionButton
+                onClick={() => onForkMessage(message)}
+                label={
+                  isForkingThisMessage
+                    ? t("panel.messageActions.forking")
+                    : t("panel.messageActions.fork")
+                }
+                disabled={forkingMessageId !== null}
+              >
+                {isForkingThisMessage ? (
+                  <RefreshCw size={11} style={{ animation: "spin 0.8s linear infinite" }} />
+                ) : (
+                  <GitBranch size={11} />
+                )}
+              </MessageActionButton>
+            )}
             {messageTimestamp && <span>{messageTimestamp}</span>}
           </div>
         </>
@@ -1677,11 +1704,14 @@ const MessageRow = memo(
     prev.assistantEngineId === next.assistantEngineId &&
     prev.workspaceRootPath === next.workspaceRootPath &&
     prev.canEditUserMessages === next.canEditUserMessages &&
+    prev.canForkAssistantMessages === next.canForkAssistantMessages &&
+    prev.forkingMessageId === next.forkingMessageId &&
     prev.editingMessageId === next.editingMessageId &&
     prev.editingDraftText === next.editingDraftText &&
     prev.editingDraftAttachments === next.editingDraftAttachments &&
     prev.editingBusy === next.editingBusy &&
     prev.onStartEdit === next.onStartEdit &&
+    prev.onForkMessage === next.onForkMessage &&
     prev.onChangeEditText === next.onChangeEditText &&
     prev.onRemoveEditAttachment === next.onRemoveEditAttachment &&
     prev.onPasteEditAttachments === next.onPasteEditAttachments &&
@@ -1940,6 +1970,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   );
   const [editingMessageDraft, setEditingMessageDraft] = useState<EditingMessageDraft | null>(null);
   const [editingMessageBusy, setEditingMessageBusy] = useState(false);
+  const [forkingMessageId, setForkingMessageId] = useState<string | null>(null);
 
   const updateInputHasText = useCallback((value: string) => {
     const nextHasText = value.trim().length > 0;
@@ -2045,7 +2076,8 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     startupRestorePending,
     createThread,
     forkCodexThread,
-    forkCodexThreadDroppingTurns,
+    forkCodexThreadAtTurn,
+    rollbackCodexThread,
     compactCodexThread,
     attachCodexRemoteThread,
     attachOpenCodeRemoteSession,
@@ -2063,7 +2095,8 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       startupRestorePending: state.startupRestorePending,
       createThread: state.createThread,
       forkCodexThread: state.forkCodexThread,
-      forkCodexThreadDroppingTurns: state.forkCodexThreadDroppingTurns,
+      forkCodexThreadAtTurn: state.forkCodexThreadAtTurn,
+      rollbackCodexThread: state.rollbackCodexThread,
       compactCodexThread: state.compactCodexThread,
       attachCodexRemoteThread: state.attachCodexRemoteThread,
       attachOpenCodeRemoteSession: state.attachOpenCodeRemoteSession,
@@ -2704,6 +2737,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const pendingPlanImplementationThreadIdRef = useRef<string | null>(null);
   const previousStreamingRef = useRef(false);
   const canEditActiveThreadMessages = canEditCodexMessageHistory(activeThread, streaming);
+  const canForkActiveThreadMessages = canUseNativeCodexHistoryToolsForThread(
+    activeThread,
+    streaming,
+  );
   const appendBranchProfileLogBestEffort = useCallback(
     (operationId: string, step: string, details?: Record<string, unknown> | string | null) => {
       let serializedDetails: string | null = null;
@@ -2717,6 +2754,82 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       });
     },
     [],
+  );
+
+  const forkFromAssistantMessage = useCallback(
+    async (message: Message) => {
+      if (
+        !activeThread ||
+        !canForkActiveThreadMessages ||
+        forkingMessageId !== null ||
+        message.role !== "assistant"
+      ) {
+        return;
+      }
+
+      const turnsAfter = computeTurnsAfterAssistantMessage(messages, message.id);
+      if (turnsAfter === null) {
+        toast.error(t("panel.toasts.codexThreadForkFailed"));
+        return;
+      }
+
+      const lastTurnId = message.nativeTurnId?.trim() || null;
+      const profileOperationId = createBranchProfileOperationId(
+        "fork-at-turn",
+        activeThread.id,
+      );
+      const totalStartedAt = performance.now();
+      appendBranchProfileLogBestEffort(profileOperationId, "frontend.fork_at_turn.start", {
+        threadId: activeThread.id,
+        messageId: message.id,
+        turnsAfter,
+        hasNativeTurnId: lastTurnId !== null,
+      });
+
+      setForkingMessageId(message.id);
+      try {
+        const forkedThread = await forkCodexThreadAtTurn(
+          activeThread.id,
+          lastTurnId,
+          turnsAfter,
+          profileOperationId,
+        );
+        if (!forkedThread) {
+          throw new Error(t("panel.toasts.codexThreadForkFailed"));
+        }
+
+        setActiveThreadInStore(forkedThread.id);
+        await bindChatThread(forkedThread.id);
+        appendBranchProfileLogBestEffort(
+          profileOperationId,
+          "frontend.fork_at_turn.success",
+          {
+            totalElapsedMs: formatBranchProfileElapsedMs(performance.now() - totalStartedAt),
+            createdThreadId: forkedThread.id,
+          },
+        );
+        toast.success(t("panel.toasts.codexThreadForked"));
+      } catch (error) {
+        appendBranchProfileLogBestEffort(profileOperationId, "frontend.fork_at_turn.failed", {
+          totalElapsedMs: formatBranchProfileElapsedMs(performance.now() - totalStartedAt),
+          error: String(error),
+        });
+        toast.error(t("panel.toasts.codexThreadForkFailed"));
+      } finally {
+        setForkingMessageId((current) => (current === message.id ? null : current));
+      }
+    },
+    [
+      activeThread,
+      appendBranchProfileLogBestEffort,
+      bindChatThread,
+      canForkActiveThreadMessages,
+      forkingMessageId,
+      forkCodexThreadAtTurn,
+      messages,
+      setActiveThreadInStore,
+      t,
+    ],
   );
 
   const recordSubmittedInput = useCallback((submittedText: string) => {
@@ -2971,10 +3084,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     }
 
     const profileOperationId = createBranchProfileOperationId(
-      "edit-bounded-fork",
+      "edit-rollback",
       activeThread.id,
     );
-    const logPrefix = "frontend.edit_branch";
+    const logPrefix = "frontend.edit_rollback";
     const totalStartedAt = performance.now();
     appendBranchProfileLogBestEffort(profileOperationId, `${logPrefix}.start`, {
       threadId: activeThread.id,
@@ -2997,46 +3110,39 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
           inputItemCount: inputItems?.length ?? 0,
         },
       );
-      const boundedForkStartedAt = performance.now();
-      const editedBranch = await forkCodexThreadDroppingTurns(
+      const rollbackStartedAt = performance.now();
+      const editedThread = await rollbackCodexThread(
         activeThread.id,
         droppedTurns,
         profileOperationId,
       );
       appendBranchProfileLogBestEffort(
         profileOperationId,
-        `${logPrefix}.bounded_fork_command.done`,
+        `${logPrefix}.rollback_command.done`,
         {
-          elapsedMs: formatBranchProfileElapsedMs(performance.now() - boundedForkStartedAt),
-          createdThreadId: editedBranch?.id ?? null,
+          elapsedMs: formatBranchProfileElapsedMs(performance.now() - rollbackStartedAt),
+          threadId: editedThread?.id ?? null,
         },
       );
-      if (!editedBranch) {
+      if (!editedThread) {
         throw new Error(t("panel.toasts.codexThreadEditFailed"));
       }
 
-      manualThreadBindTargetRef.current = editedBranch.id;
       const bindStartedAt = performance.now();
-      try {
-        await bindChatThread(editedBranch.id);
-      } finally {
-        if (manualThreadBindTargetRef.current === editedBranch.id) {
-          manualThreadBindTargetRef.current = null;
-        }
-      }
+      await bindChatThread(editedThread.id, { forceReload: true });
       appendBranchProfileLogBestEffort(
         profileOperationId,
         `${logPrefix}.bind_chat_thread.done`,
         {
           elapsedMs: formatBranchProfileElapsedMs(performance.now() - bindStartedAt),
-          createdThreadId: editedBranch.id,
+          threadId: editedThread.id,
         },
       );
 
-      const nextModelId = readThreadLastModelId(editedBranch) ?? editedBranch.modelId;
+      const nextModelId = readThreadLastModelId(editedThread) ?? editedThread.modelId;
       const nextReasoningEffort =
-        typeof editedBranch.engineMetadata?.reasoningEffort === "string"
-          ? editedBranch.engineMetadata.reasoningEffort
+        typeof editedThread.engineMetadata?.reasoningEffort === "string"
+          ? editedThread.engineMetadata.reasoningEffort
           : activeThreadReasoningEffort ?? null;
       const sendPreparedTurnStartedAt = performance.now();
       const submission = await sendPreparedTurn({
@@ -3044,15 +3150,15 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         attachments: draft.attachments,
         inputItems,
         planMode: draft.planMode,
-        thread: editedBranch,
-        engineId: editedBranch.engineId,
+        thread: editedThread,
+        engineId: editedThread.engineId,
         modelId: nextModelId,
         reasoningEffort: nextReasoningEffort,
-        personality: readThreadPersonalityValue(editedBranch),
-        serviceTier: readThreadServiceTierValue(editedBranch),
-        outputSchemaText: readThreadOutputSchemaText(editedBranch),
-        customApprovalPolicyText: readCodexThreadCustomApprovalPolicyText(editedBranch),
-        openCodeAgent: readThreadOpenCodeAgentValue(editedBranch),
+        personality: readThreadPersonalityValue(editedThread),
+        serviceTier: readThreadServiceTierValue(editedThread),
+        outputSchemaText: readThreadOutputSchemaText(editedThread),
+        customApprovalPolicyText: readCodexThreadCustomApprovalPolicyText(editedThread),
+        openCodeAgent: readThreadOpenCodeAgentValue(editedThread),
       });
       appendBranchProfileLogBestEffort(
         profileOperationId,
@@ -3071,7 +3177,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         setEditingMessageDraft(null);
         appendBranchProfileLogBestEffort(profileOperationId, `${logPrefix}.success`, {
           totalElapsedMs: formatBranchProfileElapsedMs(performance.now() - totalStartedAt),
-          createdThreadId: editedBranch.id,
+          threadId: editedThread.id,
         });
       } else if (submission === "failed") {
         restoreComposerFromEditDraft({
@@ -3113,7 +3219,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     messages,
     recordSubmittedInput,
     restoreComposerFromEditDraft,
-    forkCodexThreadDroppingTurns,
+    rollbackCodexThread,
     sendPreparedTurn,
     streaming,
     t,
@@ -4098,6 +4204,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   useEffect(() => {
     setEditingMessageDraft(null);
     setEditingMessageBusy(false);
+    setForkingMessageId(null);
   }, [activeThread?.id]);
 
   useEffect(() => {
@@ -4632,7 +4739,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     });
 
     const rollbackStartedAt = performance.now();
-    const rolledBackThread = await forkCodexThreadDroppingTurns(
+    const rolledBackThread = await rollbackCodexThread(
       activeThread.id,
       numTurns,
       profileOperationId,
@@ -4642,7 +4749,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       "frontend.rollback.store_command.done",
       {
         elapsedMs: formatBranchProfileElapsedMs(performance.now() - rollbackStartedAt),
-        createdThreadId: rolledBackThread?.id ?? null,
+        threadId: rolledBackThread?.id ?? null,
       },
     );
     if (!rolledBackThread) {
@@ -4652,20 +4759,19 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       throw new Error(t("panel.toasts.codexThreadRollbackFailed"));
     }
 
-    setActiveThreadInStore(rolledBackThread.id);
     const bindStartedAt = performance.now();
-    await bindChatThread(rolledBackThread.id);
+    await bindChatThread(rolledBackThread.id, { forceReload: true });
     appendBranchProfileLogBestEffort(
       profileOperationId,
       "frontend.rollback.bind_chat_thread.done",
       {
         elapsedMs: formatBranchProfileElapsedMs(performance.now() - bindStartedAt),
-        createdThreadId: rolledBackThread.id,
+        threadId: rolledBackThread.id,
       },
     );
     appendBranchProfileLogBestEffort(profileOperationId, "frontend.rollback.success", {
       totalElapsedMs: formatBranchProfileElapsedMs(performance.now() - totalStartedAt),
-      createdThreadId: rolledBackThread.id,
+      threadId: rolledBackThread.id,
       numTurns,
     });
     toast.success(t("panel.toasts.codexThreadRolledBack", { count: numTurns }));
@@ -4762,7 +4868,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
           description: t("threadPicker.rollbackDescription"),
           icon: RotateCcw,
           codexOnly: true,
-          disabled: !canUseNativeCodexHistoryTools,
+          disabled: !canManageActiveCodexThread,
         },
         {
           id: "compact",
@@ -6339,11 +6445,14 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                         assistantEngineId={assistantIdentity?.engineId ?? ""}
                         workspaceRootPath={getMessageWorkspaceRootPath(message)}
                         canEditUserMessages={canEditUserMessages}
+                        canForkAssistantMessages={canForkActiveThreadMessages}
+                        forkingMessageId={forkingMessageId}
                         editingMessageId={editingMessageId}
                         editingDraftText={editingDraftText}
                         editingDraftAttachments={editingMessageDraft?.attachments ?? []}
                         editingBusy={editingBusy}
                         onStartEdit={handleStartEdit}
+                        onForkMessage={forkFromAssistantMessage}
                         onChangeEditText={handleChangeEditText}
                         onRemoveEditAttachment={handleRemoveEditAttachment}
                         onPasteEditAttachments={handleEditDraftPaste}

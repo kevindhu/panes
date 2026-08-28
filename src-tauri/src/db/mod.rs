@@ -19,6 +19,7 @@ pub mod threads;
 pub mod workspaces;
 
 const SQLITE_POOL_MAX_IDLE: usize = 8;
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct Database {
@@ -121,6 +122,7 @@ impl Database {
 
     fn run_migrations(&self) -> anyhow::Result<()> {
         let mut conn = self.connect()?;
+        enable_wal_mode(&conn)?;
         conn.execute_batch(include_str!("migrations/001_initial.sql"))
             .context("failed to apply migrations")?;
         ensure_archived_columns(&conn)?;
@@ -138,16 +140,27 @@ impl Database {
 }
 
 fn configure_connection(conn: &Connection) -> anyhow::Result<()> {
+    // Install the busy handler before any pragma that may need to coordinate
+    // with another SQLite connection. Session synchronization performs a
+    // bounded transcript replacement while live turns can still persist
+    // events, so a five-second/default-zero wait is too aggressive here.
+    conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
+        .context("failed to set sqlite busy timeout")?;
     conn.pragma_update(None, "foreign_keys", "ON")
         .context("failed to enable sqlite foreign keys")?;
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .context("failed to enable sqlite WAL mode")?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .context("failed to set sqlite synchronous mode")?;
     conn.pragma_update(None, "temp_store", "MEMORY")
         .context("failed to set sqlite temp_store mode")?;
-    conn.busy_timeout(Duration::from_millis(5_000))
-        .context("failed to set sqlite busy timeout")?;
+    Ok(())
+}
+
+fn enable_wal_mode(conn: &Connection) -> anyhow::Result<()> {
+    // journal_mode is persistent database state. Set it during database
+    // initialization/migration rather than every time the pool grows under
+    // load; ordinary connections inherit WAL mode from the database.
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .context("failed to enable sqlite WAL mode")?;
     Ok(())
 }
 
@@ -231,6 +244,8 @@ fn ensure_runtime_columns(conn: &Connection) -> anyhow::Result<()> {
 }
 
 fn ensure_messages_audit_columns(conn: &Connection) -> anyhow::Result<()> {
+    ensure_column(conn, "messages", "native_turn_id", "TEXT")?;
+
     let mut has_turn_engine_id = false;
     let mut has_turn_model_id = false;
     let mut has_turn_reasoning_effort = false;
@@ -268,6 +283,18 @@ fn ensure_messages_audit_columns(conn: &Connection) -> anyhow::Result<()> {
         )
         .context("failed to add messages.turn_reasoning_effort column")?;
     }
+
+    conn.execute(
+        "UPDATE messages
+         SET native_turn_id = turn_engine_id
+         WHERE native_turn_id IS NULL
+           AND thread_id IN (SELECT id FROM threads WHERE engine_id = 'codex')
+           AND turn_engine_id IS NOT NULL
+           AND trim(turn_engine_id) <> ''
+           AND lower(turn_engine_id) <> 'codex'",
+        [],
+    )
+    .context("failed to backfill messages.native_turn_id")?;
 
     Ok(())
 }
@@ -805,6 +832,21 @@ mod tests {
         };
         db.run_migrations().expect("failed to initialize test db");
         db
+    }
+
+    #[test]
+    fn pooled_connections_use_wal_and_extended_busy_timeout() {
+        let db = test_db();
+        let conn = db.connect().expect("failed to open configured connection");
+        let journal_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("failed to read journal mode");
+        let busy_timeout_ms: i64 = conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .expect("failed to read busy timeout");
+
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(busy_timeout_ms, SQLITE_BUSY_TIMEOUT.as_millis() as i64);
     }
 
     #[test]

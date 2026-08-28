@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ChatTurnFinishedEvent } from "../lib/ipc";
+import type { ChatTurnFinishedEvent } from "../lib/codexIpc";
 import type { ApprovalResponse, Message, StreamEvent, Thread } from "../types";
 
 const mockIpc = vi.hoisted(() => ({
@@ -25,7 +25,7 @@ const mockToast = vi.hoisted(() => ({
   error: vi.fn(),
 }));
 
-vi.mock("../lib/ipc", () => ({
+vi.mock("../lib/codexIpc", () => ({
   ipc: mockIpc,
   listenThreadEvents: mockListenThreadEvents,
 }));

@@ -296,7 +296,7 @@
       "stashFailed": "Stash failed",
       "codexForked": "Created a new forked Codex thread.",
       "codexCompacted": "Started Codex thread compaction.",
-      "codexRolledBack": "Created a rollback branch ({{count}} turns removed).",
+      "codexRolledBack": "Rolled back this thread ({{count}} turns removed).",
       "codexReviewStarted": "Started an inline Codex review."
     }
   },

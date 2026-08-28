@@ -184,7 +184,6 @@ pnpm build              # frontend production build
 pnpm test               # Vitest suite
 pnpm typecheck          # TypeScript no-emit check
 
-pnpm build:claude-sidecar   # bundle the runtime Claude sidecar
 pnpm build:desktop          # build frontend + bundled sidecar assets, not native app bundles
 pnpm prune:artifacts:check  # inspect generated artifacts that are safe to remove
 pnpm prune:artifacts        # remove repo-local generated artifacts like src-tauri/target

@@ -1,5 +1,5 @@
 use anyhow::Context;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use crate::models::{ThreadDto, ThreadStatusDto};
@@ -34,6 +34,13 @@ pub fn create_thread(
 
 pub fn get_thread(db: &Database, thread_id: &str) -> anyhow::Result<Option<ThreadDto>> {
     let conn = db.connect()?;
+    get_thread_with_connection(&conn, thread_id)
+}
+
+fn get_thread_with_connection(
+    conn: &Connection,
+    thread_id: &str,
+) -> anyhow::Result<Option<ThreadDto>> {
     conn.query_row(
     "SELECT id, workspace_id, repo_id, engine_id, model_id, engine_thread_id, engine_metadata_json,
             COALESCE(title, ''), status, message_count, total_tokens, created_at, last_activity_at
@@ -76,6 +83,7 @@ pub fn list_threads_for_workspace(
             COALESCE(title, ''), status, message_count, total_tokens, created_at, last_activity_at
      FROM threads
      WHERE workspace_id = ?1
+       AND engine_id = 'codex'
        AND archived_at IS NULL
        AND (
          engine_thread_id IS NOT NULL
@@ -105,6 +113,7 @@ pub fn list_archived_threads_for_workspace(
             COALESCE(title, ''), status, message_count, total_tokens, created_at, last_activity_at
      FROM threads
      WHERE workspace_id = ?1
+       AND engine_id = 'codex'
        AND archived_at IS NOT NULL
        AND (
          engine_thread_id IS NOT NULL
@@ -285,21 +294,33 @@ pub fn update_thread_runtime_snapshot(
     status: Option<ThreadStatusDto>,
     metadata: Option<&serde_json::Value>,
 ) -> anyhow::Result<ThreadDto> {
-    let existing = get_thread(db, thread_id)?
+    let conn = db.connect()?;
+    let existing = get_thread_with_connection(&conn, thread_id)?
         .ok_or_else(|| anyhow::anyhow!("thread not found: {thread_id}"))?;
 
-    if let Some(title) =
-        title.filter(|_| !thread_manual_title_locked(existing.engine_metadata.as_ref()))
-    {
-        update_thread_title(db, thread_id, title)?;
+    let next_title =
+        title.filter(|_| !thread_manual_title_locked(existing.engine_metadata.as_ref()));
+    let next_status = status.as_ref().map(ThreadStatusDto::as_str);
+    let next_metadata = metadata.map(serde_json::Value::to_string);
+    let updated = conn
+        .execute(
+            "UPDATE threads
+             SET title = COALESCE(?1, title),
+                 last_activity_at = CASE
+                   WHEN ?2 IS NOT NULL AND status != ?2 THEN datetime('now')
+                   ELSE last_activity_at
+                 END,
+                 status = COALESCE(?2, status),
+                 engine_metadata_json = COALESCE(?3, engine_metadata_json)
+             WHERE id = ?4",
+            params![next_title, next_status, next_metadata, thread_id],
+        )
+        .context("failed to update thread runtime snapshot")?;
+    if updated == 0 {
+        anyhow::bail!("thread not found while updating runtime snapshot: {thread_id}");
     }
-    if let Some(status) = status {
-        update_thread_status(db, thread_id, status)?;
-    }
-    if let Some(metadata) = metadata {
-        update_engine_metadata(db, thread_id, metadata)?;
-    }
-    get_thread(db, thread_id)?.ok_or_else(|| {
+
+    get_thread_with_connection(&conn, thread_id)?.ok_or_else(|| {
         anyhow::anyhow!("thread not found after runtime snapshot update: {thread_id}")
     })
 }

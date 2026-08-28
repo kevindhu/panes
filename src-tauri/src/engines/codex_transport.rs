@@ -540,8 +540,8 @@ impl CodexMessageRoutingInfo {
     }
 }
 
-fn record_codex_event_routing_log(message: &str) {
-    crate::diagnostic_logs::append_codex_event_routing_log(message);
+fn record_codex_event_routing_log(message: &str) -> bool {
+    crate::diagnostic_logs::append_codex_event_routing_log(message)
 }
 
 async fn deliver_message(
@@ -558,8 +558,9 @@ async fn deliver_message(
                     "codex {subscriber_kind} event receiver closed during delivery; dropped event: {}",
                     routing_info.log_summary()
                 );
-                log::warn!("{message}");
-                record_codex_event_routing_log(&message);
+                if record_codex_event_routing_log(&message) {
+                    log::warn!("{message}");
+                }
                 return false;
             }
             true
@@ -570,8 +571,9 @@ async fn deliver_message(
                     "codex {subscriber_kind} event receiver full; dropping best-effort event: {}",
                     routing_info.log_summary()
                 );
-                log::warn!("{message}");
-                record_codex_event_routing_log(&message);
+                if record_codex_event_routing_log(&message) {
+                    log::warn!("{message}");
+                }
                 return false;
             }
 
@@ -582,8 +584,9 @@ async fn deliver_message(
                         "codex {subscriber_kind} event receiver closed during best-effort delivery; dropped event: {}",
                         routing_info.log_summary()
                     );
-                    log::warn!("{message}");
-                    record_codex_event_routing_log(&message);
+                    if record_codex_event_routing_log(&message) {
+                        log::warn!("{message}");
+                    }
                     false
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -591,8 +594,9 @@ async fn deliver_message(
                         "codex {subscriber_kind} event receiver full; dropping best-effort event: {}",
                         routing_info.log_summary()
                     );
-                    log::warn!("{message}");
-                    record_codex_event_routing_log(&message);
+                    if record_codex_event_routing_log(&message) {
+                        log::warn!("{message}");
+                    }
                     false
                 }
             }

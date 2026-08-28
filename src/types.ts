@@ -220,6 +220,7 @@ export interface Message {
   content?: string;
   blocks?: ContentBlock[];
   clientTurnId?: string | null;
+  nativeTurnId?: string | null;
   turnEngineId?: string | null;
   turnModelId?: string | null;
   turnReasoningEffort?: string | null;
@@ -1134,6 +1135,7 @@ export interface StreamTokenUsage {
 export interface TurnStartedEvent {
   type: "TurnStarted";
   client_turn_id?: string | null;
+  native_turn_id?: string | null;
 }
 
 export interface TurnCompletedEvent {
@@ -1287,9 +1289,10 @@ export interface ChatAttachment {
   mimeType?: string;
 }
 
-export interface AttachmentPreview {
+export interface PreparedAttachmentImageAsset {
+  filePath: string;
   mimeType: string;
-  dataBase64: string;
+  version: string;
 }
 
 export type ChatInputItem =

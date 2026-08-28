@@ -2,7 +2,7 @@ use anyhow::Context;
 use chrono::{Duration as ChronoDuration, Utc};
 use std::collections::HashMap;
 
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, TransactionBehavior};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -19,6 +19,7 @@ pub struct ImportedMessageRecord {
     pub content: Option<String>,
     pub blocks: Value,
     pub status: MessageStatusDto,
+    pub native_turn_id: Option<String>,
     pub turn_engine_id: Option<String>,
     pub turn_model_id: Option<String>,
     pub turn_reasoning_effort: Option<String>,
@@ -97,6 +98,25 @@ pub fn clone_thread_messages_for_branch(
     clone_message_slice(db, target_thread_id, &messages[..retained_count])
 }
 
+pub fn validate_thread_branch_cutoff(
+    db: &Database,
+    thread_id: &str,
+    turns_after: u32,
+) -> anyhow::Result<()> {
+    let messages = get_thread_messages(db, thread_id)?;
+    let turn_count = messages
+        .iter()
+        .filter(|message| message.role == "user" && !message_has_steer_marker(message))
+        .count();
+    let turns_after = usize::try_from(turns_after).unwrap_or(usize::MAX);
+    if turn_count <= turns_after {
+        anyhow::bail!(
+            "cannot fork with {turns_after} later turns from local history with only {turn_count} turns"
+        );
+    }
+    Ok(())
+}
+
 fn clone_message_slice(
     db: &Database,
     target_thread_id: &str,
@@ -121,8 +141,8 @@ fn clone_message_slice(
             "INSERT INTO messages (
                 id, thread_id, role, content, blocks_json, turn_engine_id, turn_model_id,
                 turn_reasoning_effort, schema_version, stream_seq, status, token_input,
-                token_output, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13)",
+                token_output, created_at, native_turn_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14)",
             params![
                 Uuid::new_v4().to_string(),
                 target_thread_id,
@@ -137,6 +157,7 @@ fn clone_message_slice(
                 token_usage.input as i64,
                 token_usage.output as i64,
                 message.created_at.as_str(),
+                message.native_turn_id,
             ],
         )
         .context("failed to clone thread message")?;
@@ -184,7 +205,7 @@ pub fn replace_thread_messages(
 ) -> anyhow::Result<usize> {
     let mut conn = db.connect()?;
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("failed to start thread message import transaction")?;
 
     tx.execute(
@@ -215,8 +236,8 @@ pub fn replace_thread_messages(
             "INSERT INTO messages (
                 id, thread_id, role, content, blocks_json, turn_engine_id, turn_model_id,
                 turn_reasoning_effort, schema_version, stream_seq, status, token_input,
-                token_output, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, 0, ?9, ?10, ?11, ?12)",
+                token_output, created_at, native_turn_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, 0, ?9, ?10, ?11, ?12, ?13)",
             params![
                 Uuid::new_v4().to_string(),
                 thread_id,
@@ -230,9 +251,36 @@ pub fn replace_thread_messages(
                 message.token_input as i64,
                 message.token_output as i64,
                 created_at,
+                message.native_turn_id,
             ],
         )
         .context("failed to insert imported thread message")?;
+    }
+
+    let refreshed = tx
+        .execute(
+            "UPDATE threads
+             SET message_count = (
+                   SELECT COUNT(*) FROM messages WHERE thread_id = ?1
+                 ),
+                 total_tokens = (
+                   SELECT COALESCE(
+                     SUM(COALESCE(token_input, 0) + COALESCE(token_output, 0)),
+                     0
+                   )
+                   FROM messages
+                   WHERE thread_id = ?1
+                 ),
+                 last_activity_at = COALESCE(
+                   (SELECT MAX(created_at) FROM messages WHERE thread_id = ?1),
+                   datetime('now')
+                 )
+             WHERE id = ?1",
+            params![thread_id],
+        )
+        .context("failed to refresh imported thread message stats")?;
+    if refreshed == 0 {
+        anyhow::bail!("thread not found while importing messages: {thread_id}");
     }
 
     tx.commit()
@@ -421,11 +469,37 @@ pub fn update_assistant_turn_model_id(
     Ok(())
 }
 
+pub fn update_assistant_native_turn_id(
+    db: &Database,
+    message_id: &str,
+    native_turn_id: &str,
+) -> anyhow::Result<()> {
+    let native_turn_id = native_turn_id.trim();
+    if native_turn_id.is_empty() {
+        anyhow::bail!("native turn id cannot be empty");
+    }
+
+    let conn = db.connect()?;
+    let updated = conn
+        .execute(
+            "UPDATE messages
+             SET native_turn_id = ?1
+             WHERE id = ?2 AND role = 'assistant'",
+            params![native_turn_id, message_id],
+        )
+        .context("failed to update assistant native turn id")?;
+    if updated == 0 {
+        anyhow::bail!("assistant message not found: {message_id}");
+    }
+    Ok(())
+}
+
 pub fn get_thread_messages(db: &Database, thread_id: &str) -> anyhow::Result<Vec<MessageDto>> {
     let conn = db.connect()?;
     let mut stmt = conn.prepare(
         "SELECT id, thread_id, role, content, blocks_json, schema_version, status,
-            token_input, token_output, turn_engine_id, turn_model_id, turn_reasoning_effort, created_at
+            token_input, token_output, turn_engine_id, turn_model_id, turn_reasoning_effort, created_at,
+            native_turn_id
      FROM messages
      WHERE thread_id = ?1
      ORDER BY created_at ASC, rowid ASC",
@@ -473,7 +547,8 @@ pub fn get_thread_messages_window(
     let conn = db.connect()?;
     let mut stmt = conn.prepare(
         "SELECT id, thread_id, role, content, blocks_json, schema_version, status,
-            token_input, token_output, turn_engine_id, turn_model_id, turn_reasoning_effort, created_at, rowid
+            token_input, token_output, turn_engine_id, turn_model_id, turn_reasoning_effort, created_at,
+            rowid, native_turn_id
      FROM messages
      WHERE thread_id = ?1
        AND (
@@ -731,6 +806,7 @@ pub fn search_messages(
      JOIN threads t ON t.id = m.thread_id
      JOIN workspaces w ON w.id = t.workspace_id
      WHERE t.workspace_id = ?1
+       AND t.engine_id = 'codex'
        AND t.archived_at IS NULL
        AND messages_fts MATCH ?2
      ORDER BY rank
@@ -947,7 +1023,8 @@ fn insert_message(
     let conn = db.connect()?;
     conn.query_row(
         "SELECT id, thread_id, role, content, blocks_json, schema_version, status,
-            token_input, token_output, turn_engine_id, turn_model_id, turn_reasoning_effort, created_at
+            token_input, token_output, turn_engine_id, turn_model_id, turn_reasoning_effort, created_at,
+            native_turn_id
      FROM messages
      WHERE id = ?1",
         params![id],
@@ -966,6 +1043,7 @@ fn map_message_row(row: &Row<'_>) -> rusqlite::Result<MessageDto> {
         role: row.get(2)?,
         content: row.get(3)?,
         blocks: blocks_raw.and_then(|raw| serde_json::from_str(&raw).ok()),
+        native_turn_id: row.get("native_turn_id")?,
         turn_engine_id: row.get(9)?,
         turn_model_id: row.get(10)?,
         turn_reasoning_effort: row.get(11)?,
@@ -1290,6 +1368,51 @@ mod tests {
     }
 
     #[test]
+    fn replacing_imported_messages_refreshes_thread_stats_in_the_same_transaction() {
+        let db = test_db();
+        let thread_id = test_thread(&db);
+        let imported = vec![
+            ImportedMessageRecord {
+                role: "user".to_string(),
+                content: Some("question".to_string()),
+                blocks: json!([{ "type": "text", "content": "question" }]),
+                status: MessageStatusDto::Completed,
+                native_turn_id: None,
+                turn_engine_id: Some("codex".to_string()),
+                turn_model_id: Some("gpt-5.3-codex".to_string()),
+                turn_reasoning_effort: Some("medium".to_string()),
+                token_input: 3,
+                token_output: 0,
+                created_at: Some("2026-07-25 10:00:00.000".to_string()),
+            },
+            ImportedMessageRecord {
+                role: "assistant".to_string(),
+                content: Some("answer".to_string()),
+                blocks: json!([{ "type": "text", "content": "answer" }]),
+                status: MessageStatusDto::Completed,
+                native_turn_id: None,
+                turn_engine_id: Some("codex".to_string()),
+                turn_model_id: Some("gpt-5.3-codex".to_string()),
+                turn_reasoning_effort: Some("medium".to_string()),
+                token_input: 5,
+                token_output: 7,
+                created_at: Some("2026-07-25 10:00:01.000".to_string()),
+            },
+        ];
+
+        let replaced = replace_thread_messages(&db, &thread_id, &imported)
+            .expect("failed to replace imported messages");
+        let thread = threads::get_thread(&db, &thread_id)
+            .expect("failed to reload imported thread")
+            .expect("imported thread missing");
+
+        assert_eq!(replaced, 2);
+        assert_eq!(thread.message_count, 2);
+        assert_eq!(thread.total_tokens, 15);
+        assert_eq!(thread.last_activity_at, "2026-07-25 10:00:01.000");
+    }
+
+    #[test]
     fn build_search_messages_query_quotes_free_text_terms() {
         assert_eq!(
             build_search_messages_query("foo bar:baz \"quoted\""),
@@ -1602,6 +1725,32 @@ mod tests {
         let reloaded = get_thread_messages(&db, &thread_id).unwrap();
         assert_eq!(reloaded.len(), 1);
         assert_eq!(reloaded[0].turn_model_id.as_deref(), Some("gpt-5.3-codex"));
+    }
+
+    #[test]
+    fn update_assistant_native_turn_id_persists_the_codex_fork_key() {
+        let db = test_db();
+        let thread_id = test_thread(&db);
+        let message = insert_message(
+            &db,
+            &thread_id,
+            "assistant",
+            None,
+            Some(json!([])),
+            MessageStatusDto::Streaming,
+            Some("codex"),
+            Some("gpt-5.4"),
+            None,
+        )
+        .unwrap();
+
+        update_assistant_native_turn_id(&db, &message.id, "turn-native-1").unwrap();
+
+        let reloaded = get_thread_messages(&db, &thread_id).unwrap();
+        assert_eq!(
+            reloaded[0].native_turn_id.as_deref(),
+            Some("turn-native-1")
+        );
     }
 
     #[test]

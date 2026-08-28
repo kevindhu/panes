@@ -68,6 +68,7 @@ impl TurnEventMapper {
         match method_key.as_str() {
             "turnstarted" => vec![EngineEvent::TurnStarted {
                 client_turn_id: None,
+                native_turn_id: extract_native_turn_id(params),
             }],
             "turncompleted" => {
                 let mut events = Vec::new();
@@ -304,6 +305,7 @@ impl TurnEventMapper {
                         Some(ParsedTurnStatus::Active) => {
                             out.push(EngineEvent::TurnStarted {
                                 client_turn_id: None,
+                                native_turn_id: extract_native_turn_id(result),
                             });
                         }
                         Some(ParsedTurnStatus::Terminal(completion_status)) => {
@@ -1649,6 +1651,14 @@ fn extract_any_string(value: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
+fn extract_native_turn_id(value: &Value) -> Option<String> {
+    extract_any_string(value, &["turnId", "turn_id"]).or_else(|| {
+        value
+            .get("turn")
+            .and_then(|turn| extract_any_string(turn, &["id", "turnId", "turn_id"]))
+    })
+}
+
 fn extract_any_u64(value: &Value, keys: &[&str]) -> Option<u64> {
     for key in keys {
         if let Some(found) = value.get(*key) {
@@ -1734,6 +1744,23 @@ fn join_string_array(items: Option<&Vec<Value>>) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn turn_started_carries_the_native_codex_turn_id() {
+        let mut mapper = TurnEventMapper::default();
+        let events = mapper.map_notification(
+            "turn/started",
+            &json!({ "turn": { "id": "turn-native-1" } }),
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [EngineEvent::TurnStarted {
+                native_turn_id: Some(turn_id),
+                ..
+            }] if turn_id == "turn-native-1"
+        ));
+    }
 
     #[test]
     fn map_turn_result_keeps_non_terminal_status_aliases_active() {

@@ -4,21 +4,24 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-type PreviewPayload = {
-  mimeType: string;
-  dataBase64: string;
-};
-
 const mockConvertFileSrc = vi.hoisted(() =>
   vi.fn((filePath: string) => `asset://${filePath.replaceAll("\\", "/")}`),
 );
 const mockIsTauri = vi.hoisted(() => vi.fn(() => true));
-const mockReadAttachmentPreview = vi.hoisted(() =>
-  vi.fn<(filePath: string, mimeType?: string | null) => Promise<PreviewPayload | null>>(
-    async () => ({ mimeType: "image/png", dataBase64: "YWJj" }),
-  ),
-);
-const mockCreateObjectURL = vi.hoisted(() => vi.fn(() => "blob:mock-preview"));
+const mockPrepareAttachmentImageAsset = vi.hoisted(() => vi.fn(async (
+  filePath: string,
+  mimeType?: string | null,
+  maxWidth?: number | null,
+  maxHeight?: number | null,
+) => ({
+  filePath: maxWidth || maxHeight ? `${filePath}.thumb.png` : filePath,
+  mimeType: maxWidth || maxHeight ? "image/png" : mimeType ?? "image/png",
+  version: maxWidth || maxHeight ? "thumb" : "full",
+})));
+const mockReadAttachmentImageBytes = vi.hoisted(() => vi.fn(async () => (
+  new Uint8Array([97, 98, 99]).buffer
+)));
+const mockCreateObjectURL = vi.hoisted(() => vi.fn(() => "blob:raw-fallback"));
 const mockRevokeObjectURL = vi.hoisted(() => vi.fn());
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -32,9 +35,10 @@ vi.mock("react-i18next", () => ({
   }),
 }));
 
-vi.mock("../../lib/ipc", () => ({
+vi.mock("../../lib/codexIpc", () => ({
   ipc: {
-    readAttachmentPreview: mockReadAttachmentPreview,
+    prepareAttachmentImageAsset: mockPrepareAttachmentImageAsset,
+    readAttachmentImageBytes: mockReadAttachmentImageBytes,
     copyAttachmentImageToClipboard: vi.fn(async () => undefined),
   },
 }));
@@ -80,6 +84,20 @@ describe("MarkdownContent local images", () => {
     });
     resetAttachmentImageCachesForTests();
     mockIsTauri.mockReturnValue(true);
+    mockConvertFileSrc.mockImplementation(
+      (filePath: string) => `asset://${filePath.replaceAll("\\", "/")}`,
+    );
+    mockPrepareAttachmentImageAsset.mockImplementation(async (
+      filePath: string,
+      mimeType?: string | null,
+      maxWidth?: number | null,
+      maxHeight?: number | null,
+    ) => ({
+      filePath: maxWidth || maxHeight ? `${filePath}.thumb.png` : filePath,
+      mimeType: maxWidth || maxHeight ? "image/png" : mimeType ?? "image/png",
+      version: maxWidth || maxHeight ? "thumb" : "full",
+    }));
+    mockReadAttachmentImageBytes.mockResolvedValue(new Uint8Array([97, 98, 99]).buffer);
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
@@ -95,8 +113,6 @@ describe("MarkdownContent local images", () => {
   });
 
   it("resolves workspace-relative markdown images to Tauri asset URLs", async () => {
-    mockReadAttachmentPreview.mockResolvedValueOnce(null);
-
     await act(async () => {
       root.render(
         <MarkdownContent
@@ -104,6 +120,9 @@ describe("MarkdownContent local images", () => {
           workspaceRootPath={"C:\\Users\\lemondoo\\PROJECTS\\manga_reader"}
         />,
       );
+    });
+    await act(async () => {
+      await Promise.resolve();
     });
 
     const button = container.querySelector(".markdown-local-image-button") as HTMLButtonElement | null;
@@ -115,11 +134,11 @@ describe("MarkdownContent local images", () => {
     expect(button?.tagName).toBe("BUTTON");
     expect(button?.getAttribute("aria-label")).toBe("Open image");
     expect(mockConvertFileSrc).toHaveBeenCalledWith(
-      "C:\\Users\\lemondoo\\PROJECTS\\manga_reader\\screenshots\\kim_toxic_cafe_cuties_korean-page-8-local.png",
+      "C:\\Users\\lemondoo\\PROJECTS\\manga_reader\\screenshots\\kim_toxic_cafe_cuties_korean-page-8-local.png.thumb.png",
     );
   });
 
-  it("loads a native preview object URL for local markdown images", async () => {
+  it("loads a bounded native asset thumbnail for local markdown images", async () => {
     await act(async () => {
       root.render(
         <MarkdownContent
@@ -137,12 +156,16 @@ describe("MarkdownContent local images", () => {
 
     const image = container.querySelector(".markdown-local-image-thumbnail") as HTMLImageElement | null;
     expect(image).not.toBeNull();
-    expect(mockReadAttachmentPreview).toHaveBeenCalledWith(
+    expect(mockPrepareAttachmentImageAsset).toHaveBeenCalledWith(
       "C:\\repo\\screenshots\\page.png",
       "image/png",
+      720,
+      440,
     );
-    expect(image?.getAttribute("src")).toBe("blob:mock-preview");
-    expect(mockCreateObjectURL).toHaveBeenCalledTimes(1);
+    expect(image?.getAttribute("src")).toBe(
+      "asset://C:/repo/screenshots/page.png.thumb.png?v=thumb",
+    );
+    expect(mockReadAttachmentImageBytes).not.toHaveBeenCalled();
   });
 
   it("loads absolute sibling images through the native preview pipeline", async () => {
@@ -163,9 +186,16 @@ describe("MarkdownContent local images", () => {
     const image = container.querySelector(".markdown-local-image-thumbnail") as HTMLImageElement | null;
     const absolutePath = "C:\\Users\\dev\\Downloads\\translated panels\\page 07.png";
     expect(button?.getAttribute("data-panes-markdown-local-image-path")).toBe(absolutePath);
-    expect(image?.getAttribute("src")).toBe("blob:mock-preview");
-    expect(mockConvertFileSrc).toHaveBeenCalledWith(absolutePath);
-    expect(mockReadAttachmentPreview).toHaveBeenCalledWith(absolutePath, "image/png");
+    expect(image?.getAttribute("src")).toBe(
+      "asset://C:/Users/dev/Downloads/translated%20panels/page%2007.png.thumb.png?v=thumb".replaceAll("%20", " "),
+    );
+    expect(mockConvertFileSrc).toHaveBeenCalledWith(`${absolutePath}.thumb.png`);
+    expect(mockPrepareAttachmentImageAsset).toHaveBeenCalledWith(
+      absolutePath,
+      "image/png",
+      720,
+      440,
+    );
   });
 
   it("loads UNC images without requiring a workspace root", async () => {
@@ -189,9 +219,14 @@ describe("MarkdownContent local images", () => {
       ),
     ).toBe(uncPath);
     expect(container.querySelector(".markdown-local-image-thumbnail")?.getAttribute("src")).toBe(
-      "blob:mock-preview",
+      "asset:////media-server/translations/translated page.webp.thumb.png?v=thumb",
     );
-    expect(mockReadAttachmentPreview).toHaveBeenCalledWith(uncPath, "image/webp");
+    expect(mockPrepareAttachmentImageAsset).toHaveBeenCalledWith(
+      uncPath,
+      "image/webp",
+      720,
+      440,
+    );
   });
 
   it("does not route remote images through native attachment previews", async () => {
@@ -213,7 +248,8 @@ describe("MarkdownContent local images", () => {
       "//cdn.example.com/page.webp",
     ]);
     expect(container.querySelector(".markdown-local-image-button")).toBeNull();
-    expect(mockReadAttachmentPreview).not.toHaveBeenCalled();
+    expect(mockPrepareAttachmentImageAsset).not.toHaveBeenCalled();
+    expect(mockReadAttachmentImageBytes).not.toHaveBeenCalled();
     expect(mockConvertFileSrc).not.toHaveBeenCalled();
   });
 
@@ -276,7 +312,7 @@ describe("MarkdownContent local images", () => {
     expect(document.body.querySelector(".chat-image-viewer-backdrop")).not.toBeNull();
     expect(document.body.textContent).toContain("page.png");
     expect(document.body.querySelector(".chat-image-viewer-image")?.getAttribute("src")).toBe(
-      "blob:mock-preview",
+      "asset://C:/repo/screenshots/page.png.thumb.png?v=thumb",
     );
   });
 
@@ -295,7 +331,9 @@ describe("MarkdownContent local images", () => {
     });
 
     const firstImage = container.querySelector(".markdown-local-image-thumbnail") as HTMLImageElement | null;
-    expect(firstImage?.getAttribute("src")).toBe("blob:mock-preview");
+    expect(firstImage?.getAttribute("src")).toBe(
+      "asset://C:/repo/screenshots/page.png.thumb.png?v=thumb",
+    );
 
     await act(async () => {
       if (firstImage) {
@@ -319,10 +357,12 @@ describe("MarkdownContent local images", () => {
 
     const remountedImage = container.querySelector(".markdown-local-image-thumbnail") as HTMLImageElement | null;
     const remountedButton = container.querySelector(".markdown-local-image-button") as HTMLButtonElement | null;
-    expect(remountedImage?.getAttribute("src")).toBe("blob:mock-preview");
+    expect(remountedImage?.getAttribute("src")).toBe(
+      "asset://C:/repo/screenshots/page.png.thumb.png?v=thumb",
+    );
     expect(remountedButton?.style.getPropertyValue("--markdown-local-image-frame-width")).toBe("110px");
     expect(remountedButton?.style.getPropertyValue("--markdown-local-image-aspect")).toBe("360 / 720");
-    expect(mockReadAttachmentPreview).toHaveBeenCalledTimes(1);
+    expect(mockPrepareAttachmentImageAsset).toHaveBeenCalledTimes(2);
   });
 
   it("reloads an absolute image preview after transient preview state is cleared", async () => {
@@ -337,7 +377,7 @@ describe("MarkdownContent local images", () => {
     });
 
     expect(container.querySelector(".markdown-local-image-thumbnail")?.getAttribute("src")).toBe(
-      "blob:mock-preview",
+      "asset://C:/Users/dev/sibling/translated.png.thumb.png?v=thumb",
     );
 
     await act(async () => {
@@ -357,12 +397,12 @@ describe("MarkdownContent local images", () => {
       ),
     ).toBe(absolutePath);
     expect(container.querySelector(".markdown-local-image-thumbnail")?.getAttribute("src")).toBe(
-      "blob:mock-preview",
+      "asset://C:/Users/dev/sibling/translated.png.thumb.png?v=thumb",
     );
-    expect(mockReadAttachmentPreview).toHaveBeenCalledTimes(2);
+    expect(mockPrepareAttachmentImageAsset).toHaveBeenCalledTimes(4);
   });
 
-  it("still converts relative images when Tauri asset detection is unavailable", async () => {
+  it("keeps a local-image placeholder outside Tauri", async () => {
     mockIsTauri.mockReturnValue(false);
 
     await act(async () => {
@@ -384,12 +424,10 @@ describe("MarkdownContent local images", () => {
     expect(button?.getAttribute("data-panes-markdown-local-image-path")).toBe(
       "C:\\repo\\screenshots\\page.png",
     );
-    expect(image?.getAttribute("src")).toBe("blob:mock-preview");
+    expect(image).toBeNull();
     expect(mockConvertFileSrc).not.toHaveBeenCalled();
-    expect(mockReadAttachmentPreview).toHaveBeenCalledWith(
-      "C:\\repo\\screenshots\\page.png",
-      "image/png",
-    );
+    expect(mockPrepareAttachmentImageAsset).not.toHaveBeenCalled();
+    expect(mockReadAttachmentImageBytes).not.toHaveBeenCalled();
   });
 
   it("still converts relative images when Tauri asset URL conversion fails", async () => {
@@ -413,16 +451,18 @@ describe("MarkdownContent local images", () => {
     const button = container.querySelector(".markdown-local-image-button") as HTMLButtonElement | null;
     const image = container.querySelector(".markdown-local-image-thumbnail") as HTMLImageElement | null;
     expect(button).not.toBeNull();
-    expect(image?.getAttribute("src")).toBe("blob:mock-preview");
-    expect(mockConvertFileSrc).toHaveBeenCalledWith("C:\\repo\\screenshots\\page.png");
-    expect(mockReadAttachmentPreview).toHaveBeenCalledWith(
+    expect(image?.getAttribute("src")).toBe("blob:raw-fallback");
+    expect(mockConvertFileSrc).toHaveBeenCalledWith(
+      "C:\\repo\\screenshots\\page.png.thumb.png",
+    );
+    expect(mockReadAttachmentImageBytes).toHaveBeenCalledWith(
       "C:\\repo\\screenshots\\page.png",
       "image/png",
     );
   });
 
-  it("still converts relative images when Tauri detection fails", async () => {
-    mockIsTauri.mockImplementationOnce(() => {
+  it("keeps a local-image placeholder when Tauri detection fails", async () => {
+    mockIsTauri.mockImplementation(() => {
       throw new Error("tauri unavailable");
     });
 
@@ -445,11 +485,8 @@ describe("MarkdownContent local images", () => {
     expect(button?.getAttribute("data-panes-markdown-local-image-path")).toBe(
       "C:\\repo\\screenshots\\page.png",
     );
-    expect(image?.getAttribute("src")).toBe("blob:mock-preview");
+    expect(image).toBeNull();
     expect(mockConvertFileSrc).not.toHaveBeenCalled();
-    expect(mockReadAttachmentPreview).toHaveBeenCalledWith(
-      "C:\\repo\\screenshots\\page.png",
-      "image/png",
-    );
+    expect(mockReadAttachmentImageBytes).not.toHaveBeenCalled();
   });
 });

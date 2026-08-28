@@ -3,7 +3,7 @@ import {
   ipc,
   listenThreadEvents,
   type ChatTurnFinishedEvent,
-} from "../lib/ipc";
+} from "../lib/codexIpc";
 import {
   armPlanImplementationPrompt,
   disarmPlanImplementationPrompt,
@@ -2553,6 +2553,9 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
   if (event.type === "TurnStarted" && typeof event.client_turn_id === "string") {
     assistant.clientTurnId = event.client_turn_id;
   }
+  if (event.type === "TurnStarted" && typeof event.native_turn_id === "string") {
+    assistant.nativeTurnId = event.native_turn_id;
+  }
 
   if (event.type === "TurnSnapshotRecovered") {
     assistant.blocks = normalizeBlocks(Array.isArray(event.blocks) ? event.blocks : []) ?? [];
@@ -2862,6 +2865,7 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
   const statusChanged = assistant.status !== currentAssistant.status;
   const metadataChanged =
     assistant.clientTurnId !== currentAssistant.clientTurnId ||
+    assistant.nativeTurnId !== currentAssistant.nativeTurnId ||
     assistant.turnEngineId !== currentAssistant.turnEngineId ||
     assistant.turnModelId !== currentAssistant.turnModelId ||
     assistant.turnReasoningEffort !== currentAssistant.turnReasoningEffort ||

@@ -16,12 +16,11 @@ use crate::{
     engines::validate_engine_sandbox_mode,
     engines::CodexRemoteThreadSummary,
     engines::ImportedThreadMessage,
-    engines::OpenCodeRemoteSessionSummary,
     engines::SandboxPolicy,
     engines::ThreadSyncSnapshot,
     models::{
-        CodexRemoteThreadDto, CodexRemoteThreadPageDto, MessageStatusDto, OpenCodeRemoteSessionDto,
-        OpenCodeRemoteSessionPageDto, ReasoningEffortOptionDto, RepoDto, ThreadDto,
+        CodexRemoteThreadDto, CodexRemoteThreadPageDto, MessageStatusDto,
+        ReasoningEffortOptionDto, RepoDto, ThreadDto,
         ThreadStatusDto, TrustLevelDto,
     },
     state::AppState,
@@ -408,170 +407,6 @@ pub async fn attach_codex_remote_thread(
     .await
 }
 
-#[tauri::command]
-pub async fn list_opencode_remote_sessions(
-    state: State<'_, AppState>,
-    workspace_id: String,
-    cursor: Option<String>,
-    limit: Option<u32>,
-    search_term: Option<String>,
-    archived: Option<bool>,
-) -> Result<OpenCodeRemoteSessionPageDto, String> {
-    let db = state.db.clone();
-    let (workspace_root, repos) = run_db(db.clone(), {
-        let workspace_id = workspace_id.clone();
-        move |db| {
-            let workspace = db::workspaces::find_workspace_by_id(db, &workspace_id)?
-                .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))?;
-            let repos = db::repos::get_repos(db, &workspace_id)?;
-            Ok((workspace.root_path, repos))
-        }
-    })
-    .await?;
-
-    let allowed_roots = collect_remote_thread_roots(&workspace_root, &repos);
-    let normalized_search_term = normalize_remote_thread_search_term(search_term);
-    let mut remote_sessions = Vec::new();
-    for cwd in allowed_roots.iter() {
-        let sessions = state
-            .engines
-            .list_opencode_remote_sessions(cwd, normalized_search_term.as_deref(), archived)
-            .await
-            .map_err(err_to_string)?;
-        remote_sessions.extend(sessions);
-    }
-    remote_sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    let mut seen_session_ids = std::collections::HashSet::new();
-    remote_sessions.retain(|session| seen_session_ids.insert(session.engine_thread_id.clone()));
-
-    let offset = parse_codex_remote_thread_cursor(cursor.as_deref())?;
-    let page_size = normalize_codex_remote_thread_limit(limit);
-    let page_end = offset.saturating_add(page_size).min(remote_sessions.len());
-    let page_sessions = if offset >= remote_sessions.len() {
-        Vec::new()
-    } else {
-        remote_sessions[offset..page_end].to_vec()
-    };
-    let next_cursor = (page_end < remote_sessions.len()).then(|| page_end.to_string());
-
-    run_db(db, move |db| {
-        let sessions = page_sessions
-            .into_iter()
-            .map(|session| {
-                let local_thread_id = db::threads::find_thread_by_engine_thread_id(
-                    db,
-                    "opencode",
-                    &session.engine_thread_id,
-                )?
-                .filter(|local| local.workspace_id == workspace_id)
-                .map(|local| local.id);
-                Ok(map_opencode_remote_session_dto(session, local_thread_id))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-
-        Ok(OpenCodeRemoteSessionPageDto {
-            sessions,
-            next_cursor,
-        })
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn attach_opencode_remote_session(
-    state: State<'_, AppState>,
-    workspace_id: String,
-    engine_thread_id: String,
-    cwd: String,
-    model_id: String,
-) -> Result<ThreadDto, String> {
-    let normalized_model_id =
-        validate_model_for_engine(state.inner(), "opencode", model_id.trim()).await?;
-    let db = state.db.clone();
-    let (workspace_root, repos, existing_local_thread) = run_db(db.clone(), {
-        let workspace_id = workspace_id.clone();
-        let engine_thread_id = engine_thread_id.clone();
-        move |db| {
-            let workspace = db::workspaces::find_workspace_by_id(db, &workspace_id)?
-                .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))?;
-            let repos = db::repos::get_repos(db, &workspace_id)?;
-            let existing =
-                db::threads::find_thread_by_engine_thread_id(db, "opencode", &engine_thread_id)?
-                    .filter(|thread| thread.workspace_id == workspace_id);
-            Ok((workspace.root_path, repos, existing))
-        }
-    })
-    .await?;
-
-    let allowed_roots = collect_remote_thread_roots(&workspace_root, &repos);
-    if !allowed_roots.contains(cwd.as_str()) {
-        return Err(format!(
-            "OpenCode session cwd is outside this workspace: {cwd}"
-        ));
-    }
-
-    let mut remote_session = state
-        .engines
-        .read_opencode_remote_session(&cwd, &engine_thread_id)
-        .await
-        .map_err(err_to_string)?;
-    if remote_session.archived {
-        state
-            .engines
-            .unarchive_opencode_remote_session(&cwd, &engine_thread_id)
-            .await
-            .map_err(err_to_string)?;
-        remote_session.archived = false;
-    }
-    let repo_id =
-        resolve_codex_remote_thread_repo_id(&workspace_root, &repos, &remote_session.cwd)?;
-    let title = build_opencode_remote_session_title(&remote_session);
-
-    if let Some(existing) = existing_local_thread {
-        let metadata = build_opencode_remote_session_metadata(
-            existing.engine_metadata.as_ref(),
-            &remote_session,
-            &normalized_model_id,
-        );
-        return run_db(db, move |db| {
-            let thread = match db::threads::restore_thread(db, &existing.id) {
-                Ok(restored) => restored,
-                Err(_) => existing,
-            };
-            db::threads::update_thread_runtime_snapshot(
-                db,
-                &thread.id,
-                Some(&title),
-                Some(ThreadStatusDto::Idle),
-                Some(&metadata),
-            )
-        })
-        .await;
-    }
-
-    let metadata =
-        build_opencode_remote_session_metadata(None, &remote_session, &normalized_model_id);
-    run_db(db, move |db| {
-        let created = db::threads::create_thread(
-            db,
-            &workspace_id,
-            repo_id.as_deref(),
-            "opencode",
-            &normalized_model_id,
-            &title,
-        )?;
-        db::threads::set_engine_thread_id(db, &created.id, &engine_thread_id)?;
-        db::threads::update_thread_runtime_snapshot(
-            db,
-            &created.id,
-            Some(&title),
-            Some(ThreadStatusDto::Idle),
-            Some(&metadata),
-        )
-    })
-    .await
-}
-
 async fn validate_model_for_engine(
     state: &AppState,
     engine_id: &str,
@@ -787,74 +622,6 @@ fn build_codex_remote_thread_metadata(thread: &CodexRemoteThreadSummary, model_i
     metadata
 }
 
-fn map_opencode_remote_session_dto(
-    session: OpenCodeRemoteSessionSummary,
-    local_thread_id: Option<String>,
-) -> OpenCodeRemoteSessionDto {
-    OpenCodeRemoteSessionDto {
-        engine_thread_id: session.engine_thread_id,
-        title: session.title,
-        cwd: session.cwd,
-        created_at: codex_remote_thread_timestamp_to_rfc3339(session.created_at),
-        updated_at: codex_remote_thread_timestamp_to_rfc3339(session.updated_at),
-        archived: session.archived,
-        local_thread_id,
-    }
-}
-
-fn build_opencode_remote_session_title(session: &OpenCodeRemoteSessionSummary) -> String {
-    if let Some(title) = session
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return normalize_thread_title(title).unwrap_or_else(|_| {
-            format!(
-                "OpenCode session {}",
-                short_thread_label(&session.engine_thread_id)
-            )
-        });
-    }
-
-    format!(
-        "OpenCode session {}",
-        short_thread_label(&session.engine_thread_id)
-    )
-}
-
-fn build_opencode_remote_session_metadata(
-    existing: Option<&Value>,
-    session: &OpenCodeRemoteSessionSummary,
-    model_id: &str,
-) -> Value {
-    let mut metadata = existing.cloned().unwrap_or_else(|| json!({}));
-    if !metadata.is_object() {
-        metadata = json!({});
-    }
-
-    if let Some(object) = metadata.as_object_mut() {
-        object.insert("lastModelId".to_string(), json!(model_id));
-        object.insert("opencodeRemoteSessionAttached".to_string(), json!(true));
-        object.insert(
-            "opencodeRemoteArchived".to_string(),
-            json!(session.archived),
-        );
-        object.insert("opencodeRemoteCwd".to_string(), json!(session.cwd));
-        object.insert(
-            "opencodeRemoteCreatedAt".to_string(),
-            json!(codex_remote_thread_timestamp_to_rfc3339(session.created_at)),
-        );
-        object.insert(
-            "opencodeRemoteUpdatedAt".to_string(),
-            json!(codex_remote_thread_timestamp_to_rfc3339(session.updated_at)),
-        );
-        object.insert("opencodeTranscriptImported".to_string(), json!(false));
-    }
-
-    metadata
-}
-
 #[tauri::command]
 pub async fn create_thread(
     state: State<'_, AppState>,
@@ -889,6 +656,9 @@ async fn create_thread_inner(
     reasoning_effort: Option<String>,
     service_tier: Option<String>,
 ) -> Result<ThreadDto, String> {
+    if engine_id != "codex" {
+        return Err("only Codex threads are supported".to_string());
+    }
     let effective_model_id = validate_model_for_engine(state, &engine_id, model_id.trim()).await?;
     let normalized_reasoning_effort = reasoning_effort
         .as_deref()
@@ -904,18 +674,7 @@ async fn create_thread_inner(
         } else {
             None
         };
-    let normalized_service_tier = if engine_id == "codex" {
-        normalize_thread_service_tier(service_tier)?
-    } else {
-        let candidate = service_tier
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        if candidate.is_some() {
-            return Err("service tier is only supported for Codex threads".to_string());
-        }
-        None
-    };
+    let normalized_service_tier = normalize_thread_service_tier(service_tier)?;
 
     let metadata = if validated_reasoning_effort.is_some() || normalized_service_tier.is_some() {
         let mut object = serde_json::Map::new();
@@ -1135,14 +894,6 @@ pub async fn delete_thread(state: State<'_, AppState>, thread_id: String) -> Res
         if let Err(error) = state.engines.interrupt(&thread).await {
             log::warn!("failed to interrupt thread before deletion: {error}");
         }
-        if thread.engine_id == "opencode" {
-            if let Some(engine_thread_id) = thread.engine_thread_id.as_deref() {
-                state
-                    .engines
-                    .forget_opencode_session(engine_thread_id)
-                    .await;
-            }
-        }
     } else {
         state.turns.finish(&thread_id).await;
         return Err(format!("thread not found: {thread_id}"));
@@ -1174,22 +925,11 @@ pub async fn archive_thread(state: State<'_, AppState>, thread_id: String) -> Re
             log::warn!("failed to interrupt thread before archive: {error}");
         }
 
-        if thread.engine_id == "opencode" {
-            if let Some(engine_thread_id) = thread.engine_thread_id.as_deref() {
-                let cwd = resolve_thread_cwd(state.inner(), &thread).await?;
-                state
-                    .engines
-                    .archive_opencode_remote_session(&cwd, engine_thread_id)
-                    .await
-                    .map_err(err_to_string)?;
-            }
-        } else {
-            state
-                .engines
-                .archive_thread(&thread)
-                .await
-                .map_err(err_to_string)?;
-        }
+        state
+            .engines
+            .archive_thread(&thread)
+            .await
+            .map_err(err_to_string)?;
 
         run_db(db, {
             let thread_id = thread_id.clone();
@@ -1218,22 +958,11 @@ pub async fn restore_thread(
     .await?
     .ok_or_else(|| format!("thread not found: {thread_id}"))?;
 
-    if thread.engine_id == "opencode" {
-        if let Some(engine_thread_id) = thread.engine_thread_id.as_deref() {
-            let cwd = resolve_thread_cwd(state.inner(), &thread).await?;
-            state
-                .engines
-                .unarchive_opencode_remote_session(&cwd, engine_thread_id)
-                .await
-                .map_err(err_to_string)?;
-        }
-    } else {
-        state
-            .engines
-            .unarchive_thread(&thread)
-            .await
-            .map_err(err_to_string)?;
-    }
+    state
+        .engines
+        .unarchive_thread(&thread)
+        .await
+        .map_err(err_to_string)?;
 
     let restored = run_db(db, move |db| db::threads::restore_thread(db, &thread_id)).await?;
 
@@ -1252,40 +981,6 @@ pub async fn sync_thread_from_engine(
     })
     .await?
     .ok_or_else(|| format!("thread not found: {thread_id}"))?;
-
-    if thread.engine_id == "opencode" {
-        let Some(engine_thread_id) = thread.engine_thread_id.as_deref() else {
-            return Ok(thread);
-        };
-        let cwd = resolve_thread_cwd(state.inner(), &thread).await?;
-        let session = match state
-            .engines
-            .read_opencode_remote_session(&cwd, engine_thread_id)
-            .await
-        {
-            Ok(session) => session,
-            Err(error) => {
-                log::debug!("failed to sync OpenCode session {engine_thread_id}: {error}");
-                return Ok(thread);
-            }
-        };
-        let title = build_opencode_remote_session_title(&session);
-        let metadata = build_opencode_remote_session_metadata(
-            thread.engine_metadata.as_ref(),
-            &session,
-            &thread.model_id,
-        );
-        return run_db(db, move |db| {
-            db::threads::update_thread_runtime_snapshot(
-                db,
-                &thread_id,
-                Some(&title),
-                Some(ThreadStatusDto::Idle),
-                Some(&metadata),
-            )
-        })
-        .await;
-    }
 
     if thread.engine_id != "codex" {
         return Ok(thread);
@@ -1314,6 +1009,7 @@ pub async fn sync_thread_from_engine(
                 content: message.content.clone(),
                 blocks: message.blocks.clone(),
                 status: MessageStatusDto::from_str(message.status.as_str()),
+                native_turn_id: message.native_turn_id.clone(),
                 turn_engine_id: message.turn_engine_id.clone(),
                 turn_model_id: message.turn_model_id.clone(),
                 turn_reasoning_effort: message.turn_reasoning_effort.clone(),
@@ -1326,7 +1022,6 @@ pub async fn sync_thread_from_engine(
             let thread_id = thread_id.clone();
             move |db| {
                 db::messages::replace_thread_messages(db, &thread_id, &imported_messages)?;
-                db::threads::refresh_thread_message_stats(db, &thread_id)?;
                 Ok::<_, anyhow::Error>(())
             }
         })
@@ -1491,10 +1186,46 @@ fn imported_messages_have_streaming_turn(snapshot: &ThreadSyncSnapshot) -> bool 
         .any(|message| message.status == "streaming")
 }
 
+struct CodexForkPoint {
+    last_turn_id: Option<String>,
+    turns_after: u32,
+}
+
 #[tauri::command]
 pub async fn fork_codex_thread(
     state: State<'_, AppState>,
     thread_id: String,
+    profile_operation_id: Option<String>,
+) -> Result<ThreadDto, String> {
+    fork_codex_thread_inner(state.inner(), thread_id, None, profile_operation_id).await
+}
+
+#[tauri::command]
+pub async fn fork_codex_thread_at_turn(
+    state: State<'_, AppState>,
+    thread_id: String,
+    last_turn_id: Option<String>,
+    turns_after: u32,
+    profile_operation_id: Option<String>,
+) -> Result<ThreadDto, String> {
+    fork_codex_thread_inner(
+        state.inner(),
+        thread_id,
+        Some(CodexForkPoint {
+            last_turn_id: last_turn_id
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            turns_after,
+        }),
+        profile_operation_id,
+    )
+    .await
+}
+
+async fn fork_codex_thread_inner(
+    state: &AppState,
+    thread_id: String,
+    fork_point: Option<CodexForkPoint>,
     profile_operation_id: Option<String>,
 ) -> Result<ThreadDto, String> {
     let profile_operation_id = profile_operation_id
@@ -1550,8 +1281,55 @@ pub async fn fork_codex_thread(
         .engine_thread_id
         .clone()
         .ok_or_else(|| "Codex thread has not been initialized yet".to_string())?;
+    let (last_turn_id, rollback_turns) = if let Some(fork_point) = fork_point {
+        let validate_cutoff_started_at = Instant::now();
+        run_db(db.clone(), {
+            let thread_id = thread.id.clone();
+            let turns_after = fork_point.turns_after;
+            move |db| db::messages::validate_thread_branch_cutoff(db, &thread_id, turns_after)
+        })
+        .await?;
+        log_branch_profile_step(
+            profile_operation_id,
+            "backend.fork.validate_cutoff.done",
+            Some(format!(
+                "elapsed_ms={}; turns_after={}",
+                format_elapsed_ms(validate_cutoff_started_at),
+                fork_point.turns_after
+            )),
+        );
+
+        let last_turn_id = match fork_point.last_turn_id {
+            Some(last_turn_id) => last_turn_id,
+            None => {
+                let resolve_turn_started_at = Instant::now();
+                let resolved = state
+                    .engines
+                    .resolve_codex_fork_turn_id(&engine_thread_id, fork_point.turns_after)
+                    .await
+                    .map_err(err_to_string)?;
+                log_branch_profile_step(
+                    profile_operation_id,
+                    "backend.fork.resolve_turn_id.done",
+                    Some(format!(
+                        "elapsed_ms={}; turns_after={}",
+                        format_elapsed_ms(resolve_turn_started_at),
+                        fork_point.turns_after
+                    )),
+                );
+                resolved
+            }
+        };
+        (
+            Some(last_turn_id),
+            (fork_point.turns_after > 0).then_some(fork_point.turns_after),
+        )
+    } else {
+        (None, None)
+    };
+
     let build_context_started_at = Instant::now();
-    let (cwd, model_id, sandbox) = build_codex_branch_context(state.inner(), &thread).await?;
+    let (cwd, model_id, sandbox) = build_codex_branch_context(state, &thread).await?;
     log_branch_profile_step(
         profile_operation_id,
         "backend.fork.build_context.done",
@@ -1566,7 +1344,13 @@ pub async fn fork_codex_thread(
     let remote_fork_started_at = Instant::now();
     let forked = state
         .engines
-        .fork_codex_thread(&engine_thread_id, &cwd, &model_id, None, sandbox)
+        .fork_codex_thread(
+            &engine_thread_id,
+            &cwd,
+            &model_id,
+            last_turn_id.as_deref(),
+            sandbox,
+        )
         .await
         .map_err(err_to_string)?;
     log_branch_profile_step(
@@ -1583,7 +1367,7 @@ pub async fn fork_codex_thread(
 
     let create_branch_started_at = Instant::now();
     let created = create_codex_branch_thread(
-        state.inner(),
+        state,
         &thread,
         &forked.engine_thread_id,
         &forked.model_id,
@@ -1591,7 +1375,7 @@ pub async fn fork_codex_thread(
         forked.preview.as_deref(),
         forked.raw_status.as_deref(),
         &forked.active_flags,
-        None,
+        rollback_turns,
         profile_operation_id,
     )
     .await?;
@@ -1609,7 +1393,7 @@ pub async fn fork_codex_thread(
 }
 
 #[tauri::command]
-pub async fn fork_codex_thread_dropping_turns(
+pub async fn rollback_codex_thread(
     state: State<'_, AppState>,
     thread_id: String,
     num_turns: u32,
@@ -1622,24 +1406,24 @@ pub async fn fork_codex_thread_dropping_turns(
     let total_started_at = Instant::now();
     log_branch_profile_step(
         profile_operation_id,
-        "backend.bounded_fork.command.start",
+        "backend.rollback.command.start",
         Some(format!("thread_id={thread_id}; num_turns={num_turns}")),
     );
     if num_turns == 0 {
         log_branch_profile_step(
             profile_operation_id,
-            "backend.bounded_fork.command.rejected_zero_turns",
+            "backend.rollback.command.rejected_zero_turns",
             Some(format!("thread_id={thread_id}")),
         );
-        return Err("bounded fork requires at least one turn".to_string());
+        return Err("rollback requires at least one turn".to_string());
     }
     if state.turns.get(&thread_id).await.is_some() {
         log_branch_profile_step(
             profile_operation_id,
-            "backend.bounded_fork.command.rejected_active_turn",
+            "backend.rollback.command.rejected_active_turn",
             Some(format!("thread_id={thread_id}")),
         );
-        return Err("cannot create a bounded fork while a turn is still active".to_string());
+        return Err("cannot rollback a thread while a turn is still active".to_string());
     }
 
     let load_thread_started_at = Instant::now();
@@ -1652,7 +1436,7 @@ pub async fn fork_codex_thread_dropping_turns(
     .ok_or_else(|| format!("thread not found: {thread_id}"))?;
     log_branch_profile_step(
         profile_operation_id,
-        "backend.bounded_fork.load_thread.done",
+        "backend.rollback.load_thread.done",
         Some(format!(
             "elapsed_ms={}; engine_id={}; has_engine_thread_id={}",
             format_elapsed_ms(load_thread_started_at),
@@ -1664,73 +1448,69 @@ pub async fn fork_codex_thread_dropping_turns(
     if thread.engine_id != "codex" {
         log_branch_profile_step(
             profile_operation_id,
-            "backend.bounded_fork.command.rejected_non_codex",
+            "backend.rollback.command.rejected_non_codex",
             Some(format!(
                 "thread_id={thread_id}; engine_id={}",
                 thread.engine_id
             )),
         );
-        return Err("bounded history forks are only available for Codex threads".to_string());
+        return Err("native rollback is only available for Codex threads".to_string());
     }
     let engine_thread_id = thread
         .engine_thread_id
         .clone()
         .ok_or_else(|| "Codex thread has not been initialized yet".to_string())?;
-    let build_context_started_at = Instant::now();
-    let (cwd, model_id, sandbox) = build_codex_branch_context(state.inner(), &thread).await?;
+
+    let remote_rollback_started_at = Instant::now();
+    let rollback_snapshot = match state
+        .engines
+        .rollback_codex_thread(&engine_thread_id, num_turns)
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let error = err_to_string(error);
+            log_branch_profile_step(
+                profile_operation_id,
+                "backend.rollback.remote_rollback.failed",
+                Some(format!(
+                    "elapsed_ms={}; engine_thread_id={}; error={}",
+                    format_elapsed_ms(remote_rollback_started_at),
+                    engine_thread_id,
+                    error
+                )),
+            );
+            return Err(error);
+        }
+    };
     log_branch_profile_step(
         profile_operation_id,
-        "backend.bounded_fork.build_context.done",
+        "backend.rollback.remote_rollback.done",
         Some(format!(
-            "elapsed_ms={}; model_id={}; cwd={}",
-            format_elapsed_ms(build_context_started_at),
-            model_id,
-            cwd
+            "elapsed_ms={}; engine_thread_id={}",
+            format_elapsed_ms(remote_rollback_started_at),
+            engine_thread_id
         )),
     );
 
-    let remote_fork_started_at = Instant::now();
-    let forked = state
-        .engines
-        .fork_codex_thread_dropping_turns(&engine_thread_id, &cwd, &model_id, num_turns, sandbox)
-        .await
-        .map_err(err_to_string)?;
-    log_branch_profile_step(
-        profile_operation_id,
-        "backend.bounded_fork.remote_fork.done",
-        Some(format!(
-            "elapsed_ms={}; source_engine_thread_id={}; forked_engine_thread_id={}; model_id={}",
-            format_elapsed_ms(remote_fork_started_at),
-            engine_thread_id,
-            forked.engine_thread_id,
-            forked.model_id
-        )),
-    );
-    let create_branch_started_at = Instant::now();
-    let created = create_codex_branch_thread(
-        state.inner(),
-        &thread,
-        &forked.engine_thread_id,
-        &forked.model_id,
-        forked.title.as_deref(),
-        forked.preview.as_deref(),
-        forked.raw_status.as_deref(),
-        &forked.active_flags,
-        Some(num_turns),
-        profile_operation_id,
-    )
+    let persist_started_at = Instant::now();
+    let updated = run_db(db, {
+        let thread = thread.clone();
+        let rollback_snapshot = rollback_snapshot.clone();
+        move |db| persist_codex_in_place_rollback(db, &thread, &rollback_snapshot, num_turns)
+    })
     .await?;
     log_branch_profile_step(
         profile_operation_id,
-        "backend.bounded_fork.local_branch_create.done",
+        "backend.rollback.db_persist.done",
         Some(format!(
-            "elapsed_ms={}; created_thread_id={}; total_elapsed_ms={}",
-            format_elapsed_ms(create_branch_started_at),
-            created.id,
+            "elapsed_ms={}; thread_id={}; total_elapsed_ms={}",
+            format_elapsed_ms(persist_started_at),
+            updated.id,
             format_elapsed_ms(total_started_at)
         )),
     );
-    Ok(created)
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -2065,73 +1845,6 @@ async fn set_thread_codex_config_inner(
     .ok_or_else(|| format!("thread not found after Codex config update: {thread_id}"))
 }
 
-#[tauri::command]
-pub async fn set_thread_opencode_config(
-    state: State<'_, AppState>,
-    thread_id: String,
-    update_agent: bool,
-    agent: Option<String>,
-) -> Result<ThreadDto, String> {
-    set_thread_opencode_config_inner(state.inner(), thread_id, update_agent, agent).await
-}
-
-async fn set_thread_opencode_config_inner(
-    state: &AppState,
-    thread_id: String,
-    update_agent: bool,
-    agent: Option<String>,
-) -> Result<ThreadDto, String> {
-    let db = state.db.clone();
-    let thread = run_db(db.clone(), {
-        let thread_id = thread_id.clone();
-        move |db| db::threads::get_thread(db, &thread_id)
-    })
-    .await?
-    .ok_or_else(|| format!("thread not found: {thread_id}"))?;
-
-    if thread.engine_id != "opencode" {
-        return Err("OpenCode thread config is only available for OpenCode threads".to_string());
-    }
-
-    let normalized_agent = if update_agent {
-        normalize_thread_opencode_agent(agent)?
-    } else {
-        None
-    };
-
-    let mut metadata = thread.engine_metadata.unwrap_or_else(|| json!({}));
-    if !metadata.is_object() {
-        metadata = json!({});
-    }
-
-    if let Some(object) = metadata.as_object_mut() {
-        if update_agent {
-            match normalized_agent {
-                Some(value) => {
-                    object.insert("opencodeAgent".to_string(), json!(value));
-                }
-                None => {
-                    object.remove("opencodeAgent");
-                }
-            }
-        }
-    }
-
-    run_db(db.clone(), {
-        let thread_id = thread_id.clone();
-        let metadata = metadata.clone();
-        move |db| db::threads::update_engine_metadata(db, &thread_id, &metadata)
-    })
-    .await?;
-
-    run_db(db, {
-        let thread_id = thread_id.clone();
-        move |db| db::threads::get_thread(db, &thread_id)
-    })
-    .await?
-    .ok_or_else(|| format!("thread not found after OpenCode config update: {thread_id}"))
-}
-
 async fn validate_reasoning_effort(
     state: &AppState,
     engine_id: &str,
@@ -2377,7 +2090,6 @@ async fn build_codex_branch_context(
             service_tier: thread_service_tier(thread.engine_metadata.as_ref()),
             personality: thread_personality(thread.engine_metadata.as_ref()),
             output_schema: thread_output_schema(thread.engine_metadata.as_ref()),
-            opencode_agent: thread_opencode_agent(thread.engine_metadata.as_ref()),
         },
     ))
 }
@@ -2561,6 +2273,78 @@ fn codex_thread_has_local_transcript_for_history_tools(thread: &ThreadDto) -> bo
     !is_codex_thread_sync_required(thread.engine_metadata.as_ref()) && thread.message_count > 0
 }
 
+fn persist_codex_in_place_rollback(
+    db: &crate::db::Database,
+    thread: &ThreadDto,
+    rollback_snapshot: &ThreadSyncSnapshot,
+    num_turns: u32,
+) -> anyhow::Result<ThreadDto> {
+    if codex_thread_has_local_transcript_for_history_tools(thread)
+        && !is_codex_thread_sync_required(thread.engine_metadata.as_ref())
+    {
+        match db::messages::drop_last_turns(db, &thread.id, num_turns) {
+            Ok(_) => db::threads::refresh_thread_message_stats(db, &thread.id)?,
+            Err(error) if error.to_string().contains("cannot drop") => {
+                replace_messages_from_codex_snapshot(db, &thread.id, rollback_snapshot)?;
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        replace_messages_from_codex_snapshot(db, &thread.id, rollback_snapshot)?;
+    }
+
+    let metadata = mark_codex_transcript_imported(
+        merge_codex_runtime_metadata(
+            thread.engine_metadata.clone(),
+            rollback_snapshot.raw_status.as_deref(),
+            &rollback_snapshot.active_flags,
+            rollback_snapshot.preview.as_deref(),
+            false,
+            None,
+        ),
+        true,
+    );
+    let next_status = map_codex_thread_status_to_local(
+        rollback_snapshot.raw_status.as_deref(),
+        &rollback_snapshot.active_flags,
+        false,
+    );
+
+    db::threads::update_thread_runtime_snapshot(
+        db,
+        &thread.id,
+        rollback_snapshot.title.as_deref(),
+        next_status,
+        Some(&metadata),
+    )
+}
+
+fn replace_messages_from_codex_snapshot(
+    db: &crate::db::Database,
+    thread_id: &str,
+    snapshot: &ThreadSyncSnapshot,
+) -> anyhow::Result<()> {
+    let imported_messages = snapshot
+        .imported_messages
+        .iter()
+        .map(|message| db::messages::ImportedMessageRecord {
+            role: message.role.clone(),
+            content: message.content.clone(),
+            blocks: message.blocks.clone(),
+            status: MessageStatusDto::from_str(message.status.as_str()),
+            native_turn_id: message.native_turn_id.clone(),
+            turn_engine_id: message.turn_engine_id.clone(),
+            turn_model_id: message.turn_model_id.clone(),
+            turn_reasoning_effort: message.turn_reasoning_effort.clone(),
+            token_input: message.token_input,
+            token_output: message.token_output,
+            created_at: message.created_at.clone(),
+        })
+        .collect::<Vec<_>>();
+    db::messages::replace_thread_messages(db, thread_id, &imported_messages)?;
+    Ok(())
+}
+
 fn clone_codex_branch_metadata(
     existing: Option<&Value>,
     model_id: &str,
@@ -2630,50 +2414,29 @@ fn aggregate_workspace_trust_level(repos: &[RepoDto]) -> TrustLevelDto {
 }
 
 fn approval_policy_for_engine_and_trust_level(
-    engine_id: &str,
+    _engine_id: &str,
     _trust_level: &TrustLevelDto,
 ) -> &'static str {
-    match engine_id {
-        "claude" => "trusted",
-        "opencode" => "allow",
-        _ => "never",
-    }
+    "never"
 }
 
 fn allow_network_for_trust_level(_trust_level: &TrustLevelDto) -> bool {
     true
 }
 
-fn default_sandbox_mode_for_engine(engine_id: &str) -> &'static str {
-    match engine_id {
-        "codex" => "danger-full-access",
-        _ => "workspace-write",
-    }
+fn default_sandbox_mode_for_engine(_engine_id: &str) -> &'static str {
+    "danger-full-access"
 }
 
 fn thread_approval_policy_override_value(
-    engine_id: &str,
+    _engine_id: &str,
     metadata: Option<&Value>,
 ) -> Result<Option<Value>, String> {
-    match engine_id {
-        "claude" => Ok(metadata
-            .and_then(|value| value.get("claudePermissionMode"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| matches!(*value, "trusted" | "standard" | "restricted"))
-            .map(|value| Value::String(value.to_string()))),
-        "opencode" => Ok(metadata
-            .and_then(|value| value.get("opencodePermissionMode"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| matches!(*value, "ask" | "allow" | "deny"))
-            .map(|value| Value::String(value.to_string()))),
-        _ => metadata
-            .and_then(|value| value.get("sandboxApprovalPolicy"))
-            .cloned()
-            .map(normalize_codex_approval_policy)
-            .transpose(),
-    }
+    metadata
+        .and_then(|value| value.get("sandboxApprovalPolicy"))
+        .cloned()
+        .map(normalize_codex_approval_policy)
+        .transpose()
 }
 
 fn thread_allow_network_override(metadata: Option<&Value>) -> Option<bool> {
@@ -2880,15 +2643,6 @@ fn thread_approvals_reviewer(metadata: Option<&Value>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn thread_opencode_agent(metadata: Option<&Value>) -> Option<String> {
-    metadata
-        .and_then(|value| value.get("opencodeAgent"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
 fn map_codex_thread_status_to_local(
     raw_status: Option<&str>,
     active_flags: &[String],
@@ -2971,11 +2725,8 @@ fn err_to_string(error: impl std::fmt::Display) -> String {
 }
 
 fn approval_policy_metadata_key(engine_id: &str) -> &'static str {
-    match engine_id {
-        "claude" => "claudePermissionMode",
-        "opencode" => "opencodePermissionMode",
-        _ => "sandboxApprovalPolicy",
-    }
+    let _ = engine_id;
+    "sandboxApprovalPolicy"
 }
 
 fn normalize_thread_approval_policy_for_engine(
@@ -2986,45 +2737,10 @@ fn normalize_thread_approval_policy_for_engine(
         return Ok(None);
     };
 
-    match engine_id {
-        "claude" => {
-            let normalized = value
-                .as_str()
-                .map(str::trim)
-                .filter(|candidate| !candidate.is_empty())
-                .map(str::to_lowercase)
-                .ok_or_else(|| {
-                    "invalid Claude permission mode. expected a string value".to_string()
-                })?;
-
-            match normalized.as_str() {
-                "restricted" | "standard" | "trusted" => {
-                    Ok(Some(Value::String(normalized)))
-                }
-                _ => Err(format!(
-                    "invalid Claude permission mode `{normalized}`. expected one of: restricted, standard, trusted"
-                )),
-            }
-        }
-        "opencode" => {
-            let normalized = value
-                .as_str()
-                .map(str::trim)
-                .filter(|candidate| !candidate.is_empty())
-                .map(str::to_lowercase)
-                .ok_or_else(|| {
-                    "invalid OpenCode permission mode. expected a string value".to_string()
-                })?;
-
-            match normalized.as_str() {
-                "ask" | "allow" | "deny" => Ok(Some(Value::String(normalized))),
-                _ => Err(format!(
-                    "invalid OpenCode permission mode `{normalized}`. expected one of: ask, allow, deny"
-                )),
-            }
-        }
-        _ => normalize_codex_approval_policy(value).map(Some),
+    if engine_id != "codex" {
+        return Err(format!("unsupported engine_id {engine_id}"));
     }
+    normalize_codex_approval_policy(value).map(Some)
 }
 
 fn normalize_codex_approval_policy(value: Value) -> Result<Value, String> {
@@ -3243,37 +2959,6 @@ fn normalize_thread_approvals_reviewer(value: Option<String>) -> Result<Option<S
     }
 }
 
-fn normalize_thread_opencode_agent(value: Option<String>) -> Result<Option<String>, String> {
-    let normalized = value
-        .as_deref()
-        .map(str::trim)
-        .filter(|candidate| !candidate.is_empty());
-
-    let Some(normalized) = normalized else {
-        return Ok(None);
-    };
-
-    if normalized.chars().count() > 120 {
-        return Err("invalid OpenCode agent. name is too long".to_string());
-    }
-
-    if !normalized
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-    {
-        return Err(
-            "invalid OpenCode agent. expected letters, numbers, dots, dashes, or underscores"
-                .to_string(),
-        );
-    }
-
-    if normalized == "build" {
-        return Ok(None);
-    }
-
-    Ok(Some(normalized.to_string()))
-}
-
 fn normalize_thread_sandbox_mode(value: Option<String>) -> Result<Option<String>, String> {
     let normalized = value
         .as_deref()
@@ -3368,11 +3053,9 @@ mod tests {
     use crate::{
         config::app_config::AppConfig,
         engines::EngineManager,
-        git::{repo::FileTreeCache, watcher::GitWatcherManager},
+        file_tree::FileTreeCache,
         power::KeepAwakeManager,
         state::{AppState, TurnManager},
-        terminal::TerminalManager,
-        terminal_notifications::TerminalNotificationManager,
     };
     use uuid::Uuid;
 
@@ -3384,11 +3067,7 @@ mod tests {
         AppState {
             db,
             config: Arc::new(AppConfig::default()),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             engines: Arc::new(EngineManager::new()),
-            git_watchers: Arc::new(GitWatcherManager::default()),
-            terminals: Arc::new(TerminalManager::default()),
-            notifications: Arc::new(TerminalNotificationManager::default()),
             keep_awake: Arc::new(KeepAwakeManager::new()),
             turns: Arc::new(TurnManager::default()),
             file_tree_cache: Arc::new(FileTreeCache::new()),
@@ -3660,6 +3339,7 @@ mod tests {
                 content: Some("Finished".to_string()),
                 blocks: json!([]),
                 status: "completed".to_string(),
+                native_turn_id: None,
                 turn_engine_id: Some("codex".to_string()),
                 turn_model_id: Some("gpt-5.4".to_string()),
                 turn_reasoning_effort: Some("high".to_string()),
@@ -3687,6 +3367,7 @@ mod tests {
                 content: None,
                 blocks: json!([]),
                 status: "streaming".to_string(),
+                native_turn_id: None,
                 turn_engine_id: Some("codex".to_string()),
                 turn_model_id: Some("gpt-5.4".to_string()),
                 turn_reasoning_effort: None,
@@ -3807,6 +3488,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn build_opencode_remote_session_metadata_sets_remote_fields() {
         let summary = OpenCodeRemoteSessionSummary {
@@ -3966,6 +3648,128 @@ mod tests {
         .expect_err("expected branch creation to reject missing local transcript");
 
         assert!(error.contains("locally mirrored transcript"));
+    }
+
+    #[test]
+    fn persist_codex_in_place_rollback_trims_local_history_without_creating_a_thread() {
+        let state = test_app_state();
+        let thread = test_thread(&state, "codex", "gpt-5.4");
+        let imported = [
+            ("user", "First"),
+            ("assistant", "Reply 1"),
+            ("user", "Second"),
+            ("assistant", "Reply 2"),
+        ]
+        .into_iter()
+        .map(|(role, content)| db::messages::ImportedMessageRecord {
+            role: role.to_string(),
+            content: Some(content.to_string()),
+            blocks: json!([{ "type": "text", "content": content }]),
+            status: MessageStatusDto::Completed,
+            native_turn_id: None,
+            turn_engine_id: Some("codex".to_string()),
+            turn_model_id: Some("gpt-5.4".to_string()),
+            turn_reasoning_effort: None,
+            token_input: u64::from(role == "user"),
+            token_output: u64::from(role == "assistant"),
+            created_at: None,
+        })
+        .collect::<Vec<_>>();
+        db::messages::replace_thread_messages(&state.db, &thread.id, &imported)
+            .expect("expected thread messages to be inserted");
+
+        let updated = persist_codex_in_place_rollback(
+            &state.db,
+            &thread,
+            &ThreadSyncSnapshot {
+                title: Some("Rolled back".to_string()),
+                preview: Some("First".to_string()),
+                raw_status: Some("idle".to_string()),
+                active_flags: Vec::new(),
+                imported_messages: Vec::new(),
+            },
+            1,
+        )
+        .expect("expected rollback persistence to succeed");
+
+        let messages =
+            db::messages::get_thread_messages(&state.db, &thread.id).expect("expected messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content.as_deref(), Some("First"));
+        assert_eq!(messages[1].content.as_deref(), Some("Reply 1"));
+        assert_eq!(updated.id, thread.id);
+        assert_eq!(updated.message_count, 2);
+        assert_eq!(updated.title, "Rolled back");
+        assert_eq!(
+            updated
+                .engine_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("codexTranscriptImported")),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            updated
+                .engine_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("codexPreview")),
+            Some(&json!("First"))
+        );
+    }
+
+    #[test]
+    fn persist_codex_in_place_rollback_imports_returned_history_when_local_sync_is_pending() {
+        let state = test_app_state();
+        let mut thread = test_thread(&state, "codex", "gpt-5.4");
+        thread.engine_metadata = Some(json!({
+            "codexTranscriptImported": false,
+            "codexSyncRequired": true,
+        }));
+        db::threads::update_engine_metadata(
+            &state.db,
+            &thread.id,
+            thread.engine_metadata.as_ref().expect("metadata"),
+        )
+        .expect("expected metadata update");
+
+        let updated = persist_codex_in_place_rollback(
+            &state.db,
+            &thread,
+            &ThreadSyncSnapshot {
+                title: Some("Remote rollback".to_string()),
+                preview: Some("Retained prompt".to_string()),
+                raw_status: Some("idle".to_string()),
+                active_flags: Vec::new(),
+                imported_messages: vec![ImportedThreadMessage {
+                    role: "user".to_string(),
+                    content: Some("Retained prompt".to_string()),
+                    blocks: json!([{ "type": "text", "content": "Retained prompt" }]),
+                    status: "completed".to_string(),
+                    native_turn_id: None,
+                    turn_engine_id: Some("codex".to_string()),
+                    turn_model_id: Some("gpt-5.4".to_string()),
+                    turn_reasoning_effort: None,
+                    token_input: 1,
+                    token_output: 0,
+                    created_at: None,
+                }],
+            },
+            1,
+        )
+        .expect("expected remote rollback history to be imported");
+
+        let messages =
+            db::messages::get_thread_messages(&state.db, &thread.id).expect("expected messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content.as_deref(), Some("Retained prompt"));
+        assert_eq!(updated.id, thread.id);
+        assert_eq!(updated.message_count, 1);
+        assert_eq!(
+            updated
+                .engine_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("codexSyncRequired")),
+            Some(&json!(false))
+        );
     }
 
     #[test]
@@ -4331,6 +4135,7 @@ mod tests {
         assert!(error.contains("Codex thread config is only available for Codex threads"));
     }
 
+    #[cfg(any())]
     #[tokio::test]
     async fn set_thread_opencode_config_persists_agent() {
         let state = test_app_state();
@@ -4351,6 +4156,7 @@ mod tests {
         assert_eq!(metadata.get("opencodeAgent"), Some(&json!("Explore_1")));
     }
 
+    #[cfg(any())]
     #[tokio::test]
     async fn set_thread_opencode_config_clears_build_agent() {
         let state = test_app_state();
@@ -4371,6 +4177,7 @@ mod tests {
             .is_none());
     }
 
+    #[cfg(any())]
     #[tokio::test]
     async fn set_thread_opencode_config_rejects_non_opencode_threads() {
         let state = test_app_state();

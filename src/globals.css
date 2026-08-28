@@ -3579,11 +3579,11 @@ button, input, textarea, select {
 
 /* ── Sidebar ── */
 .sb {
-  /* Keep the classic sidebar only subtly larger than the workspace surface. */
-  --sb-font-prominent: 13px;
-  --sb-font-row: 12.75px;
-  --sb-font-supporting: 11.25px;
-  --sb-font-caption: 10.25px;
+  /* Keep primary sidebar text just below the 13px workspace surface. */
+  --sb-font-prominent: 12.5px;
+  --sb-font-row: 12.5px;
+  --sb-font-supporting: 11px;
+  --sb-font-caption: 10px;
   height: 100%;
   min-height: 0;
   display: flex;

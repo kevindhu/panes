@@ -14,9 +14,7 @@ import {
   trimLinkText,
   tryParseUrl,
 } from "./localFileLinkPatterns";
-import { useFileStore } from "../stores/fileStore";
 import { useWorkspaceStore } from "../stores/workspaceStore";
-import { showWorkspaceEditorForFileLink } from "./workspacePaneNavigation";
 import type { Repo } from "../types";
 
 const EXTERNAL_PROTOCOLS = new Set(["http:", "https:", "mailto:", "tel:"]);
@@ -221,13 +219,16 @@ export async function navigateLinkTarget(
         }
       : null;
 
-    await useFileStore
-      .getState()
-      .openFileAtLocation(localTarget.rootPath, localTarget.filePath, reveal);
-
-    if (activeWorkspaceId) {
-      showWorkspaceEditorForFileLink(activeWorkspaceId, options.sourceLeafId ?? null);
-    }
+    window.dispatchEvent(
+      new CustomEvent("codex-open-file", {
+        detail: {
+          rootPath: localTarget.rootPath,
+          filePath: localTarget.filePath,
+          line: reveal?.line,
+          column: reveal?.column,
+        },
+      }),
+    );
 
     return "internal";
   }

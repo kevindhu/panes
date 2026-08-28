@@ -47,7 +47,6 @@ import {
   isMcpElicitationApproval,
   isPermissionsRequestApproval,
   isRequestUserInputApproval,
-  isSupportedClaudeToolInputApproval,
   parseApprovalCommand,
   parseApprovalReason,
   parseDynamicToolCallArguments,
@@ -81,7 +80,7 @@ import {
 interface Props {
   blocks?: ContentBlock[];
   status?: MessageStatus;
-  engineId?: string;
+  messageRole?: "user" | "assistant";
   workspaceRootPath?: string | null;
   onApproval: (approvalId: string, response: ApprovalResponse) => void;
   onLoadActionOutput?: (actionId: string) => Promise<void>;
@@ -735,11 +734,11 @@ function TurnStatusNoticeView({ block }: { block: NoticeBlock }) {
     >
       <Icon
         size={14}
+        className={status === "streaming" ? "animate-spin" : undefined}
         style={{
           flexShrink: 0,
           color: accent,
           marginTop: 1,
-          animation: status === "streaming" ? "spin 1s linear infinite" : undefined,
         }}
       />
       <div style={{ minWidth: 0, flex: 1, display: "flex", flexDirection: "column", gap: 6 }}>
@@ -985,7 +984,7 @@ function ActionStatusBadge({ status }: { status: string }) {
   if (status === "running") {
     return (
       <span style={{ display: "flex", alignItems: "center", gap: 3, color: "var(--warning)", fontSize: 10, fontWeight: 500 }}>
-        <Loader2 size={11} style={{ animation: "spin 1s linear infinite" }} />
+        <Loader2 size={11} className="animate-spin" />
         {t("messageBlocks.actionStatus.running")}
       </span>
     );
@@ -1154,7 +1153,7 @@ function ActionBlockView({
             >
               <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
                 {loadingDeferredOutput && (
-                  <Loader2 size={12} style={{ animation: "spin 1s linear infinite" }} />
+                  <Loader2 size={12} className="animate-spin" />
                 )}
                 {loadingDeferredOutput
                   ? t("messageBlocks.deferredOutput.loadingFull")
@@ -1473,42 +1472,15 @@ function ToolInputApprovalCard({
   );
 }
 
-export function shouldShowClaudeUnsupportedApproval(
-  details: Record<string, unknown>,
-  isPending: boolean,
-  isClaudeThread: boolean,
-): boolean {
-  if (!isPending || !isClaudeThread) {
-    return false;
-  }
-
-  const isToolInputRequest = isRequestUserInputApproval(details);
-  const proposedExecpolicyAmendment = parseProposedExecpolicyAmendment(details);
-  const proposedNetworkPolicyAmendments = parseProposedNetworkPolicyAmendments(details);
-
-  return (
-    (isToolInputRequest && !isSupportedClaudeToolInputApproval(details)) ||
-    (!isToolInputRequest &&
-      (isDynamicToolCallApproval(details) ||
-        isMcpElicitationApproval(details) ||
-        requiresCustomApprovalPayload(details))) ||
-    proposedExecpolicyAmendment.length > 0 ||
-    proposedNetworkPolicyAmendments.length > 0
-  );
-}
-
 function ApprovalCard({
   block,
-  engineId,
   onApproval,
 }: {
   block: ApprovalBlock;
-  engineId?: string;
   onApproval: (approvalId: string, response: ApprovalResponse) => void;
 }) {
   const { t } = useTranslation("chat");
   const isPending = block.status === "pending";
-  const isClaudeThread = engineId === "claude";
   const details = block.details ?? {};
   const isToolInputRequest = isRequestUserInputApproval(details);
   const isDynamicToolCall = isDynamicToolCallApproval(details);
@@ -1521,11 +1493,6 @@ function ApprovalCard({
   const proposedExecpolicyAmendment = parseProposedExecpolicyAmendment(details);
   const proposedNetworkPolicyAmendments = parseProposedNetworkPolicyAmendments(details);
   const requestedPermissions = isPermissionsRequest ? parseRequestedPermissions(details) : null;
-  const showClaudeUnsupportedApproval = shouldShowClaudeUnsupportedApproval(
-    details,
-    isPending,
-    isClaudeThread,
-  );
   const dynamicToolName = parseDynamicToolCallName(details);
   const dynamicToolArguments = parseDynamicToolCallArguments(details);
   const mcpServerName = parseMcpElicitationServerName(details);
@@ -1578,7 +1545,7 @@ function ApprovalCard({
     decisionColor = "var(--success)";
   }
 
-  if (isToolInputRequest && toolInputQuestions.length > 0 && !showClaudeUnsupportedApproval) {
+  if (isToolInputRequest && toolInputQuestions.length > 0) {
     return (
       <div>
         <ToolInputApprovalCard
@@ -1712,24 +1679,7 @@ function ApprovalCard({
           )}
         </div>
       )}
-      {showClaudeUnsupportedApproval && (
-        <div className="acard-section">
-          <p className="acard-reason">
-            {t("messageBlocks.approval.claudeUnsupported")}
-          </p>
-          <div className="acard-advanced-footer">
-            <button
-              type="button"
-              className="approval-btn approval-btn-deny"
-              onClick={() => onApproval(block.approvalId, { decision: "decline" })}
-            >
-              {t("panel.approvalActions.deny")}
-            </button>
-          </div>
-        </div>
-      )}
-
-      {isPending && !isClaudeThread && isDynamicToolCall && (
+      {isPending && isDynamicToolCall && (
         <div className="acard-section">
           <div className="acard-advanced" style={{ gap: 10 }}>
             <p className="acard-reason">
@@ -1777,7 +1727,7 @@ function ApprovalCard({
         </div>
       )}
 
-      {isPending && !isClaudeThread && requiresAdvancedJsonFallback && (
+      {isPending && requiresAdvancedJsonFallback && (
         <div className="acard-section">
           <p className="acard-reason">
             {t("messageBlocks.approval.customPayloadHint")}
@@ -1788,7 +1738,7 @@ function ApprovalCard({
       {/* Standard approval — no inline buttons; the approval banner handles it */}
 
       {/* Advanced JSON — for custom payload requests and malformed tool-input fallbacks */}
-      {isPending && !isClaudeThread && requiresAdvancedJsonFallback && (
+      {isPending && requiresAdvancedJsonFallback && (
         <div className="acard-section">
           <div className="acard-advanced">
             <textarea
@@ -1828,7 +1778,6 @@ function renderSingleBlock(
   index: number,
   sourceBlocks: ContentBlock[],
   status: MessageStatus | undefined,
-  engineId: string | undefined,
   workspaceRootPath: string | null | undefined,
   onApproval: (approvalId: string, response: ApprovalResponse) => void,
   onLoadActionOutput: ((actionId: string) => Promise<void>) | undefined,
@@ -1954,7 +1903,6 @@ function renderSingleBlock(
       <ApprovalCard
         key={blockKey}
         block={block}
-        engineId={engineId}
         onApproval={onApproval}
       />
     );
@@ -2001,16 +1949,23 @@ function renderSingleBlock(
 function MessageBlocksView({
   blocks = [],
   status,
-  engineId,
+  messageRole = "assistant",
   workspaceRootPath,
   onApproval,
   onLoadActionOutput,
 }: Props) {
   const safeBlocks = useMemo(
     () => dedupeDiffBlocksByScope(
-      (Array.isArray(blocks) ? blocks : []).filter(isBlockLike) as ContentBlock[],
+      (Array.isArray(blocks) ? blocks : [])
+        .filter(isBlockLike)
+        .filter(
+          (block) =>
+            messageRole === "assistant" ||
+            block.type !== "notice" ||
+            block.kind !== "turn_status",
+        ) as ContentBlock[],
     ),
-    [blocks],
+    [blocks, messageRole],
   );
 
   const isStreaming = status === "streaming";
@@ -2018,11 +1973,11 @@ function MessageBlocksView({
     const hasTurnStatus = safeBlocks.some(
       (block) => block.type === "notice" && block.kind === "turn_status",
     );
-    if (hasTurnStatus || !status) {
+    if (messageRole !== "assistant" || hasTurnStatus || !status) {
       return safeBlocks;
     }
     return [...safeBlocks, buildFallbackTurnStatusNotice(safeBlocks, status)];
-  }, [safeBlocks, status]);
+  }, [messageRole, safeBlocks, status]);
   const blockSegments = useMemo(
     () => buildBlockSegments(renderedBlocks, isStreaming),
     [renderedBlocks, isStreaming],
@@ -2068,7 +2023,6 @@ function MessageBlocksView({
                     <ApprovalCard
                       key={(inner.block as ApprovalBlock).approvalId}
                       block={inner.block as ApprovalBlock}
-                      engineId={engineId}
                       onApproval={onApproval}
                     />
                   );
@@ -2112,7 +2066,6 @@ function MessageBlocksView({
           segment.index,
           safeBlocks,
           status,
-          engineId,
           workspaceRootPath,
           onApproval,
           onLoadActionOutput,
@@ -2127,7 +2080,7 @@ export const MessageBlocks = memo(
   (prev, next) =>
     prev.blocks === next.blocks &&
     prev.status === next.status &&
-    prev.engineId === next.engineId &&
+    prev.messageRole === next.messageRole &&
     prev.workspaceRootPath === next.workspaceRootPath &&
     prev.onApproval === next.onApproval &&
     prev.onLoadActionOutput === next.onLoadActionOutput,

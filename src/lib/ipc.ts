@@ -4,7 +4,7 @@ import { normalizeDependencyReport } from "./dependencies";
 import type {
   ApprovalResponse,
   ActionOutputPayload,
-  AttachmentPreview,
+  PreparedAttachmentImageAsset,
   ChatAttachment,
   ChatEngineId,
   ChatInputItem,
@@ -342,12 +342,24 @@ export const ipc = {
       threadId,
       profileOperationId: profileOperationId ?? null,
     }),
-  forkCodexThreadDroppingTurns: (
+  forkCodexThreadAtTurn: (
+    threadId: string,
+    lastTurnId: string | null,
+    turnsAfter: number,
+    profileOperationId?: string | null,
+  ) =>
+    invoke<Thread>("fork_codex_thread_at_turn", {
+      threadId,
+      lastTurnId,
+      turnsAfter,
+      profileOperationId: profileOperationId ?? null,
+    }),
+  rollbackCodexThread: (
     threadId: string,
     numTurns: number,
     profileOperationId?: string | null,
   ) =>
-    invoke<Thread>("fork_codex_thread_dropping_turns", {
+    invoke<Thread>("rollback_codex_thread", {
       threadId,
       numTurns,
       profileOperationId: profileOperationId ?? null,
@@ -371,8 +383,20 @@ export const ipc = {
       mimeType,
       dataBase64,
     }),
-  readAttachmentPreview: (filePath: string, mimeType?: string | null) =>
-    invoke<AttachmentPreview | null>("read_attachment_preview", {
+  prepareAttachmentImageAsset: (
+    filePath: string,
+    mimeType?: string | null,
+    maxWidth?: number | null,
+    maxHeight?: number | null,
+  ) =>
+    invoke<PreparedAttachmentImageAsset>("prepare_attachment_image_asset", {
+      filePath,
+      mimeType: mimeType ?? null,
+      maxWidth: maxWidth ?? null,
+      maxHeight: maxHeight ?? null,
+    }),
+  readAttachmentImageBytes: (filePath: string, mimeType?: string | null) =>
+    invoke<ArrayBuffer | number[]>("read_attachment_image_bytes", {
       filePath,
       mimeType: mimeType ?? null,
     }),
