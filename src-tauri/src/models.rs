@@ -618,9 +618,3 @@ pub struct ResolvedEditorFileReferenceDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub column: Option<u32>,
 }
-
-// ── Git Remotes ─────────────────────────────────────────────────────
-
-// ── Setup / Onboarding ──────────────────────────────────────────────
-
-// ── Harness Management ──────────────────────────────────────────────

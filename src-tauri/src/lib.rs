@@ -199,6 +199,7 @@ pub fn run() {
             commands::chat::get_message_blocks,
             commands::chat::get_action_output,
             commands::chat::search_messages,
+            commands::codex_transcript::get_codex_turn_snapshot,
             commands::workspace::open_workspace,
             commands::workspace::retarget_workspace,
             commands::workspace::list_workspaces,

@@ -1,8 +1,17 @@
 use std::{
-    collections::HashMap, ffi::OsString, path::Path, process::Stdio, sync::Arc, time::Duration,
+    collections::HashMap,
+    ffi::OsString,
+    path::Path,
+    process::Stdio,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
 use anyhow::Context;
+use chrono::Utc;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
@@ -15,7 +24,7 @@ use super::codex_protocol::{
     notification_payload, parse_incoming, raw_value_to_value, request_payload,
     response_error_payload, response_success_payload, IncomingMessage, RpcResponse,
 };
-use super::trim_action_output_delta_content;
+use super::{CodexNativeEvent, CodexNativeEventKind, EngineEvent};
 
 const TURN_EVENT_QUEUE_CAPACITY: usize = 1024;
 const RUNTIME_EVENT_QUEUE_CAPACITY: usize = 512;
@@ -58,6 +67,7 @@ struct CodexMessageRoutingInfo {
 pub struct CodexIncomingSubscription {
     receiver: mpsc::Receiver<IncomingMessage>,
     scope: CodexEventScope,
+    native_capture: Option<CodexNativeCapture>,
 }
 
 #[derive(Default)]
@@ -75,6 +85,14 @@ struct CodexIncomingRouterState {
 struct CodexTurnSubscriber {
     scope: CodexEventScope,
     sender: mpsc::Sender<IncomingMessage>,
+    native_capture: Option<CodexNativeCapture>,
+}
+
+#[derive(Clone)]
+struct CodexNativeCapture {
+    sink: mpsc::WeakSender<EngineEvent>,
+    next_sequence: Arc<AtomicU64>,
+    send_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,9 +172,7 @@ impl CodexTransport {
                                 }
                             }
                             Ok(other) => {
-                                incoming_router
-                                    .dispatch(trim_buffered_incoming_message(other))
-                                    .await;
+                                incoming_router.dispatch(other).await;
                             }
                             Err(error) => {
                                 log::warn!("codex stdout parse error: {error}");
@@ -230,8 +246,14 @@ impl CodexTransport {
         })
     }
 
-    pub async fn subscribe_thread(&self, thread_id: &str) -> CodexIncomingSubscription {
-        self.incoming_router.subscribe_thread(thread_id).await
+    pub async fn subscribe_thread(
+        &self,
+        thread_id: &str,
+        native_event_sink: &mpsc::Sender<EngineEvent>,
+    ) -> CodexIncomingSubscription {
+        self.incoming_router
+            .subscribe_thread_with_capture(thread_id, Some(native_event_sink.downgrade()))
+            .await
     }
 
     pub async fn subscribe_runtime(&self) -> mpsc::Receiver<IncomingMessage> {
@@ -364,6 +386,70 @@ impl CodexIncomingSubscription {
     pub async fn set_turn_id(&self, turn_id: Option<String>) {
         self.scope.set_turn_id(turn_id).await;
     }
+
+    pub async fn capture_response(
+        &self,
+        method: &str,
+        native_thread_id: &str,
+        native_turn_id: Option<String>,
+        params_json: String,
+    ) -> anyhow::Result<()> {
+        self.native_capture
+            .as_ref()
+            .context("Codex subscription has no native event sink")?
+            .capture(
+                CodexNativeEventKind::Response,
+                method,
+                None,
+                native_thread_id,
+                native_turn_id,
+                params_json,
+            )
+            .await
+    }
+}
+
+impl CodexNativeCapture {
+    #[allow(clippy::too_many_arguments)]
+    async fn capture(
+        &self,
+        event_kind: CodexNativeEventKind,
+        method: &str,
+        request_id: Option<String>,
+        native_thread_id: &str,
+        native_turn_id: Option<String>,
+        params_json: String,
+    ) -> anyhow::Result<()> {
+        // Sequence assignment and channel insertion are one serialized operation. This prevents
+        // the pending response path and stdout router from assigning N/N+1 but enqueueing them
+        // in the opposite order under backpressure.
+        let _send_guard = self.send_lock.lock().await;
+        let previous = self
+            .next_sequence
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| anyhow::anyhow!("Codex native event sequence overflow"))?;
+        let source_sequence = previous + 1;
+        let sink = self
+            .sink
+            .upgrade()
+            .context("Codex native transcript receiver closed")?;
+        sink.send(EngineEvent::CodexNativeEvent {
+            event: CodexNativeEvent {
+                source_sequence,
+                observed_at_ms: Utc::now().timestamp_millis(),
+                event_kind,
+                method: method.to_owned(),
+                request_id,
+                native_thread_id: native_thread_id.to_owned(),
+                native_turn_id,
+                params_json,
+            },
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Codex native transcript receiver closed"))
+    }
 }
 
 impl CodexEventScope {
@@ -384,6 +470,10 @@ impl CodexEventScope {
 
     async fn set_turn_id(&self, turn_id: Option<String>) {
         self.inner.lock().await.turn_id = turn_id;
+    }
+
+    async fn snapshot(&self) -> CodexEventScopeState {
+        self.inner.lock().await.clone()
     }
 
     async fn matches_info(&self, info: &CodexMessageRoutingInfo) -> CodexScopeMatch {
@@ -418,16 +508,35 @@ impl CodexEventScope {
 }
 
 impl CodexIncomingRouter {
+    #[cfg(test)]
     async fn subscribe_thread(&self, thread_id: &str) -> CodexIncomingSubscription {
+        self.subscribe_thread_with_capture(thread_id, None).await
+    }
+
+    async fn subscribe_thread_with_capture(
+        &self,
+        thread_id: &str,
+        native_event_sink: Option<mpsc::WeakSender<EngineEvent>>,
+    ) -> CodexIncomingSubscription {
         let (sender, receiver) = mpsc::channel(TURN_EVENT_QUEUE_CAPACITY);
         let scope = CodexEventScope::new(thread_id);
+        let native_capture = native_event_sink.map(|sink| CodexNativeCapture {
+            sink,
+            next_sequence: Arc::new(AtomicU64::new(0)),
+            send_lock: Arc::new(Mutex::new(())),
+        });
         let subscriber = CodexTurnSubscriber {
             scope: scope.clone(),
             sender,
+            native_capture: native_capture.clone(),
         };
         self.state.lock().await.turn_subscribers.push(subscriber);
 
-        CodexIncomingSubscription { receiver, scope }
+        CodexIncomingSubscription {
+            receiver,
+            scope,
+            native_capture,
+        }
     }
 
     async fn subscribe_runtime(&self) -> mpsc::Receiver<IncomingMessage> {
@@ -437,8 +546,8 @@ impl CodexIncomingRouter {
     }
 
     async fn dispatch(&self, message: IncomingMessage) {
-        let delivery_class = delivery_class_for_message(&message);
         let routing_info = routing_info_for_message(&message);
+        let delivery_class = delivery_class_for_routing(&message, &routing_info);
         let (turn_subscribers, runtime_subscribers) = {
             let mut state = self.state.lock().await;
             state
@@ -461,6 +570,24 @@ impl CodexIncomingRouter {
         for subscriber in turn_subscribers {
             match subscriber.scope.matches_info(&routing_info).await {
                 CodexScopeMatch::Matched => {
+                    if let Some(native_capture) = subscriber.native_capture.as_ref() {
+                        if let Err(error) = capture_native_message(
+                            native_capture,
+                            &subscriber.scope,
+                            &message,
+                            &routing_info,
+                        )
+                        .await
+                        {
+                            let warning = format!(
+                                "codex native event capture failed before turn delivery: {}; error={error}",
+                                routing_info.log_summary()
+                            );
+                            log::error!("{warning}");
+                            record_codex_event_routing_log(&warning);
+                            continue;
+                        }
+                    }
                     if deliver_message(
                         &subscriber.sender,
                         message.clone(),
@@ -505,17 +632,67 @@ impl CodexIncomingRouter {
             record_codex_event_routing_log(&message);
         }
 
-        for sender in runtime_subscribers {
-            let _ = deliver_message(
-                &sender,
-                message.clone(),
-                CodexDeliveryClass::BestEffort,
-                "runtime",
-                &routing_info,
-            )
-            .await;
+        if should_route_to_runtime(&routing_info) {
+            for sender in runtime_subscribers {
+                let _ = deliver_message(
+                    &sender,
+                    message.clone(),
+                    CodexDeliveryClass::BestEffort,
+                    "runtime",
+                    &routing_info,
+                )
+                .await;
+            }
         }
     }
+}
+
+async fn capture_native_message(
+    native_capture: &CodexNativeCapture,
+    scope: &CodexEventScope,
+    message: &IncomingMessage,
+    routing_info: &CodexMessageRoutingInfo,
+) -> anyhow::Result<()> {
+    let (event_kind, method, request_id, params_json) = match message {
+        IncomingMessage::Request {
+            id, method, params, ..
+        } => (
+            CodexNativeEventKind::Request,
+            method.as_str(),
+            Some(id.clone()),
+            params.get().to_owned(),
+        ),
+        IncomingMessage::Notification { method, params }
+            if routing_info
+                .signature
+                .as_deref()
+                .is_some_and(is_lossless_conversation_signature)
+                || routing_info.turn_id.is_some() =>
+        {
+            (
+                CodexNativeEventKind::Notification,
+                method.as_str(),
+                None,
+                params.get().to_owned(),
+            )
+        }
+        IncomingMessage::Notification { .. } | IncomingMessage::Response(_) => return Ok(()),
+    };
+
+    let scope = scope.snapshot().await;
+    native_capture
+        .capture(
+            event_kind,
+            method,
+            request_id,
+            routing_info
+                .thread_id
+                .as_deref()
+                .unwrap_or(scope.thread_id.as_str()),
+            routing_info.turn_id.clone().or(scope.turn_id),
+            params_json,
+        )
+        .await
 }
 
 impl CodexMessageRoutingInfo {
@@ -669,27 +846,6 @@ fn plan_event_content_chars(value: &serde_json::Value) -> Option<usize> {
     found.then_some(total)
 }
 
-fn trim_buffered_incoming_message(message: IncomingMessage) -> IncomingMessage {
-    match message {
-        IncomingMessage::Notification { method, params } => IncomingMessage::Notification {
-            params: trim_large_output_params(&method, params),
-            method,
-        },
-        IncomingMessage::Request {
-            id,
-            raw_id,
-            method,
-            params,
-        } => IncomingMessage::Request {
-            id,
-            raw_id,
-            params: trim_large_output_params(&method, params),
-            method,
-        },
-        IncomingMessage::Response(response) => IncomingMessage::Response(response),
-    }
-}
-
 fn transport_parse_error_payload(error: &str, line: &str) -> Box<serde_json::value::RawValue> {
     serde_json::value::to_raw_value(&serde_json::json!({
         "error": error,
@@ -716,78 +872,46 @@ fn trim_transport_error_line(line: &str) -> String {
     )
 }
 
-fn trim_large_output_params(
-    method: &str,
-    params: Box<serde_json::value::RawValue>,
-) -> Box<serde_json::value::RawValue> {
-    if !is_large_output_event(method) {
-        return params;
-    }
-
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(params.get()) else {
-        return params;
-    };
-
-    if method_signature(method).contains("terminalinteraction") {
-        trim_string_field(&mut value, "stdin");
-    } else {
-        for key in ["delta", "output", "text", "content"] {
-            trim_string_field(&mut value, key);
-        }
-    }
-
-    serde_json::value::to_raw_value(&value).unwrap_or(params)
-}
-
-fn trim_string_field(value: &mut serde_json::Value, key: &str) {
-    let Some(field) = value.get_mut(key) else {
-        return;
-    };
-    let Some(content) = field.as_str() else {
-        return;
-    };
-
-    *field = serde_json::Value::String(trim_action_output_delta_content(content));
-}
-
-fn is_large_output_event(method: &str) -> bool {
-    matches!(
-        method_signature(method).as_str(),
-        "itemcommandexecutionoutputdelta"
-            | "itemfilechangeoutputdelta"
-            | "itemcommandexecutionterminalinteraction"
-            | "terminalinteraction"
-    )
-}
-
+#[cfg(test)]
 fn delivery_class_for_message(message: &IncomingMessage) -> CodexDeliveryClass {
+    let routing_info = routing_info_for_message(message);
+    delivery_class_for_routing(message, &routing_info)
+}
+
+fn delivery_class_for_routing(
+    message: &IncomingMessage,
+    routing_info: &CodexMessageRoutingInfo,
+) -> CodexDeliveryClass {
     match message {
         IncomingMessage::Request { .. } => CodexDeliveryClass::Lossless,
         IncomingMessage::Response(_) => CodexDeliveryClass::Lossless,
         IncomingMessage::Notification { method, .. } => {
             let signature = method_signature(method);
-            if matches!(
-                signature.as_str(),
-                "transporteof"
-                    | "transportreaderror"
-                    | "transportparseerror"
-                    | "turnstarted"
-                    | "turncompleted"
-                    | "turnplanupdated"
-                    | "itemcompleted"
-                    | "itemagentmessagedelta"
-                    | "itemplandelta"
-                    | "itemreasoningsummarytextdelta"
-                    | "itemreasoningtextdelta"
-                    | "threadrealtimetranscriptdelta"
-                    | "threadrealtimetranscriptdone"
-            ) {
+            if is_transport_control_signature(&signature)
+                || is_lossless_conversation_signature(&signature)
+                || routing_info.turn_id.is_some()
+            {
                 CodexDeliveryClass::Lossless
             } else {
                 CodexDeliveryClass::BestEffort
             }
         }
     }
+}
+
+fn is_lossless_conversation_signature(signature: &str) -> bool {
+    signature.starts_with("item")
+        || signature.starts_with("turn")
+        || signature.starts_with("hook")
+        || signature.starts_with("model")
+        || signature == "threadtokenusageupdated"
+}
+
+fn should_route_to_runtime(info: &CodexMessageRoutingInfo) -> bool {
+    !info
+        .signature
+        .as_deref()
+        .is_some_and(is_lossless_conversation_signature)
 }
 
 fn is_transport_control_signature(signature: &str) -> bool {
@@ -978,62 +1102,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn router_keeps_lossless_turn_completed_when_best_effort_queue_is_full() {
+    async fn router_captures_exact_native_envelope_before_turn_delivery() {
         let router = CodexIncomingRouter::default();
-        let mut subscription = router.subscribe_thread("thread-a").await;
-
-        for index in 0..(TURN_EVENT_QUEUE_CAPACITY + 16) {
-            router
-                .dispatch(IncomingMessage::Notification {
-                    method: "item/command_execution/output_delta".to_string(),
-                    params: serde_json::value::to_raw_value(&json!({
-                        "threadId": "thread-a",
-                        "turnId": "turn-a",
-                        "delta": format!("line-{index}"),
-                    }))
-                    .expect("valid params"),
-                })
-                .await;
-        }
+        let (native_sender, mut native_receiver) = mpsc::channel(8);
+        let mut subscription = router
+            .subscribe_thread_with_capture("thread-a", Some(native_sender.downgrade()))
+            .await;
+        let raw_params =
+            r#"{ "threadId" : "thread-a", "turnId":"turn-a", "itemId":"agent", "delta":"hi\n" }"#;
 
         router
             .dispatch(IncomingMessage::Notification {
-                method: "turn/completed".to_string(),
-                params: serde_json::value::to_raw_value(&json!({
-                    "threadId": "thread-a",
-                    "turnId": "turn-a",
-                    "status": "completed",
-                }))
-                .expect("valid params"),
+                method: "item/agentMessage/delta".to_owned(),
+                params: serde_json::value::RawValue::from_string(raw_params.to_owned())
+                    .expect("valid raw params"),
             })
             .await;
 
-        let mut saw_completed = false;
-        for _ in 0..TURN_EVENT_QUEUE_CAPACITY {
-            let message = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
-                .await
-                .expect("router should deliver queued messages")
-                .expect("subscription should stay open");
-            if let IncomingMessage::Notification { method, .. } = message {
-                if method == "turn/completed" {
-                    saw_completed = true;
-                    break;
-                }
-            }
+        let captured = native_receiver.recv().await.expect("captured event");
+        let EngineEvent::CodexNativeEvent { event } = captured else {
+            panic!("expected native event");
+        };
+        assert_eq!(event.source_sequence, 1);
+        assert_eq!(event.method, "item/agentMessage/delta");
+        assert_eq!(event.native_thread_id, "thread-a");
+        assert_eq!(event.native_turn_id.as_deref(), Some("turn-a"));
+        assert_eq!(event.params_json, raw_params);
+
+        let delivered = subscription.recv().await.expect("turn delivery");
+        assert!(matches!(
+            delivered,
+            IncomingMessage::Notification { ref method, .. }
+                if method == "item/agentMessage/delta"
+        ));
+
+        subscription
+            .capture_response(
+                "turn/start",
+                "thread-a",
+                Some("turn-a".to_owned()),
+                r#"{"turn":{"id":"turn-a"}}"#.to_owned(),
+            )
+            .await
+            .expect("response capture");
+        let response = native_receiver.recv().await.expect("captured response");
+        let EngineEvent::CodexNativeEvent { event } = response else {
+            panic!("expected native response");
+        };
+        assert_eq!(event.source_sequence, 2);
+        assert_eq!(event.event_kind, CodexNativeEventKind::Response);
+        assert_eq!(event.method, "turn/start");
+    }
+
+    #[test]
+    fn all_conversation_events_are_lossless_including_future_item_methods() {
+        for method in [
+            "turn/started",
+            "turn/completed",
+            "turn/plan/updated",
+            "item/started",
+            "item/completed",
+            "item/commandExecution/outputDelta",
+            "item/futureType/unknownDelta",
+            "hook/completed",
+            "model/verification",
+            "thread/tokenUsage/updated",
+        ] {
+            let message = IncomingMessage::Notification {
+                method: method.to_owned(),
+                params: serde_json::value::to_raw_value(&json!({})).expect("valid params"),
+            };
+            assert_eq!(
+                delivery_class_for_message(&message),
+                CodexDeliveryClass::Lossless,
+                "{method} must never be dropped"
+            );
         }
 
-        assert!(saw_completed);
+        let future_turn_message = IncomingMessage::Notification {
+            method: "future/turnArtifact".to_owned(),
+            params: serde_json::value::to_raw_value(&json!({
+                "threadId": "thread-a",
+                "turnId": "turn-a",
+                "opaque": true,
+            }))
+            .expect("valid params"),
+        };
+        assert_eq!(
+            delivery_class_for_message(&future_turn_message),
+            CodexDeliveryClass::Lossless,
+            "unknown turn-scoped methods must remain replayable"
+        );
     }
 
     #[tokio::test]
-    async fn router_keeps_lossless_turn_plan_updated_when_best_effort_queue_is_full() {
-        let router = CodexIncomingRouter::default();
+    async fn lossless_conversation_delivery_backpressures_instead_of_dropping() {
+        let router = Arc::new(CodexIncomingRouter::default());
         let mut subscription = router.subscribe_thread("thread-a").await;
 
-        for index in 0..(TURN_EVENT_QUEUE_CAPACITY + 16) {
+        for index in 0..TURN_EVENT_QUEUE_CAPACITY {
             router
                 .dispatch(IncomingMessage::Notification {
-                    method: "item/command_execution/output_delta".to_string(),
+                    method: "item/commandExecution/outputDelta".to_string(),
                     params: serde_json::value::to_raw_value(&json!({
                         "threadId": "thread-a",
                         "turnId": "turn-a",
@@ -1044,35 +1214,42 @@ mod tests {
                 .await;
         }
 
-        router
-            .dispatch(IncomingMessage::Notification {
-                method: "turn/plan/updated".to_string(),
-                params: serde_json::value::to_raw_value(&json!({
-                    "threadId": "thread-a",
-                    "turnId": "turn-a",
-                    "plan": [
-                        { "step": "Verify event routing", "status": "in_progress" },
-                        { "step": "Implement the plan", "status": "pending" }
-                    ],
-                }))
-                .expect("valid params"),
-            })
-            .await;
+        let blocked_router = router.clone();
+        let blocked_delivery = tokio::spawn(async move {
+            blocked_router
+                .dispatch(IncomingMessage::Notification {
+                    method: "turn/completed".to_string(),
+                    params: serde_json::value::to_raw_value(&json!({
+                        "threadId": "thread-a",
+                        "turnId": "turn-a",
+                        "status": "completed",
+                    }))
+                    .expect("valid params"),
+                })
+                .await;
+        });
 
-        let mut saw_plan_update = false;
-        for _ in 0..TURN_EVENT_QUEUE_CAPACITY {
-            let message = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
-                .await
-                .expect("router should deliver queued messages")
-                .expect("subscription should stay open");
-            if let IncomingMessage::Notification { method, .. } = message {
-                if method == "turn/plan/updated" {
-                    saw_plan_update = true;
-                    break;
-                }
+        tokio::task::yield_now().await;
+        assert!(
+            !blocked_delivery.is_finished(),
+            "a full lossless queue must apply backpressure"
+        );
+
+        subscription.recv().await.expect("queued event");
+        tokio::time::timeout(Duration::from_secs(1), blocked_delivery)
+            .await
+            .expect("delivery should resume when capacity is available")
+            .expect("delivery task should succeed");
+
+        let mut saw_completed = false;
+        while let Some(message) = subscription.try_recv() {
+            if matches!(
+                message,
+                IncomingMessage::Notification { ref method, .. } if method == "turn/completed"
+            ) {
+                saw_completed = true;
             }
         }
-
-        assert!(saw_plan_update);
+        assert!(saw_completed);
     }
 }

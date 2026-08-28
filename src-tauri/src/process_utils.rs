@@ -13,8 +13,6 @@ pub fn configure_std_command(_command: &mut std::process::Command) {}
 
 #[cfg(target_os = "windows")]
 pub fn configure_tokio_command(command: &mut tokio::process::Command) {
-    use std::os::windows::process::CommandExt;
-
     command.creation_flags(CREATE_NO_WINDOW);
 }
 

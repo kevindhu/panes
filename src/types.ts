@@ -9,66 +9,6 @@ export interface Workspace {
   lastOpenedAt: string;
 }
 
-export interface KeepAwakeState {
-  supported: boolean;
-  enabled: boolean;
-  active: boolean;
-  supportsClosedDisplay?: boolean | null;
-  closedDisplayActive?: boolean | null;
-  message?: string | null;
-  displaySleepPrevented?: boolean;
-  screenSaverPrevented?: boolean;
-  onAcPower?: boolean | null;
-  batteryPercent?: number | null;
-  sessionRemainingSecs?: number | null;
-  pausedDueToBattery?: boolean;
-  closedDisplaySleepDisabled?: boolean;
-}
-
-export interface PowerSettings {
-  keepAwakeEnabled: boolean;
-  preventDisplaySleep: boolean;
-  preventScreenSaver: boolean;
-  acOnlyMode: boolean;
-  batteryThreshold: number | null;
-  sessionDurationSecs: number | null;
-  preventClosedDisplaySleep: boolean;
-}
-
-export interface PowerSettingsInput {
-  keepAwakeEnabled: boolean;
-  preventDisplaySleep: boolean;
-  preventScreenSaver: boolean;
-  acOnlyMode: boolean;
-  batteryThreshold: number | null;
-  sessionDurationSecs: number | null;
-  preventClosedDisplaySleep: boolean;
-}
-
-export interface HelperStatus {
-  status: "registered" | "requiresApproval" | "notRegistered" | "notFound" | "notSupported" | "unknown";
-  message?: string | null;
-}
-
-export type TerminalNotificationIntegrationId = "claude" | "codex";
-
-export interface TerminalNotificationIntegrationStatus {
-  configured: boolean;
-  configPath?: string | null;
-  configExists: boolean;
-  conflict: boolean;
-  detail?: string | null;
-}
-
-export interface TerminalNotificationSettings {
-  chatEnabled: boolean;
-  terminalEnabled: boolean;
-  terminalSetupComplete: boolean;
-  notificationSound: string | null;
-  claude: TerminalNotificationIntegrationStatus;
-  codex: TerminalNotificationIntegrationStatus;
-}
-
 export interface Repo {
   id: string;
   workspaceId: string;
@@ -79,70 +19,6 @@ export interface Repo {
   trustLevel: TrustLevel;
 }
 
-export interface WorkspaceGitSelectionStatus {
-  configured: boolean;
-}
-
-export type WorkspaceStartupPresetFormat = "json" | "toml";
-export type WorkspaceDefaultView = "chat" | "split" | "terminal" | "editor";
-export type WorkspacePathBase = "workspace" | "worktree" | "absolute";
-export type WorkspaceStartupApplyWhen = "no_live_sessions";
-export type WorkspaceStartupRepoMode = "active_repo" | "fixed_repo";
-export type WorkspaceStartupSplitDirection = "horizontal" | "vertical";
-
-export interface WorkspaceStartupPreset {
-  version: 1;
-  defaultView: WorkspaceDefaultView;
-  splitPanelSize?: number | null;
-  terminal?: WorkspaceTerminalStartupPreset | null;
-}
-
-export interface WorkspaceTerminalStartupPreset {
-  applyWhen: WorkspaceStartupApplyWhen;
-  groups: WorkspaceStartupGroup[];
-  activeGroupId?: string | null;
-  focusedSessionId?: string | null;
-}
-
-export interface WorkspaceStartupGroup {
-  id: string;
-  name: string;
-  broadcastOnStart?: boolean;
-  worktree?: WorkspaceStartupWorktreeConfig | null;
-  sessions: WorkspaceStartupSession[];
-  root: WorkspaceStartupSplitNode;
-}
-
-export interface WorkspaceStartupWorktreeConfig {
-  enabled: boolean;
-  repoMode: WorkspaceStartupRepoMode;
-  repoPath?: string | null;
-  baseBranch?: string | null;
-  baseDir?: string | null;
-  branchPrefix?: string | null;
-}
-
-export interface WorkspaceStartupSession {
-  id: string;
-  title?: string | null;
-  cwd: string;
-  cwdBase?: WorkspacePathBase | null;
-  harnessId?: string | null;
-  launchHarnessOnCreate?: boolean | null;
-}
-
-export type WorkspaceStartupSplitNode =
-  | {
-      type: "leaf";
-      sessionId: string;
-    }
-  | {
-      type: "split";
-      direction: WorkspaceStartupSplitDirection;
-      ratio: number;
-      children: [WorkspaceStartupSplitNode, WorkspaceStartupSplitNode];
-    };
-
 export type ThreadStatus =
   | "idle"
   | "streaming"
@@ -150,7 +26,7 @@ export type ThreadStatus =
   | "error"
   | "completed";
 
-export type ChatEngineId = "codex" | "claude" | "opencode";
+export type ChatEngineId = "codex";
 
 export interface Thread {
   id: string;
@@ -167,49 +43,6 @@ export interface Thread {
   createdAt: string;
   lastActivityAt: string;
 }
-
-export interface CodexRemoteThread {
-  engineThreadId: string;
-  title?: string | null;
-  preview: string;
-  cwd: string;
-  createdAt: string;
-  updatedAt: string;
-  modelProvider: string;
-  sourceKind: string;
-  statusType: string;
-  activeFlags: string[];
-  archived: boolean;
-  localThreadId?: string | null;
-}
-
-export interface CodexRemoteThreadPage {
-  threads: CodexRemoteThread[];
-  nextCursor?: string | null;
-}
-
-export interface OpenCodeRemoteSession {
-  engineThreadId: string;
-  title?: string | null;
-  cwd: string;
-  createdAt: string;
-  updatedAt: string;
-  archived: boolean;
-  localThreadId?: string | null;
-}
-
-export interface OpenCodeRemoteSessionPage {
-  sessions: OpenCodeRemoteSession[];
-  nextCursor?: string | null;
-}
-
-export type CodexReviewDelivery = "inline" | "detached";
-
-export type CodexReviewTarget =
-  | { type: "uncommittedChanges" }
-  | { type: "baseBranch"; branch: string }
-  | { type: "commit"; sha: string; title?: string | null }
-  | { type: "custom"; instructions: string };
 
 export type MessageStatus = "completed" | "streaming" | "interrupted" | "error";
 
@@ -309,6 +142,69 @@ export interface ActionOutputPayload {
   found: boolean;
   outputChunks: Array<{ stream: "stdout" | "stderr" | "stdin"; content: string }>;
   truncated: boolean;
+}
+
+export interface CodexTurnRecord {
+  id: string;
+  threadId: string;
+  messageId: string;
+  nativeThreadId: string;
+  nativeTurnId: string | null;
+  status: string;
+  startedAtMs: number | null;
+  completedAtMs: number | null;
+  firstEventAtMs: number | null;
+  lastEventAtMs: number | null;
+  lastSourceSequence: number;
+  startedJson: string | null;
+  completedJson: string | null;
+  planJson: string | null;
+  usageJson: string | null;
+}
+
+export interface CodexTurnEventRecord {
+  id: number;
+  sourceSequence: number;
+  eventKind: "request" | "notification" | "response";
+  method: string;
+  requestId: string | null;
+  nativeThreadId: string;
+  nativeTurnId: string | null;
+  paramsJson: string;
+  observedAtMs: number;
+}
+
+export interface CodexTurnItemRecord {
+  itemId: string;
+  itemType: string;
+  status: string;
+  phase: string | null;
+  firstSourceSequence: number;
+  lastSourceSequence: number;
+  startedAtMs: number | null;
+  completedAtMs: number | null;
+  startedJson: string | null;
+  completedJson: string | null;
+}
+
+export interface CodexItemStreamChunkRecord {
+  id: number;
+  eventId: number;
+  itemId: string | null;
+  sourceSequence: number;
+  chunkIndex: number;
+  streamKind: string;
+  summaryIndex: number | null;
+  content: string;
+  metadataJson: string | null;
+  observedAtMs: number;
+}
+
+export interface CodexTurnSnapshot {
+  turn: CodexTurnRecord;
+  events: CodexTurnEventRecord[];
+  items: CodexTurnItemRecord[];
+  chunks: CodexItemStreamChunkRecord[];
 }
 
 export interface ApprovalBlock {
@@ -544,41 +440,6 @@ export interface CodexSkill {
   scope: string;
 }
 
-export interface OpenCodeRuntimeCatalog {
-  agents: OpenCodeAgent[];
-  commands: OpenCodeCommand[];
-  mcpServers: OpenCodeMcpServer[];
-}
-
-export interface OpenCodeAgent {
-  name: string;
-  description?: string | null;
-  mode: string;
-  native: boolean;
-  hidden: boolean;
-  modelProviderId?: string | null;
-  modelId?: string | null;
-  variant?: string | null;
-  steps?: number | null;
-}
-
-export interface OpenCodeCommand {
-  name: string;
-  description?: string | null;
-  agent?: string | null;
-  model?: string | null;
-  source?: string | null;
-  subtask: boolean;
-  hints: string[];
-}
-
-export interface OpenCodeMcpServer {
-  name: string;
-  status: string;
-  detail?: string | null;
-  raw: unknown;
-}
-
 export interface CodexPluginMarketplace {
   name: string;
   path: string;
@@ -708,15 +569,6 @@ export interface EngineRuntimeUpdatedEvent {
   toast?: RuntimeToast;
 }
 
-export interface EngineCheckResult {
-  command: string;
-  success: boolean;
-  exitCode: number | null;
-  stdout: string;
-  stderr: string;
-  durationMs: number;
-}
-
 export interface SearchResult {
   threadId: string;
   threadTitle: string;
@@ -726,397 +578,9 @@ export interface SearchResult {
   snippet: string;
 }
 
-export interface GitFileStatus {
-  path: string;
-  indexStatus?: string;
-  worktreeStatus?: string;
-}
-
-export interface GitStatus {
-  branch: string;
-  files: GitFileStatus[];
-  ahead: number;
-  behind: number;
-}
-
-export interface GitDiffPreview {
-  content: string;
-  truncated: boolean;
-  originalBytes: number;
-  returnedBytes: number;
-}
-
-export type GitCompareSource = "changes" | "staged";
-export type GitChangeType =
-  | "added"
-  | "modified"
-  | "deleted"
-  | "renamed"
-  | "untracked"
-  | "conflicted";
-
-export interface GitFileCompare {
-  source: GitCompareSource;
-  baseContent: string;
-  modifiedContent: string;
-  baseLabel: string;
-  modifiedLabel: string;
-  changeType: GitChangeType;
-  hasStagedChanges: boolean;
-  hasUnstagedChanges: boolean;
-  isBinary: boolean;
-  isEditable?: boolean;
-  fallbackReason?: string | null;
-}
-
-export type GitBranchScope = "local" | "remote";
-
-export interface GitBranch {
-  name: string;
-  fullName: string;
-  isCurrent: boolean;
-  isRemote: boolean;
-  upstream?: string;
-  ahead: number;
-  behind: number;
-  lastCommitAt?: string;
-}
-
-export interface GitBranchPage {
-  entries: GitBranch[];
-  offset: number;
-  limit: number;
-  total: number;
-  hasMore: boolean;
-}
-
-export interface GitCommit {
-  hash: string;
-  shortHash: string;
-  authorName: string;
-  authorEmail: string;
-  subject: string;
-  body: string;
-  authoredAt: string;
-}
-
-export interface GitCommitPage {
-  entries: GitCommit[];
-  offset: number;
-  limit: number;
-  total: number;
-  hasMore: boolean;
-}
-
-export interface GitStash {
-  index: number;
-  name: string;
-  branchHint?: string;
-  createdAt?: string;
-}
-
-export interface GitWorktree {
-  path: string;
-  headSha: string | null;
-  branch: string | null;
-  isMain: boolean;
-  isLocked: boolean;
-  isPrunable: boolean;
-}
-
-export interface GitRemote {
-  name: string;
-  url: string;
-}
-
-export interface GitInitRepoStatus {
-  canInitialize: boolean;
-  blockingRepoPath: string | null;
-}
-
-export interface WorktreeSessionInfo {
-  repoPath: string;
-  worktreePath: string;
-  branch: string;
-}
-
-export interface FileTreeEntry {
-  path: string;
-  isDir: boolean;
-}
-
-export interface FileTreePage {
-  entries: FileTreeEntry[];
-  offset: number;
-  limit: number;
-  total: number;
-  hasMore: boolean;
-  scanTruncated: boolean;
-}
-
-export interface ReadFileResult {
-  content: string;
-  sizeBytes: number;
-  isBinary: boolean;
-}
-
-export interface ResolvedEditorFileReference {
-  repoPath: string;
-  filePath: string;
-  line?: number | null;
-  column?: number | null;
-}
-
-export type EditorRenderMode = "plain-editor" | "markdown-preview" | "git-diff-editor";
-
-export interface GitEditorContext extends GitFileCompare {}
-
 export interface EditorRevealLocation {
   line: number;
   column?: number | null;
-}
-
-export interface EditorRevealRequest extends EditorRevealLocation {
-  nonce: string;
-}
-
-export interface EditorTab {
-  id: string;
-  workspaceId: string | null;
-  rootPath: string;
-  absolutePath: string;
-  filePath: string;
-  gitRepoPath: string | null;
-  gitFilePath: string | null;
-  fileName: string;
-  content: string;
-  savedContent: string;
-  isDirty: boolean;
-  isLoading: boolean;
-  isBinary: boolean;
-  renderMode: EditorRenderMode;
-  gitContext: GitEditorContext | null;
-  pendingReveal: EditorRevealRequest | null;
-  loadError?: string;
-}
-
-export interface TerminalSession {
-  id: string;
-  workspaceId: string;
-  shell: string;
-  cwd: string;
-  createdAt: string;
-}
-
-export interface TerminalNotification {
-  id: string;
-  workspaceId: string;
-  sessionId: string;
-  source: string;
-  title: string;
-  body: string;
-  createdAt: string;
-}
-
-export interface TerminalNotificationClearedEvent {
-  sessionId: string | null;
-}
-
-export interface TerminalOutputReadyEvent {
-  sessionId: string;
-  latestSeq: number;
-  ts: string;
-  bytes: number;
-}
-
-export interface TerminalReplayChunk {
-  seq: number;
-  ts: string;
-  data: string;
-}
-
-export interface TerminalResumeSession {
-  latestSeq: number;
-  oldestAvailableSeq: number | null;
-  gap: boolean;
-  chunks: TerminalReplayChunk[];
-}
-
-export interface TerminalExitEvent {
-  sessionId: string;
-  code: number | null;
-  signal: number | null;
-}
-
-export interface TerminalForegroundChangedEvent {
-  sessionId: string;
-  pid: number | null;
-  name: string | null;
-}
-
-export interface TerminalEnvSnapshot {
-  term: string | null;
-  colorterm: string | null;
-  termProgram: string | null;
-  termProgramVersion: string | null;
-  home: string | null;
-  userProfile: string | null;
-  appData: string | null;
-  localAppData: string | null;
-  xdgConfigHome: string | null;
-  xdgDataHome: string | null;
-  xdgCacheHome: string | null;
-  xdgStateHome: string | null;
-  tmpdir: string | null;
-  temp: string | null;
-  tmp: string | null;
-  lang: string | null;
-  lcAll: string | null;
-  lcCtype: string | null;
-  path: string | null;
-}
-
-export interface TerminalResizeSnapshot {
-  cols: number;
-  rows: number;
-  pixelWidth: number;
-  pixelHeight: number;
-  recordedAt: string;
-}
-
-export interface TerminalIoCounters {
-  stdinWrites: number;
-  stdinBytes: number;
-  stdinCtrlC: number;
-  lastStdinWriteDurationMs: number | null;
-  stdoutReads: number;
-  stdoutBytes: number;
-  stdoutEmits: number;
-  stdoutEmitBytes: number;
-  stdoutDroppedBytes: number;
-  lastStdinWriteAt: string | null;
-  lastStdoutReadAt: string | null;
-  lastStdoutEmitAt: string | null;
-}
-
-export interface TerminalLatencySnapshot {
-  stdinToStdoutReadMs: number | null;
-  stdoutReadToEmitMs: number | null;
-}
-
-export interface TerminalOutputThrottleSnapshot {
-  minEmitIntervalMs: number;
-  maxEmitBytes: number;
-  bufferBytes: number;
-  bufferCapBytes: number;
-  bufferPeakBytes: number;
-  bufferTrimmedBytes: number;
-}
-
-export interface TerminalRendererDiagnostics {
-  sessionId: string;
-  shell: string;
-  cwd: string;
-  envSnapshot: TerminalEnvSnapshot;
-  lastResize: TerminalResizeSnapshot | null;
-  ioCounters: TerminalIoCounters;
-  latency: TerminalLatencySnapshot;
-  outputThrottle: TerminalOutputThrottleSnapshot;
-}
-
-// ── Terminal Split Layout ───────────────────────────────────────────
-
-export type SplitDirection = "horizontal" | "vertical";
-
-export interface SplitLeaf {
-  type: "leaf";
-  sessionId: string;
-}
-
-export interface SplitContainer {
-  type: "split";
-  id: string;
-  direction: SplitDirection;
-  ratio: number;
-  children: [SplitNode, SplitNode];
-}
-
-export type SplitNode = SplitLeaf | SplitContainer;
-
-export interface TerminalSessionRuntimeMeta {
-  harnessId?: string | null;
-  harnessName?: string | null;
-  autoDetectedHarness?: boolean;
-  launchHarnessOnCreate?: boolean;
-  worktree?: WorktreeSessionInfo | null;
-}
-
-export interface TerminalGroup {
-  id: string;
-  root: SplitNode;
-  name: string;
-  sessionMeta?: Record<string, TerminalSessionRuntimeMeta>;
-  worktreeConfig?: WorkspaceStartupWorktreeConfig | null;
-}
-
-// ── Setup / Onboarding ──────────────────────────────────────────────
-
-export type OnboardingWorkflowPreference = "cli" | "chat";
-export type OnboardingChatEngineId = ChatEngineId;
-export type OnboardingStep =
-  | "greeting"
-  | "workflow"
-  | "cliProviders"
-  | "chatEngines"
-  | "chatReadiness"
-  | "workspace";
-
-export interface DependencyReport {
-  node: DepStatus;
-  codex: DepStatus;
-  git: DepStatus;
-  platform: string;
-  packageManagers: string[];
-}
-
-export interface DepStatus {
-  found: boolean;
-  version: string | null;
-  path: string | null;
-  canAutoInstall: boolean;
-  installMethod: string | null;
-}
-
-export interface InstallResult {
-  success: boolean;
-  message: string;
-}
-
-export interface InstallProgressEvent {
-  dependency: string;
-  line: string;
-  stream: string;
-  finished: boolean;
-}
-
-// ── Harness Management ──────────────────────────────────────────────
-
-export interface HarnessInfo {
-  id: string;
-  name: string;
-  description: string;
-  command: string;
-  found: boolean;
-  version: string | null;
-  path: string | null;
-  canAutoInstall: boolean;
-  website: string;
-  native: boolean;
-}
-
-export interface HarnessReport {
-  harnesses: HarnessInfo[];
-  npmAvailable: boolean;
 }
 
 // ── Stream Events ───────────────────────────────────────────────────
@@ -1321,42 +785,4 @@ export interface ContextUsage {
   windowWeeklyPercent: number | null;
   windowFiveHourResetsAt: string | null;
   windowWeeklyResetsAt: string | null;
-}
-
-export interface RefreshThreadUsageLimitsDiagnostics {
-  threadId: string;
-  engineId: string;
-  modelId: string;
-  threadStatus: string;
-  messageCount: number;
-  lastActivityAt: string;
-  engineThreadId: string | null;
-  threadReadAttempted: boolean;
-  threadReadSucceeded: boolean;
-  latestTurnReadAttempted: boolean;
-  latestTurnReadSucceeded: boolean;
-  latestTurnSource: string | null;
-  latestTurnId: string | null;
-  latestTurnHadTokenUsage: boolean;
-  cachedContextAvailable: boolean;
-  cachedContextUsed: boolean;
-  accountReadAttempted: boolean;
-  accountReadSucceeded: boolean;
-  currentTokens: number | null;
-  maxContextTokens: number | null;
-  contextWindowPercent: number | null;
-  fiveHourPercent: number | null;
-  weeklyPercent: number | null;
-  fiveHourResetsAt: number | null;
-  weeklyResetsAt: number | null;
-  threadReadError: string | null;
-  latestTurnReadError: string | null;
-  accountReadError: string | null;
-  fatalError: string | null;
-}
-
-export interface RefreshThreadUsageLimitsResult {
-  refreshed: boolean;
-  missingContext: boolean;
-  diagnostics: RefreshThreadUsageLimitsDiagnostics;
 }

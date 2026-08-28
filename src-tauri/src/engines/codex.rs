@@ -37,11 +37,10 @@ use super::{
     },
     codex_protocol::{raw_value_to_value, IncomingMessage},
     codex_transport::CodexTransport,
-    ActionResult, ApprovalRequestRoute, CodexRemoteThreadSummary, Engine, EngineEvent,
-    EngineThread, ImportedThreadMessage, ModelAvailabilityNux, ModelInfo, ModelUpgradeInfo,
+    ActionResult, ApprovalRequestRoute, CodexRemoteThreadSummary, Engine, EngineEvent, EngineThread,
+    ImportedThreadMessage, ModelAvailabilityNux, ModelInfo, ModelUpgradeInfo,
     ReasoningEffortOption, SandboxPolicy, ThreadScope, ThreadSyncSnapshot, TurnAttachment,
-    TurnCompletionDiagnostics, TurnCompletionSource, TurnCompletionStatus, TurnInput,
-    TurnInputItem,
+    TurnCompletionDiagnostics, TurnCompletionSource, TurnCompletionStatus, TurnInput, TurnInputItem,
 };
 
 const INITIALIZE_METHODS: &[&str] = &["initialize"];
@@ -76,6 +75,7 @@ const ACCOUNT_RATE_LIMITS_READ_METHODS: &[&str] = &["account/rateLimits/read"];
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const TURN_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const HEALTH_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(12);
+#[cfg(not(target_os = "windows"))]
 const LOGIN_SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const STREAM_LOST_RECOVERY_RETRY_DELAYS_SECS: &[u64] = &[2, 5, 10, 20, 30, 45, 60];
 const TRANSPORT_RESTART_MAX_ATTEMPTS: usize = 3;
@@ -727,7 +727,7 @@ impl Engine for CodexEngine {
 
         let mut mapper = TurnEventMapper::default();
         let thread_id = engine_thread_id.to_string();
-        let mut subscription = transport.subscribe_thread(&thread_id).await;
+        let mut subscription = transport.subscribe_thread(&thread_id, &event_tx).await;
 
         let runtime = self.thread_runtime(&thread_id).await;
         let plan_mode_activation = self
@@ -833,6 +833,16 @@ impl Engine for CodexEngine {
                   subscription.set_turn_id(Some(turn_id.clone())).await;
                   self.set_active_turn(&thread_id, &turn_id).await;
                 }
+
+                subscription
+                  .capture_response(
+                    "turn/start",
+                    &thread_id,
+                    expected_turn_id.clone(),
+                    serde_json::to_string(&result)
+                      .context("failed to serialize Codex turn/start result")?,
+                  )
+                  .await?;
 
                 for event in mapper.map_turn_result(&result) {
                   if event_indicates_sandbox_denial(&event) {
@@ -1578,7 +1588,9 @@ impl CodexEngine {
 
         let mut mapper = TurnEventMapper::default();
         let source_thread_id = source_engine_thread_id.to_string();
-        let mut subscription = transport.subscribe_thread(&source_thread_id).await;
+        let mut subscription = transport
+            .subscribe_thread(&source_thread_id, &event_tx)
+            .await;
         let mut active_thread_id = source_thread_id.clone();
         let requested_delivery = delivery.map(str::to_string);
 
@@ -1693,6 +1705,16 @@ impl CodexEngine {
                   subscription.set_turn_id(Some(turn_id.clone())).await;
                   self.set_active_turn(&active_thread_id, &turn_id).await;
                 }
+
+                subscription
+                  .capture_response(
+                    "review/start",
+                    &active_thread_id,
+                    expected_turn_id.clone(),
+                    serde_json::to_string(&result)
+                      .context("failed to serialize Codex review/start result")?,
+                  )
+                  .await?;
 
                 for event in mapper.map_turn_result(&result) {
                   if event_indicates_sandbox_denial(&event) {

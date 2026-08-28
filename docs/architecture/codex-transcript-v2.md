@@ -38,9 +38,11 @@ completed item.
 
 ## Durability boundary
 
-The lossless guarantee begins when a conversation-scoped JSON-RPC line is successfully read
-from the Codex app-server stdout pipe. Panes does not promise to reconstruct data that an older
-Panes version already truncated or data that Codex never emitted.
+The lossless guarantee begins when a conversation-scoped JSON-RPC message is successfully
+parsed, matched to an active turn subscription, and accepted by that turn's native recorder
+channel. The lossless router performs this handoff before the legacy mapper sees the message.
+Panes does not promise to reconstruct data that an older Panes version already truncated, data
+that Codex never emitted, or messages emitted outside an active turn subscription.
 
 The recorder uses a bounded, backpressured channel and batched SQLite transactions. Normal turn
 completion closes and joins the recorder so all accepted events are committed before the turn
@@ -117,4 +119,3 @@ reader remains for pre-v2 history even after the renderer switches.
 - Every reviewed `ThreadItem` type and an unknown future type survive replay.
 - Existing-database migration is idempotent.
 - Windows schema generation and parity checks pass against the installed Codex CLI.
-

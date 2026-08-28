@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { execFileSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -98,10 +98,9 @@ function quoteCmdArgument(value) {
 function generateSchema(outputDirectory) {
   const args = ["app-server", "generate-json-schema", "--out", outputDirectory];
   if (process.platform === "win32") {
-    const commandLine = ["codex", ...args].map(quoteCmdArgument).join(" ");
-    execFileSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", commandLine], {
-      stdio: "pipe",
-    });
+    // npm installs Codex as a .cmd shim on Windows. execFileSync cannot launch .cmd files
+    // directly, while execSync intentionally resolves the shim through cmd.exe.
+    execSync(["codex", ...args.map(quoteCmdArgument)].join(" "), { stdio: "pipe" });
     return;
   }
   execFileSync("codex", args, { stdio: "pipe" });
@@ -171,10 +170,12 @@ try {
   ]);
   assertSourceContains("src-tauri/src/engines/codex_transport.rs", [
     "is_lossless_conversation_signature",
-  ]);
-  assertSourceContains("src-tauri/src/engines/codex.rs", [
     "CodexNativeEvent",
     "source_sequence",
+    "capture_native_message",
+  ]);
+  assertSourceContains("src-tauri/src/engines/codex.rs", [
+    "capture_response",
   ]);
   assertSourceExcludes("src-tauri/src/engines/codex_protocol.rs", [
     "parse_large_output_params",

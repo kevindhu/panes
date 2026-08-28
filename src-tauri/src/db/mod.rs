@@ -997,10 +997,6 @@ mod tests {
         assert_eq!(workspaces[0].root_path, r"C:\Users\panes\repo");
         assert_eq!(workspaces[0].scan_depth, 7);
 
-        let startup_preset =
-            workspaces::get_workspace_startup_preset_json(&db, active_workspace_id)
-                .expect("failed to load migrated startup preset");
-        assert_eq!(startup_preset.as_deref(), Some(r#"{"layout":"split"}"#));
         assert!(workspaces::find_workspace_by_id(&db, archived_workspace_id)
             .expect("failed to check archived workspace removal")
             .is_none());

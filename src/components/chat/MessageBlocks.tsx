@@ -1035,8 +1035,6 @@ function ActionBlockView({
     [outputChunks],
   );
   const Icon = actionIcons[block.actionType] ?? Terminal;
-  const isRunning = block.status === "running";
-  const isPending = block.status === "pending";
   const hasBody = outputChunks.length > 0 || Boolean(block.result?.error) || outputDeferred;
   const actionDetails = (block.details ?? {}) as Record<string, unknown>;
   const outputTruncated =

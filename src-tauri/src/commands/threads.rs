@@ -442,25 +442,6 @@ async fn validate_model_for_engine(
     Ok(normalized_model_id.to_string())
 }
 
-async fn resolve_thread_cwd(state: &AppState, thread: &ThreadDto) -> Result<String, String> {
-    let workspace_id = thread.workspace_id.clone();
-    let repo_id = thread.repo_id.clone();
-    let thread_id = thread.id.clone();
-
-    run_db(state.db.clone(), move |db| {
-        let workspace = db::workspaces::find_workspace_by_id(db, &workspace_id)?
-            .ok_or_else(|| anyhow::anyhow!("workspace not found for thread {thread_id}"))?;
-        if let Some(repo_id) = repo_id.as_deref() {
-            let repo = db::repos::find_repo_by_id(db, repo_id)?
-                .ok_or_else(|| anyhow::anyhow!("repo not found for thread {thread_id}"))?;
-            return Ok(repo.path);
-        }
-
-        Ok(workspace.root_path)
-    })
-    .await
-}
-
 fn collect_remote_thread_roots(
     workspace_root: &str,
     repos: &[RepoDto],
@@ -3298,20 +3279,11 @@ mod tests {
             approval_policy_for_engine_and_trust_level("codex", &TrustLevelDto::Restricted),
             "never"
         );
-        assert_eq!(
-            approval_policy_for_engine_and_trust_level("claude", &TrustLevelDto::Restricted),
-            "trusted"
-        );
-        assert_eq!(
-            approval_policy_for_engine_and_trust_level("opencode", &TrustLevelDto::Restricted),
-            "allow"
-        );
         assert!(allow_network_for_trust_level(&TrustLevelDto::Restricted));
         assert_eq!(
             default_sandbox_mode_for_engine("codex"),
             "danger-full-access"
         );
-        assert_eq!(default_sandbox_mode_for_engine("claude"), "workspace-write");
     }
 
     #[test]
@@ -3323,42 +3295,6 @@ mod tests {
         assert_eq!(
             normalize_thread_sandbox_mode(Some("read_only".to_string())).unwrap(),
             Some("read-only".to_string())
-        );
-    }
-
-    #[test]
-    fn normalize_thread_approval_policy_accepts_claude_modes() {
-        assert_eq!(
-            normalize_thread_approval_policy_for_engine("claude", Some(json!("trusted"))).unwrap(),
-            Some(json!("trusted"))
-        );
-        assert_eq!(
-            normalize_thread_approval_policy_for_engine("claude", Some(json!("STANDARD"))).unwrap(),
-            Some(json!("standard"))
-        );
-    }
-
-    #[test]
-    fn normalize_thread_approval_policy_rejects_codex_values_for_claude() {
-        assert!(
-            normalize_thread_approval_policy_for_engine("claude", Some(json!("on-request")))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn normalize_thread_approval_policy_accepts_opencode_modes() {
-        assert_eq!(
-            normalize_thread_approval_policy_for_engine("opencode", Some(json!("ALLOW"))).unwrap(),
-            Some(json!("allow"))
-        );
-        assert_eq!(
-            normalize_thread_approval_policy_for_engine("opencode", Some(json!("ask"))).unwrap(),
-            Some(json!("ask"))
-        );
-        assert!(
-            normalize_thread_approval_policy_for_engine("opencode", Some(json!("on-request")))
-                .is_err()
         );
     }
 
@@ -3664,57 +3600,11 @@ mod tests {
     }
 
     #[test]
-    fn remote_timestamp_format_accepts_opencode_milliseconds() {
+    fn remote_timestamp_format_accepts_milliseconds() {
         assert_eq!(
             codex_remote_thread_timestamp_to_rfc3339(1_777_155_663_506),
             "2026-04-25T22:21:03.506+00:00"
         );
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn build_opencode_remote_session_metadata_sets_remote_fields() {
-        let summary = OpenCodeRemoteSessionSummary {
-            engine_thread_id: "ses_12345678".to_string(),
-            title: Some("OpenCode title".to_string()),
-            cwd: "/workspace".to_string(),
-            created_at: 1_777_155_663_506,
-            updated_at: 1_777_155_663_524,
-            archived: true,
-        };
-
-        let metadata = build_opencode_remote_session_metadata(
-            Some(&json!({
-                "opencodeAgent": "plan",
-                "reasoningEffort": "high"
-            })),
-            &summary,
-            "opencode/big-pickle",
-        );
-
-        assert_eq!(
-            build_opencode_remote_session_title(&summary),
-            "OpenCode title"
-        );
-        assert_eq!(
-            metadata.get("lastModelId"),
-            Some(&json!("opencode/big-pickle"))
-        );
-        assert_eq!(
-            metadata.get("opencodeRemoteSessionAttached"),
-            Some(&json!(true))
-        );
-        assert_eq!(metadata.get("opencodeRemoteArchived"), Some(&json!(true)));
-        assert_eq!(
-            metadata.get("opencodeRemoteCwd"),
-            Some(&json!("/workspace"))
-        );
-        assert_eq!(
-            metadata.get("opencodeTranscriptImported"),
-            Some(&json!(false))
-        );
-        assert_eq!(metadata.get("opencodeAgent"), Some(&json!("plan")));
-        assert_eq!(metadata.get("reasoningEffort"), Some(&json!("high")));
     }
 
     #[test]
@@ -4139,116 +4029,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_thread_inner_rejects_service_tier_for_non_codex_threads() {
-        let state = test_app_state();
-        let workspace = test_workspace(&state);
-
-        let error = create_thread_inner(
-            &state,
-            workspace.id,
-            None,
-            "claude".to_string(),
-            "claude-sonnet-4-6".to_string(),
-            "Thread".to_string(),
-            None,
-            Some("fast".to_string()),
-        )
-        .await
-        .expect_err("expected non-codex service tier to be rejected");
-
-        assert!(error.contains("service tier is only supported for Codex threads"));
-    }
-
-    #[tokio::test]
-    async fn set_thread_execution_policy_allows_claude_read_only() {
-        let state = test_app_state();
-        let thread = test_thread(&state, "claude", "claude-sonnet-4-6");
-
-        let updated = set_thread_execution_policy_inner(
-            &state,
-            thread.id.clone(),
-            false,
-            None,
-            true,
-            Some("read-only".to_string()),
-            false,
-            None,
-            false,
-            None,
-            false,
-            None,
-        )
-        .await
-        .expect("expected read-only update to succeed");
-
-        assert_eq!(
-            updated
-                .engine_metadata
-                .as_ref()
-                .and_then(|value| value.get("sandboxMode"))
-                .and_then(serde_json::Value::as_str),
-            Some("read-only")
-        );
-    }
-
-    #[tokio::test]
-    async fn set_thread_execution_policy_allows_claude_workspace_write() {
-        let state = test_app_state();
-        let thread = test_thread(&state, "claude", "claude-sonnet-4-6");
-
-        let updated = set_thread_execution_policy_inner(
-            &state,
-            thread.id.clone(),
-            false,
-            None,
-            true,
-            Some("workspace-write".to_string()),
-            false,
-            None,
-            false,
-            None,
-            false,
-            None,
-        )
-        .await
-        .expect("expected workspace-write update to succeed");
-
-        assert_eq!(
-            updated
-                .engine_metadata
-                .as_ref()
-                .and_then(|value| value.get("sandboxMode"))
-                .and_then(serde_json::Value::as_str),
-            Some("workspace-write")
-        );
-    }
-
-    #[tokio::test]
-    async fn set_thread_execution_policy_rejects_claude_danger_full_access() {
-        let state = test_app_state();
-        let thread = test_thread(&state, "claude", "claude-sonnet-4-6");
-
-        let error = set_thread_execution_policy_inner(
-            &state,
-            thread.id.clone(),
-            false,
-            None,
-            true,
-            Some("danger-full-access".to_string()),
-            false,
-            None,
-            false,
-            None,
-            false,
-            None,
-        )
-        .await
-        .expect_err("expected danger-full-access to be rejected");
-
-        assert!(error.contains("Claude sandbox mode `danger-full-access` is not supported"));
-    }
-
-    #[tokio::test]
     async fn set_thread_execution_policy_clears_permission_profile_when_sandbox_changes() {
         let state = test_app_state();
         let thread = test_thread(&state, "codex", "gpt-5.4");
@@ -4373,7 +4153,7 @@ mod tests {
     #[tokio::test]
     async fn set_thread_codex_config_rejects_non_codex_threads() {
         let state = test_app_state();
-        let thread = test_thread(&state, "claude", "claude-sonnet-4-6");
+        let thread = test_thread(&state, "unsupported", "unsupported-model");
 
         let error = set_thread_codex_config_inner(
             &state,
@@ -4389,66 +4169,6 @@ mod tests {
         .expect_err("expected non-codex thread to be rejected");
 
         assert!(error.contains("Codex thread config is only available for Codex threads"));
-    }
-
-    #[cfg(any())]
-    #[tokio::test]
-    async fn set_thread_opencode_config_persists_agent() {
-        let state = test_app_state();
-        let thread = test_thread(&state, "opencode", "opencode/big-pickle");
-
-        let updated = set_thread_opencode_config_inner(
-            &state,
-            thread.id.clone(),
-            true,
-            Some("Explore_1".to_string()),
-        )
-        .await
-        .expect("expected OpenCode config update to succeed");
-
-        let metadata = updated
-            .engine_metadata
-            .expect("expected engine metadata to be present");
-        assert_eq!(metadata.get("opencodeAgent"), Some(&json!("Explore_1")));
-    }
-
-    #[cfg(any())]
-    #[tokio::test]
-    async fn set_thread_opencode_config_clears_build_agent() {
-        let state = test_app_state();
-        let thread = test_thread(&state, "opencode", "opencode/big-pickle");
-
-        let updated = set_thread_opencode_config_inner(
-            &state,
-            thread.id.clone(),
-            true,
-            Some("build".to_string()),
-        )
-        .await
-        .expect("expected OpenCode build agent to clear override");
-
-        assert!(updated
-            .engine_metadata
-            .and_then(|metadata| metadata.get("opencodeAgent").cloned())
-            .is_none());
-    }
-
-    #[cfg(any())]
-    #[tokio::test]
-    async fn set_thread_opencode_config_rejects_non_opencode_threads() {
-        let state = test_app_state();
-        let thread = test_thread(&state, "codex", "gpt-5.4");
-
-        let error = set_thread_opencode_config_inner(
-            &state,
-            thread.id.clone(),
-            true,
-            Some("explore".to_string()),
-        )
-        .await
-        .expect_err("expected non-opencode thread to be rejected");
-
-        assert!(error.contains("OpenCode thread config is only available for OpenCode threads"));
     }
 
     #[test]

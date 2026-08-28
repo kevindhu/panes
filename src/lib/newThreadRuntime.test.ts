@@ -87,32 +87,6 @@ const engines: EngineInfo[] = [
       approvalDecisions: [],
     },
   },
-  {
-    id: "claude",
-    name: "Claude",
-    models: [
-      {
-        id: "claude-sonnet-4-6",
-        displayName: "Claude Sonnet 4.6",
-        description: "Claude",
-        hidden: false,
-        isDefault: true,
-        inputModalities: ["text"],
-        attachmentModalities: ["text"],
-        supportsPersonality: false,
-        defaultReasoningEffort: "medium",
-        supportedReasoningEfforts: [
-          { reasoningEffort: "medium", description: "Balanced" },
-          { reasoningEffort: "high", description: "Deep" },
-        ],
-      },
-    ],
-    capabilities: {
-      permissionModes: [],
-      sandboxModes: [],
-      approvalDecisions: [],
-    },
-  },
 ];
 
 function buildThread(overrides?: Partial<Thread>): Thread {
@@ -151,10 +125,6 @@ describe("resolveNewThreadRuntime", () => {
           serviceTier: "flex",
         },
       }),
-      onboardingSelection: {
-        engineId: "claude",
-        modelId: "claude-sonnet-4-6",
-      },
     });
 
     expect(runtime).toEqual({
@@ -165,7 +135,7 @@ describe("resolveNewThreadRuntime", () => {
     });
   });
 
-  it("prefers saved active-thread runtime over onboarding", () => {
+  it("prefers saved active-thread runtime over the fallback", () => {
     const runtime = resolveNewThreadRuntime({
       engines,
       activeThread: buildThread({
@@ -175,10 +145,6 @@ describe("resolveNewThreadRuntime", () => {
           serviceTier: "fast",
         },
       }),
-      onboardingSelection: {
-        engineId: "claude",
-        modelId: "claude-sonnet-4-6",
-      },
     });
 
     expect(runtime).toEqual({
@@ -189,28 +155,10 @@ describe("resolveNewThreadRuntime", () => {
     });
   });
 
-  it("uses the onboarding selection when there is no composer or active thread", () => {
-    const runtime = resolveNewThreadRuntime({
-      engines,
-      onboardingSelection: {
-        engineId: "claude",
-        modelId: "claude-sonnet-4-6",
-      },
-    });
-
-    expect(runtime).toEqual({
-      engineId: "claude",
-      modelId: "claude-sonnet-4-6",
-      reasoningEffort: null,
-      serviceTier: null,
-    });
-  });
-
   it("falls back to codex gpt-5.6-sol high when no other preference exists", () => {
     expect(
       resolveNewThreadRuntime({
         engines,
-        onboardingSelection: null,
       }),
     ).toEqual(NEW_THREAD_FALLBACK_RUNTIME);
   });
@@ -231,7 +179,6 @@ describe("resolveNewThreadRuntime", () => {
     expect(
       resolveNewThreadRuntime({
         engines: staleCodexCatalog,
-        onboardingSelection: null,
       }),
     ).toEqual({
       engineId: "codex",

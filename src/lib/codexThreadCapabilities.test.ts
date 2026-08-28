@@ -61,18 +61,12 @@ describe("codexThreadCapabilities", () => {
     expect(canEditCodexMessageHistory(thread, false)).toBe(false);
   });
 
-  it("requires an idle codex thread with an engine thread id for native history tools", () => {
+  it("requires an idle thread with an engine thread id for native history tools", () => {
     expect(canUseNativeCodexHistoryTools(makeThread(), false)).toBe(true);
     expect(canUseNativeCodexHistoryTools(makeThread(), true)).toBe(false);
     expect(
       canUseNativeCodexHistoryTools(
         makeThread({ engineThreadId: null }),
-        false,
-      ),
-    ).toBe(false);
-    expect(
-      canUseNativeCodexHistoryTools(
-        makeThread({ engineId: "claude" }),
         false,
       ),
     ).toBe(false);

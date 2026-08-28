@@ -367,65 +367,6 @@ pub fn find_workspace_by_id(
     get_workspace_by_id_optional(&conn, workspace_id)
 }
 
-pub fn get_workspace_startup_preset_json(
-    db: &Database,
-    workspace_id: &str,
-) -> anyhow::Result<Option<String>> {
-    let conn = db.connect()?;
-    conn.query_row(
-        "SELECT startup_preset_json
-         FROM workspaces
-         WHERE id = ?1",
-        params![workspace_id],
-        |row| row.get::<_, Option<String>>(0),
-    )
-    .optional()
-    .context("failed to load workspace startup preset")
-    .map(|value| value.flatten())
-}
-
-pub fn set_workspace_startup_preset_json(
-    db: &Database,
-    workspace_id: &str,
-    startup_preset_json: Option<&str>,
-) -> anyhow::Result<()> {
-    let conn = db.connect()?;
-    let affected = conn
-        .execute(
-            "UPDATE workspaces
-             SET startup_preset_json = ?1,
-                 startup_preset_updated_at = CASE
-                     WHEN ?1 IS NULL THEN NULL
-                     ELSE datetime('now')
-                 END
-             WHERE id = ?2",
-            params![startup_preset_json, workspace_id],
-        )
-        .context("failed to persist workspace startup preset")?;
-
-    if affected == 0 {
-        anyhow::bail!("workspace not found: {workspace_id}");
-    }
-
-    Ok(())
-}
-
-pub fn is_git_repo_selection_configured(db: &Database, workspace_id: &str) -> anyhow::Result<bool> {
-    let conn = db.connect()?;
-    let configured = conn
-        .query_row(
-            "SELECT git_repo_selection_configured
-         FROM workspaces
-         WHERE id = ?1",
-            params![workspace_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .context("failed to load workspace git selection state")?;
-
-    Ok(configured.unwrap_or(0) > 0)
-}
-
 pub fn set_workspace_order(db: &Database, workspace_ids: &[String]) -> anyhow::Result<()> {
     let mut conn = db.connect()?;
     let mut stmt = conn
@@ -484,28 +425,6 @@ pub fn set_workspace_order(db: &Database, workspace_ids: &[String]) -> anyhow::R
     }
     tx.commit()
         .context("failed to commit workspace sort order")?;
-
-    Ok(())
-}
-
-pub fn set_git_repo_selection_configured(
-    db: &Database,
-    workspace_id: &str,
-    configured: bool,
-) -> anyhow::Result<()> {
-    let conn = db.connect()?;
-    let affected = conn
-        .execute(
-            "UPDATE workspaces
-         SET git_repo_selection_configured = ?1
-         WHERE id = ?2",
-            params![if configured { 1 } else { 0 }, workspace_id],
-        )
-        .context("failed to update workspace git selection state")?;
-
-    if affected == 0 {
-        anyhow::bail!("workspace not found: {workspace_id}");
-    }
 
     Ok(())
 }
@@ -645,8 +564,6 @@ mod tests {
 
         let created = upsert_workspace(&db, old_root.to_string_lossy().as_ref(), Some(7))
             .expect("failed to create workspace");
-        set_workspace_startup_preset_json(&db, &created.id, Some(r#"{"version":1}"#))
-            .expect("failed to set startup preset");
         let repo = crate::db::repos::upsert_repo(
             &db,
             &created.id,
@@ -674,12 +591,6 @@ mod tests {
             path_utils::canonicalize_path(&new_root)
                 .expect("failed to canonicalize new root")
                 .to_string_lossy()
-        );
-        assert_eq!(
-            get_workspace_startup_preset_json(&db, &created.id)
-                .expect("failed to read startup preset")
-                .as_deref(),
-            Some(r#"{"version":1}"#),
         );
         let repos =
             crate::db::repos::get_repos(&db, &created.id).expect("failed to read retargeted repos");

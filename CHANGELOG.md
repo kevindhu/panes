@@ -838,13 +838,11 @@
 ### Features
 
 * add Codex as native harness with featured card styling ([e0193f7](https://github.com/wygoralves/panes/commit/e0193f77494998a979633858fa1b99691c422a9a))
-* add Gemini CLI harness and landing page integrations section ([21f2ed8](https://github.com/wygoralves/panes/commit/21f2ed85fc45be3b7fe5b98a223a71f2680b58b3)), closes [#4285f4](https://github.com/wygoralves/panes/issues/4285f4)
 * add harness installation panel for CLI tools ([e09bed7](https://github.com/wygoralves/panes/commit/e09bed73ef84bd811bdbe26fbac91d0d845837fb))
 * polish and conclude agent harnesses experience ([a0b59ca](https://github.com/wygoralves/panes/commit/a0b59ca646b148dc06de589b4c68c13a0280c5cc))
 
 ### Bug Fixes
 
-* fix factory droid and kiro places in lp and adjust harness logos ([3c65e68](https://github.com/wygoralves/panes/commit/3c65e681511caeb4f98553010711c08b63c8e0f9))
 * several fixes to the harness scanning and initialization ([f191912](https://github.com/wygoralves/panes/commit/f19191239ab4bd9adc3923b10560cb1c5885e19c))
 
 ## [](https://github.com/wygoralves/panes/compare/v0.8.0...vnull) (2026-02-23)
@@ -861,13 +859,10 @@
 * add keyboard shortcuts for new terminal tabs and splits, and allow reordering of terminal tabs ([9de4ddc](https://github.com/wygoralves/panes/commit/9de4ddcd4b8c245f49cc0a2b772145fa1eb9f709))
 * add native os menu actions support ([c538232](https://github.com/wygoralves/panes/commit/c5382325885d0fe01fece6a23af218480090acb3))
 * add native text editor for quick edits ([efc806e](https://github.com/wygoralves/panes/commit/efc806e8172bd188aa14a5fdf4a9109396ea03a2))
-* add new landing page for panes ([bd49d51](https://github.com/wygoralves/panes/commit/bd49d51ee2c0375e5f3d6a787b5acdf81787635e))
 * add search + replace feature to text editor ([e3269dc](https://github.com/wygoralves/panes/commit/e3269dc392019ef05e16e088cf60d50af522108a))
 * add stash and view commit diffs to git panel ([f5b4489](https://github.com/wygoralves/panes/commit/f5b44890a09b93c40b0d630f14844740f253ec56))
 * improve action feedback with toast messages ([212cb6e](https://github.com/wygoralves/panes/commit/212cb6e705b11a377231c1f5806a1f2eb9f1e1a1))
 * improve confirm ux with native component ([61de358](https://github.com/wygoralves/panes/commit/61de358e38ee5240e7a10d8d28cf93555c2482b0))
-* improve landing page visuals and text ([0dc9911](https://github.com/wygoralves/panes/commit/0dc991154e50c3598651aaf918d9f69ace83e762))
-* update landing page ([e6ff98c](https://github.com/wygoralves/panes/commit/e6ff98c5a06af6f6bc31775391cdd9acd7941dfd))
 
 ### Bug Fixes
 

@@ -37,6 +37,8 @@ use crate::{
     state::AppState,
 };
 
+use super::codex_transcript::CodexTranscriptRecorder;
+
 const MAX_THREAD_TITLE_CHARS: usize = 72;
 const STREAM_EVENT_COALESCE_MAX_CHARS: usize = 8_192;
 const STREAM_EVENT_COALESCE_IDLE_FLUSH_INTERVAL: Duration = Duration::from_millis(24);
@@ -2514,6 +2516,14 @@ async fn run_turn(
     let max_output_chars = state.config.debug.max_action_output_chars;
     let turn_started_at = Instant::now();
     let (event_tx, mut event_rx) = mpsc::channel::<EngineEvent>(ENGINE_EVENT_QUEUE_CAPACITY);
+    let mut transcript_recorder = (thread.engine_id == "codex").then(|| {
+        CodexTranscriptRecorder::start(
+            state.db.clone(),
+            thread.id.clone(),
+            assistant_message_id.clone(),
+        )
+    });
+    let mut transcript_recording_error: Option<String> = None;
 
     if thread.engine_id == "codex" && turn_input.plan_mode {
         let message = format!(
@@ -2678,6 +2688,24 @@ async fn run_turn(
         let Some(incoming_event) = incoming_event else {
             break;
         };
+
+        if let EngineEvent::CodexNativeEvent { event } = incoming_event {
+            if transcript_recording_error.is_none() {
+                let record_result = match transcript_recorder.as_ref() {
+                    Some(recorder) => recorder.record(event).await,
+                    None => Err(anyhow::anyhow!(
+                        "received a Codex native event without a transcript recorder"
+                    )),
+                };
+                if let Err(error) = record_result {
+                    let message = format!("Codex transcript recording failed: {error}");
+                    log::error!("{message}");
+                    transcript_recording_error = Some(message);
+                    cancellation.cancel();
+                }
+            }
+            continue;
+        }
 
         let mut current_event = incoming_event;
 
@@ -2889,6 +2917,14 @@ async fn run_turn(
         .await;
     }
 
+    if let Some(recorder) = transcript_recorder.take() {
+        if let Err(error) = recorder.finish().await {
+            let message = format!("Codex transcript flush failed: {error}");
+            log::error!("{message}");
+            transcript_recording_error.get_or_insert(message);
+        }
+    }
+
     match engine_task.await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
@@ -2951,6 +2987,28 @@ async fn run_turn(
             }
             resolve_pending_approvals_for_terminal_message(&state, &assistant_message_id).await;
         }
+    }
+
+    if let Some(error_message) = transcript_recording_error {
+        blocks.push(ContentBlock::Error {
+            message: error_message.clone(),
+        });
+        blocks_dirty = true;
+        if message_status != MessageStatusDto::Error {
+            message_status = MessageStatusDto::Error;
+            message_state_dirty = true;
+        }
+        if thread_status != ThreadStatusDto::Error {
+            thread_status = ThreadStatusDto::Error;
+            thread_status_dirty = true;
+        }
+        let _ = app.emit(
+            &stream_event_topic,
+            EngineEvent::Error {
+                message: error_message,
+                recoverable: false,
+            },
+        );
     }
 
     if cancellation.is_cancelled() && matches!(message_status, MessageStatusDto::Streaming) {
@@ -3071,6 +3129,12 @@ async fn run_codex_review_turn(
     let turn_started_at = Instant::now();
     let (event_tx, mut event_rx) = mpsc::channel::<EngineEvent>(ENGINE_EVENT_QUEUE_CAPACITY);
     let (started_tx, started_rx) = oneshot::channel();
+    let mut transcript_recorder = Some(CodexTranscriptRecorder::start(
+        state.db.clone(),
+        review_thread.id.clone(),
+        assistant_message_id.clone(),
+    ));
+    let mut transcript_recording_error: Option<String> = None;
 
     let engines = state.engines.clone();
     let source_engine_thread_id_for_engine = source_engine_thread_id.clone();
@@ -3292,6 +3356,24 @@ async fn run_codex_review_turn(
             break;
         };
 
+        if let EngineEvent::CodexNativeEvent { event } = incoming_event {
+            if transcript_recording_error.is_none() {
+                let record_result = match transcript_recorder.as_ref() {
+                    Some(recorder) => recorder.record(event).await,
+                    None => Err(anyhow::anyhow!(
+                        "received a Codex review event without a transcript recorder"
+                    )),
+                };
+                if let Err(error) = record_result {
+                    let message = format!("Codex review transcript recording failed: {error}");
+                    log::error!("{message}");
+                    transcript_recording_error = Some(message);
+                    cancellation.cancel();
+                }
+            }
+            continue;
+        }
+
         let mut current_event = incoming_event;
 
         loop {
@@ -3502,6 +3584,14 @@ async fn run_codex_review_turn(
         .await;
     }
 
+    if let Some(recorder) = transcript_recorder.take() {
+        if let Err(error) = recorder.finish().await {
+            let message = format!("Codex review transcript flush failed: {error}");
+            log::error!("{message}");
+            transcript_recording_error.get_or_insert(message);
+        }
+    }
+
     match engine_task.await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
@@ -3564,6 +3654,28 @@ async fn run_codex_review_turn(
             }
             resolve_pending_approvals_for_terminal_message(&state, &assistant_message_id).await;
         }
+    }
+
+    if let Some(error_message) = transcript_recording_error {
+        blocks.push(ContentBlock::Error {
+            message: error_message.clone(),
+        });
+        blocks_dirty = true;
+        if message_status != MessageStatusDto::Error {
+            message_status = MessageStatusDto::Error;
+            message_state_dirty = true;
+        }
+        if thread_status != ThreadStatusDto::Error {
+            thread_status = ThreadStatusDto::Error;
+            thread_status_dirty = true;
+        }
+        let _ = app.emit(
+            &stream_event_topic,
+            EngineEvent::Error {
+                message: error_message,
+                recoverable: false,
+            },
+        );
     }
 
     if cancellation.is_cancelled() && matches!(message_status, MessageStatusDto::Streaming) {
@@ -5475,11 +5587,11 @@ mod tests {
 
     fn attachment_validation_catalog(attachment_modalities: Vec<&str>) -> Vec<EngineInfoDto> {
         vec![EngineInfoDto {
-            id: "opencode".to_string(),
-            name: "OpenCode".to_string(),
+            id: "codex".to_string(),
+            name: "Codex".to_string(),
             models: vec![EngineModelDto {
-                id: "opencode/test".to_string(),
-                display_name: "OpenCode Test".to_string(),
+                id: "gpt-test".to_string(),
+                display_name: "Codex Test".to_string(),
                 description: String::new(),
                 hidden: false,
                 is_default: true,
@@ -5523,8 +5635,8 @@ mod tests {
 
         assert!(validate_attachments_for_engine_model(
             &attachments,
-            "opencode",
-            "opencode/test",
+            "codex",
+            "gpt-test",
             Some(&catalog),
         )
         .is_ok());
@@ -5537,8 +5649,8 @@ mod tests {
 
         let error = validate_attachments_for_engine_model(
             &attachments,
-            "opencode",
-            "opencode/test",
+            "codex",
+            "gpt-test",
             Some(&catalog),
         )
         .expect_err("model without attachment modalities should reject files");
@@ -5553,8 +5665,8 @@ mod tests {
 
         let error = validate_attachments_for_engine_model(
             &attachments,
-            "opencode",
-            "opencode/test",
+            "codex",
+            "gpt-test",
             Some(&catalog),
         )
         .expect_err("image should be blocked for text-only models");
@@ -5606,15 +5718,6 @@ mod tests {
         )
         .expect("failed to persist approval block");
         assistant_message.id
-    }
-
-    fn insert_pending_approval(state: &AppState, thread: &ThreadDto, approval_id: &str) -> String {
-        insert_pending_approval_with_details(
-            state,
-            thread,
-            approval_id,
-            serde_json::json!({ "command": "touch file.txt" }),
-        )
     }
 
     #[test]
@@ -6059,18 +6162,6 @@ mod tests {
     #[test]
     fn permission_defaults_use_max_privilege_modes() {
         assert_eq!(
-            approval_policy_for_engine_and_trust_level("claude", &TrustLevelDto::Trusted),
-            "trusted"
-        );
-        assert_eq!(
-            approval_policy_for_engine_and_trust_level("claude", &TrustLevelDto::Standard),
-            "trusted"
-        );
-        assert_eq!(
-            approval_policy_for_engine_and_trust_level("claude", &TrustLevelDto::Restricted),
-            "trusted"
-        );
-        assert_eq!(
             approval_policy_for_engine_and_trust_level("codex", &TrustLevelDto::Trusted),
             "never"
         );
@@ -6081,56 +6172,6 @@ mod tests {
         assert_eq!(
             approval_policy_for_engine_and_trust_level("codex", &TrustLevelDto::Restricted),
             "never"
-        );
-    }
-
-    #[test]
-    fn opencode_defaults_allow_tools_without_permission_prompts() {
-        assert_eq!(
-            approval_policy_for_engine_and_trust_level("opencode", &TrustLevelDto::Trusted),
-            "allow"
-        );
-        assert_eq!(
-            approval_policy_for_engine_and_trust_level("opencode", &TrustLevelDto::Standard),
-            "allow"
-        );
-        assert_eq!(
-            approval_policy_for_engine_and_trust_level("opencode", &TrustLevelDto::Restricted),
-            "allow"
-        );
-    }
-
-    #[test]
-    fn claude_permission_mode_override_uses_claude_key() {
-        let metadata = serde_json::json!({
-            "claudePermissionMode": "restricted",
-            "sandboxApprovalPolicy": "never",
-        });
-
-        assert_eq!(
-            thread_approval_policy_override_value("claude", Some(&metadata)).unwrap(),
-            Some(Value::String("restricted".to_string()))
-        );
-        assert_eq!(
-            thread_approval_policy_override_value("codex", Some(&metadata)).unwrap(),
-            Some(Value::String("never".to_string()))
-        );
-    }
-
-    #[test]
-    fn opencode_permission_mode_override_uses_opencode_key() {
-        let metadata = serde_json::json!({
-            "opencodePermissionMode": "allow",
-            "sandboxApprovalPolicy": "never",
-        });
-
-        assert_eq!(
-            thread_approval_policy_override_value("opencode", Some(&metadata)).unwrap(),
-            Some(Value::String("allow".to_string()))
-        );
-        assert_eq!(
-            thread_approval_policy_override_value("codex", Some(&metadata)).unwrap(),
-            Some(Value::String("never".to_string()))
         );
     }
 
@@ -6733,68 +6774,6 @@ mod tests {
             approval_response_decision_for_persistence(&response),
             "decline"
         );
-    }
-
-    #[tokio::test]
-    async fn invalid_claude_approval_response_keeps_approval_pending() {
-        let state = test_app_state();
-        let thread = test_thread(&state, "claude", "claude-sonnet-4-6");
-        let approval_id = "approval-invalid";
-        let message_id = insert_pending_approval(&state, &thread, approval_id);
-
-        let error = respond_to_approval_inner(
-            &state,
-            thread.id.clone(),
-            approval_id.to_string(),
-            serde_json::json!({}),
-        )
-        .await
-        .expect_err("expected invalid approval payload to fail");
-
-        assert!(error.contains("explicit `decision`"));
-
-        let conn = state.db.connect().expect("failed to open db connection");
-        let approval_row = conn
-            .query_row(
-                "SELECT status, decision FROM approvals WHERE id = ?1",
-                params![approval_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-            )
-            .expect("failed to load approval row");
-        assert_eq!(approval_row.0, "pending");
-        assert_eq!(approval_row.1, None);
-
-        let thread_status = conn
-            .query_row(
-                "SELECT status FROM threads WHERE id = ?1",
-                params![thread.id],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("failed to load thread status");
-        assert_eq!(thread_status, "awaiting_approval");
-
-        let raw_blocks = conn
-            .query_row(
-                "SELECT blocks_json FROM messages WHERE id = ?1",
-                params![message_id],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("failed to load message blocks");
-        let blocks: Value =
-            serde_json::from_str(&raw_blocks).expect("message blocks should deserialize");
-        assert_eq!(
-            blocks
-                .as_array()
-                .and_then(|items| items.first())
-                .and_then(|item| item.get("status"))
-                .and_then(Value::as_str),
-            Some("pending")
-        );
-        assert!(blocks
-            .as_array()
-            .and_then(|items| items.first())
-            .and_then(|item| item.get("decision"))
-            .is_none());
     }
 
     #[tokio::test]

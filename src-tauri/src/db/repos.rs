@@ -167,56 +167,6 @@ pub fn set_repo_trust_level(
     Ok(())
 }
 
-pub fn set_repo_active(db: &Database, repo_id: &str, is_active: bool) -> anyhow::Result<()> {
-    let conn = db.connect()?;
-    let affected = conn
-        .execute(
-            "UPDATE repos
-         SET is_active = ?1
-         WHERE id = ?2",
-            params![if is_active { 1 } else { 0 }, repo_id],
-        )
-        .context("failed to update repo active flag")?;
-
-    if affected == 0 {
-        anyhow::bail!("repo not found: {repo_id}");
-    }
-
-    Ok(())
-}
-
-pub fn set_workspace_active_repos(
-    db: &Database,
-    workspace_id: &str,
-    repo_ids: &[String],
-) -> anyhow::Result<()> {
-    let mut conn = db.connect()?;
-    let tx = conn.transaction().context("failed to start transaction")?;
-
-    tx.execute(
-        "UPDATE repos
-     SET is_active = 0
-     WHERE workspace_id = ?1",
-        params![workspace_id],
-    )
-    .context("failed to clear active repos")?;
-
-    for repo_id in repo_ids {
-        tx.execute(
-            "UPDATE repos
-         SET is_active = 1
-         WHERE workspace_id = ?1
-           AND id = ?2",
-            params![workspace_id, repo_id],
-        )
-        .context("failed to activate selected repo")?;
-    }
-
-    tx.commit()
-        .context("failed to commit repo active selection transaction")?;
-    Ok(())
-}
-
 pub fn find_deepest_repo_containing_path(
     db: &Database,
     path: &str,

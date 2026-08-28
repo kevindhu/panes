@@ -8,16 +8,6 @@ import {
 import type { Thread, ThreadStatus } from "../types";
 import { useEngineStore } from "./engineStore";
 
-interface EnsureThreadInput {
-  workspaceId: string;
-  repoId: string | null;
-  engineId?: string;
-  modelId?: string;
-  reasoningEffort?: string | null;
-  serviceTier?: NewThreadServiceTier | null;
-  title?: string;
-}
-
 interface CreateThreadInput {
   workspaceId: string;
   repoId: string | null;
@@ -38,7 +28,6 @@ interface ThreadState {
   error?: string;
   createThread: (input: CreateThreadInput) => Promise<string | null>;
   renameThread: (threadId: string, title: string) => Promise<void>;
-  ensureThreadForScope: (input: EnsureThreadInput) => Promise<string | null>;
   refreshThreads: (workspaceId: string) => Promise<void>;
   refreshArchivedThreads: (workspaceId: string) => Promise<void>;
   refreshAllThreads: (workspaceIds: string[]) => Promise<void>;
@@ -122,19 +111,6 @@ function applyThreadLastModel(
     ...thread,
     engineMetadata: Object.keys(metadata).length ? metadata : undefined,
   };
-}
-
-function readThreadLastModelId(thread: Thread): string | null {
-  const raw = thread.engineMetadata?.lastModelId;
-  if (typeof raw !== "string") {
-    return null;
-  }
-  const normalized = raw.trim();
-  return normalized.length > 0 ? normalized : null;
-}
-
-function threadMatchesRequestedModel(thread: Thread, modelId: string): boolean {
-  return thread.modelId === modelId || readThreadLastModelId(thread) === modelId;
 }
 
 const LAST_THREAD_KEY = "panes:lastActiveThreadId";
@@ -227,68 +203,6 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       });
     } catch (error) {
       set({ loading: false, error: String(error) });
-    }
-  },
-  ensureThreadForScope: async ({
-    workspaceId,
-    repoId,
-    engineId,
-    modelId,
-    reasoningEffort,
-    serviceTier,
-    title,
-  }) => {
-    const fallbackRuntime = resolveImplicitNewThreadRuntime(get(), workspaceId);
-    const effectiveEngine = DEFAULT_ENGINE;
-    const effectiveModel = modelId ?? fallbackRuntime.modelId;
-    const effectiveReasoningEffort =
-      reasoningEffort ?? fallbackRuntime.reasoningEffort;
-    const effectiveServiceTier = serviceTier ?? fallbackRuntime.serviceTier;
-
-    set({ loading: true, error: undefined });
-
-    try {
-      const all = await ipc.listThreads(workspaceId);
-      const scoped = all.filter(
-        (thread) =>
-          thread.repoId === repoId &&
-          thread.engineId === effectiveEngine
-      );
-      const scopedForModel = scoped
-        .filter((thread) => threadMatchesRequestedModel(thread, effectiveModel))
-        .sort(
-          (a, b) =>
-            new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime(),
-        );
-
-      const activeId = get().activeThreadId;
-      let selected =
-        scopedForModel.find((thread) => thread.id === activeId) ?? scopedForModel[0];
-      if (!selected) {
-        selected = await ipc.createThread(
-          workspaceId,
-          repoId,
-          effectiveEngine,
-          effectiveModel,
-          title ?? (repoId ? "Repo Chat" : "General"),
-          effectiveReasoningEffort,
-          effectiveServiceTier,
-        );
-      }
-
-      const workspaceThreads = [selected, ...all.filter((thread) => thread.id !== selected.id)];
-      const threadsByWorkspace = mergeWorkspaceThreads(get().threadsByWorkspace, workspaceId, workspaceThreads);
-      const threads = flattenThreadsByWorkspace(threadsByWorkspace);
-      set({
-        threadsByWorkspace,
-        threads,
-        activeThreadId: selected.id,
-        loading: false
-      });
-      return selected.id;
-    } catch (error) {
-      set({ loading: false, error: String(error) });
-      return null;
     }
   },
   refreshThreads: async (workspaceId) => {

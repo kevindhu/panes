@@ -100,12 +100,12 @@ pub fn record_native_event_batch(
     db: &Database,
     local_thread_id: &str,
     assistant_message_id: &str,
-    native_thread_id: &str,
     events: &[CodexNativeEvent],
 ) -> anyhow::Result<()> {
     if events.is_empty() {
         return Ok(());
     }
+    let native_thread_id = events[0].native_thread_id.as_str();
 
     let mut conn = db.connect()?;
     let transaction = conn
@@ -143,7 +143,9 @@ fn ensure_turn_row(
     native_thread_id: &str,
     events: &[CodexNativeEvent],
 ) -> anyhow::Result<()> {
-    let native_turn_id = events.iter().find_map(|event| event.native_turn_id.as_deref());
+    let native_turn_id = events
+        .iter()
+        .find_map(|event| event.native_turn_id.as_deref());
     let first_observed_at = events.iter().map(|event| event.observed_at_ms).min();
     let last_observed_at = events.iter().map(|event| event.observed_at_ms).max();
 
@@ -274,7 +276,10 @@ fn record_one_event(
     update_turn_from_event(transaction, turn_record_id, event, &params)?;
     update_item_from_event(transaction, turn_record_id, event, &params)?;
 
-    for (chunk_index, chunk) in project_chunks(&event.method, &params).into_iter().enumerate() {
+    for (chunk_index, chunk) in project_chunks(&event.method, &params)
+        .into_iter()
+        .enumerate()
+    {
         if let Some(item_id) = chunk.item_id.as_deref() {
             ensure_pending_item(transaction, turn_record_id, item_id, event)?;
         }
@@ -340,7 +345,12 @@ fn update_turn_from_event(
                      started_json = COALESCE(started_json, ?3),
                      updated_at = datetime('now')
                  WHERE id = ?4",
-                params![status, event.observed_at_ms, event.params_json, turn_record_id],
+                params![
+                    status,
+                    event.observed_at_ms,
+                    event.params_json,
+                    turn_record_id
+                ],
             )?;
         }
         "turncompleted" => {
@@ -352,7 +362,12 @@ fn update_turn_from_event(
                      completed_json = ?3,
                      updated_at = datetime('now')
                  WHERE id = ?4",
-                params![status, event.observed_at_ms, event.params_json, turn_record_id],
+                params![
+                    status,
+                    event.observed_at_ms,
+                    event.params_json,
+                    turn_record_id
+                ],
             )?;
         }
         "turnplanupdated" => {
@@ -398,14 +413,14 @@ fn update_item_from_event(
         .and_then(Value::as_str)
         .unwrap_or(PENDING_ITEM_TYPE);
     let phase = item.get("phase").and_then(Value::as_str);
-    let status = item
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or(if signature == "itemcompleted" {
-            "completed"
-        } else {
-            "in_progress"
-        });
+    let status =
+        item.get("status")
+            .and_then(Value::as_str)
+            .unwrap_or(if signature == "itemcompleted" {
+                "completed"
+            } else {
+                "in_progress"
+            });
     let item_json = serde_json::to_string(item)?;
     let sequence = i64::try_from(event.source_sequence)?;
 
@@ -420,8 +435,14 @@ fn update_item_from_event(
                  WHEN codex_turn_items.item_type = ?9 THEN excluded.item_type
                  ELSE codex_turn_items.item_type
                END,
-               status = excluded.status,
-               phase = COALESCE(excluded.phase, codex_turn_items.phase),
+               status = CASE
+                 WHEN codex_turn_items.completed_json IS NOT NULL THEN codex_turn_items.status
+                 ELSE excluded.status
+               END,
+               phase = CASE
+                 WHEN codex_turn_items.completed_json IS NOT NULL THEN codex_turn_items.phase
+                 ELSE COALESCE(excluded.phase, codex_turn_items.phase)
+               END,
                first_source_sequence = MIN(codex_turn_items.first_source_sequence, excluded.first_source_sequence),
                last_source_sequence = MAX(codex_turn_items.last_source_sequence, excluded.last_source_sequence),
                started_at_ms = COALESCE(codex_turn_items.started_at_ms, excluded.started_at_ms),
@@ -520,12 +541,20 @@ fn project_chunks(method: &str, params_value: &Value) -> Vec<ChunkProjection> {
 
     if !stream_kind.is_empty() {
         if let Some(content) = params_value.get(content_key).and_then(Value::as_str) {
+            let metadata_keys: &[&str] = match signature.as_str() {
+                "itemagentmessagedelta" => &["phase"],
+                "itemreasoningsummarytextdelta" => &["summaryIndex"],
+                "itemreasoningtextdelta" => &["contentIndex"],
+                "itemcommandexecutionoutputdelta" | "itemfilechangeoutputdelta" => &["stream"],
+                "itemcommandexecutionterminalinteraction" | "terminalinteraction" => &["processId"],
+                _ => &[],
+            };
             return vec![ChunkProjection {
                 item_id,
                 stream_kind,
                 summary_index,
                 content: content.to_string(),
-                metadata_json: None,
+                metadata_json: project_chunk_metadata(params_value, metadata_keys),
             }];
         }
     }
@@ -555,6 +584,18 @@ fn project_chunks(method: &str, params_value: &Value) -> Vec<ChunkProjection> {
     }
 
     Vec::new()
+}
+
+fn project_chunk_metadata(params_value: &Value, keys: &[&str]) -> Option<String> {
+    let mut metadata = serde_json::Map::new();
+    for key in keys {
+        if let Some(value) = params_value.get(*key) {
+            metadata.insert((*key).to_owned(), value.clone());
+        }
+    }
+    (!metadata.is_empty())
+        .then(|| serde_json::to_string(&Value::Object(metadata)).ok())
+        .flatten()
 }
 
 fn extract_turn_status(value: &Value) -> Option<&str> {
@@ -699,3 +740,436 @@ pub fn load_turn_snapshot(
     }))
 }
 
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeSet,
+        fs,
+        path::{Path, PathBuf},
+    };
+
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::engines::{
+        codex_protocol::{parse_incoming, IncomingMessage},
+        CodexNativeEventKind, STREAMED_DIFF_MAX_CHARS,
+    };
+
+    const LOCAL_THREAD_ID: &str = "local-thread-1";
+    const ASSISTANT_MESSAGE_ID: &str = "assistant-message-1";
+    const NATIVE_THREAD_ID: &str = "native-thread-1";
+    const NATIVE_TURN_ID: &str = "native-turn-1";
+
+    fn create_test_database(name: &str) -> (Database, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "panes-codex-transcript-{name}-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let db = Database::open(path.clone()).expect("test database should open");
+        let conn = db.connect().expect("test database connection");
+        conn.execute(
+            "INSERT INTO workspaces (id, name, root_path) VALUES ('workspace-1', 'Test', ?1)",
+            params![format!("C:\\panes-tests\\{}", Uuid::new_v4())],
+        )
+        .expect("workspace fixture");
+        conn.execute(
+            "INSERT INTO threads (
+               id, workspace_id, engine_id, model_id, engine_thread_id, title
+             ) VALUES (?1, 'workspace-1', 'codex', 'gpt-test', ?2, 'Transcript test')",
+            params![LOCAL_THREAD_ID, NATIVE_THREAD_ID],
+        )
+        .expect("thread fixture");
+        conn.execute(
+            "INSERT INTO messages (
+               id, thread_id, role, blocks_json, status, turn_engine_id, turn_model_id
+             ) VALUES (?1, ?2, 'assistant', '[]', 'streaming', 'codex', 'gpt-test')",
+            params![ASSISTANT_MESSAGE_ID, LOCAL_THREAD_ID],
+        )
+        .expect("message fixture");
+        drop(conn);
+        (db, path)
+    }
+
+    fn remove_test_database(path: &Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let candidate = PathBuf::from(format!("{}{suffix}", path.display()));
+            let _ = fs::remove_file(candidate);
+        }
+    }
+
+    fn event(source_sequence: u64, method: &str, params_value: Value) -> CodexNativeEvent {
+        CodexNativeEvent {
+            source_sequence,
+            observed_at_ms: 1_700_000_000_000 + source_sequence as i64,
+            event_kind: CodexNativeEventKind::Notification,
+            method: method.to_owned(),
+            request_id: None,
+            native_thread_id: NATIVE_THREAD_ID.to_owned(),
+            native_turn_id: Some(NATIVE_TURN_ID.to_owned()),
+            params_json: serde_json::to_string(&params_value).expect("valid event params"),
+        }
+    }
+
+    fn replay_fixture_events() -> Vec<CodexNativeEvent> {
+        include_str!("../../tests/fixtures/codex_transcript_replay.jsonl")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .enumerate()
+            .map(|(index, line)| {
+                let source_sequence = index as u64 + 1;
+                let (event_kind, method, request_id, params_json) =
+                    match parse_incoming(line).expect("fixture envelope should parse") {
+                        IncomingMessage::Notification { method, params } => (
+                            CodexNativeEventKind::Notification,
+                            method,
+                            None,
+                            params.get().to_owned(),
+                        ),
+                        IncomingMessage::Request {
+                            id, method, params, ..
+                        } => (
+                            CodexNativeEventKind::Request,
+                            method,
+                            Some(id),
+                            params.get().to_owned(),
+                        ),
+                        IncomingMessage::Response(_) => {
+                            panic!("replay fixture responses must name their semantic method")
+                        }
+                    };
+                CodexNativeEvent {
+                    source_sequence,
+                    observed_at_ms: 1_700_000_000_000 + source_sequence as i64,
+                    event_kind,
+                    method,
+                    request_id,
+                    native_thread_id: NATIVE_THREAD_ID.to_owned(),
+                    native_turn_id: Some(NATIVE_TURN_ID.to_owned()),
+                    params_json,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fixture_replay_is_ordered_idempotent_and_restart_safe() {
+        let (db, path) = create_test_database("replay");
+        let events = replay_fixture_events();
+
+        record_native_event_batch(&db, LOCAL_THREAD_ID, ASSISTANT_MESSAGE_ID, &events)
+            .expect("first fixture replay");
+        let first = load_turn_snapshot(&db, ASSISTANT_MESSAGE_ID)
+            .expect("snapshot query")
+            .expect("snapshot should exist");
+
+        record_native_event_batch(&db, LOCAL_THREAD_ID, ASSISTANT_MESSAGE_ID, &events)
+            .expect("identical replay should be a no-op");
+        let second = load_turn_snapshot(&db, ASSISTANT_MESSAGE_ID)
+            .expect("snapshot query")
+            .expect("snapshot should exist");
+        assert_eq!(second, first);
+
+        assert_eq!(first.events.len(), events.len());
+        assert!(first
+            .events
+            .windows(2)
+            .all(|pair| pair[0].source_sequence < pair[1].source_sequence));
+        assert!(first.chunks.windows(2).all(|pair| {
+            (pair[0].source_sequence, pair[0].chunk_index)
+                < (pair[1].source_sequence, pair[1].chunk_index)
+        }));
+        assert_eq!(first.turn.status, "completed");
+        assert!(first.turn.plan_json.is_some());
+        assert!(first.turn.usage_json.is_some());
+        assert!(first.events.iter().any(|event| {
+            event.method == "future/turnArtifact" && event.params_json.contains("\"retain me\"")
+        }));
+
+        let plan = first
+            .items
+            .iter()
+            .find(|item| item.item_id == "plan-1")
+            .expect("plan item");
+        assert_eq!(plan.first_source_sequence, 2, "delta arrived before start");
+        assert!(plan
+            .started_json
+            .as_deref()
+            .is_some_and(|json| json.contains("Initial plan")));
+        assert!(plan
+            .completed_json
+            .as_deref()
+            .is_some_and(|json| json.contains("Authoritative final plan")));
+        assert!(first.chunks.iter().any(|chunk| {
+            chunk.item_id.as_deref() == Some("plan-1")
+                && chunk.content == "Inspect the protocol before editing."
+        }));
+        assert!(first.chunks.iter().any(|chunk| {
+            chunk.item_id.as_deref() == Some("cmd-1")
+                && chunk.metadata_json.as_deref() == Some(r#"{"stream":"stdout"}"#)
+        }));
+
+        drop(db);
+        let reopened = Database::open(path.clone()).expect("database should reopen and remigrate");
+        let after_restart = load_turn_snapshot(&reopened, ASSISTANT_MESSAGE_ID)
+            .expect("snapshot query after restart")
+            .expect("snapshot should survive restart");
+        assert_eq!(after_restart, first);
+
+        drop(reopened);
+        remove_test_database(&path);
+    }
+
+    #[test]
+    fn conflicting_duplicate_sequence_fails_loudly() {
+        let (db, path) = create_test_database("conflict");
+        let original = event(
+            1,
+            "turn/started",
+            json!({"threadId": NATIVE_THREAD_ID, "turnId": NATIVE_TURN_ID}),
+        );
+        record_native_event_batch(
+            &db,
+            LOCAL_THREAD_ID,
+            ASSISTANT_MESSAGE_ID,
+            std::slice::from_ref(&original),
+        )
+        .expect("original event");
+
+        let mut conflicting = original;
+        conflicting.params_json =
+            r#"{"threadId":"native-thread-1","turnId":"different"}"#.to_owned();
+        let error =
+            record_native_event_batch(&db, LOCAL_THREAD_ID, ASSISTANT_MESSAGE_ID, &[conflicting])
+                .expect_err("conflicting replay must fail");
+        assert!(error.to_string().contains("conflicting Codex replay"));
+
+        drop(db);
+        remove_test_database(&path);
+    }
+
+    #[test]
+    fn migration_upgrades_an_existing_database_and_is_idempotent() {
+        let path = std::env::temp_dir().join(format!(
+            "panes-codex-transcript-legacy-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let legacy = rusqlite::Connection::open(&path).expect("legacy database");
+        legacy
+            .execute_batch(include_str!("migrations/001_initial.sql"))
+            .expect("legacy schema");
+        legacy
+            .execute(
+                "INSERT INTO workspaces (id, name, root_path)
+                 VALUES ('legacy-workspace', 'Legacy', ?1)",
+                params![format!("C:\\panes-legacy-tests\\{}", Uuid::new_v4())],
+            )
+            .expect("legacy workspace");
+        legacy
+            .execute(
+                "INSERT INTO threads (id, workspace_id, engine_id, model_id)
+                 VALUES ('legacy-thread', 'legacy-workspace', 'codex', 'gpt-test')",
+                [],
+            )
+            .expect("legacy thread");
+        legacy
+            .execute(
+                "INSERT INTO messages (id, thread_id, role, status)
+                 VALUES ('legacy-message', 'legacy-thread', 'assistant', 'completed')",
+                [],
+            )
+            .expect("legacy message");
+        drop(legacy);
+
+        for pass in 0..2 {
+            let upgraded = Database::open(path.clone()).expect("migration should apply");
+            let connection = upgraded.connect().expect("upgraded connection");
+            let table_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table'
+                       AND name IN (
+                         'codex_turns',
+                         'codex_turn_events',
+                         'codex_turn_items',
+                         'codex_item_stream_chunks'
+                       )",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("transcript tables query");
+            let legacy_message_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM messages WHERE id = 'legacy-message'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("legacy data query");
+            assert_eq!(table_count, 4, "migration pass {pass}");
+            assert_eq!(legacy_message_count, 1, "migration pass {pass}");
+            drop(connection);
+            drop(upgraded);
+        }
+
+        remove_test_database(&path);
+    }
+
+    #[test]
+    fn completed_item_remains_authoritative_when_start_arrives_late() {
+        let (db, path) = create_test_database("completion-authority");
+        let completed = event(
+            1,
+            "item/completed",
+            json!({
+                "threadId": NATIVE_THREAD_ID,
+                "turnId": NATIVE_TURN_ID,
+                "item": {
+                    "id": "late-item",
+                    "type": "agentMessage",
+                    "status": "completed",
+                    "phase": "final",
+                    "text": "authoritative"
+                }
+            }),
+        );
+        let started = event(
+            2,
+            "item/started",
+            json!({
+                "threadId": NATIVE_THREAD_ID,
+                "turnId": NATIVE_TURN_ID,
+                "item": {
+                    "id": "late-item",
+                    "type": "agentMessage",
+                    "status": "inProgress",
+                    "phase": "commentary",
+                    "text": "stale start"
+                }
+            }),
+        );
+
+        record_native_event_batch(
+            &db,
+            LOCAL_THREAD_ID,
+            ASSISTANT_MESSAGE_ID,
+            &[completed, started],
+        )
+        .expect("out-of-order lifecycle should replay");
+        let snapshot = load_turn_snapshot(&db, ASSISTANT_MESSAGE_ID)
+            .expect("snapshot query")
+            .expect("snapshot should exist");
+        let item = &snapshot.items[0];
+
+        assert_eq!(item.status, "completed");
+        assert_eq!(item.phase.as_deref(), Some("final"));
+        assert!(item
+            .completed_json
+            .as_deref()
+            .is_some_and(|json| json.contains("authoritative")));
+        assert!(item
+            .started_json
+            .as_deref()
+            .is_some_and(|json| json.contains("stale start")));
+
+        drop(db);
+        remove_test_database(&path);
+    }
+
+    #[test]
+    fn every_reviewed_item_and_unknown_future_item_survive_completion_without_start() {
+        let (db, path) = create_test_database("item-types");
+        let contract: Value = serde_json::from_str(include_str!(
+            "../../../scripts/codex-app-server-contract.json"
+        ))
+        .expect("reviewed contract JSON");
+        let reviewed = contract["threadItemTypes"]
+            .as_object()
+            .expect("thread item contract")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut expected = reviewed.iter().cloned().collect::<BTreeSet<_>>();
+        expected.insert("futureArtifact".to_owned());
+        let mut item_types = reviewed;
+        item_types.push("futureArtifact".to_owned());
+
+        let events = item_types
+            .iter()
+            .enumerate()
+            .map(|(index, item_type)| {
+                event(
+                    index as u64 + 1,
+                    "item/completed",
+                    json!({
+                        "threadId": NATIVE_THREAD_ID,
+                        "turnId": NATIVE_TURN_ID,
+                        "item": {
+                            "id": format!("item-{index}"),
+                            "type": item_type,
+                            "status": "completed",
+                            "opaque": {"retained": true}
+                        }
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        record_native_event_batch(&db, LOCAL_THREAD_ID, ASSISTANT_MESSAGE_ID, &events)
+            .expect("all item completions should replay");
+        let snapshot = load_turn_snapshot(&db, ASSISTANT_MESSAGE_ID)
+            .expect("snapshot query")
+            .expect("snapshot should exist");
+        let actual = snapshot
+            .items
+            .iter()
+            .map(|item| item.item_type.clone())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(actual, expected);
+        assert!(snapshot.items.iter().all(|item| {
+            item.started_json.is_none()
+                && item
+                    .completed_json
+                    .as_deref()
+                    .is_some_and(|json| json.contains("\"retained\":true"))
+        }));
+
+        drop(db);
+        remove_test_database(&path);
+    }
+
+    #[test]
+    fn fifty_megabyte_output_is_preserved_exactly() {
+        let (db, path) = create_test_database("large-output");
+        let content = format!(
+            "begin:{}:end",
+            "x".repeat(50 * 1024 * 1024 + STREAMED_DIFF_MAX_CHARS)
+        );
+        let large_event = event(
+            1,
+            "item/commandExecution/outputDelta",
+            json!({
+                "threadId": NATIVE_THREAD_ID,
+                "turnId": NATIVE_TURN_ID,
+                "itemId": "large-command",
+                "stream": "stdout",
+                "delta": &content
+            }),
+        );
+        let exact_params = large_event.params_json.clone();
+
+        record_native_event_batch(&db, LOCAL_THREAD_ID, ASSISTANT_MESSAGE_ID, &[large_event])
+            .expect("large output should persist");
+        let snapshot = load_turn_snapshot(&db, ASSISTANT_MESSAGE_ID)
+            .expect("snapshot query")
+            .expect("snapshot should exist");
+
+        assert_eq!(snapshot.events[0].params_json, exact_params);
+        assert_eq!(snapshot.chunks.len(), 1);
+        assert_eq!(snapshot.chunks[0].content, content);
+
+        drop(db);
+        remove_test_database(&path);
+    }
+}
