@@ -29,9 +29,17 @@ export function canUseNativeCodexHistoryTools(
   busy = false,
 ): boolean {
   return (
+    canForkCodexMessageHistory(thread) &&
+    !busy
+  );
+}
+
+export function canForkCodexMessageHistory(
+  thread: Thread | null | undefined,
+): boolean {
+  return (
     thread?.engineId === "codex" &&
     !!thread.engineThreadId &&
-    !busy &&
     hasCodexTranscriptForNativeTools(thread)
   );
 }

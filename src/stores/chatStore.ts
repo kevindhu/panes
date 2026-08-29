@@ -31,6 +31,7 @@ import type {
   NoticeBlock,
   SkillBlock,
   SteerBlock,
+  SteerMessageReceipt,
   StreamTokenUsage,
   StreamEvent,
   Thread,
@@ -147,6 +148,58 @@ const pendingTurnMetaByThread = new Map<string, PendingTurnMeta>();
 const inflightActionOutputHydration = new Map<string, Promise<void>>();
 const bindingSeqByThread = new Map<string, number>();
 const queuedTurnFinishedEventsByThread = new Map<string, ChatTurnFinishedEvent[]>();
+const MAX_CACHED_THREAD_VIEWS = 8;
+
+interface CachedThreadView {
+  messages: Message[];
+  olderCursor: MessageWindowCursor | null;
+  hasOlderMessages: boolean;
+  status: ThreadStatus;
+  streaming: boolean;
+  usageLimits: ContextUsage | null;
+}
+
+const cachedThreadViews = new Map<string, CachedThreadView>();
+
+function writeCachedThreadView(threadId: string, view: CachedThreadView): void {
+  cachedThreadViews.delete(threadId);
+  cachedThreadViews.set(threadId, view);
+  while (cachedThreadViews.size > MAX_CACHED_THREAD_VIEWS) {
+    const oldestThreadId = cachedThreadViews.keys().next().value as string | undefined;
+    if (!oldestThreadId) break;
+    cachedThreadViews.delete(oldestThreadId);
+  }
+}
+
+function readCachedThreadView(threadId: string): CachedThreadView | null {
+  const cached = cachedThreadViews.get(threadId);
+  if (!cached) return null;
+  cachedThreadViews.delete(threadId);
+  cachedThreadViews.set(threadId, cached);
+  return cached;
+}
+
+function updateCachedThreadRuntimeState(
+  threadId: string,
+  status: ThreadStatus,
+  streaming: boolean,
+): void {
+  const cached = cachedThreadViews.get(threadId);
+  if (!cached) return;
+  writeCachedThreadView(threadId, { ...cached, status, streaming });
+}
+
+function cacheBoundThreadView(state: ChatState): void {
+  if (!state.threadId) return;
+  writeCachedThreadView(state.threadId, {
+    messages: state.messages,
+    olderCursor: state.olderCursor,
+    hasOlderMessages: state.hasOlderMessages,
+    status: state.status,
+    streaming: state.streaming,
+    usageLimits: state.usageLimits,
+  });
+}
 
 function pendingTurnMatchesFinishedEvent(
   pendingTurn: PendingTurnMeta,
@@ -522,6 +575,7 @@ export function resetUsageLimitCachesForTests(): void {
   pendingTurnMetaByThread.clear();
   bindingSeqByThread.clear();
   queuedTurnFinishedEventsByThread.clear();
+  cachedThreadViews.clear();
 }
 
 function isThreadTurnActive(status: ThreadStatus): boolean {
@@ -1054,6 +1108,8 @@ function createSteerBlock(
     attachments: attachments.length > 0 ? attachments : undefined,
     skills: skills.length > 0 ? skills : undefined,
     mentions: mentions.length > 0 ? mentions : undefined,
+    observedAtMs: Date.now(),
+    status: "pending",
   };
 }
 
@@ -1078,11 +1134,14 @@ function createSteerBlockFromMessage(message: Message): SteerBlock {
   return {
     type: "steer",
     steerId: message.id,
+    persistedMessageId: message.id,
     content,
     planMode: planMode || undefined,
     attachments: attachments.length > 0 ? attachments : undefined,
     skills: skills.length > 0 ? skills : undefined,
     mentions: mentions.length > 0 ? mentions : undefined,
+    observedAtMs: parseMessageCreatedAtTimestamp(message.createdAt) ?? undefined,
+    status: "accepted",
   };
 }
 
@@ -1165,6 +1224,38 @@ function removeSteerBlock(messages: Message[], steerId: string): Message[] {
     };
   }
 
+  return nextMessages;
+}
+
+function applySteerReceipt(
+  messages: Message[],
+  steerId: string,
+  receipt: SteerMessageReceipt,
+): Message[] {
+  let nextMessages = messages;
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    const blocks = message.blocks ?? [];
+    let changed = false;
+    const nextBlocks = blocks.map((block) => {
+      if (block.type !== "steer" || block.steerId !== steerId) return block;
+      changed = true;
+      return {
+        ...block,
+        persistedMessageId: receipt.messageId,
+        sourceSequence: receipt.sourceSequence,
+        status: receipt.acceptedSourceSequence === null ? "unconfirmed" as const : "accepted" as const,
+      };
+    });
+    if (!changed) continue;
+    if (nextMessages === messages) nextMessages = [...messages];
+    nextMessages[index] = {
+      ...message,
+      blocks: nextBlocks,
+      hydration: "full",
+      hasDeferredContent: hasDeferredActionOutput(nextBlocks),
+    };
+  }
   return nextMessages;
 }
 
@@ -1295,6 +1386,89 @@ function hasPersistedUserForCurrentOptimisticUser(
   return loadedAssistantIndex > 0 && mergedMessages[loadedAssistantIndex - 1]?.role === "user";
 }
 
+function mergeRuntimeAssistantOntoPersistedMessage(
+  persisted: Message,
+  runtime: Message,
+): Message {
+  return {
+    ...runtime,
+    id: persisted.id,
+    threadId: persisted.threadId,
+    createdAt: persisted.createdAt,
+    nativeTurnId: runtime.nativeTurnId ?? persisted.nativeTurnId,
+    turnEngineId: runtime.turnEngineId ?? persisted.turnEngineId,
+    turnModelId: runtime.turnModelId ?? persisted.turnModelId,
+    turnReasoningEffort:
+      runtime.turnReasoningEffort ?? persisted.turnReasoningEffort,
+  };
+}
+
+function reconcileAssistantMessageIdentity(
+  messages: Message[],
+  optimisticAssistantMessageId: string,
+  persistedAssistantMessageId: string,
+  clientTurnId: string,
+): Message[] {
+  let runtimeIndex = messages.findIndex(
+    (message) => message.role === "assistant" && message.id === optimisticAssistantMessageId,
+  );
+  if (runtimeIndex < 0) {
+    runtimeIndex = messages.findIndex(
+      (message) =>
+        message.role === "assistant" && message.clientTurnId === clientTurnId,
+    );
+  }
+  if (runtimeIndex < 0) {
+    return messages;
+  }
+
+  const persistedIndex = messages.findIndex(
+    (message) =>
+      message.role === "assistant" && message.id === persistedAssistantMessageId,
+  );
+  const runtimeAssistant = messages[runtimeIndex];
+  if (persistedIndex < 0) {
+    const nextMessages = [...messages];
+    nextMessages[runtimeIndex] = {
+      ...runtimeAssistant,
+      id: persistedAssistantMessageId,
+      clientTurnId,
+    };
+    return nextMessages;
+  }
+
+  if (persistedIndex === runtimeIndex) {
+    if (runtimeAssistant.clientTurnId === clientTurnId) {
+      return messages;
+    }
+    const nextMessages = [...messages];
+    nextMessages[runtimeIndex] = { ...runtimeAssistant, clientTurnId };
+    return nextMessages;
+  }
+
+  const persistedAssistant = messages[persistedIndex];
+  const reconciledAssistant = shouldPreferCurrentMessageDuringBind(
+    runtimeAssistant,
+    persistedAssistant,
+  )
+    ? mergeRuntimeAssistantOntoPersistedMessage(persistedAssistant, runtimeAssistant)
+    : { ...persistedAssistant, clientTurnId };
+  const optimisticUserIndex = runtimeIndex > 0 && messages[runtimeIndex - 1]?.role === "user"
+    ? runtimeIndex - 1
+    : -1;
+  const persistedUserExists = persistedIndex > 0 && messages[persistedIndex - 1]?.role === "user";
+
+  return messages.flatMap((message, index) => {
+    if (index === persistedIndex) {
+      return [reconciledAssistant];
+    }
+    if (index === runtimeIndex || (persistedUserExists && index === optimisticUserIndex)) {
+      return [];
+    }
+    return [message];
+  });
+}
+
 function mergeLoadedMessagesWithCurrentRuntimeMessages(
   loadedMessages: Message[],
   currentMessages: Message[],
@@ -1308,11 +1482,23 @@ function mergeLoadedMessagesWithCurrentRuntimeMessages(
   const mergedMessages = [...loadedMessages];
   const loadedIndexById = new Map<string, number>();
   const loadedAssistantIndexByClientTurnId = new Map<string, number>();
+  const loadedAssistantIndexByNativeTurnId = new Map<string, number>();
+  const pendingTurn = pendingTurnMetaByThread.get(threadId);
   for (let index = 0; index < mergedMessages.length; index += 1) {
     const message = mergedMessages[index];
     loadedIndexById.set(message.id, index);
     if (message.role === "assistant" && message.clientTurnId) {
       loadedAssistantIndexByClientTurnId.set(message.clientTurnId, index);
+    }
+    if (message.role === "assistant" && message.nativeTurnId) {
+      loadedAssistantIndexByNativeTurnId.set(message.nativeTurnId, index);
+    }
+    if (
+      message.role === "assistant" &&
+      pendingTurn?.clientTurnId &&
+      pendingTurn.assistantMessageId === message.id
+    ) {
+      loadedAssistantIndexByClientTurnId.set(pendingTurn.clientTurnId, index);
     }
   }
 
@@ -1321,7 +1507,9 @@ function mergeLoadedMessagesWithCurrentRuntimeMessages(
     if (loadedIndex !== undefined) {
       const loadedMessage = mergedMessages[loadedIndex];
       if (shouldPreferCurrentMessageDuringBind(currentMessage, loadedMessage)) {
-        mergedMessages[loadedIndex] = currentMessage;
+        mergedMessages[loadedIndex] = currentMessage.role === "assistant"
+          ? mergeRuntimeAssistantOntoPersistedMessage(loadedMessage, currentMessage)
+          : currentMessage;
       }
       continue;
     }
@@ -1332,16 +1520,19 @@ function mergeLoadedMessagesWithCurrentRuntimeMessages(
 
     const loadedAssistantIndex = loadedAssistantIndexByClientTurnId.get(
       currentMessage.clientTurnId,
-    );
+    ) ?? (currentMessage.nativeTurnId
+      ? loadedAssistantIndexByNativeTurnId.get(currentMessage.nativeTurnId)
+      : undefined);
     if (loadedAssistantIndex === undefined) {
       continue;
     }
 
     const loadedAssistant = mergedMessages[loadedAssistantIndex];
     if (shouldPreferCurrentMessageDuringBind(currentMessage, loadedAssistant)) {
-      loadedIndexById.delete(loadedAssistant.id);
-      mergedMessages[loadedAssistantIndex] = currentMessage;
-      loadedIndexById.set(currentMessage.id, loadedAssistantIndex);
+      mergedMessages[loadedAssistantIndex] = mergeRuntimeAssistantOntoPersistedMessage(
+        loadedAssistant,
+        currentMessage,
+      );
       loadedAssistantIndexByClientTurnId.set(
         currentMessage.clientTurnId,
         loadedAssistantIndex,
@@ -1392,6 +1583,40 @@ function mergeLoadedMessagesWithCurrentRuntimeMessages(
   }
 
   return mergedMessages;
+}
+
+function mergeLoadedWindowWithCachedOlderHistory(
+  loadedMessages: Message[],
+  cachedMessages: Message[],
+): { messages: Message[]; preservedOlderHistory: boolean } {
+  if (loadedMessages.length === 0 || cachedMessages.length === 0) {
+    return { messages: loadedMessages, preservedOlderHistory: false };
+  }
+
+  const firstLoaded = loadedMessages[0];
+  const firstLoadedCachedIndex = cachedMessages.findIndex(
+    (message) => message.id === firstLoaded.id,
+  );
+  if (firstLoadedCachedIndex < 0) {
+    // With no shared identity there is no canonical boundary between these
+    // windows. Timestamp inference can prepend stale pre-sync rows and corrupt
+    // the backend sequence, so use the authoritative loaded window as-is.
+    return { messages: loadedMessages, preservedOlderHistory: false };
+  }
+  const cachedOlderMessages = cachedMessages.slice(0, firstLoadedCachedIndex);
+
+  if (cachedOlderMessages.length === 0) {
+    return { messages: loadedMessages, preservedOlderHistory: false };
+  }
+
+  const loadedIds = new Set(loadedMessages.map((message) => message.id));
+  return {
+    messages: [
+      ...cachedOlderMessages.filter((message) => !loadedIds.has(message.id)),
+      ...loadedMessages,
+    ],
+    preservedOlderHistory: true,
+  };
 }
 
 function resolveAssistantMessageIndex(
@@ -1532,11 +1757,7 @@ function upsertNoticeBlock(blocks: ContentBlock[], block: NoticeBlock): ContentB
     return next;
   }
 
-  if (block.kind === "turn_status") {
-    return [...blocks, block];
-  }
-
-  return [block, ...blocks];
+  return [...blocks, block];
 }
 
 type TurnStatusState =
@@ -2318,48 +2539,15 @@ function parseMessageCreatedAtTimestamp(createdAt: string): number | null {
   return Number.isFinite(direct) ? direct : null;
 }
 
-function compareMessagesChronologically(
-  left: { message: Message; index: number },
-  right: { message: Message; index: number },
-): number {
-  const leftTimestamp = parseMessageCreatedAtTimestamp(left.message.createdAt);
-  const rightTimestamp = parseMessageCreatedAtTimestamp(right.message.createdAt);
-  if (leftTimestamp !== null && rightTimestamp !== null && leftTimestamp !== rightTimestamp) {
-    return leftTimestamp - rightTimestamp;
-  }
-  return left.index - right.index;
-}
-
-function sortMessagesChronologically(messages: Message[]): Message[] {
-  if (messages.length < 2) {
-    return messages;
-  }
-
-  const indexedMessages = messages.map((message, index) => ({ message, index }));
-  let needsSort = false;
-  for (let index = 1; index < indexedMessages.length; index += 1) {
-    if (
-      compareMessagesChronologically(indexedMessages[index - 1], indexedMessages[index]) > 0
-    ) {
-      needsSort = true;
-      break;
-    }
-  }
-
-  if (!needsSort) {
-    return messages;
-  }
-
-  return [...indexedMessages]
-    .sort(compareMessagesChronologically)
-    .map(({ message }) => message);
-}
-
 function normalizeMessages(
   messages: Message[],
   options?: { collapseTrailingSteers?: boolean },
 ): Message[] {
-  let nextMessages = sortMessagesChronologically(messages);
+  // SQLite and Codex already provide an authoritative sequence. Timestamps are
+  // metadata, not ordering keys: live user/assistant rows are commonly written
+  // in the same millisecond, and imported completion times can overlap the next
+  // turn. Preserve the source order all the way to the renderer.
+  let nextMessages = messages;
   for (let index = 0; index < nextMessages.length; index += 1) {
     const message = nextMessages[index];
     const normalizedBlocks = normalizeBlocks(message.blocks);
@@ -2712,8 +2900,15 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
     const actionId = String(event.action_id ?? "");
     assistant.blocks = patchActionBlock(blocks, actionId, (block) => {
       const result = (event.result as Record<string, unknown> | undefined) ?? {};
+      const completedDetails = event.details && typeof event.details === "object" && !Array.isArray(event.details)
+        ? event.details
+        : {};
       return {
         ...block,
+        details: {
+          ...((block.details ?? {}) as Record<string, unknown>),
+          ...completedDetails,
+        },
         status: result.success ? "done" : "error",
         result: {
           success: Boolean(result.success),
@@ -2901,6 +3096,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return;
     }
 
+    const bindStartedAt = performance.now();
+    if (currentThreadId && currentThreadId !== threadId) {
+      cacheBoundThreadView(get());
+    }
+
     activeThreadBindSeq += 1;
     const bindSeq = activeThreadBindSeq;
     if (threadId) {
@@ -2924,18 +3124,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
       let backgroundTurnFinished = false;
       listenThreadEvents(currentThreadId, (event) => {
         if (event.type === "ApprovalRequested") {
+          updateCachedThreadRuntimeState(currentThreadId, "awaiting_approval", true);
           useThreadStore
             .getState()
             .setThreadStatusLocal(currentThreadId, "awaiting_approval");
           return;
         }
         if (event.type === "ApprovalResolved") {
+          updateCachedThreadRuntimeState(currentThreadId, "streaming", true);
           useThreadStore.getState().setThreadStatusLocal(currentThreadId, "streaming");
           return;
         }
         if (event.type === "Error" && !event.recoverable) {
           backgroundTurnFinished = true;
           pendingTurnMetaByThread.delete(currentThreadId);
+          updateCachedThreadRuntimeState(currentThreadId, "error", false);
           useThreadStore.getState().setThreadStatusLocal(currentThreadId, "error");
           cleanupBackgroundListener(currentThreadId);
           return;
@@ -2943,9 +3146,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
         if (event.type === "TurnCompleted") {
           backgroundTurnFinished = true;
           pendingTurnMetaByThread.delete(currentThreadId);
+          const completedStatus = threadStatusFromTurnCompletion(event);
+          updateCachedThreadRuntimeState(currentThreadId, completedStatus, false);
           useThreadStore
             .getState()
-            .setThreadStatusLocal(currentThreadId, threadStatusFromTurnCompletion(event));
+            .setThreadStatusLocal(currentThreadId, completedStatus);
           cleanupBackgroundListener(currentThreadId!);
         }
       }).then((unsub) => {
@@ -2988,32 +3193,122 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return;
     }
 
+    const cachedView = !options?.forceReload && currentThreadId !== threadId
+      ? readCachedThreadView(threadId)
+      : null;
+    if (cachedView) {
+      set({
+        threadId,
+        messages: cachedView.messages,
+        olderCursor: cachedView.olderCursor,
+        hasOlderMessages: cachedView.hasOlderMessages,
+        loadingOlderMessages: false,
+        olderLoadBlockedUntil: 0,
+        status: cachedView.status,
+        streaming: cachedView.streaming,
+        usageLimits: cachedView.usageLimits,
+        error: undefined,
+        unlisten: undefined,
+      });
+      recordPerfMetric("chat.thread.history_visible.ms", performance.now() - bindStartedAt, {
+        threadId,
+        source: "memory",
+      });
+    }
+
     try {
       // Clean up any background listener for this thread before re-subscribing
       cleanupBackgroundListener(threadId);
 
       const threadState = useThreadStore.getState();
       let activeThread = threadState.threads.find((thread) => thread.id === threadId);
-      if (isCodexThreadSyncRequired(activeThread)) {
-        try {
-          const syncedThread = await ipc.syncThreadFromEngine(threadId);
+      const syncPromise = isCodexThreadSyncRequired(activeThread)
+        ? ipc.syncThreadFromEngine(threadId).then((syncedThread) => {
           threadState.applyThreadUpdateLocal(syncedThread);
-          activeThread = syncedThread;
-        } catch (error) {
+          return syncedThread;
+        }).catch((error) => {
           console.warn(`Failed to sync Codex thread ${threadId}:`, error);
-        }
-      }
+          return null;
+        })
+        : null;
 
       const messageWindow = await ipc.getThreadMessagesWindow(
         threadId,
         null,
         MESSAGE_WINDOW_INITIAL_LIMIT,
       );
-      let messages = normalizeMessages(messageWindow.messages);
-      const olderCursor = messageWindow.nextCursor;
-      messages = applyHydrationWindow(messages);
+      const cachedHistoryMerge = cachedView
+        ? mergeLoadedWindowWithCachedOlderHistory(
+            normalizeMessages(messageWindow.messages),
+            cachedView.messages,
+          )
+        : {
+            messages: normalizeMessages(messageWindow.messages),
+            preservedOlderHistory: false,
+          };
+      let messages = applyHydrationWindow(cachedHistoryMerge.messages);
+      const olderCursor = cachedHistoryMerge.preservedOlderHistory
+        ? cachedView?.olderCursor ?? null
+        : messageWindow.nextCursor;
       if (bindSeq !== activeThreadBindSeq) {
         return;
+      }
+
+      // Publish durable local history as soon as it arrives. Listener setup and
+      // Codex rollout reconciliation both remain important, but neither belongs
+      // on the first-paint path when switching conversations.
+      messages = replayQueuedTurnFinishedEvents(threadId, messages);
+      const localState = get();
+      const locallyMergedMessages = localState.threadId === threadId
+        ? applyHydrationWindow(
+            mergeLoadedMessagesWithCurrentRuntimeMessages(
+              messages,
+              localState.messages,
+              threadId,
+            ),
+          )
+        : messages;
+      const localThread =
+        useThreadStore
+          .getState()
+          .threads.find((candidate) => candidate.id === threadId) ?? activeThread;
+      const localRuntimeState = resolveBoundThreadRuntimeState(
+        threadId,
+        localThread,
+        locallyMergedMessages,
+      );
+      const localUsageLimits = localThread?.engineId === "codex"
+        ? mergeUsageLimits(
+            contextUsageFromThreadMetadata(localThread.engineMetadata),
+            lastKnownCodexAccountUsageWindows,
+          )
+        : null;
+      set({
+        threadId,
+        messages: locallyMergedMessages,
+        olderCursor,
+        hasOlderMessages: olderCursor !== null,
+        loadingOlderMessages: false,
+        olderLoadBlockedUntil: 0,
+        unlisten: undefined,
+        error: undefined,
+        status: localRuntimeState.status,
+        streaming: localRuntimeState.streaming,
+        usageLimits: localUsageLimits,
+      });
+      writeCachedThreadView(threadId, {
+        messages: locallyMergedMessages,
+        olderCursor,
+        hasOlderMessages: olderCursor !== null,
+        status: localRuntimeState.status,
+        streaming: localRuntimeState.streaming,
+        usageLimits: localUsageLimits,
+      });
+      if (!cachedView) {
+        recordPerfMetric("chat.thread.history_visible.ms", performance.now() - bindStartedAt, {
+          threadId,
+          source: "local",
+        });
       }
 
       const queuedStreamEvents: StreamEvent[] = [];
@@ -3216,6 +3511,66 @@ export const useChatStore = create<ChatState>((set, get) => ({
         unlistenStream();
       };
 
+      const reconcileSyncedHistory = () => {
+        if (!syncPromise) return;
+        void syncPromise.then(async (syncedThread) => {
+          if (!syncedThread || bindSeq !== activeThreadBindSeq) return;
+          const syncedWindow = await ipc.getThreadMessagesWindow(
+            threadId,
+            null,
+            MESSAGE_WINDOW_INITIAL_LIMIT,
+          );
+          if (bindSeq !== activeThreadBindSeq) return;
+
+          const currentState = get();
+          if (currentState.threadId !== threadId) return;
+          const syncedHistoryMerge = mergeLoadedWindowWithCachedOlderHistory(
+            normalizeMessages(syncedWindow.messages),
+            currentState.messages,
+          );
+          const syncedMessages = applyHydrationWindow(
+            mergeLoadedMessagesWithCurrentRuntimeMessages(
+              applyHydrationWindow(syncedHistoryMerge.messages),
+              currentState.messages,
+              threadId,
+            ),
+          );
+          const syncedOlderCursor = syncedHistoryMerge.preservedOlderHistory
+            ? currentState.olderCursor
+            : syncedWindow.nextCursor;
+          const syncedRuntimeState = resolveBoundThreadRuntimeState(
+            threadId,
+            syncedThread,
+            syncedMessages,
+          );
+          const syncedUsageLimits = mergeUsageLimits(
+            contextUsageFromThreadMetadata(syncedThread.engineMetadata),
+            lastKnownCodexAccountUsageWindows,
+          );
+          set({
+            messages: syncedMessages,
+            olderCursor: syncedOlderCursor,
+            hasOlderMessages: syncedOlderCursor !== null,
+            status: syncedRuntimeState.status,
+            streaming: syncedRuntimeState.streaming,
+            usageLimits: syncedUsageLimits,
+          });
+          writeCachedThreadView(threadId, {
+            messages: syncedMessages,
+            olderCursor: syncedOlderCursor,
+            hasOlderMessages: syncedOlderCursor !== null,
+            status: syncedRuntimeState.status,
+            streaming: syncedRuntimeState.streaming,
+            usageLimits: syncedUsageLimits,
+          });
+          useThreadStore
+            .getState()
+            .setThreadStatusLocal(threadId, syncedRuntimeState.status);
+        }).catch((error) => {
+          console.warn(`Failed to reconcile synced Codex history ${threadId}:`, error);
+        });
+      };
+
       if (bindSeq !== activeThreadBindSeq) {
         unlisten();
         return;
@@ -3268,6 +3623,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           .getState()
           .setThreadStatusLocal(threadId, mergedRuntimeState.status);
         flushQueuedStreamEvents();
+        reconcileSyncedHistory();
         return;
       }
 
@@ -3304,20 +3660,29 @@ export const useChatStore = create<ChatState>((set, get) => ({
         .getState()
         .setThreadStatusLocal(threadId, boundRuntimeState.status);
       flushQueuedStreamEvents();
+      reconcileSyncedHistory();
     } catch (error) {
       if (bindSeq !== activeThreadBindSeq) {
         return;
       }
-      set({
-        threadId,
-        messages: [],
-        olderCursor: null,
-        hasOlderMessages: false,
-        loadingOlderMessages: false,
-        olderLoadBlockedUntil: 0,
-        usageLimits: null,
-        error: String(error),
-      });
+      set((current) => current.threadId === threadId
+        ? {
+            ...current,
+            loadingOlderMessages: false,
+            olderLoadBlockedUntil: 0,
+            error: String(error),
+          }
+        : {
+            ...current,
+            threadId,
+            messages: [],
+            olderCursor: null,
+            hasOlderMessages: false,
+            loadingOlderMessages: false,
+            olderLoadBlockedUntil: 0,
+            usageLimits: null,
+            error: String(error),
+          });
     } finally {
       if (bindingSeqByThread.get(threadId) === bindSeq) {
         bindingSeqByThread.delete(threadId);
@@ -3481,11 +3846,41 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const pendingTurn = pendingTurnMetaByThread.get(threadId);
       if (pendingTurn?.clientTurnId === clientTurnId) {
         pendingTurn.backendAccepted = true;
-        if (
-          typeof backendAssistantMessageId === "string" &&
-          backendAssistantMessageId.trim().length > 0
-        ) {
-          pendingTurn.assistantMessageId = backendAssistantMessageId;
+      }
+      if (
+        typeof backendAssistantMessageId === "string" &&
+        backendAssistantMessageId.trim().length > 0
+      ) {
+        const persistedAssistantMessageId = backendAssistantMessageId.trim();
+        if (pendingTurn?.clientTurnId === clientTurnId) {
+          pendingTurn.assistantMessageId = persistedAssistantMessageId;
+        }
+        set((current) => {
+          if (current.threadId !== threadId) return current;
+          const messages = reconcileAssistantMessageIdentity(
+            current.messages,
+            optimisticAssistantMessageId,
+            persistedAssistantMessageId,
+            clientTurnId,
+          );
+          return messages === current.messages
+            ? current
+            : { ...current, messages: applyHydrationWindow(messages) };
+        });
+        const cached = cachedThreadViews.get(threadId);
+        if (cached) {
+          const messages = reconcileAssistantMessageIdentity(
+            cached.messages,
+            optimisticAssistantMessageId,
+            persistedAssistantMessageId,
+            clientTurnId,
+          );
+          if (messages !== cached.messages) {
+            writeCachedThreadView(threadId, {
+              ...cached,
+              messages: applyHydrationWindow(messages),
+            });
+          }
         }
       }
       return true;
@@ -3542,13 +3937,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
     notifyTurnAccepted(options?.onAccepted);
 
     try {
-      await ipc.steerMessage(
+      const receipt = await ipc.steerMessage(
         threadId,
         message,
         attachments.length > 0 ? attachments : null,
         inputItems.length > 0 ? inputItems : null,
         planMode,
+        steerBlock.steerId,
       );
+      if (receipt) {
+        set((current) => ({
+          messages: applyHydrationWindow(
+            applySteerReceipt(current.messages, steerBlock.steerId, receipt),
+          ),
+        }));
+      }
       return true;
     } catch (error) {
       set((current) => ({

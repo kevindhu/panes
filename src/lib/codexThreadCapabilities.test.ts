@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Thread } from "../types";
 import {
   canEditCodexMessageHistory,
+  canForkCodexMessageHistory,
   canUseNativeCodexHistoryTools,
   hasCodexLocalHistoryForMessageEditing,
   hasCodexTranscriptForNativeTools,
@@ -70,5 +71,10 @@ describe("codexThreadCapabilities", () => {
         false,
       ),
     ).toBe(false);
+  });
+
+  it("keeps non-destructive message forks available while the source is busy", () => {
+    expect(canForkCodexMessageHistory(makeThread({ status: "streaming" }))).toBe(true);
+    expect(canForkCodexMessageHistory(makeThread({ engineThreadId: null }))).toBe(false);
   });
 });

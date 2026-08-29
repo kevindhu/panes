@@ -3,6 +3,7 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { useThreadPlanModeStore } from "../../stores/threadPlanModeStore";
 import { useThreadStore } from "../../stores/threadStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
 import { CodexSidebar } from "./CodexSidebar";
@@ -17,6 +18,10 @@ beforeEach(() => {
   localStorage.clear();
   useWorkspaceStore.setState({ activeWorkspaceId: null, workspaces: [] });
   useThreadStore.setState({ activeThreadId: null, threadsByWorkspace: {} });
+  useThreadPlanModeStore.setState({
+    threadModes: {},
+    newThreadModesByWorkspaceId: {},
+  });
 });
 
 afterEach(() => {
@@ -75,5 +80,54 @@ describe("CodexSidebar", () => {
     await act(async () => {
       root.unmount();
     });
+  });
+
+  it("uses yellow status circles for Plan mode and threads awaiting a question", async () => {
+    const timestamp = new Date().toISOString();
+    const makeThread = (id: string, status: "streaming" | "awaiting_approval") => ({
+      id,
+      workspaceId: "workspace-1",
+      repoId: null,
+      engineId: "codex" as const,
+      modelId: "gpt-5.6-codex",
+      engineThreadId: `engine-${id}`,
+      title: id,
+      status,
+      messageCount: 1,
+      totalTokens: 1,
+      createdAt: timestamp,
+      lastActivityAt: timestamp,
+    });
+    const threads = [
+      makeThread("plan-thread", "streaming"),
+      makeThread("question-thread", "awaiting_approval"),
+      makeThread("regular-thread", "streaming"),
+    ];
+    useWorkspaceStore.setState({
+      activeWorkspaceId: "workspace-1",
+      workspaces: [{
+        id: "workspace-1",
+        name: "Workspace",
+        path: "C:\\workspace",
+        createdAt: timestamp,
+        lastOpenedAt: timestamp,
+      }],
+    });
+    useThreadStore.setState({
+      threads,
+      threadsByWorkspace: { "workspace-1": threads },
+      activeThreadId: "plan-thread",
+    });
+    useThreadPlanModeStore.setState({
+      threadModes: { "plan-thread": "plan" },
+    });
+    const root = createRoot(container);
+
+    await act(async () => root.render(<CodexSidebar />));
+
+    expect(container.querySelectorAll(".codex-thread-status.attention")).toHaveLength(2);
+    expect(container.querySelectorAll(".codex-thread-status.streaming")).toHaveLength(1);
+
+    await act(async () => root.unmount());
   });
 });

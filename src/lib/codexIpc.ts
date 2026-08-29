@@ -23,6 +23,7 @@ import type {
   ThreadStatus,
   TrustLevel,
   Workspace,
+  SteerMessageReceipt,
 } from "../types";
 
 export const ipc = {
@@ -60,14 +61,16 @@ export const ipc = {
   archiveThread: (threadId: string) => invoke<void>("archive_thread", { threadId }),
   restoreThread: (threadId: string) => invoke<Thread>("restore_thread", { threadId }),
   syncThreadFromEngine: (threadId: string) => invoke<Thread>("sync_thread_from_engine", { threadId }),
+  refreshThreadUsageLimits: (threadId: string) =>
+    invoke<RefreshThreadUsageLimitsResult>("refresh_thread_usage_limits", { threadId }),
   forkCodexThread: (threadId: string, profileOperationId?: string | null) => invoke<Thread>("fork_codex_thread", { threadId, profileOperationId: profileOperationId ?? null }),
-  forkCodexThreadAtTurn: (threadId: string, lastTurnId: string | null, turnsAfter: number, profileOperationId?: string | null) => invoke<Thread>("fork_codex_thread_at_turn", { threadId, lastTurnId, turnsAfter, profileOperationId: profileOperationId ?? null }),
+  forkCodexThreadAtTurn: (threadId: string, sourceMessageId: string, lastTurnId: string | null, turnsAfter: number, profileOperationId?: string | null) => invoke<Thread>("fork_codex_thread_at_turn", { threadId, sourceMessageId, lastTurnId, turnsAfter, profileOperationId: profileOperationId ?? null }),
   rollbackCodexThread: (threadId: string, numTurns: number, profileOperationId?: string | null) => invoke<Thread>("rollback_codex_thread", { threadId, numTurns, profileOperationId: profileOperationId ?? null }),
   compactCodexThread: (threadId: string) => invoke<Thread>("compact_codex_thread", { threadId }),
   sendMessage: (threadId: string, message: string, modelId?: string | null, reasoningEffort?: string | null, attachments?: ChatAttachment[] | null, inputItems?: ChatInputItem[] | null, planMode?: boolean | null, clientTurnId?: string | null) =>
     invoke<string>("send_message", { threadId, message, modelId: modelId ?? null, reasoningEffort: reasoningEffort ?? null, attachments: attachments ?? null, inputItems: inputItems ?? null, planMode: planMode ?? null, clientTurnId: clientTurnId ?? null }),
-  steerMessage: (threadId: string, message: string, attachments?: ChatAttachment[] | null, inputItems?: ChatInputItem[] | null, planMode?: boolean | null) =>
-    invoke<void>("steer_message", { threadId, message, attachments: attachments ?? null, inputItems: inputItems ?? null, planMode: planMode ?? null }),
+  steerMessage: (threadId: string, message: string, attachments?: ChatAttachment[] | null, inputItems?: ChatInputItem[] | null, planMode?: boolean | null, steerId?: string | null) =>
+    invoke<SteerMessageReceipt>("steer_message", { threadId, message, attachments: attachments ?? null, inputItems: inputItems ?? null, planMode: planMode ?? null, steerId: steerId ?? null }),
   cancelTurn: (threadId: string) => invoke<void>("cancel_turn", { threadId }),
   respondApproval: (threadId: string, approvalId: string, response: ApprovalResponse) => invoke<void>("respond_to_approval", { threadId, approvalId, response }),
   getThreadMessagesWindow: (threadId: string, cursor?: MessageWindowCursor | null, limit?: number | null) => invoke<MessageWindow>("get_thread_messages_window", { threadId, cursor: cursor ?? null, limit: limit ?? null }),
@@ -82,12 +85,18 @@ export const ipc = {
   engineHealth: (engineId: string) => invoke<EngineHealth>("engine_health", { engineId }),
   listCodexSkills: (cwd: string) => invoke<CodexSkill[]>("list_codex_skills", { cwd }),
   listCodexApps: () => invoke<CodexApp[]>("list_codex_apps"),
-  savePastedImageAttachment: (fileName: string, mimeType: string, dataBase64: string) => invoke<ChatAttachment>("save_pasted_image_attachment", { fileName, mimeType, dataBase64 }),
+  savePastedImageAttachment: (fileName: string, mimeType: string, dataBase64: string) => invoke<Omit<ChatAttachment, "id">>("save_pasted_image_attachment", { fileName, mimeType, dataBase64 }),
   prepareAttachmentImageAsset: (filePath: string, mimeType?: string | null, maxWidth?: number | null, maxHeight?: number | null) => invoke<PreparedAttachmentImageAsset>("prepare_attachment_image_asset", { filePath, mimeType: mimeType ?? null, maxWidth: maxWidth ?? null, maxHeight: maxHeight ?? null }),
   readAttachmentImageBytes: (filePath: string, mimeType?: string | null) => invoke<ArrayBuffer | number[]>("read_attachment_image_bytes", { filePath, mimeType: mimeType ?? null }),
   copyAttachmentImageToClipboard: (filePath: string, mimeType?: string | null) => invoke<void>("copy_attachment_image_to_clipboard", { filePath, mimeType: mimeType ?? null }),
+  openPathWithDefaultApp: (path: string) => invoke<void>("open_path_with_default_app", { path }),
   showAgentNotification: (title: string, body: string) => invoke<void>("show_agent_notification", { title, body }),
 };
+
+export interface RefreshThreadUsageLimitsResult {
+  refreshed: boolean;
+  missingContext: boolean;
+}
 
 export interface ThreadUpdatedEvent { threadId: string; workspaceId: string; thread?: Thread | null }
 export interface ChatTurnFinishedEvent {
@@ -97,8 +106,13 @@ export interface ChatTurnFinishedEvent {
 }
 
 export interface CodexTranscriptUpdatedEvent {
+  threadId: string;
   assistantMessageId: string;
   lastSourceSequence: number;
+}
+
+export interface CodexRollbackMaterializedEvent {
+  threadId: string;
 }
 
 export async function listenThreadEvents(threadId: string, onEvent: (event: StreamEvent) => void): Promise<UnlistenFn> {
@@ -112,6 +126,9 @@ export async function listenChatTurnFinished(onEvent: (event: ChatTurnFinishedEv
 }
 export async function listenCodexTranscriptUpdated(onEvent: (event: CodexTranscriptUpdatedEvent) => void): Promise<UnlistenFn> {
   return listen<CodexTranscriptUpdatedEvent>("codex-transcript-updated", ({ payload }) => onEvent(payload));
+}
+export async function listenCodexRollbackMaterialized(onEvent: (event: CodexRollbackMaterializedEvent) => void): Promise<UnlistenFn> {
+  return listen<CodexRollbackMaterializedEvent>("codex-rollback-materialized", ({ payload }) => onEvent(payload));
 }
 export async function listenEngineRuntimeUpdated(onEvent: (event: EngineRuntimeUpdatedEvent) => void): Promise<UnlistenFn> {
   return listen<EngineRuntimeUpdatedEvent>("engine-runtime-updated", ({ payload }) => onEvent(payload));

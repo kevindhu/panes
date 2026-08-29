@@ -46,6 +46,18 @@ export function computeDroppedTurnsForEditedMessage(
   return userTurnIds.length - selectedIndex;
 }
 
+export function messagesBeforeEditableUserTurn(
+  messages: Message[],
+  messageId: string,
+): Message[] | null {
+  const selectedIndex = messages.findIndex((message) => message.id === messageId);
+  if (selectedIndex < 0 || !isEditableUserTurn(messages[selectedIndex])) {
+    return null;
+  }
+
+  return messages.slice(0, selectedIndex);
+}
+
 export function computeTurnsAfterAssistantMessage(
   messages: Message[],
   messageId: string,
@@ -63,6 +75,19 @@ export function computeTurnsAfterAssistantMessage(
     .slice(selectedIndex + 1)
     .filter((message) => message.role === "user" && !messageHasSteerMarker(message))
     .length;
+}
+
+export function canForkFromAssistantMessage(
+  message: Message,
+  sourceTurnActive: boolean,
+): boolean {
+  if (message.role !== "assistant" || message.status === "streaming") {
+    return false;
+  }
+
+  // A native turn id gives Codex an immutable boundary even if a newer turn is
+  // only optimistically visible in the frontend and has not reached app-server yet.
+  return !sourceTurnActive || Boolean(message.nativeTurnId?.trim());
 }
 
 export interface EditableMessageContext {

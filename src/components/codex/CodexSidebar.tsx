@@ -13,6 +13,7 @@ import { createAndActivateWorkspaceThread } from "../../lib/newThreadActions";
 import { activateThreadContext } from "../../lib/threadActivation";
 import { useCodexUiStore } from "../../stores/codexUiStore";
 import { useEngineStore } from "../../stores/engineStore";
+import { useThreadPlanModeStore } from "../../stores/threadPlanModeStore";
 import { useThreadStore } from "../../stores/threadStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
 import type { Thread } from "../../types";
@@ -51,6 +52,15 @@ function relativeTime(value: string): string {
   return `${Math.floor(hours / 24)}d`;
 }
 
+export function codexThreadStatusTone(
+  status: Thread["status"],
+  planMode: boolean,
+): string {
+  if (status === "error") return "error";
+  if (planMode || status === "awaiting_approval") return "attention";
+  return status;
+}
+
 export function CodexSidebar() {
   const [menuThreadId, setMenuThreadId] = useState<string | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
@@ -66,6 +76,7 @@ export function CodexSidebar() {
       : EMPTY_THREADS,
   );
   const activeThreadId = useThreadStore((state) => state.activeThreadId);
+  const threadModes = useThreadPlanModeStore((state) => state.threadModes);
   const removeThread = useThreadStore((state) => state.removeThread);
   const renameThread = useThreadStore((state) => state.renameThread);
   const refreshThreads = useThreadStore((state) => state.refreshThreads);
@@ -188,7 +199,12 @@ export function CodexSidebar() {
         {orderedThreads.map((thread) => (
           <div key={thread.id} className={`codex-thread ${thread.id === activeThreadId ? "active" : ""}`}>
             <button className="codex-thread-main" type="button" onClick={() => void selectThread(thread)}>
-              <span className={`codex-thread-status ${thread.status}`} />
+              <span
+                className={`codex-thread-status ${codexThreadStatusTone(
+                  thread.status,
+                  threadModes[thread.id] === "plan",
+                )}`}
+              />
               <span className="codex-thread-copy"><strong>{thread.title || "Untitled"}</strong><small>{relativeTime(thread.lastActivityAt)}</small></span>
             </button>
             <button className="codex-thread-menu" type="button" onClick={() => setMenuThreadId((id) => id === thread.id ? null : thread.id)} aria-label="Conversation actions">

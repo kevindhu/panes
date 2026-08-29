@@ -5,6 +5,7 @@ type PerfMetricName =
   | "chat.stream.flush.ms"
   | "chat.stream.events_per_sec"
   | "chat.render.commit.ms"
+  | "chat.thread.history_visible.ms"
   | "chat.markdown.worker.ms"
   | "chat.image.asset_prepare.ms"
   | "chat.image.viewer_first_pixel.ms"
@@ -35,6 +36,7 @@ const PERF_BUDGETS: Record<PerfMetricName, number> = {
   "chat.stream.flush.ms": 12,
   "chat.stream.events_per_sec": 450,
   "chat.render.commit.ms": 16,
+  "chat.thread.history_visible.ms": 50,
   "chat.markdown.worker.ms": 28,
   "chat.image.asset_prepare.ms": 50,
   "chat.image.viewer_first_pixel.ms": 50,

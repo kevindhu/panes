@@ -36,6 +36,7 @@ interface ThreadState {
   forkCodexThread: (threadId: string, profileOperationId?: string | null) => Promise<Thread | null>;
   forkCodexThreadAtTurn: (
     threadId: string,
+    sourceMessageId: string,
     lastTurnId: string | null,
     turnsAfter: number,
     profileOperationId?: string | null,
@@ -391,6 +392,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
   },
   forkCodexThreadAtTurn: async (
     threadId,
+    sourceMessageId,
     lastTurnId,
     turnsAfter,
     profileOperationId,
@@ -399,6 +401,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
     try {
       const forked = await ipc.forkCodexThreadAtTurn(
         threadId,
+        sourceMessageId,
         lastTurnId,
         turnsAfter,
         profileOperationId ?? null,
@@ -430,7 +433,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
     }
   },
   rollbackCodexThread: async (threadId, numTurns, profileOperationId) => {
-    set({ loading: true, error: undefined });
+    set({ error: undefined });
     try {
       const rolledBack = await ipc.rollbackCodexThread(
         threadId,
@@ -452,12 +455,11 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
         return {
           threadsByWorkspace,
           threads: flattenThreadsByWorkspace(threadsByWorkspace),
-          loading: false,
         };
       });
       return rolledBack;
     } catch (error) {
-      set({ loading: false, error: String(error) });
+      set({ error: String(error) });
       throw error;
     }
   },

@@ -86,11 +86,18 @@ describe("threadStore native Codex rollback", () => {
 
     const pending = useThreadStore
       .getState()
-      .forkCodexThreadAtTurn("thread-1", "turn-native-1", 1, "profile-1");
+      .forkCodexThreadAtTurn(
+        "thread-1",
+        "assistant-message-1",
+        "turn-native-1",
+        1,
+        "profile-1",
+      );
 
     expect(useThreadStore.getState().loading).toBe(false);
     expect(mockIpc.forkCodexThreadAtTurn).toHaveBeenCalledWith(
       "thread-1",
+      "assistant-message-1",
       "turn-native-1",
       1,
       "profile-1",
@@ -100,6 +107,20 @@ describe("threadStore native Codex rollback", () => {
     await expect(pending).resolves.toEqual(forked);
     expect(useThreadStore.getState().activeThreadId).toBe("thread-fork");
     expect(useThreadStore.getState().threadsByWorkspace["workspace-1"][0]).toEqual(forked);
+  });
+
+  it("keeps the thread store interactive while native rollback is pending", async () => {
+    const rolledBack = makeThread({ messageCount: 2 });
+    let resolveRollback!: (thread: Thread) => void;
+    mockIpc.rollbackCodexThread.mockImplementation(
+      () => new Promise<Thread>((resolve) => { resolveRollback = resolve; }),
+    );
+
+    const pending = useThreadStore.getState().rollbackCodexThread("thread-1", 1);
+
+    expect(useThreadStore.getState().loading).toBe(false);
+    resolveRollback(rolledBack);
+    await expect(pending).resolves.toEqual(rolledBack);
   });
 
   it("propagates the Codex rollback failure instead of replacing it with null", async () => {
