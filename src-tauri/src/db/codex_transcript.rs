@@ -524,6 +524,16 @@ fn project_chunks(method: &str, params_value: &Value) -> Vec<ChunkProjection> {
         .or_else(|| params_value.get("summary_index"))
         .and_then(Value::as_i64);
 
+    if signature == "itemreasoningsummarypartadded" {
+        return vec![ChunkProjection {
+            item_id,
+            stream_kind: "reasoning_summary_boundary",
+            summary_index,
+            content: String::new(),
+            metadata_json: project_chunk_metadata(params_value, &["summaryIndex"]),
+        }];
+    }
+
     let (stream_kind, content_key) = match signature.as_str() {
         "itemagentmessagedelta" => ("agent_text", "delta"),
         "itemplandelta" => ("plan", "delta"),
@@ -930,6 +940,11 @@ mod tests {
                 && chunk.content == "Inspect the protocol before editing."
         }));
         assert!(first.chunks.iter().any(|chunk| {
+            chunk.item_id.as_deref() == Some("reason-1")
+                && chunk.stream_kind == "reasoning_summary_boundary"
+                && chunk.summary_index == Some(0)
+        }));
+        assert!(first.chunks.iter().any(|chunk| {
             chunk.item_id.as_deref() == Some("cmd-1")
                 && chunk.metadata_json.as_deref() == Some(r#"{"stream":"stdout"}"#)
         }));
@@ -997,6 +1012,59 @@ mod tests {
             record_native_event_batch(&db, LOCAL_THREAD_ID, ASSISTANT_MESSAGE_ID, &[conflicting])
                 .expect_err("conflicting replay must fail");
         assert!(error.to_string().contains("conflicting Codex replay"));
+
+        drop(db);
+        remove_test_database(&path);
+    }
+
+    #[test]
+    fn client_steer_markers_survive_replay_without_becoming_fake_items() {
+        let (db, path) = create_test_database("client-steer");
+        let mut submitted = event(
+            1,
+            "turn/steer",
+            json!({
+                "steerId": "steer-1",
+                "messageId": "message-1",
+                "status": "submitted",
+                "display": {"content": "Focus on failures first."},
+                "request": {"method": "turn/steer", "params": {"expectedTurnId": NATIVE_TURN_ID}}
+            }),
+        );
+        submitted.event_kind = CodexNativeEventKind::ClientRequest;
+        submitted.request_id = Some("steer-1".to_owned());
+        let mut accepted = event(
+            2,
+            "turn/steer",
+            json!({
+                "steerId": "steer-1",
+                "messageId": "message-1",
+                "status": "accepted",
+                "result": {"turnId": NATIVE_TURN_ID}
+            }),
+        );
+        accepted.event_kind = CodexNativeEventKind::ClientResponse;
+        accepted.request_id = Some("steer-1".to_owned());
+
+        record_native_event_batch(
+            &db,
+            LOCAL_THREAD_ID,
+            ASSISTANT_MESSAGE_ID,
+            &[submitted, accepted],
+        )
+        .expect("client steer markers should persist");
+        let snapshot = load_turn_snapshot(&db, ASSISTANT_MESSAGE_ID)
+            .expect("snapshot query")
+            .expect("snapshot should exist");
+
+        assert_eq!(snapshot.events.len(), 2);
+        assert_eq!(snapshot.events[0].event_kind, "client_request");
+        assert_eq!(snapshot.events[1].event_kind, "client_response");
+        assert!(snapshot.events[0]
+            .params_json
+            .contains("Focus on failures first."));
+        assert!(snapshot.items.is_empty());
+        assert!(snapshot.chunks.is_empty());
 
         drop(db);
         remove_test_database(&path);

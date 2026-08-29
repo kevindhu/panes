@@ -27,12 +27,28 @@ struct CodexEventRoutingLogState {
 }
 
 #[cfg(not(test))]
+struct CodexEventRoutingDropLogState {
+    window_started_at: Instant,
+    observed_in_window: u64,
+}
+
+#[cfg(not(test))]
 impl Default for CodexEventRoutingLogState {
     fn default() -> Self {
         Self {
             window_started_at: Instant::now(),
             lines_in_window: 0,
             suppressed_in_window: 0,
+        }
+    }
+}
+
+#[cfg(not(test))]
+impl Default for CodexEventRoutingDropLogState {
+    fn default() -> Self {
+        Self {
+            window_started_at: Instant::now(),
+            observed_in_window: 0,
         }
     }
 }
@@ -56,6 +72,61 @@ pub fn append_codex_event_routing_log(message: &str) -> bool {
     {
         append_codex_event_routing_log_inner(message).unwrap_or(false)
     }
+}
+
+/// Records a representative queue-drop entry at most once per second. Queue pressure can produce
+/// thousands of identical failures; synchronously opening the diagnostic file for each one makes
+/// the pressure worse and can become a CPU/disk feedback loop of its own.
+#[must_use]
+pub fn append_codex_event_routing_drop_log(message: &str) -> bool {
+    #[cfg(test)]
+    {
+        let _ = message;
+        true
+    }
+
+    #[cfg(not(test))]
+    {
+        append_codex_event_routing_drop_log_inner(message).unwrap_or(false)
+    }
+}
+
+#[cfg(not(test))]
+fn append_codex_event_routing_drop_log_inner(message: &str) -> io::Result<bool> {
+    let previous_suppressed = {
+        let mut state = codex_event_routing_drop_log_state().lock().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "codex event routing drop log lock poisoned",
+            )
+        })?;
+        let now = Instant::now();
+
+        if now.duration_since(state.window_started_at) >= Duration::from_secs(1) {
+            let suppressed = state.observed_in_window.saturating_sub(1);
+            state.window_started_at = now;
+            state.observed_in_window = 1;
+            Some(suppressed)
+        } else if state.observed_in_window == 0 {
+            state.observed_in_window = 1;
+            Some(0)
+        } else {
+            state.observed_in_window = state.observed_in_window.saturating_add(1);
+            None
+        }
+    };
+
+    let Some(previous_suppressed) = previous_suppressed else {
+        return Ok(false);
+    };
+    let message = if previous_suppressed > 0 {
+        format!(
+            "suppressed {previous_suppressed} additional queue-drop entries during the previous one-second window; latest: {message}"
+        )
+    } else {
+        message.to_string()
+    };
+    append_codex_event_routing_log_inner(&message)
 }
 
 #[cfg(not(test))]
@@ -123,6 +194,12 @@ fn append_codex_event_routing_log_inner(message: &str) -> io::Result<bool> {
 fn codex_event_routing_log_state() -> &'static Mutex<CodexEventRoutingLogState> {
     static STATE: OnceLock<Mutex<CodexEventRoutingLogState>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(CodexEventRoutingLogState::default()))
+}
+
+#[cfg(not(test))]
+fn codex_event_routing_drop_log_state() -> &'static Mutex<CodexEventRoutingDropLogState> {
+    static STATE: OnceLock<Mutex<CodexEventRoutingDropLogState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(CodexEventRoutingDropLogState::default()))
 }
 
 #[cfg(not(test))]

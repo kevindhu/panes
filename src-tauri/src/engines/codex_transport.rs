@@ -260,6 +260,27 @@ impl CodexTransport {
         self.incoming_router.subscribe_runtime().await
     }
 
+    pub async fn capture_client_event(
+        &self,
+        event_kind: CodexNativeEventKind,
+        method: &str,
+        request_id: Option<String>,
+        native_thread_id: &str,
+        native_turn_id: &str,
+        params_json: String,
+    ) -> anyhow::Result<u64> {
+        self.incoming_router
+            .capture_client_event(
+                event_kind,
+                method,
+                request_id,
+                native_thread_id,
+                native_turn_id,
+                params_json,
+            )
+            .await
+    }
+
     pub async fn request(
         &self,
         method: &str,
@@ -405,7 +426,8 @@ impl CodexIncomingSubscription {
                 native_turn_id,
                 params_json,
             )
-            .await
+            .await?;
+        Ok(())
     }
 }
 
@@ -419,7 +441,7 @@ impl CodexNativeCapture {
         native_thread_id: &str,
         native_turn_id: Option<String>,
         params_json: String,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u64> {
         // Sequence assignment and channel insertion are one serialized operation. This prevents
         // the pending response path and stdout router from assigning N/N+1 but enqueueing them
         // in the opposite order under backpressure.
@@ -448,7 +470,8 @@ impl CodexNativeCapture {
             },
         })
         .await
-        .map_err(|_| anyhow::anyhow!("Codex native transcript receiver closed"))
+        .map_err(|_| anyhow::anyhow!("Codex native transcript receiver closed"))?;
+        Ok(source_sequence)
     }
 }
 
@@ -543,6 +566,59 @@ impl CodexIncomingRouter {
         let (sender, receiver) = mpsc::channel(RUNTIME_EVENT_QUEUE_CAPACITY);
         self.state.lock().await.runtime_subscribers.push(sender);
         receiver
+    }
+
+    async fn capture_client_event(
+        &self,
+        event_kind: CodexNativeEventKind,
+        method: &str,
+        request_id: Option<String>,
+        native_thread_id: &str,
+        native_turn_id: &str,
+        params_json: String,
+    ) -> anyhow::Result<u64> {
+        let subscribers = {
+            let mut state = self.state.lock().await;
+            state
+                .turn_subscribers
+                .retain(|subscriber| !subscriber.sender.is_closed());
+            state.turn_subscribers.clone()
+        };
+
+        let mut matching_capture: Option<CodexNativeCapture> = None;
+        for subscriber in subscribers {
+            let scope = subscriber.scope.snapshot().await;
+            if scope.thread_id != native_thread_id
+                || scope.turn_id.as_deref() != Some(native_turn_id)
+            {
+                continue;
+            }
+            let capture = subscriber
+                .native_capture
+                .context("matching Codex turn subscription has no native event sink")?;
+            if matching_capture.is_some() {
+                anyhow::bail!(
+                    "multiple active Codex transcript subscriptions matched thread {native_thread_id} turn {native_turn_id}"
+                );
+            }
+            matching_capture = Some(capture);
+        }
+
+        matching_capture
+            .with_context(|| {
+                format!(
+                    "no active Codex transcript subscription matched thread {native_thread_id} turn {native_turn_id}"
+                )
+            })?
+            .capture(
+                event_kind,
+                method,
+                request_id,
+                native_thread_id,
+                Some(native_turn_id.to_owned()),
+                params_json,
+            )
+            .await
     }
 
     async fn dispatch(&self, message: IncomingMessage) {
@@ -692,7 +768,8 @@ async fn capture_native_message(
             routing_info.turn_id.clone().or(scope.turn_id),
             params_json,
         )
-        .await
+        .await?;
+    Ok(())
 }
 
 impl CodexMessageRoutingInfo {
@@ -719,6 +796,10 @@ impl CodexMessageRoutingInfo {
 
 fn record_codex_event_routing_log(message: &str) -> bool {
     crate::diagnostic_logs::append_codex_event_routing_log(message)
+}
+
+fn record_codex_event_routing_drop_log(message: &str) -> bool {
+    crate::diagnostic_logs::append_codex_event_routing_drop_log(message)
 }
 
 async fn deliver_message(
@@ -748,7 +829,7 @@ async fn deliver_message(
                     "codex {subscriber_kind} event receiver full; dropping best-effort event: {}",
                     routing_info.log_summary()
                 );
-                if record_codex_event_routing_log(&message) {
+                if record_codex_event_routing_drop_log(&message) {
                     log::warn!("{message}");
                 }
                 return false;
@@ -771,7 +852,7 @@ async fn deliver_message(
                         "codex {subscriber_kind} event receiver full; dropping best-effort event: {}",
                         routing_info.log_summary()
                     );
-                    if record_codex_event_routing_log(&message) {
+                    if record_codex_event_routing_drop_log(&message) {
                         log::warn!("{message}");
                     }
                     false
@@ -1152,6 +1233,76 @@ mod tests {
         assert_eq!(event.source_sequence, 2);
         assert_eq!(event.event_kind, CodexNativeEventKind::Response);
         assert_eq!(event.method, "turn/start");
+
+        subscription.set_turn_id(Some("turn-a".to_owned())).await;
+        let client_sequence = router
+            .capture_client_event(
+                CodexNativeEventKind::ClientRequest,
+                "turn/steer",
+                Some("steer-1".to_owned()),
+                "thread-a",
+                "turn-a",
+                r#"{"steerId":"steer-1","status":"submitted"}"#.to_owned(),
+            )
+            .await
+            .expect("client event capture");
+        assert_eq!(client_sequence, 3);
+        let client = native_receiver.recv().await.expect("captured client event");
+        let EngineEvent::CodexNativeEvent { event } = client else {
+            panic!("expected native client event");
+        };
+        assert_eq!(event.source_sequence, 3);
+        assert_eq!(event.event_kind, CodexNativeEventKind::ClientRequest);
+        assert_eq!(event.method, "turn/steer");
+        assert_eq!(event.request_id.as_deref(), Some("steer-1"));
+    }
+
+    #[tokio::test]
+    async fn client_capture_serializes_rapid_steers_with_channel_order() {
+        let router = Arc::new(CodexIncomingRouter::default());
+        let (native_sender, mut native_receiver) = mpsc::channel(8);
+        let subscription = router
+            .subscribe_thread_with_capture("thread-a", Some(native_sender.downgrade()))
+            .await;
+        subscription.set_turn_id(Some("turn-a".to_owned())).await;
+
+        let first_router = router.clone();
+        let second_router = router.clone();
+        let (first, second) = tokio::join!(
+            first_router.capture_client_event(
+                CodexNativeEventKind::ClientRequest,
+                "turn/steer",
+                Some("steer-1".to_owned()),
+                "thread-a",
+                "turn-a",
+                r#"{"steerId":"steer-1"}"#.to_owned(),
+            ),
+            second_router.capture_client_event(
+                CodexNativeEventKind::ClientRequest,
+                "turn/steer",
+                Some("steer-2".to_owned()),
+                "thread-a",
+                "turn-a",
+                r#"{"steerId":"steer-2"}"#.to_owned(),
+            ),
+        );
+        let mut assigned = vec![
+            first.expect("first capture"),
+            second.expect("second capture"),
+        ];
+        assigned.sort_unstable();
+        assert_eq!(assigned, vec![1, 2]);
+
+        let mut delivered = Vec::new();
+        for _ in 0..2 {
+            let EngineEvent::CodexNativeEvent { event } =
+                native_receiver.recv().await.expect("captured client event")
+            else {
+                panic!("expected native client event");
+            };
+            delivered.push(event.source_sequence);
+        }
+        assert_eq!(delivered, vec![1, 2]);
     }
 
     #[test]

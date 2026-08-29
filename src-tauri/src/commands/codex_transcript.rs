@@ -39,6 +39,7 @@ pub(super) struct CodexTranscriptRecorder {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexTranscriptUpdatedEvent {
+    thread_id: String,
     assistant_message_id: String,
     last_source_sequence: u64,
 }
@@ -46,6 +47,7 @@ struct CodexTranscriptUpdatedEvent {
 #[cfg(not(test))]
 fn emit_transcript_updated(
     app: Option<&CodexTranscriptUpdateTarget>,
+    thread_id: &str,
     assistant_message_id: &str,
     last_source_sequence: u64,
 ) {
@@ -55,6 +57,7 @@ fn emit_transcript_updated(
     if let Err(error) = app.emit(
         "codex-transcript-updated",
         CodexTranscriptUpdatedEvent {
+            thread_id: thread_id.to_owned(),
             assistant_message_id: assistant_message_id.to_owned(),
             last_source_sequence,
         },
@@ -72,6 +75,7 @@ fn emit_transcript_updated(
 #[cfg(test)]
 fn emit_transcript_updated(
     _app: Option<&CodexTranscriptUpdateTarget>,
+    _thread_id: &str,
     _assistant_message_id: &str,
     _last_source_sequence: u64,
 ) {
@@ -190,7 +194,12 @@ async fn run_recorder(
         .await
         .context("Codex transcript database task failed to join")??;
 
-        emit_transcript_updated(app.as_ref(), &assistant_message_id, last_source_sequence);
+        emit_transcript_updated(
+            app.as_ref(),
+            &local_thread_id,
+            &assistant_message_id,
+            last_source_sequence,
+        );
 
         if channel_closed {
             break;

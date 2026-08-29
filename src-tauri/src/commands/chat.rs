@@ -24,8 +24,8 @@ use crate::{
     engines::{
         approval_response_route_for_engine, normalize_approval_response_for_engine,
         trim_action_output_delta_content, validate_engine_sandbox_mode, ApprovalRequestRoute,
-        EngineEvent, OutputStream, SandboxPolicy, ThreadScope, TurnAttachment,
-        TurnCompletionSource, TurnCompletionStatus, TurnInput, TurnInputItem,
+        EngineEvent, OutputStream, SandboxPolicy, SteerMarker, SteerReceipt, ThreadScope,
+        TurnAttachment, TurnCompletionSource, TurnCompletionStatus, TurnInput, TurnInputItem,
         STREAMED_DIFF_MAX_CHARS,
     },
     models::{
@@ -1189,8 +1189,16 @@ pub async fn send_message(
     // engine thread is materialized before the turn starts; the background prefetch has
     // usually already done this, so this is normally instant.
     if crate::commands::threads::is_engine_fork_pending(thread.engine_metadata.as_ref()) {
-        thread =
-            crate::commands::threads::resolve_pending_engine_fork(state.inner(), &thread.id).await?;
+        thread = crate::commands::threads::resolve_pending_engine_fork(state.inner(), &thread.id)
+            .await?;
+    }
+    if crate::commands::threads::is_engine_rollback_pending(thread.engine_metadata.as_ref()) {
+        thread = crate::commands::threads::resolve_pending_engine_rollback(
+            state.inner(),
+            &thread.id,
+            Some(&app),
+        )
+        .await?;
     }
     let requested_model_id = model_id
         .as_deref()
@@ -1277,9 +1285,10 @@ pub async fn send_message(
         configured_reasoning_effort.clone()
     };
     let sandbox_mode_override = thread_sandbox_mode(thread.engine_metadata.as_ref())?;
-    let sandbox_mode = Some(sandbox_mode_override.clone().unwrap_or_else(|| {
-        default_sandbox_mode_for_engine(thread.engine_id.as_str()).to_string()
-    }));
+    let sandbox_mode =
+        Some(sandbox_mode_override.clone().unwrap_or_else(|| {
+            default_sandbox_mode_for_engine(thread.engine_id.as_str()).to_string()
+        }));
     let workspace_writable_roots = if selected_repo.is_some() {
         None
     } else {
@@ -1558,7 +1567,7 @@ pub async fn start_codex_review(
     }
 
     let db = state.db.clone();
-    let source_thread = run_db(db.clone(), {
+    let mut source_thread = run_db(db.clone(), {
         let thread_id = thread_id.clone();
         move |db| db::threads::get_thread(db, &thread_id)
     })
@@ -1567,6 +1576,21 @@ pub async fn start_codex_review(
 
     if source_thread.engine_id != "codex" {
         return Err("Native review is only available for Codex threads.".to_string());
+    }
+
+    if crate::commands::threads::is_engine_fork_pending(source_thread.engine_metadata.as_ref()) {
+        source_thread =
+            crate::commands::threads::resolve_pending_engine_fork(state.inner(), &source_thread.id)
+                .await?;
+    }
+    if crate::commands::threads::is_engine_rollback_pending(source_thread.engine_metadata.as_ref())
+    {
+        source_thread = crate::commands::threads::resolve_pending_engine_rollback(
+            state.inner(),
+            &source_thread.id,
+            Some(&app),
+        )
+        .await?;
     }
 
     let source_engine_thread_id = source_thread
@@ -1702,7 +1726,8 @@ pub async fn steer_message(
     attachments: Option<Vec<ChatAttachmentPayload>>,
     input_items: Option<Vec<ChatInputItemPayload>>,
     plan_mode: Option<bool>,
-) -> Result<(), String> {
+    steer_id: Option<String>,
+) -> Result<SteerReceipt, String> {
     if state.turns.get(&thread_id).await.is_none() {
         return Err(
             "No active turn is running for this thread yet. Wait for Codex to start the turn before steering."
@@ -1729,6 +1754,13 @@ pub async fn steer_message(
     let attachments = normalize_attachments(attachments)?;
     let input_items = normalize_input_items(message.as_str(), input_items)?;
     let plan_mode = plan_mode.unwrap_or(false);
+    let steer_id = steer_id
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    if steer_id.len() > 128 {
+        return Err("Steer id cannot exceed 128 characters.".to_string());
+    }
     let turn_input = TurnInput {
         message: message.clone(),
         attachments: attachments.clone(),
@@ -1761,28 +1793,41 @@ pub async fn steer_message(
     })
     .await?;
 
-    if let Err(error) = state
+    let steer_marker = SteerMarker {
+        steer_id,
+        message_id: user_message.id.clone(),
+        display: json!({
+            "content": message,
+            "planMode": plan_mode,
+            "blocks": user_blocks,
+        }),
+    };
+
+    let receipt = match state
         .engines
-        .steer_message(&thread, &engine_thread_id, turn_input)
+        .steer_message(&thread, &engine_thread_id, turn_input, steer_marker)
         .await
     {
-        let rollback_result = run_db(db, {
-            let message_id = user_message.id.clone();
-            move |db| db::messages::delete_message(db, &message_id)
-        })
-        .await;
-        if let Err(rollback_error) = rollback_result {
-            log::warn!(
-                "failed to roll back persisted steer message {} after steer error: {}",
-                user_message.id,
-                rollback_error
-            );
+        Ok(receipt) => receipt,
+        Err(error) => {
+            let rollback_result = run_db(db, {
+                let message_id = user_message.id.clone();
+                move |db| db::messages::delete_message(db, &message_id)
+            })
+            .await;
+            if let Err(rollback_error) = rollback_result {
+                log::warn!(
+                    "failed to roll back persisted steer message {} after steer error: {}",
+                    user_message.id,
+                    rollback_error
+                );
+            }
+
+            return Err(err_to_string(error));
         }
+    };
 
-        return Err(err_to_string(error));
-    }
-
-    Ok(())
+    Ok(receipt)
 }
 
 fn build_user_blocks(
@@ -4051,11 +4096,18 @@ async fn process_stream_event(
                 log::warn!("failed to persist action start: {error}");
             }
         }
-        EngineEvent::ActionCompleted { action_id, result } => {
+        EngineEvent::ActionCompleted {
+            action_id,
+            result,
+            details,
+        } => {
             if let Err(error) = run_db(state.db.clone(), {
                 let action_id = action_id.clone();
                 let result = result.clone();
-                move |db| db::actions::update_action_completed(db, &action_id, &result)
+                let details = details.clone();
+                move |db| {
+                    db::actions::update_action_completed(db, &action_id, &result, details.as_ref())
+                }
             })
             .await
             {
@@ -4700,14 +4752,22 @@ fn apply_event_to_blocks(
                 }
             }
         }
-        EngineEvent::ActionCompleted { action_id, result } => {
+        EngineEvent::ActionCompleted {
+            action_id,
+            result,
+            details: completed_details,
+        } => {
             if let Some(index) = action_index.get(action_id).copied() {
                 if let Some(ContentBlock::Action {
+                    details,
                     status,
                     result: block_result,
                     ..
                 }) = blocks.get_mut(index)
                 {
+                    if let Some(completed_details) = completed_details {
+                        merge_action_details(details, completed_details);
+                    }
                     *status = if result.success { "done" } else { "error" }.to_string();
                     *block_result = Some(ActionBlockResult {
                         success: result.success,
@@ -4762,6 +4822,7 @@ fn apply_event_to_blocks(
                     next_blocks.push(block);
                 }
                 *blocks = next_blocks;
+                rebuild_block_indexes(blocks, action_index, approval_index);
             } else {
                 blocks.push(ContentBlock::Diff {
                     diff: diff.to_string(),
@@ -4932,6 +4993,20 @@ fn update_action_progress(details: &mut Box<RawValue>, message: &str) -> bool {
     false
 }
 
+fn merge_action_details(details: &mut Box<RawValue>, completed_details: &Value) {
+    let mut value: Value = serde_json::from_str(details.get())
+        .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+    match (&mut value, completed_details) {
+        (Value::Object(existing), Value::Object(completed)) => {
+            for (key, completed_value) in completed {
+                existing.insert(key.clone(), completed_value.clone());
+            }
+        }
+        (_, completed) => value = completed.clone(),
+    }
+    *details = value_to_raw(&value);
+}
+
 fn upsert_action_block(
     blocks: &mut Vec<ContentBlock>,
     action_index: &mut HashMap<String, usize>,
@@ -4992,11 +5067,9 @@ fn upsert_notice_block(
         }
     }
 
-    if kind == "turn_status" {
-        blocks.push(block);
-    } else {
-        blocks.insert(0, block);
-    }
+    // A notice is part of the event stream, not message metadata. Keep its
+    // first-observed position; later updates of the same kind stay in place.
+    blocks.push(block);
     rebuild_block_indexes(blocks, action_index, approval_index);
     true
 }
@@ -5562,7 +5635,8 @@ mod tests {
             keep_awake: Arc::new(KeepAwakeManager::new()),
             turns: Arc::new(TurnManager::default()),
             file_tree_cache: Arc::new(FileTreeCache::new()),
-            pending_forks: Arc::new(crate::state::PendingForkManager::default()),
+            pending_forks: Arc::new(crate::state::PendingThreadMutationManager::default()),
+            pending_rollbacks: Arc::new(crate::state::PendingThreadMutationManager::default()),
         }
     }
 
@@ -6249,7 +6323,7 @@ mod tests {
     }
 
     #[test]
-    fn model_reroute_notice_reindexes_action_blocks() {
+    fn model_reroute_notice_preserves_arrival_order_and_action_updates() {
         let mut blocks = Vec::new();
         let mut action_index = HashMap::new();
         let mut approval_index = HashMap::new();
@@ -6299,7 +6373,7 @@ mod tests {
         assert!(progress.blocks_changed);
 
         assert!(matches!(
-            &blocks[0],
+            &blocks[1],
             ContentBlock::Notice {
                 kind,
                 level,
@@ -6307,7 +6381,7 @@ mod tests {
                 ..
             } if kind == "model_rerouted" && level == "info" && title == "Model rerouted"
         ));
-        match &blocks[1] {
+        match &blocks[0] {
             ContentBlock::Action { details, .. } => {
                 let details_value: Value = serde_json::from_str(details.get())
                     .expect("action details should parse as JSON");
@@ -6329,6 +6403,86 @@ mod tests {
     }
 
     #[test]
+    fn action_completion_replaces_empty_web_search_start_details() {
+        let mut blocks = Vec::new();
+        let mut action_index = HashMap::new();
+        let mut approval_index = HashMap::new();
+
+        let started = apply_event_to_blocks(
+            &mut blocks,
+            &mut action_index,
+            &mut approval_index,
+            &EngineEvent::ActionStarted {
+                action_id: "search-action".to_string(),
+                engine_action_id: Some("search-item".to_string()),
+                action_type: crate::engines::events::ActionType::Search,
+                summary: "Web search".to_string(),
+                details: serde_json::json!({
+                    "query": "",
+                    "action": null,
+                    "results": null
+                }),
+            },
+            1000,
+            None,
+        );
+        assert!(started.blocks_changed);
+
+        let completed = apply_event_to_blocks(
+            &mut blocks,
+            &mut action_index,
+            &mut approval_index,
+            &EngineEvent::ActionCompleted {
+                action_id: "search-action".to_string(),
+                result: crate::engines::ActionResult {
+                    success: true,
+                    output: None,
+                    error: None,
+                    diff: None,
+                    duration_ms: 25,
+                },
+                details: Some(serde_json::json!({
+                    "query": "Shiro no Yakata game",
+                    "action": { "type": "search", "query": "Shiro no Yakata game" },
+                    "results": [{
+                        "title": "Developer blog",
+                        "url": "https://zell23.livedoor.blog/"
+                    }]
+                })),
+            },
+            1000,
+            None,
+        );
+        assert!(completed.blocks_changed);
+
+        match &blocks[0] {
+            ContentBlock::Action {
+                details,
+                status,
+                result,
+                ..
+            } => {
+                let details: Value = serde_json::from_str(details.get())
+                    .expect("completed search details should remain valid JSON");
+                assert_eq!(status, "done");
+                assert_eq!(
+                    details.get("query").and_then(Value::as_str),
+                    Some("Shiro no Yakata game")
+                );
+                assert_eq!(
+                    details
+                        .get("results")
+                        .and_then(Value::as_array)
+                        .map(Vec::len),
+                    Some(1)
+                );
+                assert_eq!(result.as_ref().map(|result| result.duration_ms), Some(25));
+            }
+            other => panic!("expected completed search action block, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn diff_update_collapses_existing_same_scope_diff_blocks() {
         let mut blocks = vec![
             ContentBlock::Diff {
@@ -6344,9 +6498,20 @@ mod tests {
                 diff: "old diff 2".to_string(),
                 scope: "turn".to_string(),
             },
+            ContentBlock::Action {
+                action_id: "action-after-diff".to_string(),
+                engine_action_id: None,
+                action_type: "other".to_string(),
+                summary: "Continue".to_string(),
+                details: empty_raw_value(),
+                output_chunks: Vec::new(),
+                status: "running".to_string(),
+                result: None,
+            },
         ];
         let mut action_index = HashMap::new();
         let mut approval_index = HashMap::new();
+        rebuild_block_indexes(&blocks, &mut action_index, &mut approval_index);
 
         let progress = apply_event_to_blocks(
             &mut blocks,
@@ -6361,7 +6526,7 @@ mod tests {
         );
 
         assert!(progress.blocks_changed);
-        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks.len(), 3);
         assert!(matches!(
             &blocks[0],
             ContentBlock::Text { content, .. } if content == "kept"
@@ -6370,6 +6535,30 @@ mod tests {
             &blocks[1],
             ContentBlock::Diff { diff, scope } if diff == "new diff" && scope == "turn"
         ));
+
+        let follow_up = apply_event_to_blocks(
+            &mut blocks,
+            &mut action_index,
+            &mut approval_index,
+            &EngineEvent::ActionProgressUpdated {
+                action_id: "action-after-diff".to_string(),
+                message: "Still in sequence".to_string(),
+            },
+            1000,
+            None,
+        );
+        assert!(follow_up.blocks_changed);
+        match &blocks[2] {
+            ContentBlock::Action { details, .. } => {
+                let details: Value = serde_json::from_str(details.get())
+                    .expect("action details should remain valid JSON");
+                assert_eq!(
+                    details.get("progressMessage").and_then(Value::as_str),
+                    Some("Still in sequence")
+                );
+            }
+            other => panic!("expected action after collapsed diff, got {other:?}"),
+        }
     }
 
     #[test]

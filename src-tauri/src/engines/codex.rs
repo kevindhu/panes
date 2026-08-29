@@ -37,10 +37,11 @@ use super::{
     },
     codex_protocol::{raw_value_to_value, IncomingMessage},
     codex_transport::CodexTransport,
-    ActionResult, ApprovalRequestRoute, CodexRemoteThreadSummary, Engine, EngineEvent, EngineThread,
-    ImportedThreadMessage, ModelAvailabilityNux, ModelInfo, ModelUpgradeInfo,
-    ReasoningEffortOption, SandboxPolicy, ThreadScope, ThreadSyncSnapshot, TurnAttachment,
-    TurnCompletionDiagnostics, TurnCompletionSource, TurnCompletionStatus, TurnInput, TurnInputItem,
+    ActionResult, ApprovalRequestRoute, CodexNativeEventKind, CodexRemoteThreadSummary, Engine,
+    EngineEvent, EngineThread, ImportedThreadMessage, ModelAvailabilityNux, ModelInfo,
+    ModelUpgradeInfo, ReasoningEffortOption, SandboxPolicy, SteerMarker, SteerReceipt, ThreadScope,
+    ThreadSyncSnapshot, TurnAttachment, TurnCompletionDiagnostics, TurnCompletionSource,
+    TurnCompletionStatus, TurnInput, TurnInputItem,
 };
 
 const INITIALIZE_METHODS: &[&str] = &["initialize"];
@@ -82,10 +83,11 @@ const TRANSPORT_RESTART_MAX_ATTEMPTS: usize = 3;
 const TRANSPORT_RESTART_BASE_BACKOFF: Duration = Duration::from_millis(250);
 const TRANSPORT_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(2);
 const CODEX_MISSING_DEFAULT_DETAILS: &str = "`codex` executable not found in PATH";
+const FAST_DURABLE_FORK_MIN_VERSION: (u64, u64, u64) = (0, 150, 1);
 const MAX_ATTACHMENTS_PER_TURN: usize = 10;
 const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_TEXT_ATTACHMENT_CHARS: usize = 40_000;
-const PLAN_MODE_PROMPT_PREFIX: &str = "Plan the solution first. Do not execute commands or edit files until the plan is complete. Reply with a structured plan using one line per step in the exact format `- [pending] Step`.";
+const REASONING_SUMMARY_LEVEL: &str = "detailed";
 
 pub struct CodexEngine {
     state: Arc<Mutex<CodexState>>,
@@ -118,7 +120,6 @@ struct ThreadRuntime {
 enum PlanModeActivation {
     Disabled,
     NativeCollaboration,
-    PromptPrefix,
 }
 
 struct TurnStartOutcome {
@@ -664,7 +665,11 @@ impl Engine for CodexEngine {
                     return Ok(EngineThread { engine_thread_id });
                 }
                 Err(error) => {
-                    log::warn!("codex thread resume failed, falling back to thread/start: {error}");
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to resume persisted codex thread {existing_thread_id}; refusing to replace it with an empty thread"
+                        )
+                    });
                 }
             }
         }
@@ -1198,7 +1203,8 @@ impl Engine for CodexEngine {
         &self,
         engine_thread_id: &str,
         input: TurnInput,
-    ) -> Result<(), anyhow::Error> {
+        marker: SteerMarker,
+    ) -> Result<SteerReceipt, anyhow::Error> {
         let transport = self.ensure_ready_transport().await?;
         validate_turn_attachments(&input.attachments).await?;
 
@@ -1213,11 +1219,10 @@ impl Engine for CodexEngine {
             engine_thread_id,
             &expected_turn_id,
             &input,
+            &marker,
         )
         .await
-        .context("turn/steer request failed")?;
-
-        Ok(())
+        .context("turn/steer request failed")
     }
 
     async fn respond_to_approval(
@@ -1418,7 +1423,6 @@ impl CodexEngine {
             .clone()
             .unwrap_or_else(default_codex_approval_policy);
         let force_external_sandbox = self.resolve_external_sandbox_mode().await;
-        let sandbox_mode = sandbox_mode_from_policy(&sandbox, force_external_sandbox);
         let sandbox_policy = sandbox_policy_to_json(&sandbox, force_external_sandbox);
         let requested_runtime = ThreadRuntime {
             cwd: cwd.to_string(),
@@ -1437,19 +1441,22 @@ impl CodexEngine {
         let response = request_with_fallback(
             transport.as_ref(),
             THREAD_FORK_METHODS,
-            build_thread_fork_params(
-                engine_thread_id,
-                cwd,
-                model,
-                &approval_policy,
-                &sandbox_mode,
-                last_turn_id,
-                &sandbox,
-            ),
+            build_thread_fork_params(engine_thread_id, last_turn_id),
             DEFAULT_TIMEOUT,
         )
         .await
         .context("failed to fork codex thread")?;
+
+        let returned_thread = response.get("thread").unwrap_or(&response);
+        if returned_thread
+            .get("ephemeral")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            anyhow::bail!(
+                "codex returned an ephemeral fork even though Panes requested a durable rollout"
+            );
+        }
 
         let new_engine_thread_id = extract_thread_id(&response)
             .ok_or_else(|| anyhow::anyhow!("missing thread id in thread/fork response"))?;
@@ -1513,7 +1520,13 @@ impl CodexEngine {
                 let resume_response = request_with_fallback(
                     transport.as_ref(),
                     THREAD_RESUME_METHODS,
-                    serde_json::json!({ "threadId": engine_thread_id }),
+                    serde_json::json!({
+                        "threadId": engine_thread_id,
+                        // Loading the persisted rollout is required; serializing every
+                        // turn back to Panes is not. Omitting that response payload keeps
+                        // the restart recovery path fast on long conversations.
+                        "excludeTurns": true,
+                    }),
                     DEFAULT_TIMEOUT,
                 )
                 .await
@@ -2089,6 +2102,15 @@ impl CodexEngine {
         };
 
         if available {
+            if version
+                .as_deref()
+                .is_some_and(|value| !codex_version_supports_fast_durable_forks(value))
+            {
+                warnings.push(
+                    "Codex CLI 0.150.1 or newer is required for sub-second durable forks. Update with `npm install -g @openai/codex@latest`, then restart Panes."
+                        .to_string(),
+                );
+            }
             if let Some(warning) = self.sandbox_preflight_warning().await {
                 warnings.push(warning);
             }
@@ -2699,6 +2721,8 @@ impl CodexEngine {
             let transport = state.transport.take();
             state.initialized = false;
             state.approval_requests.clear();
+            state.active_turn_ids.clear();
+            state.thread_runtimes.clear();
             state.sandbox_probe_completed = false;
             state.force_external_sandbox = false;
             if let Some(diagnostics) = state.protocol_diagnostics.as_mut() {
@@ -2810,19 +2834,13 @@ impl CodexEngine {
             state.protocol_diagnostics.clone()
         };
 
-        let mut advertised_activation = None;
-        if let Some(diagnostics) = cached_diagnostics.as_ref() {
-            if !diagnostics.stale {
-                advertised_activation = plan_mode_activation_from_diagnostics(Some(diagnostics));
-            }
-        }
-
-        if advertised_activation.is_none() {
-            let refreshed_diagnostics = self.protocol_diagnostics_snapshot().await;
-            advertised_activation =
-                plan_mode_activation_from_diagnostics(refreshed_diagnostics.as_ref())
-                    .or_else(|| plan_mode_activation_from_diagnostics(cached_diagnostics.as_ref()));
-        }
+        // Turn submission is the hot path. Current Codex accepts the native
+        // collaboration payload directly, so a missing/stale health snapshot
+        // must not add a blocking capability round-trip before every Plan turn.
+        let advertised_activation = cached_diagnostics
+            .as_ref()
+            .filter(|diagnostics| !diagnostics.stale)
+            .and_then(|diagnostics| plan_mode_activation_from_diagnostics(Some(diagnostics)));
 
         resolve_requested_plan_mode_activation(
             input.plan_mode,
@@ -3108,13 +3126,14 @@ impl CodexEngine {
                                     );
                                 }
                             }
-                            "skills/changed" | "app/list/updated" => {
+                            "app/list/updated" => {
+                                // The notification already carries the complete app list. Calling
+                                // `app/list` here creates a feedback loop because a forced app-list
+                                // fetch emits another `app/list/updated` notification.
                                 if let Some(diagnostics) =
-                                    refresh_protocol_diagnostics_with_fallback(
-                                        transport.as_ref(),
+                                    update_protocol_diagnostics_with_app_list(
                                         state.clone(),
-                                        &format!("after {normalized_method}"),
-                                        false,
+                                        &params,
                                     )
                                     .await
                                 {
@@ -3125,6 +3144,30 @@ impl CodexEngine {
                                         },
                                     );
                                 }
+                            }
+                            "skills/changed" => {
+                                // Skill changes are an invalidation signal, not a reason to run the
+                                // full diagnostics suite (which also probes apps and MCP servers).
+                                // Refresh only skills and keep draining runtime events meanwhile.
+                                let transport = transport.clone();
+                                let state = state.clone();
+                                let runtime_events = runtime_events.clone();
+                                tokio::spawn(async move {
+                                    if let Some(diagnostics) =
+                                        refresh_protocol_skills_for_runtime_monitor(
+                                            transport.as_ref(),
+                                            state,
+                                        )
+                                        .await
+                                    {
+                                        let _ = runtime_events.send(
+                                            CodexRuntimeEvent::DiagnosticsUpdated {
+                                                diagnostics,
+                                                toast: None,
+                                            },
+                                        );
+                                    }
+                                });
                             }
                             "thread/realtime/started"
                             | "thread/realtime/closed"
@@ -3667,6 +3710,23 @@ fn codex_health_checks() -> Vec<String> {
     codex_health_checks_for_platform(runtime_env::platform_id())
 }
 
+fn codex_version_supports_fast_durable_forks(raw: &str) -> bool {
+    let Some(version) = raw.split_whitespace().find_map(|token| {
+        let token = token.trim_start_matches('v');
+        let core = token.split(['-', '+']).next()?;
+        let mut parts = core.split('.');
+        Some((
+            parts.next()?.parse::<u64>().ok()?,
+            parts.next()?.parse::<u64>().ok()?,
+            parts.next()?.parse::<u64>().ok()?,
+        ))
+    }) else {
+        return false;
+    };
+
+    version >= FAST_DURABLE_FORK_MIN_VERSION
+}
+
 fn codex_health_checks_for_platform(platform: &str) -> Vec<String> {
     let mut checks = vec![
         "codex --version".to_string(),
@@ -3881,55 +3941,27 @@ async fn request_turn_start(
     let uses_native_collaboration_mode =
         should_use_native_collaboration_mode(plan_mode_activation, runtime_ref);
 
+    if input.plan_mode && !uses_native_collaboration_mode {
+        anyhow::bail!(
+            "Codex native plan mode is unavailable because the thread runtime has no model. Restart Codex and retry the turn."
+        );
+    }
+
     let primary_params =
         build_turn_start_params(thread_id, runtime_ref, &input, plan_mode_activation).await?;
-    match request_with_fallback(
+    let result = request_with_fallback(
         transport,
         TURN_START_METHODS,
         primary_params,
         TURN_REQUEST_TIMEOUT,
     )
     .await
-    {
-        Ok(result) => Ok(TurnStartOutcome {
-            result,
-            native_plan_mode_active: input.plan_mode && uses_native_collaboration_mode,
-        }),
-        Err(error) => {
-            if !uses_native_collaboration_mode || !is_plan_mode_protocol_error(&error.to_string()) {
-                return Err(error).context("codex turn/start request failed");
-            }
+    .context("codex turn/start request failed")?;
 
-            let fallback_activation = if input.plan_mode {
-                log::warn!(
-                    "native codex plan mode rejected by app-server; retrying with prompt-guided fallback: {error}"
-                );
-                PlanModeActivation::PromptPrefix
-            } else {
-                log::warn!(
-                    "native codex collaboration-mode reset rejected by app-server; retrying without collaboration mode override: {error}"
-                );
-                PlanModeActivation::Disabled
-            };
-
-            let fallback_params =
-                build_turn_start_params(thread_id, runtime_ref, &input, fallback_activation)
-                    .await?;
-            let result = request_with_fallback(
-                transport,
-                TURN_START_METHODS,
-                fallback_params,
-                TURN_REQUEST_TIMEOUT,
-            )
-            .await
-            .context("codex turn/start request failed after plan-mode fallback")?;
-
-            Ok(TurnStartOutcome {
-                result,
-                native_plan_mode_active: false,
-            })
-        }
-    }
+    Ok(TurnStartOutcome {
+        result,
+        native_plan_mode_active: input.plan_mode && uses_native_collaboration_mode,
+    })
 }
 
 async fn request_turn_steer(
@@ -3937,16 +3969,104 @@ async fn request_turn_steer(
     thread_id: &str,
     expected_turn_id: &str,
     input: &TurnInput,
-) -> anyhow::Result<serde_json::Value> {
+    marker: &SteerMarker,
+) -> anyhow::Result<SteerReceipt> {
     let params = serde_json::json!({
       "threadId": thread_id,
       "expectedTurnId": expected_turn_id,
-      "input": build_turn_input_items(input, false).await?,
+      "input": build_turn_input_items(input).await?,
     });
-
-    request_with_fallback(transport, TURN_STEER_METHODS, params, TURN_REQUEST_TIMEOUT)
+    let method = TURN_STEER_METHODS[0];
+    let submitted = serde_json::json!({
+        "steerId": marker.steer_id,
+        "messageId": marker.message_id,
+        "status": "submitted",
+        "display": marker.display,
+        "request": {
+            "method": method,
+            "params": params,
+        },
+    });
+    let source_sequence = transport
+        .capture_client_event(
+            CodexNativeEventKind::ClientRequest,
+            method,
+            Some(marker.steer_id.clone()),
+            thread_id,
+            expected_turn_id,
+            serde_json::to_string(&submitted)
+                .context("failed to serialize submitted turn/steer marker")?,
+        )
         .await
-        .context("codex turn/steer request failed")
+        .context("failed to record submitted turn/steer marker")?;
+
+    match transport
+        .request(method, params, TURN_REQUEST_TIMEOUT)
+        .await
+    {
+        Ok(result) => {
+            let accepted = serde_json::json!({
+                "steerId": marker.steer_id,
+                "messageId": marker.message_id,
+                "status": "accepted",
+                "result": result,
+            });
+            let accepted_source_sequence = match transport
+                .capture_client_event(
+                    CodexNativeEventKind::ClientResponse,
+                    method,
+                    Some(marker.steer_id.clone()),
+                    thread_id,
+                    expected_turn_id,
+                    serde_json::to_string(&accepted)
+                        .context("failed to serialize accepted turn/steer marker")?,
+                )
+                .await
+            {
+                Ok(sequence) => Some(sequence),
+                Err(error) => {
+                    log::error!(
+                        "turn/steer was accepted but its receipt could not be captured: thread={thread_id}, turn={expected_turn_id}, steer={}; error={error}",
+                        marker.steer_id
+                    );
+                    None
+                }
+            };
+            Ok(SteerReceipt {
+                steer_id: marker.steer_id.clone(),
+                message_id: marker.message_id.clone(),
+                native_turn_id: expected_turn_id.to_owned(),
+                source_sequence,
+                accepted_source_sequence,
+            })
+        }
+        Err(error) => {
+            let failed = serde_json::json!({
+                "steerId": marker.steer_id,
+                "messageId": marker.message_id,
+                "status": "failed",
+                "error": format!("{error:#}"),
+            });
+            if let Err(capture_error) = transport
+                .capture_client_event(
+                    CodexNativeEventKind::ClientResponse,
+                    method,
+                    Some(marker.steer_id.clone()),
+                    thread_id,
+                    expected_turn_id,
+                    serde_json::to_string(&failed)
+                        .context("failed to serialize failed turn/steer marker")?,
+                )
+                .await
+            {
+                log::error!(
+                    "failed to capture rejected turn/steer receipt: thread={thread_id}, turn={expected_turn_id}, steer={}; error={capture_error}",
+                    marker.steer_id
+                );
+            }
+            Err(error).context("codex turn/steer request failed")
+        }
+    }
 }
 
 async fn build_turn_start_params(
@@ -3959,12 +4079,10 @@ async fn build_turn_start_params(
         should_use_native_collaboration_mode(plan_mode_activation, runtime);
     let mut turn_params = serde_json::json!({
       "threadId": thread_id,
-      "input": build_turn_input_items(
-          input,
-          matches!(plan_mode_activation, PlanModeActivation::PromptPrefix)
-              || (input.plan_mode && !use_native_collaboration_mode),
-      )
-      .await?,
+      "input": build_turn_input_items(input).await?,
+      // Without an explicit summary level Codex can emit a reasoning item with
+      // no user-readable text, leaving the transcript at "Still thinking".
+      "summary": REASONING_SUMMARY_LEVEL,
     });
 
     if let Some(runtime) = runtime {
@@ -4018,14 +4136,6 @@ async fn build_turn_start_params(
                     collaboration_mode_protocol_payload(runtime, input.plan_mode)
                 {
                     params.insert("collaborationMode".to_string(), collaboration_mode);
-                    params.insert(
-                        "summary".to_string(),
-                        if input.plan_mode {
-                            serde_json::Value::String("detailed".to_string())
-                        } else {
-                            serde_json::Value::Null
-                        },
-                    );
                 }
             }
         }
@@ -4034,10 +4144,7 @@ async fn build_turn_start_params(
     Ok(turn_params)
 }
 
-async fn build_turn_input_items(
-    input: &TurnInput,
-    force_plan_prompt_prefix: bool,
-) -> anyhow::Result<Vec<serde_json::Value>> {
+async fn build_turn_input_items(input: &TurnInput) -> anyhow::Result<Vec<serde_json::Value>> {
     let base_items = if input.input_items.is_empty() {
         vec![TurnInputItem::Text {
             text: input.message.clone(),
@@ -4046,9 +4153,8 @@ async fn build_turn_input_items(
         input.input_items.clone()
     };
 
-    let text_items = apply_plan_prompt_prefix(base_items, force_plan_prompt_prefix);
-    let mut items = Vec::with_capacity(text_items.len() + input.attachments.len());
-    for item in text_items {
+    let mut items = Vec::with_capacity(base_items.len() + input.attachments.len());
+    for item in base_items {
         match item {
             TurnInputItem::Text { text } => {
                 items.push(serde_json::json!({
@@ -4133,6 +4239,13 @@ fn collaboration_mode_protocol_payload(
             serde_json::Value::String(effort.clone()),
         );
     }
+    // Codex app-server defines explicit null as "use the built-in instructions
+    // for the selected collaboration mode". Always send it for both Plan and
+    // Default so a mode switch also emits the authoritative Default reset.
+    settings.insert(
+        "developer_instructions".to_string(),
+        serde_json::Value::Null,
+    );
 
     Some(serde_json::json!({
       "mode": if plan_mode { "plan" } else { "default" },
@@ -4166,19 +4279,11 @@ fn plan_mode_activation_from_diagnostics(
         .map(|entry| entry.status.as_str());
 
     match availability {
-        Some("available") => Some(if advertises_plan {
-            PlanModeActivation::NativeCollaboration
-        } else {
-            PlanModeActivation::PromptPrefix
-        }),
-        Some("unsupported") => Some(PlanModeActivation::PromptPrefix),
+        Some("available") if advertises_plan => Some(PlanModeActivation::NativeCollaboration),
+        Some("available") | Some("unsupported") => None,
         Some("error") => None,
         Some(_) => None,
-        None if !diagnostics.collaboration_modes.is_empty() => Some(if advertises_plan {
-            PlanModeActivation::NativeCollaboration
-        } else {
-            PlanModeActivation::PromptPrefix
-        }),
+        None if advertises_plan => Some(PlanModeActivation::NativeCollaboration),
         None => None,
     }
 }
@@ -4189,7 +4294,10 @@ fn resolve_requested_plan_mode_activation(
     advertised_activation: Option<PlanModeActivation>,
 ) -> PlanModeActivation {
     if plan_mode {
-        return advertised_activation.unwrap_or(PlanModeActivation::NativeCollaboration);
+        // A stale or failed capability probe must never downgrade Plan into a
+        // prompt imitation. Current Codex exposes Plan as a native mode; let the
+        // native request either succeed or return its real protocol error.
+        return PlanModeActivation::NativeCollaboration;
     }
 
     // The UI's normal-mode state is an explicit contract for the next turn. Do not
@@ -4204,52 +4312,8 @@ fn resolve_requested_plan_mode_activation(
     {
         PlanModeActivation::NativeCollaboration
     } else {
-        // Prompt-guided plan mode has no native server state to reset. A normal
-        // unprefixed turn is therefore the explicit default-mode request.
         PlanModeActivation::Disabled
     }
-}
-
-fn apply_plan_prompt_prefix(items: Vec<TurnInputItem>, include_prefix: bool) -> Vec<TurnInputItem> {
-    if !include_prefix {
-        return items;
-    }
-
-    let mut prefixed = Vec::with_capacity(items.len().saturating_add(1));
-    let mut applied = false;
-    for item in items {
-        match item {
-            TurnInputItem::Text { text } if !applied => {
-                let text = if text.is_empty() {
-                    PLAN_MODE_PROMPT_PREFIX.to_string()
-                } else {
-                    format!("{}\n\n{}", PLAN_MODE_PROMPT_PREFIX, text)
-                };
-                prefixed.push(TurnInputItem::Text { text });
-                applied = true;
-            }
-            other => prefixed.push(other),
-        }
-    }
-
-    if !applied {
-        prefixed.insert(
-            0,
-            TurnInputItem::Text {
-                text: PLAN_MODE_PROMPT_PREFIX.to_string(),
-            },
-        );
-    }
-
-    prefixed
-}
-
-fn is_plan_mode_protocol_error(error: &str) -> bool {
-    let value = error.to_lowercase();
-    value.contains("collaborationmode")
-        || value.contains("collaboration_mode")
-        || value.contains("unknown field `collaboration")
-        || (value.contains("unknown field") && value.contains("plan"))
 }
 
 async fn validate_turn_attachments(attachments: &[TurnAttachment]) -> anyhow::Result<()> {
@@ -4482,6 +4546,7 @@ fn build_thread_resume_params(
     insert_optional_string(&mut params, "approvalsReviewer", approvals_reviewer);
     insert_optional_string(&mut params, "serviceTier", service_tier);
     insert_optional_string(&mut params, "personality", personality);
+    params.insert("excludeTurns".to_string(), serde_json::Value::Bool(true));
     params.insert(
         "persistExtendedHistory".to_string(),
         serde_json::Value::Bool(false),
@@ -4529,53 +4594,20 @@ fn build_thread_start_params(
     serde_json::Value::Object(params)
 }
 
-fn build_thread_fork_params(
-    thread_id: &str,
-    cwd: &str,
-    model: &str,
-    approval_policy: &serde_json::Value,
-    sandbox_mode: &str,
-    last_turn_id: Option<&str>,
-    sandbox: &SandboxPolicy,
-) -> serde_json::Value {
+fn build_thread_fork_params(thread_id: &str, last_turn_id: Option<&str>) -> serde_json::Value {
     let mut params = serde_json::Map::new();
     params.insert(
         "threadId".to_string(),
         serde_json::Value::String(thread_id.to_string()),
     );
-    params.insert(
-        "cwd".to_string(),
-        serde_json::Value::String(cwd.to_string()),
-    );
-    params.insert(
-        "model".to_string(),
-        serde_json::Value::String(model.to_string()),
-    );
-    params.insert("approvalPolicy".to_string(), approval_policy.clone());
-    insert_permission_or_sandbox(
-        &mut params,
-        sandbox.permission_profile.as_ref(),
-        sandbox_mode,
-    );
-    insert_optional_string(
-        &mut params,
-        "approvalsReviewer",
-        sandbox.approvals_reviewer.as_deref(),
-    );
-    insert_optional_string(&mut params, "serviceTier", sandbox.service_tier.as_deref());
-    insert_optional_string(&mut params, "personality", sandbox.personality.as_deref());
     insert_optional_string(&mut params, "lastTurnId", last_turn_id);
-    // Panes clones its persisted transcript locally. Asking Codex to hydrate and
-    // return every historical turn makes thread/fork take seconds on long chats.
-    params.insert(
-        "excludeTurns".to_string(),
-        serde_json::Value::Bool(true),
-    );
-    // A durable Codex fork rewrites the complete parent rollout before it
-    // responds. Long threads can spend 10+ seconds duplicating that file.
-    // Panes already persists the branch transcript, so keep the native fork
-    // in the live app-server and avoid that synchronous history rewrite.
-    params.insert("ephemeral".to_string(), serde_json::Value::Bool(true));
+    // A user-visible fork must always be backed by a Codex rollout. Ephemeral
+    // forks exist only in the current app-server process and cannot be resumed
+    // after that process restarts.
+    params.insert("ephemeral".to_string(), serde_json::Value::Bool(false));
+    // Fork-time runtime overrides and `excludeTurns` both force slower setup paths
+    // in current Codex releases. The child inherits the source runtime here; Panes
+    // applies the selected model, permissions, and cwd on the next turn instead.
     serde_json::Value::Object(params)
 }
 
@@ -4911,7 +4943,7 @@ fn extract_thread_id(value: &serde_json::Value) -> Option<String> {
 }
 
 fn extract_turn_id(value: &serde_json::Value) -> Option<String> {
-    if let Some(id) = extract_any_string(value, &["turnId", "turn_id"]) {
+    if let Some(id) = extract_any_string(value, &["id", "turnId", "turn_id"]) {
         return Some(id);
     }
 
@@ -6069,7 +6101,9 @@ async fn fetch_apps(transport: &CodexTransport) -> MethodCallOutcome<Vec<CodexAp
         serde_json::json!({
             "limit": 200,
             "cursor": cursor,
-            "forceRefetch": true,
+            // Background consumers use Codex's cached directory. A forced refetch emits
+            // `app/list/updated`, so forcing it from notification handling can recurse forever.
+            "forceRefetch": false,
         })
     })
     .await
@@ -6078,27 +6112,28 @@ async fn fetch_apps(transport: &CodexTransport) -> MethodCallOutcome<Vec<CodexAp
         Err(error) => return method_call_outcome_from_error(error),
     };
 
-    MethodCallOutcome::Available(
-        response
-            .into_iter()
-            .map(|entry| CodexAppDto {
-                id: extract_any_string(&entry, &["id"]).unwrap_or_else(|| "unknown".to_string()),
-                name: extract_any_string(&entry, &["name"])
-                    .unwrap_or_else(|| "unknown".to_string()),
-                description: extract_any_string(&entry, &["description"]),
-                is_enabled: entry
-                    .get("isEnabled")
-                    .or_else(|| entry.get("is_enabled"))
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(true),
-                is_accessible: entry
-                    .get("isAccessible")
-                    .or_else(|| entry.get("is_accessible"))
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false),
-            })
-            .collect(),
-    )
+    MethodCallOutcome::Available(map_app_entries(&response))
+}
+
+fn map_app_entries(entries: &[serde_json::Value]) -> Vec<CodexAppDto> {
+    entries
+        .iter()
+        .map(|entry| CodexAppDto {
+            id: extract_any_string(entry, &["id"]).unwrap_or_else(|| "unknown".to_string()),
+            name: extract_any_string(entry, &["name"]).unwrap_or_else(|| "unknown".to_string()),
+            description: extract_any_string(entry, &["description"]),
+            is_enabled: entry
+                .get("isEnabled")
+                .or_else(|| entry.get("is_enabled"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true),
+            is_accessible: entry
+                .get("isAccessible")
+                .or_else(|| entry.get("is_accessible"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        })
+        .collect()
 }
 
 fn map_skill_entries(entries: &[serde_json::Value]) -> Vec<CodexSkillDto> {
@@ -6755,6 +6790,75 @@ async fn refresh_protocol_diagnostics_with_fallback(
             }
         }
     }
+}
+
+async fn refresh_protocol_skills_for_runtime_monitor(
+    transport: &CodexTransport,
+    state: Arc<Mutex<CodexState>>,
+) -> Option<CodexProtocolDiagnosticsDto> {
+    let skills = fetch_skills(transport).await;
+    let mut state = state.lock().await;
+    let diagnostics = state
+        .protocol_diagnostics
+        .get_or_insert_with(Default::default);
+
+    let availability = match skills {
+        MethodCallOutcome::Available(value) => {
+            diagnostics.skills = value;
+            CodexMethodAvailabilityDto {
+                method: "skills/list".to_string(),
+                status: "available".to_string(),
+                detail: None,
+            }
+        }
+        MethodCallOutcome::Unsupported(detail) => {
+            diagnostics.skills.clear();
+            CodexMethodAvailabilityDto {
+                method: "skills/list".to_string(),
+                status: "unsupported".to_string(),
+                detail,
+            }
+        }
+        MethodCallOutcome::Error(detail) => CodexMethodAvailabilityDto {
+            method: "skills/list".to_string(),
+            status: "error".to_string(),
+            detail: Some(detail),
+        },
+    };
+    update_method_availability(diagnostics, "skills/list", availability);
+    diagnostics.fetched_at = Some(Utc::now().to_rfc3339());
+    diagnostics
+        .method_availability
+        .sort_by(|left, right| left.method.cmp(&right.method));
+    Some(diagnostics.clone())
+}
+
+async fn update_protocol_diagnostics_with_app_list(
+    state: Arc<Mutex<CodexState>>,
+    params: &serde_json::Value,
+) -> Option<CodexProtocolDiagnosticsDto> {
+    let entries = params.get("data")?.as_array()?;
+    let apps = map_app_entries(entries);
+
+    let mut state = state.lock().await;
+    let diagnostics = state
+        .protocol_diagnostics
+        .get_or_insert_with(Default::default);
+    diagnostics.apps = apps;
+    update_method_availability(
+        diagnostics,
+        "app/list",
+        CodexMethodAvailabilityDto {
+            method: "app/list".to_string(),
+            status: "available".to_string(),
+            detail: None,
+        },
+    );
+    diagnostics.fetched_at = Some(Utc::now().to_rfc3339());
+    diagnostics
+        .method_availability
+        .sort_by(|left, right| left.method.cmp(&right.method));
+    Some(diagnostics.clone())
 }
 
 async fn update_protocol_diagnostics_with_config_warning(
@@ -7743,32 +7847,11 @@ mod tests {
 
     #[test]
     fn thread_fork_params_include_bounded_history_cutoff() {
-        let sandbox = SandboxPolicy {
-            writable_roots: vec!["/tmp/workspace".to_string()],
-            allow_network: false,
-            approval_policy: None,
-            permission_profile: None,
-            approvals_reviewer: None,
-            reasoning_effort: None,
-            sandbox_mode: Some("workspace-write".to_string()),
-            service_tier: None,
-            personality: None,
-            output_schema: None,
-        };
-
-        let params = build_thread_fork_params(
-            "thread-1",
-            "/tmp/workspace",
-            "gpt-5.4",
-            &default_codex_approval_policy(),
-            "workspace-write",
-            Some("turn-2"),
-            &sandbox,
-        );
+        let params = build_thread_fork_params("thread-1", Some("turn-2"));
 
         assert_eq!(params.get("lastTurnId"), Some(&json!("turn-2")));
-        assert_eq!(params.get("excludeTurns"), Some(&json!(true)));
-        assert_eq!(params.get("ephemeral"), Some(&json!(true)));
+        assert_eq!(params.get("ephemeral"), Some(&json!(false)));
+        assert_eq!(params.as_object().map(serde_json::Map::len), Some(3));
     }
 
     #[test]
@@ -7839,6 +7922,7 @@ mod tests {
                 "sandbox": "workspace-write",
                 "serviceTier": "fast",
                 "personality": "friendly",
+                "excludeTurns": true,
                 "persistExtendedHistory": false,
             })
         );
@@ -7888,6 +7972,7 @@ mod tests {
                 "settings": {
                     "model": "gpt-5.4",
                     "reasoning_effort": "medium",
+                    "developer_instructions": null,
                 }
             }))
         );
@@ -7951,10 +8036,11 @@ mod tests {
                 "settings": {
                     "model": "gpt-5.4",
                     "reasoning_effort": "medium",
+                    "developer_instructions": null,
                 }
             }))
         );
-        assert_eq!(params.get("summary"), Some(&Value::Null));
+        assert_eq!(params.get("summary"), Some(&json!("detailed")));
 
         let payload = params
             .get("input")
@@ -8011,18 +8097,14 @@ mod tests {
                 .and_then(|value| value.get("mode")),
             Some(&json!("default"))
         );
-        assert_eq!(params.get("summary"), Some(&Value::Null));
+        assert_eq!(params.get("summary"), Some(&json!("detailed")));
     }
 
     #[test]
-    fn normal_turn_uses_an_unprefixed_default_when_native_collaboration_is_unsupported() {
+    fn plan_turn_stays_native_when_capability_probe_is_unavailable() {
         assert_eq!(
-            resolve_requested_plan_mode_activation(
-                false,
-                false,
-                Some(PlanModeActivation::PromptPrefix),
-            ),
-            PlanModeActivation::Disabled
+            resolve_requested_plan_mode_activation(true, false, None,),
+            PlanModeActivation::NativeCollaboration
         );
     }
 
@@ -8035,7 +8117,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_turn_start_params_uses_prompt_fallback_when_plan_mode_is_not_native() {
+    async fn build_turn_start_params_never_rewrites_native_plan_input() {
         let runtime = ThreadRuntime {
             cwd: "/tmp/workspace".to_string(),
             model_id: "gpt-5.4".to_string(),
@@ -8066,13 +8148,23 @@ mod tests {
             "thread-123",
             Some(&runtime),
             &input,
-            PlanModeActivation::PromptPrefix,
+            PlanModeActivation::NativeCollaboration,
         )
         .await
         .expect("turn/start params");
 
-        assert_eq!(params.get("collaborationMode"), None);
-        assert_eq!(params.get("summary"), None);
+        assert_eq!(
+            params.get("collaborationMode"),
+            Some(&json!({
+                "mode": "plan",
+                "settings": {
+                    "model": "gpt-5.4",
+                    "reasoning_effort": "medium",
+                    "developer_instructions": null,
+                }
+            }))
+        );
+        assert_eq!(params.get("summary"), Some(&json!("detailed")));
 
         let payload = params
             .get("input")
@@ -8082,9 +8174,7 @@ mod tests {
             .get("text")
             .and_then(Value::as_str)
             .expect("text payload");
-        assert!(text.starts_with(PLAN_MODE_PROMPT_PREFIX));
-        assert!(text.contains("- [pending] Step"));
-        assert!(text.contains("Inspect the repo first"));
+        assert_eq!(text, "Inspect the repo first");
     }
 
     #[tokio::test]
@@ -8104,7 +8194,7 @@ mod tests {
                 .expect("turn/start params");
 
         assert_eq!(params.get("collaborationMode"), None);
-        assert_eq!(params.get("summary"), None);
+        assert_eq!(params.get("summary"), Some(&json!("detailed")));
 
         let payload = params
             .get("input")
@@ -8149,7 +8239,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_activation_falls_back_when_plan_is_not_advertised() {
+    fn unsupported_probe_does_not_advertise_a_prompt_fallback() {
         let diagnostics = CodexProtocolDiagnosticsDto {
             method_availability: vec![CodexMethodAvailabilityDto {
                 method: "collaborationMode/list".to_string(),
@@ -8176,7 +8266,11 @@ mod tests {
 
         assert_eq!(
             plan_mode_activation_from_diagnostics(Some(&diagnostics)),
-            Some(PlanModeActivation::PromptPrefix)
+            None
+        );
+        assert_eq!(
+            resolve_requested_plan_mode_activation(true, false, None),
+            PlanModeActivation::NativeCollaboration
         );
     }
 
@@ -9066,6 +9160,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_list_notification_updates_diagnostics_without_a_transport_refresh() {
+        let state = Arc::new(Mutex::new(CodexState::default()));
+        {
+            let mut locked = state.lock().await;
+            locked.protocol_diagnostics = Some(CodexProtocolDiagnosticsDto {
+                method_availability: vec![CodexMethodAvailabilityDto {
+                    method: "mcpServerStatus/list".to_string(),
+                    status: "available".to_string(),
+                    detail: None,
+                }],
+                stale: true,
+                ..Default::default()
+            });
+        }
+
+        // This helper deliberately has no transport argument: app/list/updated already contains
+        // the complete response and must never trigger another app/list request.
+        let diagnostics = update_protocol_diagnostics_with_app_list(
+            state,
+            &json!({
+                "data": [
+                    {
+                        "id": "connected-app",
+                        "name": "Connected App",
+                        "description": "Ready",
+                        "isEnabled": false,
+                        "isAccessible": true
+                    },
+                    {
+                        "id": "default-flags",
+                        "name": "Default Flags"
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("app diagnostics should update");
+
+        assert_eq!(diagnostics.apps.len(), 2);
+        assert_eq!(diagnostics.apps[0].id, "connected-app");
+        assert!(!diagnostics.apps[0].is_enabled);
+        assert!(diagnostics.apps[0].is_accessible);
+        assert!(diagnostics.apps[1].is_enabled);
+        assert!(!diagnostics.apps[1].is_accessible);
+        assert!(
+            diagnostics.stale,
+            "a component update must preserve global staleness"
+        );
+        assert!(diagnostics
+            .method_availability
+            .iter()
+            .any(|entry| entry.method == "mcpServerStatus/list"));
+        let app_availability = diagnostics
+            .method_availability
+            .iter()
+            .find(|entry| entry.method == "app/list")
+            .expect("app/list availability");
+        assert_eq!(app_availability.status, "available");
+    }
+
+    #[tokio::test]
+    async fn malformed_app_list_notification_does_not_replace_cached_apps() {
+        let state = Arc::new(Mutex::new(CodexState::default()));
+        {
+            let mut locked = state.lock().await;
+            locked.protocol_diagnostics = Some(CodexProtocolDiagnosticsDto {
+                apps: map_app_entries(&[json!({
+                    "id": "cached-app",
+                    "name": "Cached App"
+                })]),
+                ..Default::default()
+            });
+        }
+
+        assert!(
+            update_protocol_diagnostics_with_app_list(state.clone(), &json!({}))
+                .await
+                .is_none()
+        );
+        let locked = state.lock().await;
+        assert_eq!(
+            locked.protocol_diagnostics.as_ref().unwrap().apps[0].id,
+            "cached-app"
+        );
+    }
+
+    #[tokio::test]
     async fn update_protocol_diagnostics_with_config_warning_tracks_end_range() {
         let state = Arc::new(Mutex::new(CodexState::default()));
 
@@ -9264,6 +9445,7 @@ mod tests {
                 diff: None,
                 duration_ms: 10,
             },
+            details: None,
         };
 
         assert!(!event_indicates_auth_failure(&event));
@@ -9277,6 +9459,22 @@ mod tests {
         assert!(checks.contains(&"where node".to_string()));
         assert!(checks.contains(&"echo %PATH%".to_string()));
         assert!(!checks.iter().any(|check| check == "command -v codex"));
+    }
+
+    #[test]
+    fn codex_fast_durable_fork_version_gate_matches_verified_release() {
+        assert!(!codex_version_supports_fast_durable_forks(
+            "codex-cli 0.144.0"
+        ));
+        assert!(!codex_version_supports_fast_durable_forks(
+            "codex-cli 0.150.0"
+        ));
+        assert!(codex_version_supports_fast_durable_forks(
+            "codex-cli 0.150.1"
+        ));
+        assert!(codex_version_supports_fast_durable_forks(
+            "codex-cli 0.151.0-alpha.1"
+        ));
     }
 
     #[test]

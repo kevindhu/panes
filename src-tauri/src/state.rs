@@ -16,26 +16,23 @@ pub struct AppState {
     pub keep_awake: Arc<KeepAwakeManager>,
     pub turns: Arc<TurnManager>,
     pub file_tree_cache: Arc<FileTreeCache>,
-    pub pending_forks: Arc<PendingForkManager>,
+    pub pending_forks: Arc<PendingThreadMutationManager>,
+    pub pending_rollbacks: Arc<PendingThreadMutationManager>,
 }
 
-/// Coordinates the deferred engine-level fork of branched Codex threads.
+/// Coordinates a deferred engine-level mutation for Codex threads.
 ///
-/// A branch thread is created locally and returned to the UI immediately, while the
-/// slow `thread/fork` call to the Codex app-server (which spins up a whole new session,
-/// re-initializing MCP servers and auth) runs in the background. A best-effort prefetch
-/// task and the first use of the branch (a send, rollback, or re-fork) may race to
-/// materialize the engine thread; this manager guarantees the fork runs exactly once by
-/// funneling every caller through a shared [`OnceCell`] keyed by the branch thread id.
+/// Fork and rollback each own a manager instance. Their local projection is returned to
+/// the UI immediately, while a prefetch task and first use may race to materialize the
+/// native operation. The shared [`OnceCell`] guarantees one in-flight call per thread.
 ///
-/// The cell stores the fork result on success only (via `get_or_try_init`), so a failed
-/// fork leaves the slot empty and the next caller retries.
+/// The cell stores successful results only, so a failed mutation remains retryable.
 #[derive(Default)]
-pub struct PendingForkManager {
+pub struct PendingThreadMutationManager {
     cells: Mutex<HashMap<String, Arc<OnceCell<ThreadDto>>>>,
 }
 
-impl PendingForkManager {
+impl PendingThreadMutationManager {
     /// Returns the shared once-cell for `thread_id`, creating it on first request.
     pub async fn cell(&self, thread_id: &str) -> Arc<OnceCell<ThreadDto>> {
         let mut cells = self.cells.lock().await;
@@ -45,8 +42,7 @@ impl PendingForkManager {
             .clone()
     }
 
-    /// Drops any coordination slot for `thread_id`. Called once the fork has been
-    /// durably persisted so the map does not grow without bound.
+    /// Drops a coordination slot after the mutation has been durably persisted.
     pub async fn forget(&self, thread_id: &str) {
         self.cells.lock().await.remove(thread_id);
     }

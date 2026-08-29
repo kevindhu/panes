@@ -617,6 +617,7 @@ impl TurnEventMapper {
                         diff,
                         duration_ms,
                     },
+                    details: Some(item.clone()),
                 }]
             }
             "agentMessage" => {
@@ -1763,6 +1764,66 @@ mod tests {
     }
 
     #[test]
+    fn web_search_completion_carries_the_authoritative_queries_and_results() {
+        let mut mapper = TurnEventMapper::default();
+        let started = json!({
+            "item": {
+                "type": "webSearch",
+                "id": "search-1",
+                "query": "",
+                "action": null,
+                "results": null
+            }
+        });
+        let completed = json!({
+            "item": {
+                "type": "webSearch",
+                "id": "search-1",
+                "query": "Shiro no Yakata game",
+                "action": {
+                    "type": "search",
+                    "query": "Shiro no Yakata game"
+                },
+                "results": [{
+                    "type": "text_result",
+                    "domain": "zell23.livedoor.blog",
+                    "ref_id": "turn0search0",
+                    "title": "Developer blog",
+                    "url": "https://zell23.livedoor.blog/"
+                }]
+            }
+        });
+
+        assert!(matches!(
+            mapper.map_notification("item/started", &started).as_slice(),
+            [EngineEvent::ActionStarted { details, .. }]
+                if details.get("action") == Some(&Value::Null)
+        ));
+        let events = mapper.map_notification("item/completed", &completed);
+        match events.as_slice() {
+            [EngineEvent::ActionCompleted {
+                result,
+                details: Some(details),
+                ..
+            }] => {
+                assert!(result.success);
+                assert_eq!(
+                    details.get("query").and_then(Value::as_str),
+                    Some("Shiro no Yakata game")
+                );
+                assert_eq!(
+                    details
+                        .get("results")
+                        .and_then(Value::as_array)
+                        .map(Vec::len),
+                    Some(1)
+                );
+            }
+            other => panic!("expected authoritative web-search completion, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn map_turn_result_keeps_non_terminal_status_aliases_active() {
         for status in [
             "inProgress",
@@ -1885,6 +1946,54 @@ mod tests {
                 assert_eq!(summary, "Qual linguagem usar?");
             }
             _ => panic!("expected approval request event"),
+        }
+    }
+
+    #[test]
+    fn map_server_request_preserves_current_user_input_question_contract() {
+        let mut mapper = TurnEventMapper::default();
+        let params = json!({
+            "threadId": "thr_123",
+            "turnId": "turn_123",
+            "itemId": "item_43",
+            "isBlocking": true,
+            "autoResolutionMs": null,
+            "questions": [{
+                "id": "scope",
+                "header": "Scope",
+                "question": "Which scope?",
+                "isOther": false,
+                "isSecret": false,
+                "options": [{
+                    "label": "Focused",
+                    "description": "Only the affected flow"
+                }]
+            }]
+        });
+
+        let approval = mapper
+            .map_server_request(
+                "request-current",
+                &json!(43),
+                "item/tool/requestUserInput",
+                &params,
+            )
+            .expect("expected approval request");
+
+        match approval.event {
+            EngineEvent::ApprovalRequested { details, .. } => {
+                assert_eq!(details.get("isBlocking"), Some(&json!(true)));
+                assert_eq!(details.pointer("/questions/0/isOther"), Some(&json!(false)));
+                assert_eq!(
+                    details.pointer("/questions/0/isSecret"),
+                    Some(&json!(false))
+                );
+                assert_eq!(
+                    details.pointer("/questions/0/options/0/description"),
+                    Some(&json!("Only the affected flow"))
+                );
+            }
+            other => panic!("expected approval request event, got {other:?}"),
         }
     }
 

@@ -956,7 +956,7 @@ pub async fn sync_thread_from_engine(
     thread_id: String,
 ) -> Result<ThreadDto, String> {
     let db = state.db.clone();
-    let thread = run_db(db.clone(), {
+    let mut thread = run_db(db.clone(), {
         let thread_id = thread_id.clone();
         move |db| db::threads::get_thread(db, &thread_id)
     })
@@ -965,6 +965,13 @@ pub async fn sync_thread_from_engine(
 
     if thread.engine_id != "codex" {
         return Ok(thread);
+    }
+
+    if is_engine_fork_pending(thread.engine_metadata.as_ref()) {
+        thread = resolve_pending_engine_fork(state.inner(), &thread.id).await?;
+    }
+    if is_engine_rollback_pending(thread.engine_metadata.as_ref()) {
+        return resolve_pending_engine_rollback(state.inner(), &thread.id, None).await;
     }
 
     let Some(snapshot) = state
@@ -1168,8 +1175,15 @@ fn imported_messages_have_streaming_turn(snapshot: &ThreadSyncSnapshot) -> bool 
 }
 
 struct CodexForkPoint {
+    source_message_id: Option<String>,
     last_turn_id: Option<String>,
     turns_after: u32,
+}
+
+fn has_stable_active_fork_boundary(fork_point: Option<&CodexForkPoint>) -> bool {
+    fork_point.is_some_and(|fork_point| {
+        fork_point.source_message_id.is_some() && fork_point.last_turn_id.is_some()
+    })
 }
 
 /// Metadata key marking a branch whose engine-level Codex fork has not completed yet.
@@ -1270,6 +1284,127 @@ fn clear_engine_fork_pending(mut metadata: Value) -> Value {
     metadata
 }
 
+/// Metadata for an in-place rollback whose local transcript has already been
+/// projected but whose native Codex rollback is still materializing.
+const ENGINE_ROLLBACK_PENDING_KEY: &str = "engineRollbackPending";
+const ENGINE_ROLLBACK_PHASE_KEY: &str = "engineRollbackPhase";
+const ENGINE_ROLLBACK_NUM_TURNS_KEY: &str = "engineRollbackNumTurns";
+const ENGINE_ROLLBACK_SOURCE_TURN_COUNT_KEY: &str = "engineRollbackSourceTurnCount";
+const ENGINE_ROLLBACK_TARGET_TURN_COUNT_KEY: &str = "engineRollbackTargetTurnCount";
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum EngineRollbackPhase {
+    Prepared,
+    Started,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct EngineRollbackIntent {
+    num_turns: u32,
+    source_turn_count: u32,
+    target_turn_count: u32,
+    phase: EngineRollbackPhase,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexRollbackMaterializedEvent {
+    thread_id: String,
+}
+
+pub fn emit_codex_rollback_materialized(app: &tauri::AppHandle, thread_id: &str) {
+    if let Err(error) = app.emit(
+        "codex-rollback-materialized",
+        CodexRollbackMaterializedEvent {
+            thread_id: thread_id.to_string(),
+        },
+    ) {
+        log::warn!("failed to emit materialized rollback for thread {thread_id}: {error}");
+    }
+}
+
+pub fn is_engine_rollback_pending(metadata: Option<&Value>) -> bool {
+    metadata
+        .and_then(|value| value.get(ENGINE_ROLLBACK_PENDING_KEY))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn engine_rollback_intent(metadata: Option<&Value>) -> Option<EngineRollbackIntent> {
+    let metadata = metadata?;
+    if !is_engine_rollback_pending(Some(metadata)) {
+        return None;
+    }
+
+    let read_u32 = |key: &str| {
+        metadata
+            .get(key)
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+    };
+    let num_turns = read_u32(ENGINE_ROLLBACK_NUM_TURNS_KEY)?;
+    let source_turn_count = read_u32(ENGINE_ROLLBACK_SOURCE_TURN_COUNT_KEY)?;
+    let target_turn_count = read_u32(ENGINE_ROLLBACK_TARGET_TURN_COUNT_KEY)?;
+    let phase = match metadata
+        .get(ENGINE_ROLLBACK_PHASE_KEY)
+        .and_then(Value::as_str)
+    {
+        Some("prepared") => EngineRollbackPhase::Prepared,
+        Some("started") => EngineRollbackPhase::Started,
+        _ => return None,
+    };
+    if num_turns == 0 || source_turn_count.checked_sub(num_turns) != Some(target_turn_count) {
+        return None;
+    }
+
+    Some(EngineRollbackIntent {
+        num_turns,
+        source_turn_count,
+        target_turn_count,
+        phase,
+    })
+}
+
+fn mark_engine_rollback_pending(mut metadata: Value, intent: &EngineRollbackIntent) -> Value {
+    if !metadata.is_object() {
+        metadata = json!({});
+    }
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert(ENGINE_ROLLBACK_PENDING_KEY.to_string(), json!(true));
+        object.insert(
+            ENGINE_ROLLBACK_PHASE_KEY.to_string(),
+            json!(match intent.phase {
+                EngineRollbackPhase::Prepared => "prepared",
+                EngineRollbackPhase::Started => "started",
+            }),
+        );
+        object.insert(
+            ENGINE_ROLLBACK_NUM_TURNS_KEY.to_string(),
+            json!(intent.num_turns),
+        );
+        object.insert(
+            ENGINE_ROLLBACK_SOURCE_TURN_COUNT_KEY.to_string(),
+            json!(intent.source_turn_count),
+        );
+        object.insert(
+            ENGINE_ROLLBACK_TARGET_TURN_COUNT_KEY.to_string(),
+            json!(intent.target_turn_count),
+        );
+    }
+    metadata
+}
+
+fn clear_engine_rollback_pending(mut metadata: Value) -> Value {
+    if let Some(object) = metadata.as_object_mut() {
+        object.remove(ENGINE_ROLLBACK_PENDING_KEY);
+        object.remove(ENGINE_ROLLBACK_PHASE_KEY);
+        object.remove(ENGINE_ROLLBACK_NUM_TURNS_KEY);
+        object.remove(ENGINE_ROLLBACK_SOURCE_TURN_COUNT_KEY);
+        object.remove(ENGINE_ROLLBACK_TARGET_TURN_COUNT_KEY);
+    }
+    metadata
+}
+
 #[tauri::command]
 pub async fn fork_codex_thread(
     state: State<'_, AppState>,
@@ -1283,6 +1418,7 @@ pub async fn fork_codex_thread(
 pub async fn fork_codex_thread_at_turn(
     state: State<'_, AppState>,
     thread_id: String,
+    source_message_id: Option<String>,
     last_turn_id: Option<String>,
     turns_after: u32,
     profile_operation_id: Option<String>,
@@ -1291,6 +1427,9 @@ pub async fn fork_codex_thread_at_turn(
         state.inner(),
         thread_id,
         Some(CodexForkPoint {
+            source_message_id: source_message_id
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             last_turn_id: last_turn_id
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
@@ -1317,14 +1456,7 @@ async fn fork_codex_thread_inner(
         "backend.fork.command.start",
         Some(format!("thread_id={thread_id}")),
     );
-    if state.turns.get(&thread_id).await.is_some() {
-        log_branch_profile_step(
-            profile_operation_id,
-            "backend.fork.command.rejected_active_turn",
-            Some(format!("thread_id={thread_id}")),
-        );
-        return Err("cannot fork a thread while a turn is still active".to_string());
-    }
+    let source_turn_registered = state.turns.get(&thread_id).await.is_some();
 
     let load_thread_started_at = Instant::now();
     let db = state.db.clone();
@@ -1345,6 +1477,23 @@ async fn fork_codex_thread_inner(
         )),
     );
 
+    let source_turn_active = source_turn_registered
+        || matches!(
+            thread.status,
+            ThreadStatusDto::Streaming | ThreadStatusDto::AwaitingApproval
+        );
+    if source_turn_active && !has_stable_active_fork_boundary(fork_point.as_ref()) {
+        log_branch_profile_step(
+            profile_operation_id,
+            "backend.fork.command.rejected_active_turn",
+            Some(format!("thread_id={thread_id}")),
+        );
+        return Err(
+            "cannot fork an active thread without a completed message and native turn boundary"
+                .to_string(),
+        );
+    }
+
     if thread.engine_id != "codex" {
         log_branch_profile_step(
             profile_operation_id,
@@ -1363,17 +1512,34 @@ async fn fork_codex_thread_inner(
     } else {
         thread
     };
+    let thread = if is_engine_rollback_pending(thread.engine_metadata.as_ref()) {
+        resolve_pending_engine_rollback(state, &thread.id, None).await?
+    } else {
+        thread
+    };
     let engine_thread_id = thread
         .engine_thread_id
         .clone()
         .ok_or_else(|| "Codex thread has not been initialized yet".to_string())?;
 
-    let (last_turn_id, turns_after, rollback_turns) = if let Some(fork_point) = fork_point {
+    let (source_message_id, last_turn_id, turns_after, rollback_turns) = if let Some(fork_point) =
+        fork_point
+    {
         let validate_cutoff_started_at = Instant::now();
         run_db(db.clone(), {
             let thread_id = thread.id.clone();
+            let source_message_id = fork_point.source_message_id.clone();
+            let last_turn_id = fork_point.last_turn_id.clone();
             let turns_after = fork_point.turns_after;
-            move |db| db::messages::validate_thread_branch_cutoff(db, &thread_id, turns_after)
+            move |db| match source_message_id.as_deref() {
+                Some(source_message_id) => db::messages::validate_thread_branch_message_cutoff(
+                    db,
+                    &thread_id,
+                    source_message_id,
+                    last_turn_id.as_deref(),
+                ),
+                None => db::messages::validate_thread_branch_cutoff(db, &thread_id, turns_after),
+            }
         })
         .await?;
         log_branch_profile_step(
@@ -1386,18 +1552,19 @@ async fn fork_codex_thread_inner(
             )),
         );
         (
+            fork_point.source_message_id.clone(),
             fork_point.last_turn_id,
             Some(fork_point.turns_after),
-            (fork_point.turns_after > 0).then_some(fork_point.turns_after),
+            (fork_point.source_message_id.is_none() && fork_point.turns_after > 0)
+                .then_some(fork_point.turns_after),
         )
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
 
-    // The slow part — codex `thread/fork` spins up a whole new session (re-initializing
-    // MCP servers and auth), taking many seconds. Instead of blocking the fork command on
-    // it, create the local branch immediately with the fork recorded as pending, then
-    // materialize the engine thread in the background (and lazily on first use).
+    // Keep native fork materialization off the UI round trip. Current Codex releases
+    // complete this quickly, while older app-server versions may still take many seconds.
+    // The durable pending intent also lets Panes retry safely after a process restart.
     let intent = EngineForkIntent {
         source_engine_thread_id: engine_thread_id,
         last_turn_id,
@@ -1408,6 +1575,7 @@ async fn fork_codex_thread_inner(
         state,
         &thread,
         &intent,
+        source_message_id.as_deref(),
         rollback_turns,
         profile_operation_id,
     )
@@ -1432,7 +1600,8 @@ async fn fork_codex_thread_inner(
 /// Materializes the engine-level Codex thread for a branch created with a pending fork.
 ///
 /// Runs at most once per branch across all racing callers (the background prefetch and
-/// any first use of the branch) via the shared [`crate::state::PendingForkManager`] cell.
+/// any first use of the branch) via the shared
+/// [`crate::state::PendingThreadMutationManager`] cell.
 /// On success the branch is durably updated with its engine thread id and cleared of the
 /// pending markers; the returned [`ThreadDto`] reflects that state. If no fork is pending
 /// (already materialized, or not a branch), the current thread is returned unchanged.
@@ -1467,8 +1636,8 @@ pub async fn resolve_pending_engine_fork(
 }
 
 /// Executes the codex `thread/fork` and persists the resulting engine thread onto the
-/// branch, clearing the pending markers. This is the slow (~10s) step; it is only ever
-/// reached from [`resolve_pending_engine_fork`].
+/// branch, clearing the pending markers. It is only ever reached from
+/// [`resolve_pending_engine_fork`].
 async fn perform_engine_fork(
     state: &AppState,
     branch: &ThreadDto,
@@ -1524,6 +1693,7 @@ fn spawn_engine_fork_prefetch(state: AppState, thread_id: String) {
 
 #[tauri::command]
 pub async fn rollback_codex_thread(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     thread_id: String,
     num_turns: u32,
@@ -1586,68 +1756,236 @@ pub async fn rollback_codex_thread(
         );
         return Err("native rollback is only available for Codex threads".to_string());
     }
-    // A branch whose deferred fork has not completed has no engine thread to roll back
-    // yet; materialize it first.
+    // Resolve earlier deferred mutations before preparing another rollback so the
+    // new local projection always starts from Codex's authoritative current history.
     let thread = if is_engine_fork_pending(thread.engine_metadata.as_ref()) {
         resolve_pending_engine_fork(state.inner(), &thread.id).await?
     } else {
         thread
     };
-    let engine_thread_id = thread
-        .engine_thread_id
-        .clone()
-        .ok_or_else(|| "Codex thread has not been initialized yet".to_string())?;
-
-    let remote_rollback_started_at = Instant::now();
-    let rollback_snapshot = match state
-        .engines
-        .rollback_codex_thread(&engine_thread_id, num_turns)
-        .await
-    {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            let error = err_to_string(error);
-            log_branch_profile_step(
-                profile_operation_id,
-                "backend.rollback.remote_rollback.failed",
-                Some(format!(
-                    "elapsed_ms={}; engine_thread_id={}; error={}",
-                    format_elapsed_ms(remote_rollback_started_at),
-                    engine_thread_id,
-                    error
-                )),
-            );
-            return Err(error);
-        }
+    let thread = if is_engine_rollback_pending(thread.engine_metadata.as_ref()) {
+        resolve_pending_engine_rollback(state.inner(), &thread.id, Some(&app)).await?
+    } else {
+        thread
     };
-    log_branch_profile_step(
-        profile_operation_id,
-        "backend.rollback.remote_rollback.done",
-        Some(format!(
-            "elapsed_ms={}; engine_thread_id={}",
-            format_elapsed_ms(remote_rollback_started_at),
-            engine_thread_id
-        )),
-    );
+    thread
+        .engine_thread_id
+        .as_deref()
+        .ok_or_else(|| "Codex thread has not been initialized yet".to_string())?;
+    if !codex_thread_has_local_transcript_for_history_tools(&thread)
+        || is_codex_thread_sync_required(thread.engine_metadata.as_ref())
+    {
+        return Err(
+            "native Codex history tools require a locally mirrored transcript. Attached remote threads without imported history cannot be forked or rolled back yet."
+                .to_string(),
+        );
+    }
 
-    let persist_started_at = Instant::now();
-    let updated = run_db(db, {
+    let source_turn_count = run_db(db.clone(), {
+        let thread_id = thread.id.clone();
+        move |db| db::messages::thread_turn_count(db, &thread_id)
+    })
+    .await?;
+    let target_turn_count = source_turn_count.checked_sub(num_turns).ok_or_else(|| {
+        format!(
+            "cannot drop {num_turns} turns from local thread history with only {source_turn_count} turns"
+        )
+    })?;
+    let intent = EngineRollbackIntent {
+        num_turns,
+        source_turn_count,
+        target_turn_count,
+        phase: EngineRollbackPhase::Prepared,
+    };
+    let pending_metadata = mark_engine_rollback_pending(
+        thread.engine_metadata.clone().unwrap_or_else(|| json!({})),
+        &intent,
+    );
+    let local_rollback_started_at = Instant::now();
+    let projected = run_db(db, {
         let thread = thread.clone();
-        let rollback_snapshot = rollback_snapshot.clone();
-        move |db| persist_codex_in_place_rollback(db, &thread, &rollback_snapshot, num_turns)
+        let pending_metadata = pending_metadata.clone();
+        move |db| {
+            db::messages::prepare_pending_thread_rollback(
+                db,
+                &thread.id,
+                num_turns,
+                &pending_metadata,
+            )?;
+            db::threads::get_thread(db, &thread.id)?.ok_or_else(|| {
+                anyhow::anyhow!("thread not found after preparing rollback: {}", thread.id)
+            })
+        }
     })
     .await?;
     log_branch_profile_step(
         profile_operation_id,
-        "backend.rollback.db_persist.done",
+        "backend.rollback.local_projection.done",
         Some(format!(
-            "elapsed_ms={}; thread_id={}; total_elapsed_ms={}",
-            format_elapsed_ms(persist_started_at),
-            updated.id,
+            "elapsed_ms={}; thread_id={}; source_turns={}; target_turns={}; total_elapsed_ms={}",
+            format_elapsed_ms(local_rollback_started_at),
+            projected.id,
+            source_turn_count,
+            target_turn_count,
             format_elapsed_ms(total_started_at)
         )),
     );
-    Ok(updated)
+
+    // Match the fork path: native work is prefetched off the UI round trip, while
+    // first use joins this exact single-flight operation if it is still running.
+    spawn_engine_rollback_prefetch(
+        app,
+        state.inner().clone(),
+        projected.id.clone(),
+    );
+    Ok(projected)
+}
+
+pub async fn resolve_pending_engine_rollback(
+    state: &AppState,
+    thread_id: &str,
+    app: Option<&tauri::AppHandle>,
+) -> Result<ThreadDto, String> {
+    let cell = state.pending_rollbacks.cell(thread_id).await;
+    let result = cell
+        .get_or_try_init(|| async {
+            let thread = run_db(state.db.clone(), {
+                let thread_id = thread_id.to_string();
+                move |db| db::threads::get_thread(db, &thread_id)
+            })
+            .await?
+            .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+
+            if !is_engine_rollback_pending(thread.engine_metadata.as_ref()) {
+                return Ok(thread);
+            }
+            let intent = engine_rollback_intent(thread.engine_metadata.as_ref())
+                .ok_or_else(|| format!("invalid pending rollback metadata for thread {thread_id}"))?;
+            let updated = perform_engine_rollback(state, &thread, &intent).await?;
+            if let Some(app) = app {
+                emit_codex_rollback_materialized(app, thread_id);
+            }
+            Ok(updated)
+        })
+        .await
+        .cloned();
+
+    if result.is_ok() {
+        state.pending_rollbacks.forget(thread_id).await;
+    }
+    result
+}
+
+async fn perform_engine_rollback(
+    state: &AppState,
+    thread: &ThreadDto,
+    intent: &EngineRollbackIntent,
+) -> Result<ThreadDto, String> {
+    let mut persistence_thread = thread.clone();
+    let rollback_snapshot = match intent.phase {
+        EngineRollbackPhase::Prepared => {
+            persistence_thread = run_db(state.db.clone(), {
+                let thread_id = thread.id.clone();
+                move |db| db::threads::mark_pending_rollback_started(db, &thread_id)
+            })
+            .await?;
+            execute_native_engine_rollback(state, &persistence_thread, intent).await?
+        }
+        EngineRollbackPhase::Started => {
+            let engine_thread_id = thread
+                .engine_thread_id
+                .as_deref()
+                .ok_or_else(|| "Codex thread has not been initialized yet".to_string())?;
+            let remote_read_started_at = Instant::now();
+            let current_snapshot = state
+                .engines
+                .read_thread_sync_snapshot(thread)
+                .await
+                .map_err(err_to_string)?
+                .ok_or_else(|| format!("Codex thread {engine_thread_id} could not be read"))?;
+            let current_turn_count = imported_turn_count(&current_snapshot)?;
+            log::info!(
+                "checked deferred codex rollback state for thread {} in {}ms (remote_turns={})",
+                thread.id,
+                format_elapsed_ms(remote_read_started_at),
+                current_turn_count,
+            );
+
+            if current_turn_count == intent.target_turn_count {
+                // The native rollback completed before an earlier process stopped.
+                current_snapshot
+            } else if current_turn_count == intent.source_turn_count {
+                execute_native_engine_rollback(state, thread, intent).await?
+            } else {
+                return Err(format!(
+                    "Codex thread {} changed while rollback was pending: found {current_turn_count} turns, expected {} or {}",
+                    thread.id, intent.source_turn_count, intent.target_turn_count
+                ));
+            }
+        }
+    };
+
+    run_db(state.db.clone(), {
+        move |db| {
+            persist_codex_in_place_rollback(db, &persistence_thread, &rollback_snapshot)
+        }
+    })
+    .await
+}
+
+async fn execute_native_engine_rollback(
+    state: &AppState,
+    thread: &ThreadDto,
+    intent: &EngineRollbackIntent,
+) -> Result<ThreadSyncSnapshot, String> {
+    let engine_thread_id = thread
+        .engine_thread_id
+        .as_deref()
+        .ok_or_else(|| "Codex thread has not been initialized yet".to_string())?;
+    let remote_rollback_started_at = Instant::now();
+    let snapshot = state
+        .engines
+        .rollback_codex_thread(engine_thread_id, intent.num_turns)
+        .await
+        .map_err(err_to_string)?;
+    let resulting_turn_count = imported_turn_count(&snapshot)?;
+    if resulting_turn_count != intent.target_turn_count {
+        return Err(format!(
+            "Codex rollback for thread {} returned {resulting_turn_count} turns; expected {}",
+            thread.id, intent.target_turn_count
+        ));
+    }
+    log::info!(
+        "materialized deferred codex rollback for thread {} in {}ms",
+        thread.id,
+        format_elapsed_ms(remote_rollback_started_at),
+    );
+    Ok(snapshot)
+}
+
+fn imported_turn_count(snapshot: &ThreadSyncSnapshot) -> Result<u32, String> {
+    let count = snapshot
+        .imported_messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .count();
+    u32::try_from(count).map_err(|_| "Codex thread turn count exceeds u32".to_string())
+}
+
+fn spawn_engine_rollback_prefetch(
+    app: tauri::AppHandle,
+    state: AppState,
+    thread_id: String,
+) {
+    tokio::spawn(async move {
+        if let Err(error) =
+            resolve_pending_engine_rollback(&state, &thread_id, Some(&app)).await
+        {
+            log::warn!(
+                "background codex rollback prefetch for thread {thread_id} failed: {error}"
+            );
+        }
+    });
 }
 
 #[tauri::command]
@@ -1660,7 +1998,7 @@ pub async fn compact_codex_thread(
     }
 
     let db = state.db.clone();
-    let thread = run_db(db.clone(), {
+    let mut thread = run_db(db.clone(), {
         let thread_id = thread_id.clone();
         move |db| db::threads::get_thread(db, &thread_id)
     })
@@ -1669,6 +2007,12 @@ pub async fn compact_codex_thread(
 
     if thread.engine_id != "codex" {
         return Err("native compact is only available for Codex threads".to_string());
+    }
+    if is_engine_fork_pending(thread.engine_metadata.as_ref()) {
+        thread = resolve_pending_engine_fork(state.inner(), &thread.id).await?;
+    }
+    if is_engine_rollback_pending(thread.engine_metadata.as_ref()) {
+        thread = resolve_pending_engine_rollback(state.inner(), &thread.id, None).await?;
     }
     let engine_thread_id = thread
         .engine_thread_id
@@ -2238,6 +2582,7 @@ async fn create_pending_codex_branch_thread(
     state: &AppState,
     source_thread: &ThreadDto,
     intent: &EngineForkIntent,
+    source_message_id: Option<&str>,
     rollback_turns: Option<u32>,
     profile_operation_id: Option<&str>,
 ) -> Result<ThreadDto, String> {
@@ -2274,6 +2619,7 @@ async fn create_pending_codex_branch_thread(
         let source_thread = source_thread.clone();
         let model_id = model_id.clone();
         let intent = intent.clone();
+        let source_message_id = source_message_id.map(str::to_string);
         let profile_operation_id = profile_operation_id.clone();
         move |db| {
             let clone_local_history = should_clone_local_branch_history(&source_thread);
@@ -2297,12 +2643,23 @@ async fn create_pending_codex_branch_thread(
             );
             if clone_local_history {
                 let clone_history_started_at = Instant::now();
-                let cloned_count = db::messages::clone_thread_messages_for_branch(
-                    db,
-                    &source_thread.id,
-                    &created.id,
-                    rollback_turns,
-                )?;
+                let cloned_count = match source_message_id.as_deref() {
+                    Some(source_message_id) => {
+                        db::messages::clone_thread_messages_for_branch_at_message(
+                            db,
+                            &source_thread.id,
+                            &created.id,
+                            source_message_id,
+                            intent.last_turn_id.as_deref(),
+                        )?
+                    }
+                    None => db::messages::clone_thread_messages_for_branch(
+                        db,
+                        &source_thread.id,
+                        &created.id,
+                        rollback_turns,
+                    )?,
+                };
                 log_branch_profile_step(
                     profile_operation_id.as_deref(),
                     "backend.branch.db_clone_history.done",
@@ -2440,25 +2797,28 @@ fn persist_codex_in_place_rollback(
     db: &crate::db::Database,
     thread: &ThreadDto,
     rollback_snapshot: &ThreadSyncSnapshot,
-    num_turns: u32,
 ) -> anyhow::Result<ThreadDto> {
-    if codex_thread_has_local_transcript_for_history_tools(thread)
-        && !is_codex_thread_sync_required(thread.engine_metadata.as_ref())
-    {
-        match db::messages::drop_last_turns(db, &thread.id, num_turns) {
-            Ok(_) => db::threads::refresh_thread_message_stats(db, &thread.id)?,
-            Err(error) if error.to_string().contains("cannot drop") => {
-                replace_messages_from_codex_snapshot(db, &thread.id, rollback_snapshot)?;
-            }
-            Err(error) => return Err(error),
-        }
-    } else {
-        replace_messages_from_codex_snapshot(db, &thread.id, rollback_snapshot)?;
-    }
+    // The retained local prefix was already projected atomically when the rollback
+    // intent was recorded. The native response has also been checked against the
+    // expected target turn count, so rebuilding every retained message here would
+    // only discard stable local IDs/timestamps and hold an unnecessarily large write
+    // transaction.
 
+    // The deferred native call may overlap harmless local settings updates. Reload
+    // metadata after the native call so clearing the rollback intent does not overwrite
+    // settings saved while the native operation was in flight.
+    let current_thread = db::threads::get_thread(db, &thread.id)?.ok_or_else(|| {
+        anyhow::anyhow!("thread not found while persisting rollback: {}", thread.id)
+    })?;
+    let metadata = clear_engine_rollback_pending(
+        current_thread
+            .engine_metadata
+            .clone()
+            .unwrap_or_else(|| json!({})),
+    );
     let metadata = mark_codex_transcript_imported(
         merge_codex_runtime_metadata(
-            thread.engine_metadata.clone(),
+            Some(metadata),
             rollback_snapshot.raw_status.as_deref(),
             &rollback_snapshot.active_flags,
             rollback_snapshot.preview.as_deref(),
@@ -2480,32 +2840,6 @@ fn persist_codex_in_place_rollback(
         next_status,
         Some(&metadata),
     )
-}
-
-fn replace_messages_from_codex_snapshot(
-    db: &crate::db::Database,
-    thread_id: &str,
-    snapshot: &ThreadSyncSnapshot,
-) -> anyhow::Result<()> {
-    let imported_messages = snapshot
-        .imported_messages
-        .iter()
-        .map(|message| db::messages::ImportedMessageRecord {
-            role: message.role.clone(),
-            content: message.content.clone(),
-            blocks: message.blocks.clone(),
-            status: MessageStatusDto::from_str(message.status.as_str()),
-            native_turn_id: message.native_turn_id.clone(),
-            turn_engine_id: message.turn_engine_id.clone(),
-            turn_model_id: message.turn_model_id.clone(),
-            turn_reasoning_effort: message.turn_reasoning_effort.clone(),
-            token_input: message.token_input,
-            token_output: message.token_output,
-            created_at: message.created_at.clone(),
-        })
-        .collect::<Vec<_>>();
-    db::messages::replace_thread_messages(db, thread_id, &imported_messages)?;
-    Ok(())
 }
 
 fn clone_codex_branch_metadata(
@@ -3234,7 +3568,8 @@ mod tests {
             keep_awake: Arc::new(KeepAwakeManager::new()),
             turns: Arc::new(TurnManager::default()),
             file_tree_cache: Arc::new(FileTreeCache::new()),
-            pending_forks: Arc::new(crate::state::PendingForkManager::default()),
+            pending_forks: Arc::new(crate::state::PendingThreadMutationManager::default()),
+            pending_rollbacks: Arc::new(crate::state::PendingThreadMutationManager::default()),
         }
     }
 
@@ -3697,6 +4032,66 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn active_codex_fork_boundary_requires_both_local_and_native_anchors() {
+        assert!(!has_stable_active_fork_boundary(None));
+        assert!(!has_stable_active_fork_boundary(Some(&CodexForkPoint {
+            source_message_id: Some("assistant-message-1".to_string()),
+            last_turn_id: None,
+            turns_after: 1,
+        })));
+        assert!(!has_stable_active_fork_boundary(Some(&CodexForkPoint {
+            source_message_id: None,
+            last_turn_id: Some("native-turn-1".to_string()),
+            turns_after: 1,
+        })));
+        assert!(has_stable_active_fork_boundary(Some(&CodexForkPoint {
+            source_message_id: Some("assistant-message-1".to_string()),
+            last_turn_id: Some("native-turn-1".to_string()),
+            turns_after: 1,
+        })));
+    }
+
+    #[tokio::test]
+    async fn active_codex_fork_rejects_unbounded_requests_but_accepts_stable_gate() {
+        let state = test_app_state();
+        let source = test_thread(&state, "codex", "gpt-5.4");
+        assert!(
+            state
+                .turns
+                .try_register(&source.id, tokio_util::sync::CancellationToken::new(),)
+                .await
+        );
+
+        let unbounded_error = fork_codex_thread_inner(&state, source.id.clone(), None, None)
+            .await
+            .expect_err("an unbounded active-source fork must remain blocked");
+        assert!(unbounded_error.contains("cannot fork an active thread"));
+
+        let stable_error = fork_codex_thread_inner(
+            &state,
+            source.id.clone(),
+            Some(CodexForkPoint {
+                source_message_id: Some("assistant-message-1".to_string()),
+                last_turn_id: Some("native-turn-1".to_string()),
+                turns_after: 1,
+            }),
+            None,
+        )
+        .await
+        .expect_err("the fixture has no initialized engine thread");
+        assert_eq!(stable_error, "Codex thread has not been initialized yet");
+        assert!(state.turns.get(&source.id).await.is_some());
+
+        state.turns.finish(&source.id).await;
+        db::threads::update_thread_status(&state.db, &source.id, ThreadStatusDto::Streaming)
+            .expect("mark the persisted source runtime active");
+        let persisted_active_error = fork_codex_thread_inner(&state, source.id.clone(), None, None)
+            .await
+            .expect_err("persisted active runtime must enforce the same stable boundary");
+        assert!(persisted_active_error.contains("cannot fork an active thread"));
+    }
+
     #[tokio::test]
     async fn create_codex_branch_thread_rejects_threads_without_imported_transcript() {
         let state = test_app_state();
@@ -3710,7 +4105,7 @@ mod tests {
             last_turn_id: None,
             turns_after: None,
         };
-        let error = create_pending_codex_branch_thread(&state, &thread, &intent, None, None)
+        let error = create_pending_codex_branch_thread(&state, &thread, &intent, None, None, None)
             .await
             .expect_err("expected branch creation to reject missing local transcript");
 
@@ -3743,6 +4138,41 @@ mod tests {
         let metadata = json!({ "engineForkPending": true });
         assert!(is_engine_fork_pending(Some(&metadata)));
         assert_eq!(engine_fork_intent(Some(&metadata)), None);
+    }
+
+    #[test]
+    fn engine_rollback_intent_round_trips_through_metadata() {
+        let intent = EngineRollbackIntent {
+            num_turns: 2,
+            source_turn_count: 5,
+            target_turn_count: 3,
+            phase: EngineRollbackPhase::Prepared,
+        };
+        let metadata =
+            mark_engine_rollback_pending(json!({ "lastModelId": "gpt-5.4" }), &intent);
+
+        assert!(is_engine_rollback_pending(Some(&metadata)));
+        assert_eq!(engine_rollback_intent(Some(&metadata)), Some(intent));
+        assert_eq!(metadata.get("lastModelId"), Some(&json!("gpt-5.4")));
+
+        let cleared = clear_engine_rollback_pending(metadata);
+        assert!(!is_engine_rollback_pending(Some(&cleared)));
+        assert_eq!(engine_rollback_intent(Some(&cleared)), None);
+        assert_eq!(cleared.get("lastModelId"), Some(&json!("gpt-5.4")));
+    }
+
+    #[test]
+    fn engine_rollback_intent_rejects_inconsistent_counts() {
+        let metadata = json!({
+            "engineRollbackPending": true,
+            "engineRollbackPhase": "prepared",
+            "engineRollbackNumTurns": 2,
+            "engineRollbackSourceTurnCount": 5,
+            "engineRollbackTargetTurnCount": 4,
+        });
+
+        assert!(is_engine_rollback_pending(Some(&metadata)));
+        assert_eq!(engine_rollback_intent(Some(&metadata)), None);
     }
 
     #[tokio::test]
@@ -3781,7 +4211,9 @@ mod tests {
             last_turn_id: None,
             turns_after: None,
         };
-        let branch = create_pending_codex_branch_thread(&state, &source, &intent, None, None)
+        let branch = create_pending_codex_branch_thread(
+            &state, &source, &intent, None, None, None,
+        )
             .await
             .expect("expected pending branch creation to succeed");
 
@@ -3794,6 +4226,77 @@ mod tests {
         );
         // The transcript was cloned locally so the branch is immediately readable.
         assert_eq!(branch.message_count, 4);
+    }
+
+    #[tokio::test]
+    async fn create_pending_codex_branch_thread_uses_exact_message_boundary() {
+        let state = test_app_state();
+        let source = test_thread(&state, "codex", "gpt-5.4");
+        let imported = [
+            ("user", "First", MessageStatusDto::Completed, None),
+            (
+                "assistant",
+                "Reply 1",
+                MessageStatusDto::Completed,
+                Some("native-turn-1"),
+            ),
+            ("user", "Second", MessageStatusDto::Completed, None),
+            (
+                "assistant",
+                "Partial reply 2",
+                MessageStatusDto::Streaming,
+                Some("native-turn-2"),
+            ),
+        ]
+        .into_iter()
+        .map(|(role, content, status, native_turn_id)| db::messages::ImportedMessageRecord {
+            role: role.to_string(),
+            content: Some(content.to_string()),
+            blocks: json!([{ "type": "text", "content": content }]),
+            status,
+            native_turn_id: native_turn_id.map(str::to_string),
+            turn_engine_id: Some("codex".to_string()),
+            turn_model_id: Some("gpt-5.4".to_string()),
+            turn_reasoning_effort: None,
+            token_input: u64::from(role == "user"),
+            token_output: u64::from(role == "assistant"),
+            created_at: None,
+        })
+        .collect::<Vec<_>>();
+        db::messages::replace_thread_messages(&state.db, &source.id, &imported)
+            .expect("expected source messages to be inserted");
+        let source_messages = db::messages::get_thread_messages(&state.db, &source.id)
+            .expect("load source messages");
+        let completed_assistant_id = source_messages[1].id.clone();
+        let source = db::threads::get_thread(&state.db, &source.id)
+            .expect("get source thread")
+            .expect("source thread exists");
+
+        let intent = EngineForkIntent {
+            source_engine_thread_id: "engine-source".to_string(),
+            last_turn_id: Some("native-turn-1".to_string()),
+            turns_after: Some(1),
+        };
+        let branch = create_pending_codex_branch_thread(
+            &state,
+            &source,
+            &intent,
+            Some(&completed_assistant_id),
+            None,
+            None,
+        )
+        .await
+        .expect("expected exact pending branch creation to succeed");
+
+        assert_eq!(branch.message_count, 2);
+        let branch_messages = db::messages::get_thread_messages(&state.db, &branch.id)
+            .expect("load branch messages");
+        assert_eq!(branch_messages.len(), 2);
+        assert_eq!(branch_messages[1].content.as_deref(), Some("Reply 1"));
+        assert_eq!(
+            branch_messages[1].native_turn_id.as_deref(),
+            Some("native-turn-1")
+        );
     }
 
     /// Measures the user-perceived fork latency after deferring the engine `thread/fork`.
@@ -3853,7 +4356,9 @@ mod tests {
             .expect("load source")
             .expect("source exists");
             let branch =
-                create_pending_codex_branch_thread(&state, &source, &intent, None, None)
+                create_pending_codex_branch_thread(
+                    &state, &source, &intent, None, None, None,
+                )
                     .await
                     .expect("branch creation should succeed");
             let elapsed = started.elapsed();
@@ -3874,8 +4379,99 @@ mod tests {
         }
     }
 
+    /// Measures the synchronous local projection used by the deferred rollback
+    /// command. Native Codex read/rollback work is deliberately excluded because
+    /// it runs through the background single-flight path.
+    #[tokio::test]
+    async fn rollback_command_round_trip_is_fast() {
+        let state = test_app_state();
+
+        for message_count in [6usize, 100, 500] {
+            let source = test_thread(&state, "codex", "gpt-5.4");
+            db::threads::set_engine_thread_id(&state.db, &source.id, "engine-source")
+                .expect("set engine thread id");
+            let imported = (0..message_count)
+                .map(|index| {
+                    let role = if index % 2 == 0 { "user" } else { "assistant" };
+                    db::messages::ImportedMessageRecord {
+                        role: role.to_string(),
+                        content: Some(format!("message {index}")),
+                        blocks: json!([{ "type": "text", "content": format!("message {index}") }]),
+                        status: MessageStatusDto::Completed,
+                        native_turn_id: Some(format!("turn-{}", index / 2)),
+                        turn_engine_id: Some("codex".to_string()),
+                        turn_model_id: Some("gpt-5.4".to_string()),
+                        turn_reasoning_effort: None,
+                        token_input: u64::from(role == "user"),
+                        token_output: u64::from(role == "assistant"),
+                        created_at: None,
+                    }
+                })
+                .collect::<Vec<_>>();
+            db::messages::replace_thread_messages(&state.db, &source.id, &imported)
+                .expect("insert source messages");
+            db::threads::update_engine_metadata(
+                &state.db,
+                &source.id,
+                &json!({ "codexTranscriptImported": true }),
+            )
+            .expect("mark transcript imported");
+
+            let started = Instant::now();
+            let source_turn_count = db::messages::thread_turn_count(&state.db, &source.id)
+                .expect("count source turns");
+            let intent = EngineRollbackIntent {
+                num_turns: 1,
+                source_turn_count,
+                target_turn_count: source_turn_count - 1,
+                phase: EngineRollbackPhase::Prepared,
+            };
+            let pending_metadata = mark_engine_rollback_pending(
+                json!({ "codexTranscriptImported": true }),
+                &intent,
+            );
+            db::messages::prepare_pending_thread_rollback(
+                &state.db,
+                &source.id,
+                1,
+                &pending_metadata,
+            )
+            .expect("prepare local rollback");
+            let projected = db::threads::get_thread(&state.db, &source.id)
+                .expect("load projected thread")
+                .expect("projected thread exists");
+            let elapsed = started.elapsed();
+
+            assert_eq!(projected.id, source.id);
+            assert_eq!(projected.engine_thread_id.as_deref(), Some("engine-source"));
+            assert_eq!(projected.message_count, message_count as i64 - 2);
+            assert_eq!(
+                engine_rollback_intent(projected.engine_metadata.as_ref()),
+                Some(intent.clone())
+            );
+            let started = db::threads::mark_pending_rollback_started(&state.db, &source.id)
+                .expect("mark rollback started");
+            assert_eq!(
+                engine_rollback_intent(started.engine_metadata.as_ref()),
+                Some(EngineRollbackIntent {
+                    phase: EngineRollbackPhase::Started,
+                    ..intent
+                })
+            );
+            println!(
+                "rollback round trip: {message_count} messages -> {:.2} ms (returned pending, transcript projected)",
+                elapsed.as_secs_f64() * 1000.0
+            );
+            assert!(
+                elapsed.as_millis() < 500,
+                "rollback round trip took {:?} for {message_count} messages",
+                elapsed
+            );
+        }
+    }
+
     #[test]
-    fn persist_codex_in_place_rollback_trims_local_history_without_creating_a_thread() {
+    fn persist_codex_in_place_rollback_keeps_the_projected_local_prefix() {
         let state = test_app_state();
         let thread = test_thread(&state, "codex", "gpt-5.4");
         let imported = [
@@ -3902,17 +4498,68 @@ mod tests {
         db::messages::replace_thread_messages(&state.db, &thread.id, &imported)
             .expect("expected thread messages to be inserted");
 
+        let intent = EngineRollbackIntent {
+            num_turns: 1,
+            source_turn_count: 2,
+            target_turn_count: 1,
+            phase: EngineRollbackPhase::Prepared,
+        };
+        let pending_metadata = mark_engine_rollback_pending(
+            thread.engine_metadata.clone().unwrap_or_else(|| json!({})),
+            &intent,
+        );
+        db::messages::prepare_pending_thread_rollback(
+            &state.db,
+            &thread.id,
+            intent.num_turns,
+            &pending_metadata,
+        )
+        .expect("expected local rollback projection");
+        let projected = db::threads::mark_pending_rollback_started(&state.db, &thread.id)
+            .expect("expected rollback to be marked started");
+        let retained_before = db::messages::get_thread_messages(&state.db, &thread.id)
+            .expect("expected projected messages")
+            .into_iter()
+            .map(|message| (message.id, message.created_at, message.content))
+            .collect::<Vec<_>>();
+
         let updated = persist_codex_in_place_rollback(
             &state.db,
-            &thread,
+            &projected,
             &ThreadSyncSnapshot {
                 title: Some("Rolled back".to_string()),
                 preview: Some("First".to_string()),
                 raw_status: Some("idle".to_string()),
                 active_flags: Vec::new(),
-                imported_messages: Vec::new(),
+                imported_messages: vec![
+                    ImportedThreadMessage {
+                        role: "user".to_string(),
+                        content: Some("First".to_string()),
+                        blocks: json!([{ "type": "text", "content": "First" }]),
+                        status: "completed".to_string(),
+                        native_turn_id: Some("turn-1".to_string()),
+                        turn_engine_id: Some("codex".to_string()),
+                        turn_model_id: Some("gpt-5.4".to_string()),
+                        turn_reasoning_effort: None,
+                        token_input: 1,
+                        token_output: 0,
+                        created_at: None,
+                    },
+                    ImportedThreadMessage {
+                        role: "assistant".to_string(),
+                        content: Some("Codex reply 1".to_string()),
+                        blocks: json!([{ "type": "text", "content": "Codex reply 1" }]),
+                        status: "completed".to_string(),
+                        native_turn_id: Some("turn-1".to_string()),
+                        turn_engine_id: Some("codex".to_string()),
+                        turn_model_id: Some("gpt-5.4".to_string()),
+                        turn_reasoning_effort: None,
+                        token_input: 0,
+                        token_output: 1,
+                        created_at: None,
+                    },
+                ],
             },
-            1,
         )
         .expect("expected rollback persistence to succeed");
 
@@ -3921,9 +4568,20 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content.as_deref(), Some("First"));
         assert_eq!(messages[1].content.as_deref(), Some("Reply 1"));
+        assert_eq!(messages[1].native_turn_id, None);
+        assert_eq!(
+            messages
+                .into_iter()
+                .map(|message| (message.id, message.created_at, message.content))
+                .collect::<Vec<_>>(),
+            retained_before
+        );
         assert_eq!(updated.id, thread.id);
         assert_eq!(updated.message_count, 2);
         assert_eq!(updated.title, "Rolled back");
+        assert!(!is_engine_rollback_pending(
+            updated.engine_metadata.as_ref()
+        ));
         assert_eq!(
             updated
                 .engine_metadata
@@ -3937,62 +4595,6 @@ mod tests {
                 .as_ref()
                 .and_then(|metadata| metadata.get("codexPreview")),
             Some(&json!("First"))
-        );
-    }
-
-    #[test]
-    fn persist_codex_in_place_rollback_imports_returned_history_when_local_sync_is_pending() {
-        let state = test_app_state();
-        let mut thread = test_thread(&state, "codex", "gpt-5.4");
-        thread.engine_metadata = Some(json!({
-            "codexTranscriptImported": false,
-            "codexSyncRequired": true,
-        }));
-        db::threads::update_engine_metadata(
-            &state.db,
-            &thread.id,
-            thread.engine_metadata.as_ref().expect("metadata"),
-        )
-        .expect("expected metadata update");
-
-        let updated = persist_codex_in_place_rollback(
-            &state.db,
-            &thread,
-            &ThreadSyncSnapshot {
-                title: Some("Remote rollback".to_string()),
-                preview: Some("Retained prompt".to_string()),
-                raw_status: Some("idle".to_string()),
-                active_flags: Vec::new(),
-                imported_messages: vec![ImportedThreadMessage {
-                    role: "user".to_string(),
-                    content: Some("Retained prompt".to_string()),
-                    blocks: json!([{ "type": "text", "content": "Retained prompt" }]),
-                    status: "completed".to_string(),
-                    native_turn_id: None,
-                    turn_engine_id: Some("codex".to_string()),
-                    turn_model_id: Some("gpt-5.4".to_string()),
-                    turn_reasoning_effort: None,
-                    token_input: 1,
-                    token_output: 0,
-                    created_at: None,
-                }],
-            },
-            1,
-        )
-        .expect("expected remote rollback history to be imported");
-
-        let messages =
-            db::messages::get_thread_messages(&state.db, &thread.id).expect("expected messages");
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].content.as_deref(), Some("Retained prompt"));
-        assert_eq!(updated.id, thread.id);
-        assert_eq!(updated.message_count, 1);
-        assert_eq!(
-            updated
-                .engine_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("codexSyncRequired")),
-            Some(&json!(false))
         );
     }
 

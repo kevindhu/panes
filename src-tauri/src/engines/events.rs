@@ -69,6 +69,8 @@ pub enum EngineEvent {
     ActionCompleted {
         action_id: String,
         result: ActionResult,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
     },
     DiffUpdated {
         diff: String,
@@ -128,6 +130,8 @@ pub struct CodexNativeEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CodexNativeEventKind {
+    ClientRequest,
+    ClientResponse,
     Request,
     Notification,
     Response,
@@ -136,6 +140,8 @@ pub enum CodexNativeEventKind {
 impl CodexNativeEventKind {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::ClientRequest => "client_request",
+            Self::ClientResponse => "client_response",
             Self::Request => "request",
             Self::Notification => "notification",
             Self::Response => "response",

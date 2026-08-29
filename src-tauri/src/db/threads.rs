@@ -230,6 +230,33 @@ pub fn update_engine_metadata(
     Ok(())
 }
 
+pub fn mark_pending_rollback_started(
+    db: &Database,
+    thread_id: &str,
+) -> anyhow::Result<ThreadDto> {
+    let conn = db.connect()?;
+    let affected = conn
+        .execute(
+            "UPDATE threads
+             SET engine_metadata_json = json_set(
+                   COALESCE(engine_metadata_json, '{}'),
+                   '$.engineRollbackPhase',
+                   'started'
+                 )
+             WHERE id = ?1
+               AND json_extract(engine_metadata_json, '$.engineRollbackPending') = 1
+               AND json_extract(engine_metadata_json, '$.engineRollbackPhase') = 'prepared'",
+            params![thread_id],
+        )
+        .context("failed to mark pending rollback as started")?;
+    if affected == 0 {
+        anyhow::bail!("pending rollback is no longer prepared: {thread_id}");
+    }
+
+    get_thread_with_connection(&conn, thread_id)?
+        .ok_or_else(|| anyhow::anyhow!("thread not found after starting rollback: {thread_id}"))
+}
+
 pub fn bump_message_counters(
     db: &Database,
     thread_id: &str,

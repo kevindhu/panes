@@ -274,6 +274,23 @@ pub struct TurnInput {
     pub input_items: Vec<TurnInputItem>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SteerMarker {
+    pub steer_id: String,
+    pub message_id: String,
+    pub display: Value,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SteerReceipt {
+    pub steer_id: String,
+    pub message_id: String,
+    pub native_turn_id: String,
+    pub source_sequence: u64,
+    pub accepted_source_sequence: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum TurnInputItem {
@@ -310,7 +327,8 @@ pub trait Engine: Send + Sync {
         &self,
         engine_thread_id: &str,
         input: TurnInput,
-    ) -> Result<(), anyhow::Error>;
+        marker: SteerMarker,
+    ) -> Result<SteerReceipt, anyhow::Error>;
 
     async fn respond_to_approval(
         &self,
@@ -530,11 +548,12 @@ impl EngineManager {
         thread: &ThreadDto,
         engine_thread_id: &str,
         input: TurnInput,
-    ) -> anyhow::Result<()> {
+        marker: SteerMarker,
+    ) -> anyhow::Result<SteerReceipt> {
         match thread.engine_id.as_str() {
             "codex" => self
                 .codex
-                .steer_message(engine_thread_id, input)
+                .steer_message(engine_thread_id, input, marker)
                 .await
                 .context("codex steer_message failed"),
             _ => anyhow::bail!("unsupported engine_id {}", thread.engine_id),

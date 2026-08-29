@@ -1,8 +1,10 @@
 use anyhow::Context;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{Duration as ChronoDuration, NaiveDateTime, Utc};
 use std::collections::HashMap;
 
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, TransactionBehavior};
+use rusqlite::{
+    params, params_from_iter, Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
+};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -95,6 +97,22 @@ pub fn clone_thread_messages_for_branch(
 ) -> anyhow::Result<usize> {
     let messages = get_thread_messages(db, source_thread_id)?;
     let retained_count = retained_message_count_after_rollback(&messages, rollback_turns)?;
+    clone_message_slice(db, target_thread_id, &messages[..retained_count])
+}
+
+pub fn clone_thread_messages_for_branch_at_message(
+    db: &Database,
+    source_thread_id: &str,
+    target_thread_id: &str,
+    source_message_id: &str,
+    expected_native_turn_id: Option<&str>,
+) -> anyhow::Result<usize> {
+    let messages = get_thread_messages(db, source_thread_id)?;
+    let retained_count = retained_message_count_through_assistant_message(
+        &messages,
+        source_message_id,
+        expected_native_turn_id,
+    )?;
     clone_message_slice(db, target_thread_id, &messages[..retained_count])
 }
 
@@ -198,6 +216,43 @@ fn retained_message_count_after_rollback(
     Ok(user_message_indexes[user_message_indexes.len() - turns_to_drop])
 }
 
+fn retained_message_count_through_assistant_message(
+    messages: &[MessageDto],
+    source_message_id: &str,
+    expected_native_turn_id: Option<&str>,
+) -> anyhow::Result<usize> {
+    let source_message_id = source_message_id.trim();
+    if source_message_id.is_empty() {
+        anyhow::bail!("source message id cannot be empty");
+    }
+
+    let (message_index, message) = messages
+        .iter()
+        .enumerate()
+        .find(|(_, message)| message.id == source_message_id)
+        .ok_or_else(|| anyhow::anyhow!("fork source message not found: {source_message_id}"))?;
+    if message.role != "assistant" {
+        anyhow::bail!("fork source message must be an assistant response");
+    }
+    if message.status == MessageStatusDto::Streaming {
+        anyhow::bail!("cannot fork through an assistant response that is still streaming");
+    }
+
+    if let Some(expected_native_turn_id) = expected_native_turn_id {
+        let expected_native_turn_id = expected_native_turn_id.trim();
+        if expected_native_turn_id.is_empty() {
+            anyhow::bail!("native turn id cannot be empty");
+        }
+        if message.native_turn_id.as_deref() != Some(expected_native_turn_id) {
+            anyhow::bail!(
+                "fork source message does not match native turn {expected_native_turn_id}"
+            );
+        }
+    }
+
+    Ok(message_index + 1)
+}
+
 pub fn replace_thread_messages(
     db: &Database,
     thread_id: &str,
@@ -225,12 +280,34 @@ pub fn replace_thread_messages(
     .context("failed to clear imported thread messages")?;
 
     let fallback_created_at_base = Utc::now();
+    let mut previous_created_at = None;
     for (index, message) in messages.iter().enumerate() {
-        let created_at = message.created_at.clone().unwrap_or_else(|| {
-            (fallback_created_at_base + ChronoDuration::milliseconds(index as i64))
-                .format("%Y-%m-%d %H:%M:%S%.3f")
-                .to_string()
-        });
+        let requested_created_at = message
+            .created_at
+            .as_deref()
+            .and_then(|value| {
+                NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+                    .ok()
+                    .map(|timestamp| timestamp.and_utc())
+                    .or_else(|| {
+                        chrono::DateTime::parse_from_rfc3339(value)
+                            .ok()
+                            .map(|timestamp| timestamp.with_timezone(&Utc))
+                    })
+            })
+            .unwrap_or_else(|| {
+                fallback_created_at_base + ChronoDuration::milliseconds(index as i64)
+            });
+        let ordered_created_at = match previous_created_at {
+            Some(previous) if requested_created_at <= previous => {
+                previous + ChronoDuration::milliseconds(1)
+            }
+            _ => requested_created_at,
+        };
+        previous_created_at = Some(ordered_created_at);
+        let created_at = ordered_created_at
+            .format("%Y-%m-%d %H:%M:%S%.3f")
+            .to_string();
 
         tx.execute(
             "INSERT INTO messages (
@@ -291,6 +368,90 @@ pub fn replace_thread_messages(
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn drop_last_turns(db: &Database, thread_id: &str, num_turns: u32) -> anyhow::Result<usize> {
     let messages = get_thread_messages(db, thread_id)?;
+    let message_ids = rollback_message_ids(&messages, num_turns)?;
+    if message_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut conn = db.connect()?;
+    let tx = conn
+        .transaction()
+        .context("failed to start thread rollback transaction")?;
+    delete_rollback_messages(&tx, thread_id, &message_ids)?;
+    tx.commit()
+        .context("failed to commit thread rollback transaction")?;
+    Ok(message_ids.len())
+}
+
+pub fn thread_turn_count(db: &Database, thread_id: &str) -> anyhow::Result<u32> {
+    let count = get_thread_messages(db, thread_id)?
+        .iter()
+        .filter(|message| message.role == "user" && !message_has_steer_marker(message))
+        .count();
+    u32::try_from(count).context("thread turn count exceeds u32")
+}
+
+/// Atomically records a deferred rollback intent and projects the retained local
+/// transcript. The projection remains authoritative locally after Codex confirms
+/// the native rollback reached the expected turn count.
+pub fn prepare_pending_thread_rollback(
+    db: &Database,
+    thread_id: &str,
+    num_turns: u32,
+    pending_metadata: &Value,
+) -> anyhow::Result<usize> {
+    let messages = get_thread_messages(db, thread_id)?;
+    let message_ids = rollback_message_ids(&messages, num_turns)?;
+    if message_ids.is_empty() {
+        anyhow::bail!("rollback did not identify any messages to remove");
+    }
+
+    let mut conn = db.connect()?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("failed to start pending thread rollback transaction")?;
+    let marked = tx
+        .execute(
+            "UPDATE threads
+             SET engine_metadata_json = ?1
+             WHERE id = ?2
+               AND COALESCE(json_extract(engine_metadata_json, '$.engineRollbackPending'), 0) = 0",
+            params![pending_metadata.to_string(), thread_id],
+        )
+        .context("failed to record pending thread rollback")?;
+    if marked == 0 {
+        anyhow::bail!("thread not found or another rollback is already pending: {thread_id}");
+    }
+
+    delete_rollback_messages(&tx, thread_id, &message_ids)?;
+    tx.execute(
+        "UPDATE threads
+         SET message_count = (
+               SELECT COUNT(*) FROM messages WHERE thread_id = ?1
+             ),
+             total_tokens = (
+               SELECT COALESCE(
+                 SUM(COALESCE(token_input, 0) + COALESCE(token_output, 0)),
+                 0
+               )
+               FROM messages
+               WHERE thread_id = ?1
+             ),
+             last_activity_at = COALESCE(
+               (SELECT MAX(created_at) FROM messages WHERE thread_id = ?1),
+               datetime('now')
+             )
+         WHERE id = ?1",
+        params![thread_id],
+    )
+    .context("failed to refresh pending rollback thread stats")?;
+
+    tx.commit()
+        .context("failed to commit pending thread rollback transaction")?;
+    Ok(message_ids.len())
+}
+
+fn rollback_message_ids(messages: &[MessageDto], num_turns: u32) -> anyhow::Result<Vec<String>> {
     let user_message_indexes = messages
         .iter()
         .enumerate()
@@ -311,20 +472,18 @@ pub fn drop_last_turns(db: &Database, thread_id: &str, num_turns: u32) -> anyhow
     }
 
     let cutoff_index = user_message_indexes[user_message_indexes.len() - turns_to_drop];
-    let message_ids = messages
+    Ok(messages
         .iter()
         .skip(cutoff_index)
         .map(|message| message.id.clone())
-        .collect::<Vec<_>>();
-    if message_ids.is_empty() {
-        return Ok(0);
-    }
+        .collect())
+}
 
-    let mut conn = db.connect()?;
-    let tx = conn
-        .transaction()
-        .context("failed to start thread rollback transaction")?;
-
+fn delete_rollback_messages(
+    tx: &Transaction<'_>,
+    thread_id: &str,
+    message_ids: &[String],
+) -> anyhow::Result<()> {
     for chunk in message_ids.chunks(500) {
         let placeholders = std::iter::repeat_n("?", chunk.len())
             .collect::<Vec<_>>()
@@ -359,10 +518,22 @@ pub fn drop_last_turns(db: &Database, thread_id: &str, num_turns: u32) -> anyhow
     // removed by the chunked delete_approvals_sql above, which scopes deletions to
     // message_id IN (...). The previous thread-wide pending approval sweep is intentionally
     // removed here to avoid deleting pending approvals that belong to retained messages.
+    Ok(())
+}
 
-    tx.commit()
-        .context("failed to commit thread rollback transaction")?;
-    Ok(message_ids.len())
+pub fn validate_thread_branch_message_cutoff(
+    db: &Database,
+    thread_id: &str,
+    source_message_id: &str,
+    expected_native_turn_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let messages = get_thread_messages(db, thread_id)?;
+    retained_message_count_through_assistant_message(
+        &messages,
+        source_message_id,
+        expected_native_turn_id,
+    )?;
+    Ok(())
 }
 
 fn message_has_steer_marker(message: &MessageDto) -> bool {
@@ -1413,6 +1584,101 @@ mod tests {
     }
 
     #[test]
+    fn replacing_imported_messages_makes_source_order_timestamp_monotonic() {
+        let db = test_db();
+        let thread_id = test_thread(&db);
+        let imported = vec![
+            ImportedMessageRecord {
+                role: "user".to_string(),
+                content: Some("first".to_string()),
+                blocks: json!([{ "type": "text", "content": "first" }]),
+                status: MessageStatusDto::Completed,
+                native_turn_id: Some("turn-1".to_string()),
+                turn_engine_id: Some("codex".to_string()),
+                turn_model_id: None,
+                turn_reasoning_effort: None,
+                token_input: 0,
+                token_output: 0,
+                created_at: Some("2026-07-25 10:00:05.000".to_string()),
+            },
+            ImportedMessageRecord {
+                role: "assistant".to_string(),
+                content: Some("second".to_string()),
+                blocks: json!([{ "type": "text", "content": "second" }]),
+                status: MessageStatusDto::Completed,
+                native_turn_id: Some("turn-1".to_string()),
+                turn_engine_id: Some("codex".to_string()),
+                turn_model_id: None,
+                turn_reasoning_effort: None,
+                token_input: 0,
+                token_output: 0,
+                created_at: Some("2026-07-25 10:00:04.000".to_string()),
+            },
+            ImportedMessageRecord {
+                role: "user".to_string(),
+                content: Some("third".to_string()),
+                blocks: json!([{ "type": "text", "content": "third" }]),
+                status: MessageStatusDto::Completed,
+                native_turn_id: Some("turn-2".to_string()),
+                turn_engine_id: Some("codex".to_string()),
+                turn_model_id: None,
+                turn_reasoning_effort: None,
+                token_input: 0,
+                token_output: 0,
+                created_at: Some("2026-07-25 10:00:03.000".to_string()),
+            },
+        ];
+
+        replace_thread_messages(&db, &thread_id, &imported).unwrap();
+        let messages = get_thread_messages(&db, &thread_id).unwrap();
+
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.content.as_deref().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+        assert!(messages
+            .windows(2)
+            .all(|pair| pair[0].created_at < pair[1].created_at));
+    }
+
+    #[test]
+    fn message_window_cursor_preserves_row_order_when_timestamps_are_identical() {
+        let db = test_db();
+        let thread_id = test_thread(&db);
+        let mut inserted_ids = Vec::new();
+        for content in ["one", "two", "three", "four"] {
+            inserted_ids.push(
+                insert_user_message(&db, &thread_id, content, None, None, None, None)
+                    .unwrap()
+                    .id,
+            );
+        }
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE messages SET created_at = '2026-07-25 10:00:00.000' WHERE thread_id = ?1",
+            params![thread_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let latest = get_thread_messages_window(&db, &thread_id, None, 2).unwrap();
+        let older =
+            get_thread_messages_window(&db, &thread_id, latest.next_cursor.as_ref(), 2).unwrap();
+        let combined = older
+            .messages
+            .into_iter()
+            .chain(latest.messages)
+            .map(|message| message.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(combined, inserted_ids);
+        assert!(older.next_cursor.is_none());
+    }
+
+    #[test]
     fn build_search_messages_query_quotes_free_text_terms() {
         assert_eq!(
             build_search_messages_query("foo bar:baz \"quoted\""),
@@ -1747,10 +2013,7 @@ mod tests {
         update_assistant_native_turn_id(&db, &message.id, "turn-native-1").unwrap();
 
         let reloaded = get_thread_messages(&db, &thread_id).unwrap();
-        assert_eq!(
-            reloaded[0].native_turn_id.as_deref(),
-            Some("turn-native-1")
-        );
+        assert_eq!(reloaded[0].native_turn_id.as_deref(), Some("turn-native-1"));
     }
 
     #[test]
@@ -2059,6 +2322,88 @@ mod tests {
         assert_eq!(target_messages.len(), 2);
         assert_eq!(target_messages[0].content.as_deref(), Some("turn 1"));
         assert_eq!(target_messages[1].content.as_deref(), Some("answer 1"));
+    }
+
+    #[test]
+    fn clone_thread_messages_for_branch_at_message_ignores_a_newer_streaming_suffix() {
+        let db = test_db();
+        let source_thread_id = test_thread(&db);
+        let target_thread_id = test_thread(&db);
+
+        insert_user_message(&db, &source_thread_id, "turn 1", None, None, None, None).unwrap();
+        let completed_assistant = insert_message(
+            &db,
+            &source_thread_id,
+            "assistant",
+            Some("answer 1".to_string()),
+            Some(json!([{ "type": "text", "content": "answer 1" }])),
+            MessageStatusDto::Completed,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        update_assistant_native_turn_id(&db, &completed_assistant.id, "turn-native-1").unwrap();
+        insert_user_message(&db, &source_thread_id, "turn 2", None, None, None, None).unwrap();
+        insert_assistant_placeholder(&db, &source_thread_id, None, None, None).unwrap();
+
+        let mismatched_native_turn = validate_thread_branch_message_cutoff(
+            &db,
+            &source_thread_id,
+            &completed_assistant.id,
+            Some("turn-native-wrong"),
+        )
+        .expect_err("local and native fork anchors must describe the same turn");
+        assert!(mismatched_native_turn
+            .to_string()
+            .contains("does not match native turn"));
+
+        validate_thread_branch_message_cutoff(
+            &db,
+            &source_thread_id,
+            &completed_assistant.id,
+            Some("turn-native-1"),
+        )
+        .unwrap();
+        let cloned = clone_thread_messages_for_branch_at_message(
+            &db,
+            &source_thread_id,
+            &target_thread_id,
+            &completed_assistant.id,
+            Some("turn-native-1"),
+        )
+        .unwrap();
+
+        assert_eq!(cloned, 2);
+        let target_messages = get_thread_messages(&db, &target_thread_id).unwrap();
+        assert_eq!(target_messages.len(), 2);
+        assert_eq!(target_messages[0].content.as_deref(), Some("turn 1"));
+        assert_eq!(target_messages[1].content.as_deref(), Some("answer 1"));
+        assert_eq!(
+            target_messages[1].native_turn_id.as_deref(),
+            Some("turn-native-1")
+        );
+    }
+
+    #[test]
+    fn branch_message_cutoff_rejects_a_streaming_assistant_boundary() {
+        let db = test_db();
+        let source_thread_id = test_thread(&db);
+        insert_user_message(&db, &source_thread_id, "turn 1", None, None, None, None).unwrap();
+        let streaming_assistant =
+            insert_assistant_placeholder(&db, &source_thread_id, None, None, None).unwrap();
+        update_assistant_native_turn_id(&db, &streaming_assistant.id, "turn-native-active")
+            .unwrap();
+
+        let error = validate_thread_branch_message_cutoff(
+            &db,
+            &source_thread_id,
+            &streaming_assistant.id,
+            Some("turn-native-active"),
+        )
+        .expect_err("streaming boundaries must not be forkable");
+
+        assert!(error.to_string().contains("still streaming"));
     }
 
     #[test]
