@@ -2,6 +2,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -27,6 +28,7 @@ import {
   Copy,
   Check,
   MessageSquare,
+  Search,
 } from "lucide-react";
 import type {
   ActionBlock,
@@ -77,11 +79,17 @@ import {
   getWorkspacePaneLeafIdFromEventTarget,
   navigateLinkTarget,
 } from "../../lib/fileLinkNavigation";
+import {
+  recordTranscriptLinkPointerDown,
+  transcriptLinkShouldNavigate,
+} from "../../lib/transcriptSelection";
+import { webSearchDetails } from "../../lib/codexTranscript";
 interface Props {
   blocks?: ContentBlock[];
   status?: MessageStatus;
   messageRole?: "user" | "assistant";
   workspaceRootPath?: string | null;
+  selectionNamespace?: string;
   onApproval: (approvalId: string, response: ApprovalResponse) => void;
   onLoadActionOutput?: (actionId: string) => Promise<void>;
 }
@@ -91,6 +99,21 @@ const CONTEXT_COMPACTION_PROMPT_DETAIL_PREFIX = "prompt::";
 
 function isBlockLike(value: unknown): value is { type: string } {
   return typeof value === "object" && value !== null && "type" in value;
+}
+
+function getSelectionBlockScopeKey(
+  block: ContentBlock,
+  index: number,
+  blocks: ContentBlock[],
+): string {
+  if (block.type === "action") return `action:${block.actionId}`;
+  if (block.type === "approval") return `approval:${block.approvalId}`;
+  if (block.type === "steer") return `steer:${block.steerId}`;
+  let ordinal = 0;
+  for (let current = 0; current < index; current += 1) {
+    if (blocks[current]?.type === block.type) ordinal += 1;
+  }
+  return `${block.type}:${ordinal}`;
 }
 
 function dedupeDiffBlocksByScope(blocks: ContentBlock[]): ContentBlock[] {
@@ -154,25 +177,25 @@ function handlePlainTextLinkClick(
     return;
   }
 
-  const selection = globalThis.getSelection?.();
-  if (selection && !selection.isCollapsed && selection.toString().trim().length > 0) {
-    event.preventDefault();
-    return;
-  }
-
   event.preventDefault();
-  if (!event.shiftKey) {
-    return;
-  }
-
+  if (!transcriptLinkShouldNavigate(event, event.currentTarget)) return;
   event.stopPropagation();
   void navigateLinkTarget(target, {
-    shiftKey: true,
+    shiftKey: event.shiftKey,
     sourceLeafId: getWorkspacePaneLeafIdFromEventTarget(event.currentTarget),
   });
 }
 
-function LinkifiedPlainText({ text }: { text: string }) {
+export const ACTION_HEADER_MAX_CHARS = 160;
+
+export function truncateActionHeader(text: string): string {
+  if (text.length <= ACTION_HEADER_MAX_CHARS) {
+    return text;
+  }
+  return `${text.slice(0, ACTION_HEADER_MAX_CHARS).trimEnd()}\u2026`;
+}
+
+export function LinkifiedPlainText({ text }: { text: string }) {
   const matches = useMemo(() => extractTextLinkMatches(text), [text]);
   if (matches.length === 0) {
     return <>{text}</>;
@@ -190,6 +213,7 @@ function LinkifiedPlainText({ text }: { text: string }) {
         href={match.text}
         className="chat-plain-link"
         rel="noreferrer noopener"
+        onMouseDown={(event) => recordTranscriptLinkPointerDown(event, event.currentTarget)}
         onClick={(event) => handlePlainTextLinkClick(event, match.text)}
       >
         {match.text}
@@ -211,6 +235,7 @@ const actionIcons: Record<string, typeof Terminal> = {
   file_edit: FileCode2,
   file_read: FileCode2,
   file_delete: FileCode2,
+  search: Search,
 };
 
 /* ── Action Group Segmentation ── */
@@ -240,56 +265,6 @@ function isCardSegment(seg: BlockSegment): seg is InnerSegment {
     return true;
   }
   return false;
-}
-
-function isCompletedActionSegment(
-  segment: InnerSegment,
-): segment is { kind: "single"; block: ActionBlock; index: number } {
-  return (
-    segment.kind === "single" &&
-    segment.block.type === "action" &&
-    segment.block.status !== "running" &&
-    segment.block.status !== "pending"
-  );
-}
-
-function groupCompletedActionsInCard(cardSegments: InnerSegment[]): InnerSegment[] {
-  const actionBlocks: ActionBlock[] = [];
-  const indices: number[] = [];
-  for (const segment of cardSegments) {
-    if (segment.kind === "action-group") {
-      actionBlocks.push(...segment.blocks);
-      indices.push(...segment.indices);
-    } else if (isCompletedActionSegment(segment)) {
-      actionBlocks.push(segment.block);
-      indices.push(segment.index);
-    }
-  }
-
-  if (actionBlocks.length < ACTION_GROUP_MIN_SIZE) {
-    return cardSegments;
-  }
-
-  let insertedGroup = false;
-  const groupedSegment: InnerSegment = {
-    kind: "action-group",
-    blocks: actionBlocks,
-    indices,
-  };
-
-  const groupedSegments: InnerSegment[] = [];
-  for (const segment of cardSegments) {
-    if (segment.kind === "action-group" || isCompletedActionSegment(segment)) {
-      if (insertedGroup) {
-        continue;
-      }
-      insertedGroup = true;
-      groupedSegments.push(groupedSegment);
-      continue;
-    }
-    groupedSegments.push(segment);
-  }
-  return groupedSegments;
 }
 
 function buildBlockSegments(blocks: ContentBlock[], isStreaming?: boolean): BlockSegment[] {
@@ -362,7 +337,10 @@ function buildBlockSegments(blocks: ContentBlock[], isStreaming?: boolean): Bloc
     }
     segments.push({
       kind: "action-card",
-      segments: groupCompletedActionsInCard(cardSegments),
+      // Card styling may span adjacent activity-like blocks, but chronology may
+      // not. Completed actions separated by a thought, diff, or approval must
+      // remain on their original sides of that boundary.
+      segments: cardSegments,
     });
   }
   return segments;
@@ -447,10 +425,12 @@ function ThinkingBlockView({
   block,
   isStreaming,
   workspaceRootPath,
+  selectionScopeId,
 }: {
   block: ThinkingBlock;
   isStreaming: boolean;
   workspaceRootPath?: string | null;
+  selectionScopeId: string;
 }) {
   const { t } = useTranslation("chat");
   const [expanded, setExpanded] = useState(false);
@@ -508,6 +488,7 @@ function ThinkingBlockView({
             content={content}
             className="prose"
             workspaceRootPath={workspaceRootPath}
+            selectionScopeId={selectionScopeId}
             style={{
               fontSize: 12.5,
               color: "var(--text-2)",
@@ -965,6 +946,15 @@ function SteerBlockView({ block }: { block: SteerBlock }) {
             })}
           </div>
         )}
+        {block.status && block.status !== "accepted" && (
+          <div className={`msg-steer-status ${block.status}`}>
+            {block.status === "pending"
+              ? "Sending interruption…"
+              : block.status === "failed"
+                ? `Interruption failed${block.error ? `: ${block.error}` : "."}`
+                : "Interruption delivery was not confirmed."}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1036,6 +1026,21 @@ function ActionBlockView({
   );
   const Icon = actionIcons[block.actionType] ?? Terminal;
   const actionDetails = (block.details ?? {}) as Record<string, unknown>;
+  const searchDetails = useMemo(
+    () => block.actionType === "search" ? webSearchDetails(actionDetails) : null,
+    [actionDetails, block.actionType],
+  );
+  const displaySummary = useMemo(() => {
+    if (!searchDetails) return block.summary;
+    if (searchDetails.queries.length > 1) {
+      return `Searched ${searchDetails.queries[0]} +${searchDetails.queries.length - 1} more`;
+    }
+    if (searchDetails.query) return `Searched ${searchDetails.query}`;
+    if (searchDetails.results.length > 0) {
+      return `Read ${searchDetails.results.length} ${searchDetails.results.length === 1 ? "source" : "sources"}`;
+    }
+    return block.summary;
+  }, [block.summary, searchDetails]);
   const inputDetail = useMemo(() => {
     const pretty = (value: unknown) => {
       try {
@@ -1049,17 +1054,18 @@ function ActionBlockView({
       return { label: "Command", content: command };
     }
     if (block.actionType === "search") {
-      if (typeof actionDetails.query === "string") {
-        const action = actionDetails.action === undefined ? "" : `\n\naction:\n${pretty(actionDetails.action)}`;
-        return { label: "Web search", content: `query: ${actionDetails.query}${action}` };
-      }
-      return { label: "Web search", content: pretty(actionDetails) };
+      if (!searchDetails) return { label: "Web search", content: pretty(actionDetails) };
+      const operation = searchDetails.actionType ?? (searchDetails.queries.length > 0 ? "search" : "browse");
+      const queryLines = searchDetails.queries.length > 0
+        ? searchDetails.queries.map((query) => `- ${query}`).join("\n")
+        : "(no textual query emitted)";
+      return { label: "Web search", content: `operation: ${operation}\nqueries:\n${queryLines}` };
     }
     if (Object.keys(actionDetails).length > 0) {
       return { label: "Tool input", content: pretty(actionDetails) };
     }
     return { label: "Tool input", content: block.summary };
-  }, [actionDetails, block.actionType, block.summary]);
+  }, [actionDetails, block.actionType, block.summary, searchDetails]);
   const outputTruncated =
     "outputTruncated" in actionDetails && actionDetails.outputTruncated === true;
   const progressMessage =
@@ -1105,7 +1111,7 @@ function ActionBlockView({
 
   const toggleExpanded = useCallback(() => setExpanded((v) => !v), []);
   return (
-    <div>
+    <div className="msg-action">
       <div
         className={canToggle ? "msg-block-header msg-block-header--compact" : undefined}
         style={canToggle ? undefined : { display: "flex", alignItems: "center", gap: 6, padding: "3px 12px" }}
@@ -1124,8 +1130,8 @@ function ActionBlockView({
           />
         )}
         <Icon size={12} style={{ color: "var(--text-3)", flexShrink: 0 }} />
-        <span style={{ fontSize: 11.5, color: "var(--text-2)", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {block.summary}
+        <span className="msg-action-title" title={displaySummary}>
+          {truncateActionHeader(displaySummary)}
         </span>
         <ActionStatusBadge status={block.status} />
         {block.result?.durationMs != null && block.status === "done" && (
@@ -1151,16 +1157,38 @@ function ActionBlockView({
       )}
 
       {expanded && (
-        <div style={{
-          margin: "2px 12px 4px",
-          borderRadius: "var(--radius-sm)",
-          border: "1px solid var(--border)",
-          overflow: "hidden",
-        }}>
+        <div className="legacy-action-details">
           <div className="legacy-action-input">
             <span>{inputDetail.label}</span>
             <pre className="action-output-pre"><LinkifiedPlainText text={inputDetail.content} /></pre>
           </div>
+
+          {searchDetails && searchDetails.results.length > 0 && (
+            <div className="legacy-web-search-results">
+              <span>Results ({searchDetails.results.length})</span>
+              <div className="codex-native-search-results">
+                {searchDetails.results.map((result, index) => (
+                  <details className="codex-native-search-result" key={`${result.refId ?? result.url ?? result.title}:${index}`}>
+                    <summary>
+                      <span>{result.title}</span>
+                      {result.domain && <small>{result.domain}</small>}
+                      <ChevronRight size={11} />
+                    </summary>
+                    <div className="codex-native-search-result-body">
+                      {result.snippet && <p>{result.snippet}</p>}
+                      {result.url && <div className="codex-native-search-url"><LinkifiedPlainText text={result.url} /></div>}
+                      {(result.refId || result.resultType) && (
+                        <div className="codex-native-search-result-meta">
+                          {result.refId && <span>{result.refId}</span>}
+                          {result.resultType && <span>{result.resultType}</span>}
+                        </div>
+                      )}
+                    </div>
+                  </details>
+                ))}
+              </div>
+            </div>
+          )}
 
           {outputDeferred && outputChunks.length === 0 && (
             <div
@@ -1240,8 +1268,11 @@ function ActionBlockView({
             </pre>
           )}
 
-          {!outputDeferred && outputChunks.length === 0 && !block.result?.error && (
+          {!outputDeferred && outputChunks.length === 0 && !block.result?.error && !searchDetails && (
             <div className="legacy-action-empty-output">No output was emitted.</div>
+          )}
+          {!outputDeferred && outputChunks.length === 0 && !block.result?.error && searchDetails && searchDetails.results.length === 0 && block.status !== "running" && (
+            <div className="legacy-action-empty-output">Codex completed this web action without emitting search results.</div>
           )}
         </div>
       )}
@@ -1303,7 +1334,7 @@ function ActionGroupView({
 
   const toggleExpanded = useCallback(() => setExpanded((v) => !v), []);
   return (
-    <div className="animate-slide-up">
+    <div className="animate-slide-up action-group">
       <div
         className="msg-block-header"
         role="button"
@@ -1444,7 +1475,7 @@ function ToolInputApprovalCard({
   isPending,
 }: {
   block: ApprovalBlock;
-  questions: { id: string; question: string }[];
+  questions: { id: string; question: string; secret?: boolean }[];
   isPending: boolean;
   decisionLabel: string;
   decisionBackground: string;
@@ -1492,7 +1523,7 @@ function ToolInputApprovalCard({
             if (!text) return null;
             return (
               <div key={q.id} className="tool-input-qa-row">
-                {q.question} → <strong>{text}</strong>
+                {q.question} → <strong>{q.secret ? "••••••" : text}</strong>
               </div>
             );
           })}
@@ -1811,8 +1842,10 @@ function renderSingleBlock(
   workspaceRootPath: string | null | undefined,
   onApproval: (approvalId: string, response: ApprovalResponse) => void,
   onLoadActionOutput: ((actionId: string) => Promise<void>) | undefined,
+  selectionNamespace: string,
 ) {
   const blockKey = getMessageBlockKey(block, index, sourceBlocks);
+  const selectionScopeId = `${selectionNamespace}:${getSelectionBlockScopeKey(block, index, sourceBlocks)}`;
 
   /* ── Text ── */
   if (block.type === "text") {
@@ -1826,9 +1859,10 @@ function renderSingleBlock(
           key={blockKey}
           content={textContent}
           streaming
-          className="prose"
+          className="prose chat-message-prose"
           workspaceRootPath={workspaceRootPath}
-          style={{ fontSize: 13, padding: "6px 14px" }}
+          selectionScopeId={selectionScopeId}
+          style={{ padding: "6px 14px" }}
         />
       );
     }
@@ -1837,9 +1871,10 @@ function renderSingleBlock(
       <MarkdownContent
         key={blockKey}
         content={textContent}
-        className="prose"
+        className="prose chat-message-prose"
         workspaceRootPath={workspaceRootPath}
-        style={{ fontSize: 13, padding: "6px 14px" }}
+        selectionScopeId={selectionScopeId}
+        style={{ padding: "6px 14px" }}
       />
     );
   }
@@ -1948,6 +1983,7 @@ function renderSingleBlock(
           block={block}
           isStreaming={thinkingActive}
           workspaceRootPath={workspaceRootPath}
+          selectionScopeId={selectionScopeId}
         />
       </div>
     );
@@ -1981,9 +2017,12 @@ function MessageBlocksView({
   status,
   messageRole = "assistant",
   workspaceRootPath,
+  selectionNamespace,
   onApproval,
   onLoadActionOutput,
 }: Props) {
+  const generatedSelectionNamespace = useId();
+  const resolvedSelectionNamespace = selectionNamespace ?? `message-blocks:${generatedSelectionNamespace}`;
   const safeBlocks = useMemo(
     () => dedupeDiffBlocksByScope(
       (Array.isArray(blocks) ? blocks : [])
@@ -2014,7 +2053,11 @@ function MessageBlocksView({
   );
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+    <div
+      className="message-blocks"
+      data-transcript-selection-scope={resolvedSelectionNamespace}
+      style={{ display: "flex", flexDirection: "column", gap: 4 }}
+    >
       {blockSegments.map((segment, segIdx) => {
         if (segment.kind === "divider") {
           return <div key={`divider-${segIdx}`} className="msg-section-divider" />;
@@ -2039,12 +2082,19 @@ function MessageBlocksView({
                   const thinkingBlock = inner.block as ThinkingBlock;
                   const isLastBlock = inner.index === safeBlocks.length - 1;
                   const thinkingActive = status === "streaming" && isLastBlock;
+                  const blockKey = getMessageBlockKey(inner.block, inner.index, safeBlocks);
+                  const selectionBlockKey = getSelectionBlockScopeKey(
+                    inner.block,
+                    inner.index,
+                    safeBlocks,
+                  );
                   return (
                     <ThinkingBlockView
-                      key={getMessageBlockKey(inner.block, inner.index, safeBlocks)}
+                      key={blockKey}
                       block={thinkingBlock}
                       isStreaming={thinkingActive}
                       workspaceRootPath={workspaceRootPath}
+                      selectionScopeId={`${resolvedSelectionNamespace}:${selectionBlockKey}`}
                     />
                   );
                 }
@@ -2099,6 +2149,7 @@ function MessageBlocksView({
           workspaceRootPath,
           onApproval,
           onLoadActionOutput,
+          resolvedSelectionNamespace,
         );
       })}
     </div>
@@ -2112,6 +2163,7 @@ export const MessageBlocks = memo(
     prev.status === next.status &&
     prev.messageRole === next.messageRole &&
     prev.workspaceRootPath === next.workspaceRootPath &&
+    prev.selectionNamespace === next.selectionNamespace &&
     prev.onApproval === next.onApproval &&
     prev.onLoadActionOutput === next.onLoadActionOutput,
 );

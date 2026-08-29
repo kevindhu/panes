@@ -8,6 +8,7 @@ import {
   Copy,
   FileDiff,
   Layers,
+  ListChecks,
   Loader2,
   MessageSquare,
   Search,
@@ -27,10 +28,14 @@ import { ipc } from "../../lib/codexIpc";
 import {
   authoritativeCodexItem,
   commandOutputParts,
+  interleaveLegacyTranscriptBlocks,
   mergeCodexTurnSnapshot,
   parseCodexJsonRecord,
   projectCodexTranscript,
+  reasoningText,
+  webSearchDetails,
   type CodexActivityKind,
+  type CodexPlanProgress,
   type CodexTranscriptActivity,
   type CodexTranscriptEntry,
 } from "../../lib/codexTranscript";
@@ -42,9 +47,48 @@ import type {
   MessageStatus,
 } from "../../types";
 import MarkdownContent from "./MarkdownContent";
-import { MessageBlocks } from "./MessageBlocks";
+import { LinkifiedPlainText, MessageBlocks, truncateActionHeader } from "./MessageBlocks";
 
 const LARGE_TEXT_PREVIEW_CHARS = 160_000;
+const MAX_CACHED_CODEX_TURN_SNAPSHOTS = 120;
+const codexTurnSnapshotCache = new Map<string, CodexTurnSnapshot>();
+const codexTranscriptProjectionCache = new WeakMap<
+  CodexTurnSnapshot,
+  ReturnType<typeof projectCodexTranscript>
+>();
+
+function readCodexTranscriptProjection(snapshot: CodexTurnSnapshot) {
+  const cached = codexTranscriptProjectionCache.get(snapshot);
+  if (cached) return cached;
+  const projection = projectCodexTranscript(snapshot);
+  codexTranscriptProjectionCache.set(snapshot, projection);
+  return projection;
+}
+
+function readCachedCodexTurnSnapshot(messageId: string): CodexTurnSnapshot | null {
+  const cached = codexTurnSnapshotCache.get(messageId);
+  if (!cached) return null;
+  codexTurnSnapshotCache.delete(messageId);
+  codexTurnSnapshotCache.set(messageId, cached);
+  return cached;
+}
+
+function writeCachedCodexTurnSnapshot(
+  messageId: string,
+  snapshot: CodexTurnSnapshot,
+): void {
+  codexTurnSnapshotCache.delete(messageId);
+  codexTurnSnapshotCache.set(messageId, snapshot);
+  while (codexTurnSnapshotCache.size > MAX_CACHED_CODEX_TURN_SNAPSHOTS) {
+    const oldestMessageId = codexTurnSnapshotCache.keys().next().value as string | undefined;
+    if (!oldestMessageId) break;
+    codexTurnSnapshotCache.delete(oldestMessageId);
+  }
+}
+
+export function resetCodexTurnSnapshotCacheForTests(): void {
+  codexTurnSnapshotCache.clear();
+}
 
 interface CodexTurnTranscriptProps {
   messageId: string;
@@ -55,6 +99,7 @@ interface CodexTurnTranscriptProps {
   refreshSequence: number;
   onApproval: (approvalId: string, response: ApprovalResponse) => void;
   onLoadActionOutput?: (actionId: string) => Promise<void>;
+  onPlanText?: (messageId: string, planText: string | null) => void;
 }
 
 interface CodexTranscriptRendererProps {
@@ -65,6 +110,7 @@ interface CodexTranscriptRendererProps {
   workspaceRootPath?: string | null;
   onApproval: (approvalId: string, response: ApprovalResponse) => void;
   loadError?: string | null;
+  onPlanText?: (planText: string | null) => void;
 }
 
 function useCodexTurnSnapshot(
@@ -72,10 +118,21 @@ function useCodexTurnSnapshot(
   refreshSequence: number,
   status: MessageStatus,
 ) {
-  const [snapshot, setSnapshot] = useState<CodexTurnSnapshot | null>(null);
-  const [resolved, setResolved] = useState(false);
+  const initialSnapshotRef = useRef<{
+    messageId: string;
+    snapshot: CodexTurnSnapshot | null;
+  } | null>(null);
+  if (!initialSnapshotRef.current) {
+    initialSnapshotRef.current = {
+      messageId,
+      snapshot: readCachedCodexTurnSnapshot(messageId),
+    };
+  }
+  const initialSnapshot = initialSnapshotRef.current.snapshot;
+  const [snapshot, setSnapshot] = useState<CodexTurnSnapshot | null>(initialSnapshot);
+  const [resolved, setResolved] = useState(initialSnapshot !== null);
   const [error, setError] = useState<string | null>(null);
-  const snapshotRef = useRef<CodexTurnSnapshot | null>(null);
+  const snapshotRef = useRef<CodexTurnSnapshot | null>(initialSnapshot);
   const mountedRef = useRef(true);
   const inFlightRef = useRef(false);
   const queuedRef = useRef(false);
@@ -102,6 +159,7 @@ function useCodexTurnSnapshot(
         if (incoming) {
           const merged = mergeCodexTurnSnapshot(snapshotRef.current, incoming);
           snapshotRef.current = merged;
+          writeCachedCodexTurnSnapshot(messageId, merged);
           setSnapshot(merged);
         }
         setResolved(true);
@@ -118,9 +176,10 @@ function useCodexTurnSnapshot(
   }, [messageId]);
 
   useEffect(() => {
-    snapshotRef.current = null;
-    setSnapshot(null);
-    setResolved(false);
+    const cached = readCachedCodexTurnSnapshot(messageId);
+    snapshotRef.current = cached;
+    setSnapshot(cached);
+    setResolved(cached !== null);
     setError(null);
     void refresh();
   }, [messageId, refresh]);
@@ -143,7 +202,7 @@ function useCodexTurnSnapshot(
     return () => window.clearInterval(recoveryTimer);
   }, [refresh, status]);
 
-  return { snapshot, resolved, error };
+  return { snapshot, resolved, error, retry: refresh };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -369,25 +428,82 @@ function ToolDetails({ activity }: { activity: CodexTranscriptActivity }) {
   );
 }
 
-function ReasoningDetails({ activity }: { activity: CodexTranscriptActivity }) {
-  const summaryChunks = activity.chunks.filter((chunk) => chunk.streamKind === "reasoning_summary").map((chunk) => chunk.content).join("");
-  const reasoningChunks = activity.chunks.filter((chunk) => chunk.streamKind === "reasoning").map((chunk) => chunk.content).join("");
-  const summary = activity.completedPayload && Object.prototype.hasOwnProperty.call(activity.completedPayload, "summary")
-    ? textValue(activity.completedPayload.summary)
-    : summaryChunks || textValue(activity.payload.summary);
-  const content = activity.completedPayload && Object.prototype.hasOwnProperty.call(activity.completedPayload, "content")
-    ? textValue(activity.completedPayload.content)
-    : reasoningChunks || textValue(activity.payload.content);
-  const planChunks = activity.chunks.filter((chunk) => chunk.streamKind === "plan").map((chunk) => chunk.content).join("");
-  const plan = activity.completedPayload && Object.prototype.hasOwnProperty.call(activity.completedPayload, "text")
-    ? textValue(activity.completedPayload.text)
-    : planChunks || recordString(activity.payload, "text") || "";
+function WebSearchDetails({ activity }: { activity: CodexTranscriptActivity }) {
+  const details = webSearchDetails(activity.payload);
+  const operation = details.actionType
+    ?? (details.queries.length > 0 ? "search" : details.results.length > 0 ? "browse" : null);
   return (
     <>
-      {summary && <DetailSection label="Summary"><ExpandableText text={summary} /></DetailSection>}
-      {content && <DetailSection label="Reasoning"><ExpandableText text={content} /></DetailSection>}
-      {plan && <DetailSection label="Plan"><ExpandableText text={plan} /></DetailSection>}
-      {!summary && !content && !plan && <div className="codex-native-empty-output">No textual details were emitted.</div>}
+      {operation && (
+        <DetailSection label="Operation">
+          <div className="codex-native-search-operation">{operation}</div>
+        </DetailSection>
+      )}
+      {details.queries.length > 0 && (
+        <DetailSection label={details.queries.length === 1 ? "Query" : `Queries (${details.queries.length})`}>
+          <ol className="codex-native-search-queries">
+            {details.queries.map((query, index) => <li key={`${index}:${query}`}>{query}</li>)}
+          </ol>
+        </DetailSection>
+      )}
+      <DetailSection label={`Results (${details.results.length})`}>
+        {details.results.length > 0 ? (
+          <div className="codex-native-search-results">
+            {details.results.map((result, index) => (
+              <details className="codex-native-search-result" key={`${result.refId ?? result.url ?? result.title}:${index}`}>
+                <summary>
+                  <span>{result.title}</span>
+                  {result.domain && <small>{result.domain}</small>}
+                  <ChevronRight size={11} />
+                </summary>
+                <div className="codex-native-search-result-body">
+                  {result.snippet && <p>{result.snippet}</p>}
+                  {result.url && (
+                    <div className="codex-native-search-url">
+                      <LinkifiedPlainText text={result.url} />
+                    </div>
+                  )}
+                  {(result.refId || result.resultType) && (
+                    <div className="codex-native-search-result-meta">
+                      {result.refId && <span>{result.refId}</span>}
+                      {result.resultType && <span>{result.resultType}</span>}
+                    </div>
+                  )}
+                </div>
+              </details>
+            ))}
+          </div>
+        ) : (
+          <div className="codex-native-empty-output">
+            {activity.status === "running"
+              ? "Search started; waiting for the completed search payload."
+              : "Codex completed this web action without emitting search results."}
+          </div>
+        )}
+      </DetailSection>
+    </>
+  );
+}
+
+function ReasoningDetails({ activity }: { activity: CodexTranscriptActivity }) {
+  const details = reasoningText(activity);
+  return (
+    <>
+      {details.summarySections.map((summary, index) => (
+        <DetailSection
+          key={`summary:${index}`}
+          label={details.summarySections.length === 1 ? "Summary" : `Summary ${index + 1}`}
+        >
+          <ExpandableText text={summary} />
+        </DetailSection>
+      ))}
+      {details.content && <DetailSection label="Reasoning"><ExpandableText text={details.content} /></DetailSection>}
+      {details.plan && <DetailSection label="Plan"><ExpandableText text={details.plan} /></DetailSection>}
+      {!details.hasReadableText && (
+        <div className="codex-native-reasoning-unavailable">
+          Codex reported thinking activity, but did not emit a readable summary for this item.
+        </div>
+      )}
     </>
   );
 }
@@ -397,7 +513,8 @@ function ActivityDetails({ activity }: { activity: CodexTranscriptActivity }) {
     <div className="codex-native-activity-details">
       {activity.activityKind === "command" && <CommandDetails activity={activity} />}
       {activity.activityKind === "file" && <FileChangeDetails activity={activity} />}
-      {(activity.activityKind === "mcp" || activity.activityKind === "search") && <ToolDetails activity={activity} />}
+      {activity.activityKind === "mcp" && <ToolDetails activity={activity} />}
+      {activity.activityKind === "search" && <WebSearchDetails activity={activity} />}
       {(activity.activityKind === "reasoning" || activity.activityKind === "plan") && <ReasoningDetails activity={activity} />}
       {activity.activityKind === "diff" && <DiffText diff={recordString(activity.payload, "diff") ?? ""} />}
       {!["command", "file", "mcp", "search", "reasoning", "plan", "diff"].includes(activity.activityKind) && (
@@ -435,11 +552,21 @@ function ActivityStatus({ activity }: { activity: CodexTranscriptActivity }) {
   return <Circle size={12} />;
 }
 
-function ActivityRow({ activity }: { activity: CodexTranscriptActivity }) {
+function ActivityRow({
+  activity,
+  selectionNamespace,
+}: {
+  activity: CodexTranscriptActivity;
+  selectionNamespace: string;
+}) {
   const [expanded, setExpanded] = useState(false);
   const Icon = activityIcons[activity.activityKind];
   return (
-    <div className={`codex-native-activity-row ${expanded ? "expanded" : ""}`} data-item-type={activity.itemType}>
+    <div
+      className={`codex-native-activity-row ${expanded ? "expanded" : ""}`}
+      data-item-type={activity.itemType}
+      data-transcript-selection-scope={`${selectionNamespace}:activity:${activity.id}`}
+    >
       <button
         type="button"
         className="codex-native-activity-header"
@@ -448,13 +575,123 @@ function ActivityRow({ activity }: { activity: CodexTranscriptActivity }) {
       >
         <ChevronRight size={12} className={`codex-native-chevron ${expanded ? "open" : ""}`} />
         <Icon size={13} className="codex-native-activity-icon" />
-        <span className="codex-native-activity-title" title={activity.title}>{activity.title}</span>
+        <span className="codex-native-activity-title" title={activity.title}>{truncateActionHeader(activity.title)}</span>
         {activity.subtitle && <span className="codex-native-activity-subtitle" title={activity.subtitle}>{activity.subtitle}</span>}
         <ActivityStatus activity={activity} />
         {activity.durationMs !== null && <span className="codex-native-duration">{formatDuration(activity.durationMs)}</span>}
       </button>
       {expanded && <ActivityDetails activity={activity} />}
     </div>
+  );
+}
+
+export function stripProposedPlanEnvelope(text: string): string {
+  return text
+    .replace(/^\s*<proposed_plan>\s*/i, "")
+    .replace(/\s*<\/proposed_plan>\s*$/i, "")
+    .trim();
+}
+
+function nativePlanText(entries: CodexTranscriptEntry[]): string | null {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry.kind !== "activity" || entry.activityKind !== "plan") continue;
+    const text = reasoningText(entry).plan.trim();
+    if (text) return text;
+  }
+  return null;
+}
+
+function NativePlanEntry({
+  entry,
+  status,
+  workspaceRootPath,
+  selectionNamespace,
+}: {
+  entry: CodexTranscriptActivity;
+  status: MessageStatus;
+  workspaceRootPath?: string | null;
+  selectionNamespace: string;
+}) {
+  const text = stripProposedPlanEnvelope(reasoningText(entry).plan);
+  const [expanded, setExpanded] = useState(true);
+  if (!text) return <ActivityRow activity={entry} selectionNamespace={selectionNamespace} />;
+
+  return (
+    <section
+      className={`codex-native-final-plan ${expanded ? "expanded" : "collapsed"}`}
+      data-item-type={entry.itemType}
+      data-transcript-selection-scope={`${selectionNamespace}:plan:${entry.id}`}
+    >
+      <header>
+        <button
+          type="button"
+          className="codex-native-final-plan-toggle"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((value) => !value)}
+        >
+          <ChevronRight
+            size={13}
+            className={`codex-native-chevron ${expanded ? "open" : ""}`}
+          />
+          <ListChecks size={14} />
+          <strong>Plan</strong>
+          <ActivityStatus activity={entry} />
+        </button>
+      </header>
+      {expanded && (
+        <MarkdownContent
+          content={text}
+          streaming={entry.status === "running" && status === "streaming"}
+          className="prose chat-message-prose codex-native-final-plan-content"
+          workspaceRootPath={workspaceRootPath}
+          selectionScopeId={`${selectionNamespace}:plan:${entry.id}:content`}
+        />
+      )}
+    </section>
+  );
+}
+
+function NativePlanProgress({
+  plan,
+  sourceSequence,
+  selectionScopeId,
+}: {
+  plan: CodexPlanProgress;
+  sourceSequence: number;
+  selectionScopeId: string;
+}) {
+  return (
+    <section
+      className="codex-native-plan-progress"
+      aria-label="Plan progress"
+      data-source-sequence={sourceSequence}
+      data-transcript-selection-scope={selectionScopeId}
+    >
+      <header>
+        <ListChecks size={13} />
+        <strong>Progress</strong>
+        <span>{plan.completed}/{plan.total}</span>
+      </header>
+      {plan.explanation && <p>{plan.explanation}</p>}
+      <ol>
+        {plan.steps.map((step, index) => {
+          const status = step.status.replace(/[_-]/g, "").toLowerCase();
+          const completed = status === "completed";
+          const running = status === "inprogress" || status === "running";
+          return (
+            <li className={completed ? "completed" : running ? "running" : "pending"} key={`${index}:${step.step}`}>
+              {completed
+                ? <CheckCircle2 size={12} />
+                : running
+                  ? <Loader2 size={12} className="animate-spin" />
+                  : <Circle size={12} />}
+              <span>{step.step}</span>
+            </li>
+          );
+        })}
+      </ol>
+    </section>
   );
 }
 
@@ -469,12 +706,24 @@ function activityTypeBreakdown(activities: CodexTranscriptActivity[]): string {
   return [...counts.entries()].map(([kind, count]) => `${count} ${labels[kind]}`).join(" · ");
 }
 
-function ActivityGroup({ activities }: { activities: CodexTranscriptActivity[] }) {
+function ActivityGroup({
+  activities,
+  selectionNamespace,
+}: {
+  activities: CodexTranscriptActivity[];
+  selectionNamespace: string;
+}) {
   const running = activities.some((activity) => activity.status === "running" || activity.status === "pending");
   const failures = activities.filter((activity) => activity.status === "error").length;
   const [expanded, setExpanded] = useState(true);
-  const noun = activities.length === 1 ? "tool" : "tools";
-  const summary = running ? `Using ${activities.length} ${noun}` : `Used ${activities.length} ${noun}`;
+  const toolKinds = new Set<CodexActivityKind>(["command", "file", "mcp", "search", "image", "diff"]);
+  const toolCount = activities.filter((activity) => toolKinds.has(activity.activityKind)).length;
+  const thoughtCount = activities.filter((activity) => activity.activityKind === "reasoning").length;
+  const summary = toolCount === activities.length
+    ? `${running ? "Using" : "Used"} ${activities.length} ${activities.length === 1 ? "tool" : "tools"}`
+    : thoughtCount === activities.length
+      ? running ? "Thinking" : thoughtCount === 1 ? "Thought" : `${thoughtCount} thoughts`
+      : `${running ? "Running" : "Completed"} ${activities.length} activities`;
   return (
     <section className="codex-native-group">
       <button
@@ -493,14 +742,20 @@ function ActivityGroup({ activities }: { activities: CodexTranscriptActivity[] }
             ? <AlertTriangle size={13} className="codex-native-error" />
             : <CheckCircle2 size={13} />}
       </button>
-      {expanded && <div className="codex-native-group-body">{activities.map((activity) => <ActivityRow key={activity.id} activity={activity} />)}</div>}
+      {expanded && <div className="codex-native-group-body">{activities.map((activity) => <ActivityRow key={activity.id} activity={activity} selectionNamespace={selectionNamespace} />)}</div>}
     </section>
   );
 }
 
 type TranscriptSegment =
   | { kind: "message"; entry: Extract<CodexTranscriptEntry, { kind: "message" }> }
-  | { kind: "activities"; entries: CodexTranscriptActivity[] };
+  | { kind: "activities"; entries: CodexTranscriptActivity[] }
+  | { kind: "plan"; entry: CodexTranscriptActivity }
+  | { kind: "planProgress"; entry: Extract<CodexTranscriptEntry, { kind: "planProgress" }> }
+  | { kind: "steer"; entry: Extract<CodexTranscriptEntry, { kind: "steer" }> }
+  | { kind: "approval"; entry: Extract<CodexTranscriptEntry, { kind: "approval" }> }
+  | { kind: "notice"; entry: Extract<CodexTranscriptEntry, { kind: "notice" }> }
+  | { kind: "error"; entry: Extract<CodexTranscriptEntry, { kind: "error" }> };
 
 function buildSegments(entries: CodexTranscriptEntry[]): TranscriptSegment[] {
   const segments: TranscriptSegment[] = [];
@@ -510,14 +765,131 @@ function buildSegments(entries: CodexTranscriptEntry[]): TranscriptSegment[] {
     activities = [];
   };
   for (const entry of entries) {
-    if (entry.kind === "activity") activities.push(entry);
-    else {
+    if (entry.kind === "activity" && entry.activityKind === "plan") {
       flushActivities();
-      segments.push({ kind: "message", entry });
+      segments.push({ kind: "plan", entry });
+    } else if (entry.kind === "activity") {
+      activities.push(entry);
+    } else {
+      flushActivities();
+      if (entry.kind === "message") {
+        segments.push({ kind: "message", entry });
+      } else if (entry.kind === "planProgress") {
+        segments.push({ kind: "planProgress", entry });
+      } else if (entry.kind === "steer") {
+        segments.push({ kind: "steer", entry });
+      } else if (entry.kind === "approval") {
+        segments.push({ kind: "approval", entry });
+      } else if (entry.kind === "notice") {
+        segments.push({ kind: "notice", entry });
+      } else {
+        segments.push({ kind: "error", entry });
+      }
     }
   }
   flushActivities();
   return segments;
+}
+
+function NativeLegacyBlockTimelineEntry({
+  entry,
+  workspaceRootPath,
+  onApproval,
+  selectionNamespace,
+}: {
+  entry: Extract<CodexTranscriptEntry, { kind: "notice" | "error" }>;
+  workspaceRootPath?: string | null;
+  onApproval: (approvalId: string, response: ApprovalResponse) => void;
+  selectionNamespace: string;
+}) {
+  return (
+    <section
+      className={`codex-native-${entry.kind}`}
+      data-source-sequence={entry.sequence}
+      data-transcript-selection-scope={`${selectionNamespace}:entry:${entry.id}`}
+    >
+      <MessageBlocks
+        blocks={[entry.block]}
+        messageRole="assistant"
+        workspaceRootPath={workspaceRootPath}
+        selectionNamespace={`${selectionNamespace}:entry:${entry.id}:blocks`}
+        onApproval={onApproval}
+      />
+    </section>
+  );
+}
+
+function ApprovalTimelineEntry({
+  entry,
+  workspaceRootPath,
+  onApproval,
+  selectionNamespace,
+}: {
+  entry: Extract<CodexTranscriptEntry, { kind: "approval" }>;
+  workspaceRootPath?: string | null;
+  onApproval: (approvalId: string, response: ApprovalResponse) => void;
+  selectionNamespace: string;
+}) {
+  return (
+    <section
+      className="codex-native-approval"
+      data-approval-id={entry.block.approvalId}
+      data-source-sequence={entry.sequence}
+      data-transcript-selection-scope={`${selectionNamespace}:entry:${entry.id}`}
+    >
+      <MessageBlocks
+        blocks={[entry.block]}
+        messageRole="assistant"
+        workspaceRootPath={workspaceRootPath}
+        selectionNamespace={`${selectionNamespace}:entry:${entry.id}:blocks`}
+        onApproval={onApproval}
+      />
+    </section>
+  );
+}
+
+function SteerTimelineEntry({
+  entry,
+  workspaceRootPath,
+  onApproval,
+  selectionNamespace,
+}: {
+  entry: Extract<CodexTranscriptEntry, { kind: "steer" }>;
+  workspaceRootPath?: string | null;
+  onApproval: (approvalId: string, response: ApprovalResponse) => void;
+  selectionNamespace: string;
+}) {
+  return (
+    <section
+      className={`codex-native-steer ${entry.block.status ?? "unconfirmed"}`}
+      data-steer-id={entry.block.steerId}
+      data-source-sequence={entry.sequence}
+      data-transcript-selection-scope={`${selectionNamespace}:entry:${entry.id}`}
+    >
+      <MessageBlocks
+        blocks={[entry.block]}
+        messageRole="assistant"
+        workspaceRootPath={workspaceRootPath}
+        selectionNamespace={`${selectionNamespace}:entry:${entry.id}:blocks`}
+        onApproval={onApproval}
+      />
+      <details className="codex-native-steer-details">
+        <summary>Delivery details</summary>
+        {!entry.exact && (
+          <div className="codex-native-legacy-anchor">
+            Historical placement is estimated from its persisted timestamp; new steers use an exact native sequence.
+          </div>
+        )}
+        {entry.requestPayload && <JsonSection label="Submitted request" value={entry.requestPayload} />}
+        {entry.responsePayload && <JsonSection label="App-server receipt" value={entry.responsePayload} />}
+        {!entry.requestPayload && !entry.responsePayload && (
+          <div className="codex-native-meta-value">
+            Source sequence: {entry.sequence}
+          </div>
+        )}
+      </details>
+    </section>
+  );
 }
 
 function NativeEventRow({ event }: { event: CodexTurnEventRecord }) {
@@ -650,10 +1022,24 @@ function TurnFooter({
   );
 }
 
-function supplementaryBlocks(blocks: ContentBlock[] | undefined): ContentBlock[] {
-  return (blocks ?? []).filter((block) => {
-    if (block.type === "approval" || block.type === "steer" || block.type === "error" || block.type === "attachment") return true;
-    return block.type === "notice" && block.kind !== "turn_status";
+function supplementaryBlocks(
+  blocks: ContentBlock[] | undefined,
+  consumedSteerIds: Set<string>,
+  consumedApprovalIds: Set<string>,
+  consumedNoticeKinds: Set<string>,
+  consumedErrorBlockIndexes: Set<number>,
+): ContentBlock[] {
+  return (blocks ?? []).filter((block, blockIndex) => {
+    if (block.type === "steer") {
+      return !consumedSteerIds.has(block.steerId)
+        && !(block.persistedMessageId && consumedSteerIds.has(block.persistedMessageId));
+    }
+    if (block.type === "approval") return !consumedApprovalIds.has(block.approvalId);
+    if (block.type === "error") return !consumedErrorBlockIndexes.has(blockIndex);
+    if (block.type === "attachment") return true;
+    return block.type === "notice"
+      && block.kind !== "turn_status"
+      && !consumedNoticeKinds.has(block.kind);
   });
 }
 
@@ -665,32 +1051,133 @@ export function CodexTranscriptRenderer({
   workspaceRootPath,
   onApproval,
   loadError,
+  onPlanText,
 }: CodexTranscriptRendererProps) {
-  const projection = useMemo(() => projectCodexTranscript(snapshot), [snapshot]);
-  const segments = useMemo(() => buildSegments(projection.entries), [projection.entries]);
-  const supplements = useMemo(() => supplementaryBlocks(legacyBlocks), [legacyBlocks]);
+  const projection = useMemo(() => readCodexTranscriptProjection(snapshot), [snapshot]);
+  const finalPlanText = useMemo(() => nativePlanText(projection.entries), [projection.entries]);
+  useEffect(() => {
+    onPlanText?.(finalPlanText);
+  }, [finalPlanText, onPlanText]);
+  const interleaved = useMemo(
+    () => interleaveLegacyTranscriptBlocks(projection.entries, projection.events, legacyBlocks),
+    [projection.entries, projection.events, legacyBlocks],
+  );
+  const segments = useMemo(() => buildSegments(interleaved.entries), [interleaved.entries]);
+  const supplements = useMemo(
+    () => supplementaryBlocks(
+      legacyBlocks,
+      interleaved.consumedSteerIds,
+      interleaved.consumedApprovalIds,
+      interleaved.consumedNoticeKinds,
+      interleaved.consumedErrorBlockIndexes,
+    ),
+    [
+      legacyBlocks,
+      interleaved.consumedApprovalIds,
+      interleaved.consumedErrorBlockIndexes,
+      interleaved.consumedNoticeKinds,
+      interleaved.consumedSteerIds,
+    ],
+  );
+  const selectionNamespace = `message:${snapshot.turn.messageId}`;
   return (
-    <div className="codex-native-transcript" data-source-sequence={snapshot.turn.lastSourceSequence}>
-      {segments.map((segment) => segment.kind === "activities" ? (
-        <ActivityGroup key={`activities:${segment.entries[0]?.id ?? "empty"}`} activities={segment.entries} />
-      ) : (
-        <MarkdownContent
-          key={segment.entry.id}
-          content={segment.entry.text}
-          streaming={segment.entry.streaming && status === "streaming"}
-          className="prose codex-native-message"
-          workspaceRootPath={workspaceRootPath}
-        />
-      ))}
+    <div
+      className="codex-native-transcript"
+      data-source-sequence={snapshot.turn.lastSourceSequence}
+      data-transcript-selection-scope={`${selectionNamespace}:native`}
+    >
+      {segments.map((segment) => {
+        if (segment.kind === "activities") {
+          return (
+            <ActivityGroup
+              key={`activities:${segment.entries[0]?.id ?? "empty"}`}
+              activities={segment.entries}
+              selectionNamespace={selectionNamespace}
+            />
+          );
+        }
+        if (segment.kind === "plan") {
+          return (
+            <NativePlanEntry
+              key={segment.entry.id}
+              entry={segment.entry}
+              status={status}
+              workspaceRootPath={workspaceRootPath}
+              selectionNamespace={selectionNamespace}
+            />
+          );
+        }
+        if (segment.kind === "planProgress") {
+          return (
+            <NativePlanProgress
+              key={segment.entry.id}
+              plan={segment.entry.plan}
+              sourceSequence={segment.entry.sequence}
+              selectionScopeId={`${selectionNamespace}:entry:${segment.entry.id}:plan-progress`}
+            />
+          );
+        }
+        if (segment.kind === "steer") {
+          return (
+            <SteerTimelineEntry
+              key={segment.entry.id}
+              entry={segment.entry}
+              workspaceRootPath={workspaceRootPath}
+              onApproval={onApproval}
+              selectionNamespace={selectionNamespace}
+            />
+          );
+        }
+        if (segment.kind === "approval") {
+          return (
+            <ApprovalTimelineEntry
+              key={segment.entry.id}
+              entry={segment.entry}
+              workspaceRootPath={workspaceRootPath}
+              onApproval={onApproval}
+              selectionNamespace={selectionNamespace}
+            />
+          );
+        }
+        if (segment.kind === "notice" || segment.kind === "error") {
+          return (
+            <NativeLegacyBlockTimelineEntry
+              key={segment.entry.id}
+              entry={segment.entry}
+              workspaceRootPath={workspaceRootPath}
+              onApproval={onApproval}
+              selectionNamespace={selectionNamespace}
+            />
+          );
+        }
+        return (
+          <MarkdownContent
+            key={segment.entry.id}
+            content={segment.entry.text}
+            streaming={segment.entry.streaming && status === "streaming"}
+            className="prose chat-message-prose codex-native-message"
+            workspaceRootPath={workspaceRootPath}
+            selectionScopeId={`${selectionNamespace}:entry:${segment.entry.id}:message`}
+          />
+        );
+      })}
       {supplements.length > 0 && (
         <div className="codex-native-supplements">
           <MessageBlocks
             blocks={supplements}
             messageRole="assistant"
             workspaceRootPath={workspaceRootPath}
+            selectionNamespace={`${selectionNamespace}:supplements`}
             onApproval={onApproval}
           />
         </div>
+      )}
+      {projection.plan && !projection.entries.some((entry) => entry.kind === "planProgress") && (
+        <NativePlanProgress
+          plan={projection.plan}
+          sourceSequence={snapshot.turn.lastSourceSequence + 0.5}
+          selectionScopeId={`${selectionNamespace}:plan-progress`}
+        />
       )}
       {loadError && <div className="codex-native-sync-warning"><AlertTriangle size={12} /> Transcript refresh failed: {loadError}</div>}
       <NativeEventsDrawer events={projection.events} />
@@ -715,16 +1202,32 @@ export function CodexTurnTranscript({
   refreshSequence,
   onApproval,
   onLoadActionOutput,
+  onPlanText,
 }: CodexTurnTranscriptProps) {
-  const { snapshot, resolved, error } = useCodexTurnSnapshot(messageId, refreshSequence, status);
+  const { snapshot, resolved, error, retry } = useCodexTurnSnapshot(messageId, refreshSequence, status);
+  const reportPlanText = useCallback(
+    (planText: string | null) => onPlanText?.(messageId, planText),
+    [messageId, onPlanText],
+  );
+  useEffect(() => {
+    if (!snapshot) onPlanText?.(messageId, null);
+  }, [messageId, onPlanText, snapshot]);
   if (!snapshot) {
     return (
-      <div className={resolved ? undefined : "codex-native-loading"}>
+      <div className={resolved ? "codex-native-fallback" : "codex-native-loading"}>
+        {error && (
+          <div className="codex-native-sync-warning">
+            <AlertTriangle size={12} />
+            <span>Native transcript unavailable; showing the compatibility transcript. {error}</span>
+            <button type="button" onClick={() => void retry()}>Retry</button>
+          </div>
+        )}
         <MessageBlocks
           blocks={blocks}
           status={status}
           messageRole="assistant"
           workspaceRootPath={workspaceRootPath}
+          selectionNamespace={`message:${messageId}:fallback`}
           onApproval={onApproval}
           onLoadActionOutput={onLoadActionOutput}
         />
@@ -740,6 +1243,7 @@ export function CodexTurnTranscript({
       workspaceRootPath={workspaceRootPath}
       onApproval={onApproval}
       loadError={error}
+      onPlanText={reportPlanText}
     />
   );
 }

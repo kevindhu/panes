@@ -165,7 +165,7 @@ export interface CodexTurnRecord {
 export interface CodexTurnEventRecord {
   id: number;
   sourceSequence: number;
-  eventKind: "request" | "notification" | "response";
+  eventKind: "client_request" | "client_response" | "request" | "notification" | "response";
   method: string;
   requestId: string | null;
   nativeThreadId: string;
@@ -325,11 +325,24 @@ export interface MentionBlock {
 export interface SteerBlock {
   type: "steer";
   steerId: string;
+  persistedMessageId?: string;
   content: string;
   planMode?: boolean;
   attachments?: AttachmentBlock[];
   skills?: SkillBlock[];
   mentions?: MentionBlock[];
+  sourceSequence?: number;
+  observedAtMs?: number;
+  status?: "pending" | "accepted" | "failed" | "unconfirmed";
+  error?: string;
+}
+
+export interface SteerMessageReceipt {
+  steerId: string;
+  messageId: string;
+  nativeTurnId: string;
+  sourceSequence: number;
+  acceptedSourceSequence: number | null;
 }
 
 export type ContentBlock =
@@ -662,6 +675,7 @@ export interface ActionProgressUpdatedEvent {
 export interface ActionCompletedEvent {
   type: "ActionCompleted";
   action_id: string;
+  details?: Record<string, unknown> | null;
   result: {
     success: boolean;
     output?: string | null;

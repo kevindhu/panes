@@ -23,10 +23,16 @@ const mockReadAttachmentImageBytes = vi.hoisted(() => vi.fn(async () => (
 )));
 const mockCreateObjectURL = vi.hoisted(() => vi.fn(() => "blob:raw-fallback"));
 const mockRevokeObjectURL = vi.hoisted(() => vi.fn());
+const mockOpenExternal = vi.hoisted(() => vi.fn(async () => undefined));
+const mockClipboardWriteText = vi.hoisted(() => vi.fn(async () => undefined));
 
 vi.mock("@tauri-apps/api/core", () => ({
   convertFileSrc: mockConvertFileSrc,
   isTauri: mockIsTauri,
+}));
+
+vi.mock("@tauri-apps/plugin-shell", () => ({
+  open: mockOpenExternal,
 }));
 
 vi.mock("react-i18next", () => ({
@@ -74,6 +80,10 @@ describe("MarkdownContent local images", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: mockClipboardWriteText },
+      configurable: true,
+    });
     Object.defineProperty(URL, "createObjectURL", {
       value: mockCreateObjectURL,
       configurable: true,
@@ -108,6 +118,7 @@ describe("MarkdownContent local images", () => {
       root.unmount();
     });
     resetAttachmentImageCachesForTests();
+    globalThis.getSelection?.()?.removeAllRanges();
     container.remove();
     document.body.innerHTML = "";
   });
@@ -136,6 +147,160 @@ describe("MarkdownContent local images", () => {
     expect(mockConvertFileSrc).toHaveBeenCalledWith(
       "C:\\Users\\lemondoo\\PROJECTS\\manga_reader\\screenshots\\kim_toxic_cafe_cuties_korean-page-8-local.png.thumb.png",
     );
+  });
+
+  it("copies only the selected fenced code block", async () => {
+    await act(async () => {
+      root.render(
+        <MarkdownContent
+          content={[
+            "```ts",
+            "const first = '<one>';",
+            "```",
+            "",
+            "```bash",
+            "echo second",
+            "```",
+          ].join("\n")}
+        />,
+      );
+    });
+
+    const codeBlocks = container.querySelectorAll(".markdown-code-block");
+    const copyButtons = container.querySelectorAll<HTMLButtonElement>(".markdown-code-copy");
+    expect(codeBlocks).toHaveLength(2);
+    expect(copyButtons).toHaveLength(2);
+    expect(copyButtons[1]?.getAttribute("aria-label")).toBe("Copy code");
+
+    await act(async () => {
+      copyButtons[1]?.click();
+      await Promise.resolve();
+    });
+
+    expect(mockClipboardWriteText).toHaveBeenCalledTimes(1);
+    expect(mockClipboardWriteText).toHaveBeenCalledWith("echo second\n");
+    expect(copyButtons[1]?.getAttribute("aria-label")).toBe("Code copied");
+    expect(copyButtons[0]?.getAttribute("aria-label")).toBe("Copy code");
+  });
+
+  it("opens a markdown web link on Ctrl-click when unrelated text remains selected", async () => {
+    const selectedText = document.createElement("div");
+    selectedText.textContent = "previous selection";
+    document.body.appendChild(selectedText);
+    const range = document.createRange();
+    range.selectNodeContents(selectedText);
+    globalThis.getSelection?.()?.addRange(range);
+
+    await act(async () => {
+      root.render(
+        <MarkdownContent
+          content="[Demo footage](https://www.youtube.com/watch?v=t6ZLKt4vthQ)"
+        />,
+      );
+    });
+
+    const anchor = container.querySelector("a") as HTMLAnchorElement;
+    await act(async () => {
+      anchor.dispatchEvent(new MouseEvent("mousedown", {
+        bubbles: true,
+        button: 0,
+        clientX: 20,
+        clientY: 10,
+      }));
+      anchor.dispatchEvent(new MouseEvent("click", {
+        bubbles: true,
+        cancelable: true,
+        button: 0,
+        ctrlKey: true,
+        clientX: 20,
+        clientY: 10,
+        detail: 1,
+      }));
+      await Promise.resolve();
+    });
+
+    expect(globalThis.getSelection?.()?.toString()).toBe("previous selection");
+    expect(mockOpenExternal).toHaveBeenCalledWith(
+      "https://www.youtube.com/watch?v=t6ZLKt4vthQ",
+    );
+  });
+
+  it("keeps a plain click on markdown link text available for selection", async () => {
+    await act(async () => {
+      root.render(<MarkdownContent content="[Demo footage](https://example.com/demo)" />);
+    });
+
+    const anchor = container.querySelector("a") as HTMLAnchorElement;
+    await act(async () => {
+      anchor.dispatchEvent(new MouseEvent("mousedown", {
+        bubbles: true,
+        button: 0,
+        clientX: 10,
+        clientY: 10,
+      }));
+      anchor.dispatchEvent(new MouseEvent("click", {
+        bubbles: true,
+        cancelable: true,
+        button: 0,
+        clientX: 24,
+        clientY: 10,
+        detail: 1,
+      }));
+      await Promise.resolve();
+    });
+
+    expect(mockOpenExternal).not.toHaveBeenCalled();
+  });
+
+  it("does not open a Ctrl-clicked markdown link when the selection intersects it", async () => {
+    await act(async () => {
+      root.render(<MarkdownContent content="[Demo footage](https://example.com/demo)" />);
+    });
+
+    const anchor = container.querySelector("a") as HTMLAnchorElement;
+    const textNode = anchor.firstChild as Text;
+    const range = document.createRange();
+    range.setStart(textNode, 0);
+    range.setEnd(textNode, 4);
+    globalThis.getSelection?.()?.addRange(range);
+
+    expect(globalThis.getSelection?.()?.toString()).toBe("Demo");
+    await act(async () => {
+      anchor.dispatchEvent(new MouseEvent("mousedown", {
+        bubbles: true,
+        button: 0,
+      }));
+      globalThis.getSelection?.()?.removeAllRanges();
+      anchor.dispatchEvent(new MouseEvent("click", {
+        bubbles: true,
+        cancelable: true,
+        button: 0,
+        ctrlKey: true,
+        detail: 1,
+      }));
+      await Promise.resolve();
+    });
+
+    expect(mockOpenExternal).not.toHaveBeenCalled();
+  });
+
+  it("keeps keyboard activation available for markdown links", async () => {
+    await act(async () => {
+      root.render(<MarkdownContent content="[Demo footage](https://example.com/demo)" />);
+    });
+
+    const anchor = container.querySelector("a") as HTMLAnchorElement;
+    await act(async () => {
+      anchor.dispatchEvent(new MouseEvent("click", {
+        bubbles: true,
+        cancelable: true,
+        button: 0,
+        detail: 0,
+      }));
+      await Promise.resolve();
+    });
+
+    expect(mockOpenExternal).toHaveBeenCalledWith("https://example.com/demo");
   });
 
   it("loads a bounded native asset thumbnail for local markdown images", async () => {

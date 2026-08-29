@@ -1,8 +1,16 @@
 import type {
+  ApprovalBlock,
+  AttachmentBlock,
   CodexItemStreamChunkRecord,
   CodexTurnEventRecord,
   CodexTurnItemRecord,
   CodexTurnSnapshot,
+  ContentBlock,
+  ErrorBlock,
+  MentionBlock,
+  NoticeBlock,
+  SkillBlock,
+  SteerBlock,
 } from "../types";
 
 export type CodexActivityKind =
@@ -48,7 +56,61 @@ export interface CodexTranscriptActivity {
   chunks: CodexItemStreamChunkRecord[];
 }
 
-export type CodexTranscriptEntry = CodexTranscriptMessageEntry | CodexTranscriptActivity;
+export interface CodexTranscriptSteerEntry {
+  kind: "steer";
+  id: string;
+  sequence: number;
+  observedAtMs: number | null;
+  exact: boolean;
+  block: SteerBlock;
+  requestPayload: JsonRecord | null;
+  responsePayload: JsonRecord | null;
+}
+
+export interface CodexTranscriptApprovalEntry {
+  kind: "approval";
+  id: string;
+  sequence: number;
+  observedAtMs: number | null;
+  exact: true;
+  block: ApprovalBlock;
+  requestPayload: JsonRecord;
+  requestId: string | null;
+}
+
+export interface CodexTranscriptNoticeEntry {
+  kind: "notice";
+  id: string;
+  sequence: number;
+  observedAtMs: number | null;
+  exact: true;
+  block: NoticeBlock;
+}
+
+export interface CodexTranscriptErrorEntry {
+  kind: "error";
+  id: string;
+  sequence: number;
+  observedAtMs: number | null;
+  exact: true;
+  block: ErrorBlock;
+}
+
+export interface CodexTranscriptPlanProgressEntry {
+  kind: "planProgress";
+  id: string;
+  sequence: number;
+  plan: CodexPlanProgress;
+}
+
+export type CodexTranscriptEntry =
+  | CodexTranscriptMessageEntry
+  | CodexTranscriptActivity
+  | CodexTranscriptSteerEntry
+  | CodexTranscriptApprovalEntry
+  | CodexTranscriptNoticeEntry
+  | CodexTranscriptErrorEntry
+  | CodexTranscriptPlanProgressEntry;
 
 export interface CodexTokenBucket {
   input: number | null;
@@ -74,6 +136,31 @@ export interface CodexPlanProgress {
   completed: number;
   total: number;
   activeStep: string | null;
+  explanation: string | null;
+}
+
+export interface CodexReasoningText {
+  summarySections: string[];
+  content: string;
+  plan: string;
+  hasReadableText: boolean;
+}
+
+export interface CodexWebSearchResult {
+  title: string;
+  url: string | null;
+  domain: string | null;
+  snippet: string | null;
+  refId: string | null;
+  resultType: string | null;
+  raw: JsonRecord;
+}
+
+export interface CodexWebSearchDetails {
+  actionType: string | null;
+  query: string | null;
+  queries: string[];
+  results: CodexWebSearchResult[];
 }
 
 export interface CodexTranscriptProjection {
@@ -118,6 +205,59 @@ function readNumber(record: JsonRecord, ...keys: string[]): number | null {
     if (typeof value === "number" && Number.isFinite(value)) return value;
   }
   return null;
+}
+
+function readNonEmptyString(record: JsonRecord, ...keys: string[]): string | null {
+  const value = readString(record, ...keys)?.trim();
+  return value ? value : null;
+}
+
+function uniqueStrings(values: unknown[]): string[] {
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const text = value.trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    normalized.push(text);
+  }
+  return normalized;
+}
+
+export function webSearchDetails(payload: JsonRecord): CodexWebSearchDetails {
+  const action = isRecord(payload.action) ? payload.action : {};
+  const actionQueries = Array.isArray(action.queries) ? action.queries : [];
+  const actionQuery = readNonEmptyString(action, "query");
+  const payloadQuery = readNonEmptyString(payload, "query");
+  const queries = uniqueStrings([
+    ...actionQueries,
+    ...(actionQuery ? [actionQuery] : []),
+    ...(actionQueries.length === 0 && !actionQuery && payloadQuery ? [payloadQuery] : []),
+  ]);
+  const results = (Array.isArray(payload.results) ? payload.results : [])
+    .filter(isRecord)
+    .map((result, index): CodexWebSearchResult => {
+      const url = readNonEmptyString(result, "url");
+      const domain = readNonEmptyString(result, "domain");
+      const refId = readNonEmptyString(result, "ref_id", "refId");
+      return {
+        title: readNonEmptyString(result, "title") ?? domain ?? url ?? refId ?? `Result ${index + 1}`,
+        url,
+        domain,
+        snippet: readNonEmptyString(result, "snippet", "text", "content"),
+        refId,
+        resultType: readNonEmptyString(result, "type"),
+        raw: result,
+      };
+    });
+
+  return {
+    actionType: readNonEmptyString(action, "type"),
+    query: payloadQuery ?? actionQuery ?? queries[0] ?? null,
+    queries,
+    results,
+  };
 }
 
 function textFromUnknown(value: unknown): string {
@@ -245,14 +385,24 @@ function activityTitle(itemType: string, payload: JsonRecord): { title: string; 
     case "subAgentActivity":
       return { title: readString(payload, "status", "message") ?? "Agent activity", subtitle: "Subagent" };
     case "webSearch": {
-      const action = isRecord(payload.action) ? payload.action : {};
-      const queries = Array.isArray(action.queries)
-        ? action.queries.filter((value): value is string => typeof value === "string").join(", ")
-        : "";
-      const query = readString(payload, "query")
-        ?? readString(action, "query", "url", "pattern")
-        ?? (queries || "Web search");
-      return { title: query === "Web search" ? query : `Searched ${query}`, subtitle: null };
+      const details = webSearchDetails(payload);
+      const resultLabel = details.results.length > 0
+        ? `${details.results.length} ${details.results.length === 1 ? "result" : "results"}`
+        : null;
+      if (details.queries.length > 1) {
+        return {
+          title: `Searched ${details.queries[0]} +${details.queries.length - 1} more`,
+          subtitle: resultLabel,
+        };
+      }
+      if (details.query) return { title: `Searched ${details.query}`, subtitle: resultLabel };
+      if (details.results.length > 0) {
+        return {
+          title: `Read ${details.results.length} ${details.results.length === 1 ? "source" : "sources"}`,
+          subtitle: resultLabel,
+        };
+      }
+      return { title: "Web search", subtitle: null };
     }
     case "reasoning": {
       const summary = textFromUnknown(payload.summary).trim();
@@ -308,13 +458,83 @@ function durationForItem(item: CodexTurnItemRecord, payload: JsonRecord): number
   return null;
 }
 
+function nonEmptyText(value: unknown): string {
+  return textFromUnknown(value).trim();
+}
+
+function nonEmptyTextSections(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map(nonEmptyText).filter(Boolean);
+  }
+  const text = nonEmptyText(value);
+  return text ? [text] : [];
+}
+
+function streamedReasoningSummarySections(chunks: CodexItemStreamChunkRecord[]): string[] {
+  const sections = new Map<number, string>();
+  let fallbackIndex = 0;
+  for (const chunk of chunks) {
+    if (chunk.streamKind !== "reasoning_summary" && chunk.streamKind !== "reasoning_summary_boundary") {
+      continue;
+    }
+    const index = chunk.summaryIndex ?? fallbackIndex;
+    if (chunk.streamKind === "reasoning_summary_boundary") {
+      if (!sections.has(index)) sections.set(index, "");
+      fallbackIndex = Math.max(fallbackIndex, index);
+      continue;
+    }
+    sections.set(index, `${sections.get(index) ?? ""}${chunk.content}`);
+    fallbackIndex = index;
+  }
+  return [...sections.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, value]) => value.trim())
+    .filter(Boolean);
+}
+
+export function reasoningText(activity: CodexTranscriptActivity): CodexReasoningText {
+  const streamedSummary = streamedReasoningSummarySections(activity.chunks);
+  const completedSummary = nonEmptyTextSections(activity.completedPayload?.summary);
+  const startedSummary = nonEmptyTextSections(activity.startedPayload?.summary);
+  const summarySections = completedSummary.length > 0
+    ? completedSummary
+    : streamedSummary.length > 0
+      ? streamedSummary
+      : startedSummary;
+
+  const streamedContent = activity.chunks
+    .filter((chunk) => chunk.streamKind === "reasoning")
+    .map((chunk) => chunk.content)
+    .join("")
+    .trim();
+  const completedContent = nonEmptyText(activity.completedPayload?.content);
+  const startedContent = nonEmptyText(activity.startedPayload?.content);
+  const content = completedContent || streamedContent || startedContent;
+
+  const streamedPlan = activity.chunks
+    .filter((chunk) => chunk.streamKind === "plan")
+    .map((chunk) => chunk.content)
+    .join("")
+    .trim();
+  const completedPlan = nonEmptyText(activity.completedPayload?.text);
+  const startedPlan = nonEmptyText(activity.startedPayload?.text);
+  const plan = completedPlan || streamedPlan || startedPlan;
+
+  return {
+    summarySections,
+    content,
+    plan,
+    hasReadableText: summarySections.length > 0 || Boolean(content) || Boolean(plan),
+  };
+}
+
 function buildActivity(
   item: CodexTurnItemRecord,
   chunks: CodexItemStreamChunkRecord[],
 ): CodexTranscriptActivity {
   const { payload, startedPayload, completedPayload } = codexItemPayloads(item);
   const { title, subtitle } = activityTitle(item.itemType, payload);
-  return {
+  const activity: CodexTranscriptActivity = {
     kind: "activity",
     id: `item:${item.itemId}`,
     itemId: item.itemId,
@@ -331,6 +551,14 @@ function buildActivity(
     completedPayload,
     chunks,
   };
+  if (activity.activityKind === "reasoning") {
+    const details = reasoningText(activity);
+    activity.title = details.summarySections[0]
+      ? firstLine(details.summarySections[0])
+      : "Thought";
+    activity.subtitle = details.hasReadableText ? null : "No readable summary emitted";
+  }
+  return activity;
 }
 
 function buildTurnDiffActivity(event: CodexTurnEventRecord): CodexTranscriptActivity | null {
@@ -361,6 +589,298 @@ function methodSignature(method: string): string {
   return method.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
 }
 
+function blocksFromUnknown(value: unknown): ContentBlock[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((candidate): candidate is ContentBlock => (
+    isRecord(candidate) && typeof candidate.type === "string"
+  ));
+}
+
+function steerBlockFromSubmittedEvent(
+  event: CodexTurnEventRecord,
+  payload: JsonRecord,
+): SteerBlock | null {
+  const steerId = readString(payload, "steerId") ?? event.requestId;
+  if (!steerId) return null;
+  const display = isRecord(payload.display) ? payload.display : {};
+  const displayBlocks = blocksFromUnknown(display.blocks);
+  const attachments = displayBlocks.filter(
+    (block): block is AttachmentBlock => block.type === "attachment",
+  );
+  const skills = displayBlocks.filter((block): block is SkillBlock => block.type === "skill");
+  const mentions = displayBlocks.filter((block): block is MentionBlock => block.type === "mention");
+  const textBlocks = displayBlocks.filter(
+    (block): block is Extract<ContentBlock, { type: "text" }> => block.type === "text",
+  );
+  const content = readString(display, "content")
+    ?? textBlocks.map((block) => block.content).join("\n");
+  return {
+    type: "steer",
+    steerId,
+    persistedMessageId: readString(payload, "messageId") ?? undefined,
+    content,
+    planMode: display.planMode === true || textBlocks.some((block) => block.planMode === true) || undefined,
+    attachments: attachments.length > 0 ? attachments : undefined,
+    skills: skills.length > 0 ? skills : undefined,
+    mentions: mentions.length > 0 ? mentions : undefined,
+    sourceSequence: event.sourceSequence,
+    observedAtMs: event.observedAtMs,
+    status: "pending",
+  };
+}
+
+function buildSteerEntries(events: CodexTurnEventRecord[]): CodexTranscriptSteerEntry[] {
+  const entries = new Map<string, CodexTranscriptSteerEntry>();
+  const ordered = [...events].sort((left, right) => left.sourceSequence - right.sourceSequence);
+  for (const event of ordered) {
+    if (methodSignature(event.method) !== "turnsteer") continue;
+    if (event.eventKind !== "client_request" && event.eventKind !== "client_response") continue;
+    const payload = parseCodexJsonRecord(event.paramsJson);
+    const steerId = readString(payload, "steerId") ?? event.requestId;
+    if (!steerId) continue;
+    if (event.eventKind === "client_request") {
+      const block = steerBlockFromSubmittedEvent(event, payload);
+      if (!block) continue;
+      entries.set(steerId, {
+        kind: "steer",
+        id: `steer:${steerId}`,
+        sequence: event.sourceSequence,
+        observedAtMs: event.observedAtMs,
+        exact: true,
+        block,
+        requestPayload: payload,
+        responsePayload: null,
+      });
+      continue;
+    }
+
+    const existing = entries.get(steerId);
+    if (!existing) continue;
+    const status = readString(payload, "status");
+    existing.block = {
+      ...existing.block,
+      status: status === "failed" ? "failed" : status === "accepted" ? "accepted" : "unconfirmed",
+      error: readString(payload, "error") ?? undefined,
+    };
+    existing.responsePayload = payload;
+  }
+  return [...entries.values()].map((entry) => (
+    entry.block.status === "pending"
+      ? { ...entry, block: { ...entry.block, status: "unconfirmed" } }
+      : entry
+  ));
+}
+
+function estimateLegacySteerSequence(
+  events: CodexTurnEventRecord[],
+  observedAtMs: number,
+  offset: number,
+): number | null {
+  const ordered = [...events].sort((left, right) => left.sourceSequence - right.sourceSequence);
+  if (ordered.length === 0) return null;
+  const nextIndex = ordered.findIndex((event) => event.observedAtMs > observedAtMs);
+  const epsilon = Math.min(0.49, (offset + 1) / 10_000);
+  if (nextIndex === 0) return ordered[0]!.sourceSequence - 0.5 + epsilon;
+  if (nextIndex < 0) return ordered.at(-1)!.sourceSequence + 0.5 + epsilon;
+  const previous = ordered[nextIndex - 1]!;
+  const next = ordered[nextIndex]!;
+  return previous.sourceSequence + (next.sourceSequence - previous.sourceSequence) / 2 + epsilon;
+}
+
+function approvalRequestIdentifiers(event: CodexTurnEventRecord): string[] {
+  if (event.eventKind !== "request") return [];
+  const signature = methodSignature(event.method);
+  const isApprovalRequest = signature.includes("requestapproval")
+    || signature.includes("requestuserinput")
+    || signature === "execcommandapproval"
+    || signature === "applypatchapproval"
+    || signature === "itemtoolcall"
+    || signature === "mcpserverelicitationrequest";
+  if (!isApprovalRequest) return [];
+
+  const payload = parseCodexJsonRecord(event.paramsJson);
+  const identifiers = [
+    readString(payload, "approvalId", "itemId", "callId", "id"),
+    event.requestId,
+  ].filter((value): value is string => Boolean(value));
+  return [...new Set(identifiers)];
+}
+
+function noticeKindFromEvent(event: CodexTurnEventRecord): string | null {
+  if (event.eventKind !== "notification") return null;
+  const signature = methodSignature(event.method);
+  switch (signature) {
+    case "modelrerouted": return "model_rerouted";
+    case "threadcompacted":
+    case "contextcompacted": return "context_compacted";
+    case "warning": return "codex_warning";
+    case "guardianwarning": return "codex_guardian_warning";
+    case "modelverification": return "codex_model_verification";
+    case "itemguardianapprovalreviewstarted": return "codex_guardian_review_started";
+    case "itemguardianapprovalreviewcompleted": return "codex_guardian_review_completed";
+    case "threadrealtimestarted": return "codex_realtime_started";
+    case "threadrealtimeclosed": return "codex_realtime_closed";
+    case "deprecationnotice": return "deprecation_notice";
+    case "hookstarted":
+    case "hookcompleted": {
+      const payload = parseCodexJsonRecord(event.paramsJson);
+      const run = isRecord(payload.run) ? payload.run : {};
+      const hookId = readString(run, "id") ?? "unknown";
+      return `${signature === "hookstarted" ? "hook_started" : "hook_completed"}_${hookId}`;
+    }
+    default: return null;
+  }
+}
+
+function nativeErrorMessage(event: CodexTurnEventRecord): string | null {
+  if (event.eventKind !== "notification") return null;
+  const signature = methodSignature(event.method);
+  if (signature !== "error" && signature !== "threadrealtimeerror") return null;
+  const payload = parseCodexJsonRecord(event.paramsJson);
+  const nestedError = isRecord(payload.error) ? payload.error : {};
+  return readString(nestedError, "message") ?? readString(payload, "message") ?? "Unknown error";
+}
+
+export function interleaveLegacyTranscriptBlocks(
+  entries: CodexTranscriptEntry[],
+  events: CodexTurnEventRecord[],
+  blocks: ContentBlock[] | undefined,
+): {
+  entries: CodexTranscriptEntry[];
+  consumedSteerIds: Set<string>;
+  consumedApprovalIds: Set<string>;
+  consumedNoticeKinds: Set<string>;
+  consumedErrorBlockIndexes: Set<number>;
+} {
+  const consumedSteerIds = new Set<string>();
+  const consumedApprovalIds = new Set<string>();
+  const consumedNoticeKinds = new Set<string>();
+  const consumedErrorBlockIndexes = new Set<number>();
+  const nativeSteers = entries.filter(
+    (entry): entry is CodexTranscriptSteerEntry => entry.kind === "steer",
+  );
+  const nativeIds = new Set<string>();
+  for (const entry of nativeSteers) {
+    nativeIds.add(entry.block.steerId);
+    if (entry.block.persistedMessageId) nativeIds.add(entry.block.persistedMessageId);
+  }
+
+  const merged = [...entries];
+  (blocks ?? []).forEach((block, index) => {
+    if (block.type !== "steer") return;
+    const keys = [block.steerId, block.persistedMessageId].filter(
+      (value): value is string => typeof value === "string" && value.length > 0,
+    );
+    if (keys.some((key) => nativeIds.has(key))) {
+      keys.forEach((key) => consumedSteerIds.add(key));
+      return;
+    }
+    const exactSequence = typeof block.sourceSequence === "number" && Number.isFinite(block.sourceSequence)
+      ? block.sourceSequence
+      : null;
+    const estimatedSequence = exactSequence === null && typeof block.observedAtMs === "number"
+      ? estimateLegacySteerSequence(events, block.observedAtMs, index)
+      : null;
+    const sequence = exactSequence ?? estimatedSequence;
+    if (sequence === null) return;
+    keys.forEach((key) => consumedSteerIds.add(key));
+    merged.push({
+      kind: "steer",
+      id: `legacy-steer:${block.steerId}`,
+      sequence,
+      observedAtMs: block.observedAtMs ?? null,
+      exact: exactSequence !== null,
+      block,
+      requestPayload: null,
+      responsePayload: null,
+    });
+  });
+
+  const approvalRequestById = new Map<string, CodexTurnEventRecord>();
+  for (const event of [...events].sort(
+    (left, right) => left.sourceSequence - right.sourceSequence,
+  )) {
+    for (const identifier of approvalRequestIdentifiers(event)) {
+      if (!approvalRequestById.has(identifier)) {
+        approvalRequestById.set(identifier, event);
+      }
+    }
+  }
+  for (const block of blocks ?? []) {
+    if (block.type !== "approval") continue;
+    const event = approvalRequestById.get(block.approvalId);
+    if (!event) continue;
+    consumedApprovalIds.add(block.approvalId);
+    merged.push({
+      kind: "approval",
+      id: `approval:${block.approvalId}`,
+      sequence: event.sourceSequence,
+      observedAtMs: event.observedAtMs,
+      exact: true,
+      block,
+      requestPayload: parseCodexJsonRecord(event.paramsJson),
+      requestId: event.requestId,
+    });
+  }
+
+  const noticeEventByKind = new Map<string, CodexTurnEventRecord>();
+  const nativeErrors: Array<{ event: CodexTurnEventRecord; message: string }> = [];
+  const usedNativeErrorIndexes = new Set<number>();
+  for (const event of [...events].sort(
+    (left, right) => left.sourceSequence - right.sourceSequence,
+  )) {
+    const noticeKind = noticeKindFromEvent(event);
+    if (noticeKind && !noticeEventByKind.has(noticeKind)) {
+      noticeEventByKind.set(noticeKind, event);
+    }
+    const errorMessage = nativeErrorMessage(event);
+    if (errorMessage !== null) nativeErrors.push({ event, message: errorMessage });
+  }
+  (blocks ?? []).forEach((block, blockIndex) => {
+    if (block.type === "notice" && block.kind !== "turn_status") {
+      const event = noticeEventByKind.get(block.kind);
+      if (!event) return;
+      consumedNoticeKinds.add(block.kind);
+      merged.push({
+        kind: "notice",
+        id: `notice:${block.kind}`,
+        sequence: event.sourceSequence,
+        observedAtMs: event.observedAtMs,
+        exact: true,
+        block,
+      });
+      return;
+    }
+    if (block.type !== "error") return;
+    let nativeErrorIndex = nativeErrors.findIndex(
+      ({ message }, index) => !usedNativeErrorIndexes.has(index) && message === block.message,
+    );
+    if (nativeErrorIndex < 0) {
+      nativeErrorIndex = nativeErrors.findIndex((_, index) => !usedNativeErrorIndexes.has(index));
+    }
+    if (nativeErrorIndex < 0) return;
+    usedNativeErrorIndexes.add(nativeErrorIndex);
+    consumedErrorBlockIndexes.add(blockIndex);
+    const event = nativeErrors[nativeErrorIndex]!.event;
+    merged.push({
+      kind: "error",
+      id: `error:${blockIndex}:${event.sourceSequence}`,
+      sequence: event.sourceSequence,
+      observedAtMs: event.observedAtMs,
+      exact: true,
+      block,
+    });
+  });
+  merged.sort((left, right) => left.sequence - right.sequence || left.id.localeCompare(right.id));
+  return {
+    entries: merged,
+    consumedSteerIds,
+    consumedApprovalIds,
+    consumedNoticeKinds,
+    consumedErrorBlockIndexes,
+  };
+}
+
 export function projectCodexTranscript(snapshot: CodexTurnSnapshot): CodexTranscriptProjection {
   const chunksByItem = new Map<string, CodexItemStreamChunkRecord[]>();
   for (const chunk of snapshot.chunks) {
@@ -373,7 +893,7 @@ export function projectCodexTranscript(snapshot: CodexTurnSnapshot): CodexTransc
     chunks.sort((left, right) => left.sourceSequence - right.sourceSequence || left.chunkIndex - right.chunkIndex);
   }
 
-  const entries: CodexTranscriptEntry[] = [];
+  const entries: CodexTranscriptEntry[] = buildSteerEntries(snapshot.events);
   for (const item of snapshot.items) {
     const payload = authoritativeCodexItem(item);
     const chunks = chunksByItem.get(item.itemId) ?? [];
@@ -403,12 +923,27 @@ export function projectCodexTranscript(snapshot: CodexTurnSnapshot): CodexTransc
     if (diff) entries.push(diff);
   }
 
+  const plan = parseCodexPlanProgress(snapshot.turn.planJson);
+  if (plan) {
+    const latestPlanEvent = [...snapshot.events]
+      .reverse()
+      .find((event) => methodSignature(event.method) === "turnplanupdated");
+    if (latestPlanEvent) {
+      entries.push({
+        kind: "planProgress",
+        id: `plan-progress:${latestPlanEvent.sourceSequence}`,
+        sequence: latestPlanEvent.sourceSequence,
+        plan,
+      });
+    }
+  }
+
   entries.sort((left, right) => left.sequence - right.sequence || left.id.localeCompare(right.id));
   return {
     entries,
     events: [...snapshot.events].sort((left, right) => left.sourceSequence - right.sourceSequence),
     usage: parseCodexTranscriptUsage(snapshot.turn.usageJson),
-    plan: parseCodexPlanProgress(snapshot.turn.planJson),
+    plan,
   };
 }
 
@@ -450,7 +985,13 @@ export function parseCodexPlanProgress(value: string | null | undefined): CodexP
     const status = step.status.replace(/[_-]/g, "").toLowerCase();
     return status === "inprogress" || status === "running";
   })?.step ?? null;
-  return { steps, completed, total: steps.length, activeStep };
+  return {
+    steps,
+    completed,
+    total: steps.length,
+    activeStep,
+    explanation: readNonEmptyString(payload, "explanation"),
+  };
 }
 
 function eventConflict(existing: CodexTurnEventRecord, incoming: CodexTurnEventRecord): boolean {

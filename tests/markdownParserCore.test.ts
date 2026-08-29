@@ -36,6 +36,23 @@ describe("markdownParserCoreInternals.isFenceClosing", () => {
 });
 
 describe("renderMarkdownToHtml", () => {
+  it("removes internal citation annotations and incomplete streaming citations", () => {
+    const complete = renderMarkdownToHtml(
+      "First fact. \uE200cite\uE202turn2view1\uE201\n\nSecond fact. \uE200cite\uE202turn2view0\uE202turn2view2\uE201",
+    );
+    expect(complete).toContain("First fact.");
+    expect(complete).toContain("Second fact.");
+    expect(complete).not.toContain("cite");
+    expect(complete).not.toContain("turn2view");
+    expect(complete).not.toMatch(/[\uE200-\uE202]/u);
+
+    const streaming = renderMarkdownToHtml("Still arriving. \uE200cite\uE202turn2view");
+    expect(streaming).toContain("Still arriving.");
+    expect(streaming).not.toContain("cite");
+    expect(streaming).not.toContain("turn2view");
+    expect(streaming).not.toMatch(/[\uE200-\uE202]/u);
+  });
+
   it("highlights closed fences and keeps unclosed fences as plain markdown input", () => {
     const highlighted = renderMarkdownToHtml("```js\nconst value = 1;\n```\n");
     expect(highlighted).toContain("class=\"hljs language-js\"");
@@ -76,6 +93,16 @@ describe("renderMarkdownToHtml", () => {
 
     expect(html).toContain('href="README.md"');
     expect(html).toContain('href="file:///repo/README.md#L4"');
+  });
+
+  it("preserves the encoded target for an absolute folder link containing spaces", () => {
+    const html = renderMarkdownToHtml(
+      "[Panes Memory Leak Investigation 2026-08-29](<C:/Users/lemondoo/Documents/Panes Memory Leak Investigation 2026-08-29>)",
+    );
+
+    expect(html).toContain(
+      'href="C:/Users/lemondoo/Documents/Panes%20Memory%20Leak%20Investigation%202026-08-29"',
+    );
   });
 
   it("does not allow local file URLs in image sources", () => {

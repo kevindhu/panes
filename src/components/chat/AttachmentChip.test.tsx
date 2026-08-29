@@ -207,6 +207,40 @@ describe("AttachmentChip", () => {
     expect(document.body.querySelector(".chat-image-viewer-backdrop")).toBeNull();
   });
 
+  it("renders a minimal composer thumbnail with separate preview and remove actions", async () => {
+    const onRemove = vi.fn();
+    await renderChip(
+      {
+        fileName: "pasted-image.png",
+        filePath: "C:/images/pasted-image.png",
+        mimeType: "image/png",
+      },
+      {
+        composerPreview: true,
+        onRemove,
+        removeLabel: "Remove pasted image",
+      },
+    );
+
+    const chip = container.querySelector(".chat-attachment-chip-composer-image");
+    expect(chip).not.toBeNull();
+    expect(chip?.querySelector(".chat-attachment-thumbnail")).not.toBeNull();
+    expect(chip?.querySelector(".chat-attachment-chip-name")).toBeNull();
+
+    const preview = chip?.querySelector("[role='button']") as HTMLDivElement | null;
+    await act(async () => preview?.click());
+    expect(document.body.querySelector(".chat-image-viewer-backdrop")).not.toBeNull();
+
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    });
+    const removeButton = chip?.querySelector(".chat-attachment-chip-remove") as HTMLButtonElement | null;
+    expect(removeButton?.getAttribute("aria-label")).toBe("Remove pasted image");
+    await act(async () => removeButton?.click());
+    expect(onRemove).toHaveBeenCalledTimes(1);
+    expect(document.body.querySelector(".chat-image-viewer-backdrop")).toBeNull();
+  });
+
   async function renderChip(
     attachment: {
       fileName: string;
@@ -214,6 +248,7 @@ describe("AttachmentChip", () => {
       mimeType?: string;
     },
     props: {
+      composerPreview?: boolean;
       onRemove?: () => void;
       removeLabel?: string;
     } = {},
@@ -222,6 +257,7 @@ describe("AttachmentChip", () => {
       root.render(
         <AttachmentChip
           attachment={attachment}
+          composerPreview={props.composerPreview}
           onRemove={props.onRemove}
           removeLabel={props.removeLabel}
         />,

@@ -27,6 +27,7 @@ interface AttachmentChipData {
 interface AttachmentChipProps {
   attachment: AttachmentChipData;
   compact?: boolean;
+  composerPreview?: boolean;
   showSize?: boolean;
   removeLabel?: string;
   onRemove?: () => void;
@@ -125,6 +126,7 @@ function getAttachmentIcon(mimeType?: string) {
 export function AttachmentChip({
   attachment,
   compact = false,
+  composerPreview = false,
   showSize = false,
   removeLabel,
   onRemove,
@@ -293,6 +295,8 @@ export function AttachmentChip({
     compact ? "chat-attachment-chip-compact" : "",
     thumbnailSrc ? "chat-attachment-chip-image" : "",
     interactive ? "chat-attachment-chip-openable" : "",
+    composerPreview ? "chat-attachment-chip-composer" : "",
+    composerPreview && interactive ? "chat-attachment-chip-composer-image" : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -365,8 +369,10 @@ export function AttachmentChip({
         ) : (
           <IconComponent size={compact ? 10 : 12} />
         )}
-        <span className="chat-attachment-chip-name">{attachment.fileName}</span>
-        {showSize && sizeBytes > 0 && (
+        {(!composerPreview || !interactive) && (
+          <span className="chat-attachment-chip-name">{attachment.fileName}</span>
+        )}
+        {showSize && !composerPreview && sizeBytes > 0 && (
           <span className="chat-attachment-chip-size">{formatFileSize(sizeBytes)}</span>
         )}
       </div>

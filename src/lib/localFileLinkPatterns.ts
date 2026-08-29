@@ -174,8 +174,17 @@ export function parseLocalAbsolutePathTarget(rawTarget: string): ParsedLocalPath
   }
 
   const hashIndex = rawTarget.indexOf("#");
-  const basePath = hashIndex >= 0 ? rawTarget.slice(0, hashIndex) : rawTarget;
+  const encodedBasePath = hashIndex >= 0 ? rawTarget.slice(0, hashIndex) : rawTarget;
   const hash = hashIndex >= 0 ? rawTarget.slice(hashIndex) : "";
+  let basePath: string;
+  try {
+    basePath = decodeURIComponent(encodedBasePath);
+  } catch {
+    return null;
+  }
+  if (!isLocalAbsolutePath(basePath)) {
+    return null;
+  }
   const parsed = stripLocationSuffix(basePath, isLocalAbsolutePath);
 
   return {
