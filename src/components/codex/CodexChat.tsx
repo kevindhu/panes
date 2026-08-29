@@ -39,7 +39,7 @@ import {
 } from "../../lib/codexThreadCapabilities";
 import { createAndActivateWorkspaceThread } from "../../lib/newThreadActions";
 import { activateThreadContext } from "../../lib/threadActivation";
-import { ipc } from "../../lib/codexIpc";
+import { ipc, listenCodexTranscriptUpdated } from "../../lib/codexIpc";
 import { useChatStore } from "../../stores/chatStore";
 import { useEngineStore } from "../../stores/engineStore";
 import { useThreadPlanModeStore } from "../../stores/threadPlanModeStore";
@@ -50,6 +50,9 @@ import type { ApprovalResponse, ChatAttachment, CodexApp, CodexSkill, ContentBlo
 
 const MessageBlocks = lazy(() =>
   import("../chat/MessageBlocks").then((module) => ({ default: module.MessageBlocks })),
+);
+const CodexTurnTranscript = lazy(() =>
+  import("../chat/CodexTurnTranscript").then((module) => ({ default: module.CodexTurnTranscript })),
 );
 
 function fileNameFromPath(filePath: string): string {
@@ -105,6 +108,7 @@ export function CodexChat() {
   const [forkingMessageId, setForkingMessageId] = useState<string | null>(null);
   const [rollingBackMessageId, setRollingBackMessageId] = useState<string | null>(null);
   const [referenceCatalog, setReferenceCatalog] = useState<{ skills: CodexSkill[]; apps: CodexApp[] } | null>(null);
+  const [transcriptSequences, setTranscriptSequences] = useState<Record<string, number>>({});
 
   const activeWorkspaceId = useWorkspaceStore((state) => state.activeWorkspaceId);
   const workspace = useWorkspaceStore((state) => state.workspaces.find((item) => item.id === state.activeWorkspaceId) ?? null);
@@ -157,7 +161,28 @@ export function CodexChat() {
   useEffect(() => {
     setForkingMessageId(null);
     setRollingBackMessageId(null);
+    setTranscriptSequences({});
   }, [activeThreadId]);
+
+  useEffect(() => {
+    let disposed = false;
+    let stopListening: (() => void) | undefined;
+    void listenCodexTranscriptUpdated((event) => {
+      setTranscriptSequences((current) => {
+        if ((current[event.assistantMessageId] ?? 0) >= event.lastSourceSequence) return current;
+        return { ...current, [event.assistantMessageId]: event.lastSourceSequence };
+      });
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else stopListening = unlisten;
+    }).catch((listenError) => {
+      console.error("Could not listen for Codex transcript updates", listenError);
+    });
+    return () => {
+      disposed = true;
+      stopListening?.();
+    };
+  }, []);
 
   useEffect(() => {
     if (!input.includes("$") || referenceCatalog || !workspace?.rootPath) return;
@@ -462,14 +487,27 @@ export function CodexChat() {
                 )}
               </div>
               <Suspense fallback={<div className="codex-loading">Rendering…</div>}>
-                <MessageBlocks
-                  blocks={blocks}
-                  status={message.status}
-                  messageRole={message.role}
-                  workspaceRootPath={workspace.rootPath}
-                  onApproval={approval}
-                  onLoadActionOutput={(actionId) => hydrateActionOutput(message.id, actionId)}
-                />
+                {message.role === "assistant" ? (
+                  <CodexTurnTranscript
+                    messageId={message.id}
+                    blocks={blocks}
+                    status={message.status}
+                    tokenUsage={message.tokenUsage}
+                    workspaceRootPath={workspace.rootPath}
+                    refreshSequence={transcriptSequences[message.id] ?? 0}
+                    onApproval={approval}
+                    onLoadActionOutput={(actionId) => hydrateActionOutput(message.id, actionId)}
+                  />
+                ) : (
+                  <MessageBlocks
+                    blocks={blocks}
+                    status={message.status}
+                    messageRole={message.role}
+                    workspaceRootPath={workspace.rootPath}
+                    onApproval={approval}
+                    onLoadActionOutput={(actionId) => hydrateActionOutput(message.id, actionId)}
+                  />
+                )}
               </Suspense>
               {message.role === "assistant" && message.status !== "streaming" && (
                 <div className="codex-message-actions">

@@ -2521,6 +2521,7 @@ async fn run_turn(
             state.db.clone(),
             thread.id.clone(),
             assistant_message_id.clone(),
+            &app,
         )
     });
     let mut transcript_recording_error: Option<String> = None;
@@ -3133,6 +3134,7 @@ async fn run_codex_review_turn(
         state.db.clone(),
         review_thread.id.clone(),
         assistant_message_id.clone(),
+        &app,
     ));
     let mut transcript_recording_error: Option<String> = None;
 

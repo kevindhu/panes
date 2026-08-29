@@ -3796,6 +3796,84 @@ mod tests {
         assert_eq!(branch.message_count, 4);
     }
 
+    /// Measures the user-perceived fork latency after deferring the engine `thread/fork`.
+    /// The slow codex session-init (~10-26s) is now a background prefetch, so the fork
+    /// command's synchronous return is just a local thread load + branch creation (the
+    /// remaining active-turn check and the `tokio::spawn` of the prefetch are effectively
+    /// free). This times exactly that critical path. Run with:
+    ///   cargo test --lib -- fork_command_round_trip_is_fast --nocapture
+    #[tokio::test]
+    async fn fork_command_round_trip_is_fast() {
+        let state = test_app_state();
+
+        for message_count in [6usize, 100, 500] {
+            let source = test_thread(&state, "codex", "gpt-5.4");
+            db::threads::set_engine_thread_id(&state.db, &source.id, "engine-source")
+                .expect("set engine thread id");
+            let imported = (0..message_count)
+                .map(|index| {
+                    let role = if index % 2 == 0 { "user" } else { "assistant" };
+                    db::messages::ImportedMessageRecord {
+                        role: role.to_string(),
+                        content: Some(format!("message {index}")),
+                        blocks: json!([{ "type": "text", "content": format!("message {index}") }]),
+                        status: MessageStatusDto::Completed,
+                        native_turn_id: Some(format!("turn-{}", index / 2)),
+                        turn_engine_id: Some("codex".to_string()),
+                        turn_model_id: Some("gpt-5.4".to_string()),
+                        turn_reasoning_effort: None,
+                        token_input: u64::from(role == "user"),
+                        token_output: u64::from(role == "assistant"),
+                        created_at: None,
+                    }
+                })
+                .collect::<Vec<_>>();
+            db::messages::replace_thread_messages(&state.db, &source.id, &imported)
+                .expect("insert source messages");
+            db::threads::update_engine_metadata(
+                &state.db,
+                &source.id,
+                &json!({ "codexTranscriptImported": true }),
+            )
+            .expect("mark transcript imported");
+
+            let intent = EngineForkIntent {
+                source_engine_thread_id: "engine-source".to_string(),
+                last_turn_id: None,
+                turns_after: None,
+            };
+
+            // Time the exact synchronous work the fork command does before returning.
+            let started = Instant::now();
+            let source = run_db(state.db.clone(), {
+                let source_id = source.id.clone();
+                move |db| db::threads::get_thread(db, &source_id)
+            })
+            .await
+            .expect("load source")
+            .expect("source exists");
+            let branch =
+                create_pending_codex_branch_thread(&state, &source, &intent, None, None)
+                    .await
+                    .expect("branch creation should succeed");
+            let elapsed = started.elapsed();
+
+            assert!(is_engine_fork_pending(branch.engine_metadata.as_ref()));
+            assert!(branch.engine_thread_id.is_none());
+            assert_eq!(branch.message_count, message_count as i64);
+
+            println!(
+                "fork round trip: {message_count} messages -> {:.2} ms (returned pending, transcript cloned)",
+                elapsed.as_secs_f64() * 1000.0
+            );
+            assert!(
+                elapsed.as_millis() < 500,
+                "fork round trip took {:?} for {message_count} messages",
+                elapsed
+            );
+        }
+    }
+
     #[test]
     fn persist_codex_in_place_rollback_trims_local_history_without_creating_a_thread() {
         let state = test_app_state();

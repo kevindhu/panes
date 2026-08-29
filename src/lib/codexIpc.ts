@@ -72,7 +72,11 @@ export const ipc = {
   respondApproval: (threadId: string, approvalId: string, response: ApprovalResponse) => invoke<void>("respond_to_approval", { threadId, approvalId, response }),
   getThreadMessagesWindow: (threadId: string, cursor?: MessageWindowCursor | null, limit?: number | null) => invoke<MessageWindow>("get_thread_messages_window", { threadId, cursor: cursor ?? null, limit: limit ?? null }),
   getActionOutput: (messageId: string, actionId: string) => invoke<ActionOutputPayload>("get_action_output", { messageId, actionId }),
-  getCodexTurnSnapshot: (assistantMessageId: string) => invoke<CodexTurnSnapshot | null>("get_codex_turn_snapshot", { assistantMessageId }),
+  getCodexTurnSnapshot: (assistantMessageId: string, afterSourceSequence?: number | null) =>
+    invoke<CodexTurnSnapshot | null>("get_codex_turn_snapshot", {
+      assistantMessageId,
+      afterSourceSequence: afterSourceSequence ?? null,
+    }),
   searchMessages: (workspaceId: string, query: string) => invoke<SearchResult[]>("search_messages", { workspaceId, query }),
   listEngines: () => invoke<EngineInfo[]>("list_engines"),
   engineHealth: (engineId: string) => invoke<EngineHealth>("engine_health", { engineId }),
@@ -92,6 +96,11 @@ export interface ChatTurnFinishedEvent {
   threadStatus: ThreadStatus; status: "completed" | "interrupted" | "error"; preview?: string | null;
 }
 
+export interface CodexTranscriptUpdatedEvent {
+  assistantMessageId: string;
+  lastSourceSequence: number;
+}
+
 export async function listenThreadEvents(threadId: string, onEvent: (event: StreamEvent) => void): Promise<UnlistenFn> {
   return listen<StreamEvent>(`stream-event-${threadId}`, ({ payload }) => onEvent(payload));
 }
@@ -100,6 +109,9 @@ export async function listenThreadUpdated(onEvent: (event: ThreadUpdatedEvent) =
 }
 export async function listenChatTurnFinished(onEvent: (event: ChatTurnFinishedEvent) => void): Promise<UnlistenFn> {
   return listen<ChatTurnFinishedEvent>("chat-turn-finished", ({ payload }) => onEvent(payload));
+}
+export async function listenCodexTranscriptUpdated(onEvent: (event: CodexTranscriptUpdatedEvent) => void): Promise<UnlistenFn> {
+  return listen<CodexTranscriptUpdatedEvent>("codex-transcript-updated", ({ payload }) => onEvent(payload));
 }
 export async function listenEngineRuntimeUpdated(onEvent: (event: EngineRuntimeUpdatedEvent) => void): Promise<UnlistenFn> {
   return listen<EngineRuntimeUpdatedEvent>("engine-runtime-updated", ({ payload }) => onEvent(payload));

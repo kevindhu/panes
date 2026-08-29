@@ -1,6 +1,7 @@
 # Codex transcript v2: lossless capture and replay contract
 
-Status: accepted for implementation on `feature/codex-transcript-v2`.
+Status: Phase 1 capture/replay and Phase 2 native presentation implemented on
+`feature/codex-transcript-v2`.
 
 ## Purpose
 
@@ -105,9 +106,35 @@ inventory is nevertheless required so schema changes are visible during developm
 
 ## Rollout
 
-Phase 1 is additive and dual-write. It does not delete legacy blocks, rewrite existing messages,
-or switch the renderer. Later phases may read v2 snapshots behind a feature flag. The legacy
-reader remains for pre-v2 history even after the renderer switches.
+Phase 1 remains additive and dual-write; it does not delete legacy blocks or rewrite existing
+messages. Phase 2 selects the native renderer whenever a v2 ledger exists. The legacy reader
+remains the compatibility path for pre-v2 history.
+
+## Phase 2 presentation contract
+
+The Codex chat renderer loads an initial native snapshot for each assistant message and merges
+subsequent slices by source sequence. The recorder emits `codex-transcript-updated` only after a
+SQLite batch commits, so the UI never races an update notification against uncommitted data.
+While a turn is active, a low-frequency incremental read is retained as recovery if the desktop
+event listener is temporarily unavailable. History reload and live streaming therefore share the
+same projector and ordering rules.
+
+The semantic timeline renders agent messages in source order and groups adjacent native
+activities. Every activity row is independently expandable, including successful commands and
+web searches that emitted no output. Specialized bodies cover commands, stdout/stderr/stdin,
+file diffs, MCP/dynamic/collaboration tools, web-search queries and actions, plans, reasoning,
+images, review events, compaction, and unknown future item types. Started and completed item
+payloads remain separately inspectable; completion is labeled authoritative.
+
+An exact native-event drawer exposes every retained JSON-RPC params string. Large values are
+collapsed to a bounded DOM preview but can be fully revealed or copied; this is a presentation
+limit only and does not mutate the snapshot. The turn footer derives elapsed time, per-turn token
+usage, structured plan progress, lifecycle state, and current activity from the same snapshot.
+
+Messages without a v2 ledger continue through the legacy reader. Its action rows remain
+expandable and expose whatever command/search input the older message retained, including an
+explicit no-output state. It does not claim to reconstruct fields that older Panes versions
+discarded.
 
 ## Phase 1 acceptance gates
 
@@ -119,3 +146,15 @@ reader remains for pre-v2 history even after the renderer switches.
 - Every reviewed `ThreadItem` type and an unknown future type survive replay.
 - Existing-database migration is idempotent.
 - Windows schema generation and parity checks pass against the installed Codex CLI.
+
+## Phase 2 acceptance gates
+
+- A completed command with an empty output stream always expands to its complete command and cwd.
+- A native web search always exposes its query/action; MCP browser tools expose arguments,
+  progress, results, and errors.
+- Started-only fields and authoritative completed fields remain accessible independently.
+- Live committed slices and a fresh full snapshot project to the same ordered timeline.
+- All reviewed item types and an unknown future item receive a visible semantic or raw activity.
+- The footer updates elapsed time, current activity, token usage, and plan completion without
+  depending on legacy blocks.
+- Pre-v2 zero-output command/search rows remain expandable as a compatibility fallback.

@@ -1035,8 +1035,31 @@ function ActionBlockView({
     [outputChunks],
   );
   const Icon = actionIcons[block.actionType] ?? Terminal;
-  const hasBody = outputChunks.length > 0 || Boolean(block.result?.error) || outputDeferred;
   const actionDetails = (block.details ?? {}) as Record<string, unknown>;
+  const inputDetail = useMemo(() => {
+    const pretty = (value: unknown) => {
+      try {
+        return JSON.stringify(value, null, 2) ?? String(value);
+      } catch {
+        return String(value);
+      }
+    };
+    if (block.actionType === "command") {
+      const command = typeof actionDetails.command === "string" ? actionDetails.command : block.summary;
+      return { label: "Command", content: command };
+    }
+    if (block.actionType === "search") {
+      if (typeof actionDetails.query === "string") {
+        const action = actionDetails.action === undefined ? "" : `\n\naction:\n${pretty(actionDetails.action)}`;
+        return { label: "Web search", content: `query: ${actionDetails.query}${action}` };
+      }
+      return { label: "Web search", content: pretty(actionDetails) };
+    }
+    if (Object.keys(actionDetails).length > 0) {
+      return { label: "Tool input", content: pretty(actionDetails) };
+    }
+    return { label: "Tool input", content: block.summary };
+  }, [actionDetails, block.actionType, block.summary]);
   const outputTruncated =
     "outputTruncated" in actionDetails && actionDetails.outputTruncated === true;
   const progressMessage =
@@ -1047,7 +1070,7 @@ function ActionBlockView({
   const [loadingDeferredOutput, setLoadingDeferredOutput] = useState(false);
   const [deferredOutputError, setDeferredOutputError] = useState<string | null>(null);
   const deferredOutputRequestedRef = useRef(false);
-  const canToggle = hasBody;
+  const canToggle = true;
 
   const requestDeferredOutput = useCallback(() => {
     if (!onLoadDeferredOutput || deferredOutputRequestedRef.current) {
@@ -1127,13 +1150,18 @@ function ActionBlockView({
         </div>
       )}
 
-      {expanded && (outputChunks.length > 0 || block.result?.error || outputDeferred) && (
+      {expanded && (
         <div style={{
           margin: "2px 12px 4px",
           borderRadius: "var(--radius-sm)",
           border: "1px solid var(--border)",
           overflow: "hidden",
         }}>
+          <div className="legacy-action-input">
+            <span>{inputDetail.label}</span>
+            <pre className="action-output-pre"><LinkifiedPlainText text={inputDetail.content} /></pre>
+          </div>
+
           {outputDeferred && outputChunks.length === 0 && (
             <div
               style={{
@@ -1210,6 +1238,10 @@ function ActionBlockView({
             >
               <LinkifiedPlainText text={String(block.result.error)} />
             </pre>
+          )}
+
+          {!outputDeferred && outputChunks.length === 0 && !block.result?.error && (
+            <div className="legacy-action-empty-output">No output was emitted.</div>
           )}
         </div>
       )}

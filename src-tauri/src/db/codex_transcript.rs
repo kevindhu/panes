@@ -629,6 +629,17 @@ pub fn load_turn_snapshot(
     db: &Database,
     assistant_message_id: &str,
 ) -> anyhow::Result<Option<CodexTurnSnapshot>> {
+    load_turn_snapshot_after(db, assistant_message_id, 0)
+}
+
+/// Loads an ordered replay slice after `after_source_sequence` while always returning the
+/// current turn record. Items are returned when they changed after the cursor, allowing the
+/// frontend to replace their authoritative snapshot without reloading the entire turn.
+pub fn load_turn_snapshot_after(
+    db: &Database,
+    assistant_message_id: &str,
+    after_source_sequence: u64,
+) -> anyhow::Result<Option<CodexTurnSnapshot>> {
     let conn = db.connect()?;
     let turn = conn
         .query_row(
@@ -662,74 +673,87 @@ pub fn load_turn_snapshot(
     let Some(turn) = turn else {
         return Ok(None);
     };
+    let after_source_sequence = i64::try_from(after_source_sequence)
+        .context("Codex snapshot cursor exceeds SQLite integer range")?;
 
     let mut event_statement = conn.prepare(
         "SELECT id, source_sequence, event_kind, method, request_id, native_thread_id,
                 native_turn_id, params_json, observed_at_ms
-         FROM codex_turn_events WHERE turn_id = ?1 ORDER BY source_sequence ASC",
+         FROM codex_turn_events
+         WHERE turn_id = ?1 AND source_sequence > ?2
+         ORDER BY source_sequence ASC",
     )?;
     let events = event_statement
-        .query_map(params![assistant_message_id], |row| {
-            Ok(CodexTurnEventRecord {
-                id: row.get(0)?,
-                source_sequence: row.get::<_, i64>(1)? as u64,
-                event_kind: row.get(2)?,
-                method: row.get(3)?,
-                request_id: row.get(4)?,
-                native_thread_id: row.get(5)?,
-                native_turn_id: row.get(6)?,
-                params_json: row.get(7)?,
-                observed_at_ms: row.get(8)?,
-            })
-        })?
+        .query_map(
+            params![assistant_message_id, after_source_sequence],
+            |row| {
+                Ok(CodexTurnEventRecord {
+                    id: row.get(0)?,
+                    source_sequence: row.get::<_, i64>(1)? as u64,
+                    event_kind: row.get(2)?,
+                    method: row.get(3)?,
+                    request_id: row.get(4)?,
+                    native_thread_id: row.get(5)?,
+                    native_turn_id: row.get(6)?,
+                    params_json: row.get(7)?,
+                    observed_at_ms: row.get(8)?,
+                })
+            },
+        )?
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut item_statement = conn.prepare(
         "SELECT item_id, item_type, status, phase, first_source_sequence,
                 last_source_sequence, started_at_ms, completed_at_ms, started_json, completed_json
          FROM codex_turn_items
-         WHERE turn_id = ?1
+         WHERE turn_id = ?1 AND last_source_sequence > ?2
          ORDER BY first_source_sequence ASC, item_id ASC",
     )?;
     let items = item_statement
-        .query_map(params![assistant_message_id], |row| {
-            Ok(CodexTurnItemRecord {
-                item_id: row.get(0)?,
-                item_type: row.get(1)?,
-                status: row.get(2)?,
-                phase: row.get(3)?,
-                first_source_sequence: row.get::<_, i64>(4)? as u64,
-                last_source_sequence: row.get::<_, i64>(5)? as u64,
-                started_at_ms: row.get(6)?,
-                completed_at_ms: row.get(7)?,
-                started_json: row.get(8)?,
-                completed_json: row.get(9)?,
-            })
-        })?
+        .query_map(
+            params![assistant_message_id, after_source_sequence],
+            |row| {
+                Ok(CodexTurnItemRecord {
+                    item_id: row.get(0)?,
+                    item_type: row.get(1)?,
+                    status: row.get(2)?,
+                    phase: row.get(3)?,
+                    first_source_sequence: row.get::<_, i64>(4)? as u64,
+                    last_source_sequence: row.get::<_, i64>(5)? as u64,
+                    started_at_ms: row.get(6)?,
+                    completed_at_ms: row.get(7)?,
+                    started_json: row.get(8)?,
+                    completed_json: row.get(9)?,
+                })
+            },
+        )?
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut chunk_statement = conn.prepare(
         "SELECT id, event_id, item_id, source_sequence, chunk_index, stream_kind,
                 summary_index, content, metadata_json, observed_at_ms
          FROM codex_item_stream_chunks
-         WHERE turn_id = ?1
+         WHERE turn_id = ?1 AND source_sequence > ?2
          ORDER BY source_sequence ASC, chunk_index ASC",
     )?;
     let chunks = chunk_statement
-        .query_map(params![assistant_message_id], |row| {
-            Ok(CodexItemStreamChunkRecord {
-                id: row.get(0)?,
-                event_id: row.get(1)?,
-                item_id: row.get(2)?,
-                source_sequence: row.get::<_, i64>(3)? as u64,
-                chunk_index: row.get::<_, i64>(4)? as u32,
-                stream_kind: row.get(5)?,
-                summary_index: row.get(6)?,
-                content: row.get(7)?,
-                metadata_json: row.get(8)?,
-                observed_at_ms: row.get(9)?,
-            })
-        })?
+        .query_map(
+            params![assistant_message_id, after_source_sequence],
+            |row| {
+                Ok(CodexItemStreamChunkRecord {
+                    id: row.get(0)?,
+                    event_id: row.get(1)?,
+                    item_id: row.get(2)?,
+                    source_sequence: row.get::<_, i64>(3)? as u64,
+                    chunk_index: row.get::<_, i64>(4)? as u32,
+                    stream_kind: row.get(5)?,
+                    summary_index: row.get(6)?,
+                    content: row.get(7)?,
+                    metadata_json: row.get(8)?,
+                    observed_at_ms: row.get(9)?,
+                })
+            },
+        )?
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Some(CodexTurnSnapshot {
@@ -909,6 +933,35 @@ mod tests {
             chunk.item_id.as_deref() == Some("cmd-1")
                 && chunk.metadata_json.as_deref() == Some(r#"{"stream":"stdout"}"#)
         }));
+
+        let replay_tail = load_turn_snapshot_after(&db, ASSISTANT_MESSAGE_ID, 20)
+            .expect("incremental snapshot query")
+            .expect("incremental snapshot should exist");
+        assert_eq!(replay_tail.turn.last_source_sequence, events.len() as u64);
+        assert_eq!(
+            replay_tail
+                .events
+                .iter()
+                .map(|event| event.source_sequence)
+                .collect::<Vec<_>>(),
+            vec![21, 22, 23, 24, 25, 26]
+        );
+        assert_eq!(
+            replay_tail
+                .items
+                .iter()
+                .map(|item| item.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agent-1"]
+        );
+        assert_eq!(
+            replay_tail
+                .chunks
+                .iter()
+                .map(|chunk| (chunk.source_sequence, chunk.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(21, "Final answer.")]
+        );
 
         drop(db);
         let reopened = Database::open(path.clone()).expect("database should reopen and remigrate");

@@ -1,6 +1,11 @@
 use std::time::Duration;
 
 use anyhow::Context;
+#[cfg(not(test))]
+use serde::Serialize;
+use tauri::AppHandle;
+#[cfg(not(test))]
+use tauri::Emitter;
 use tokio::{
     sync::mpsc,
     task::JoinHandle,
@@ -18,6 +23,11 @@ const RECORDER_BATCH_MAX_EVENTS: usize = 128;
 const RECORDER_BATCH_MAX_BYTES: usize = 4 * 1024 * 1024;
 const RECORDER_BATCH_MAX_LATENCY: Duration = Duration::from_millis(25);
 
+#[cfg(not(test))]
+type CodexTranscriptUpdateTarget = AppHandle;
+#[cfg(test)]
+type CodexTranscriptUpdateTarget = ();
+
 /// Lossless, bounded turn recorder. Sending applies backpressure; finishing closes the queue,
 /// commits the final batch, and joins the worker before the assistant turn is finalized.
 pub(super) struct CodexTranscriptRecorder {
@@ -25,23 +35,88 @@ pub(super) struct CodexTranscriptRecorder {
     worker: JoinHandle<anyhow::Result<()>>,
 }
 
+#[cfg(not(test))]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexTranscriptUpdatedEvent {
+    assistant_message_id: String,
+    last_source_sequence: u64,
+}
+
+#[cfg(not(test))]
+fn emit_transcript_updated(
+    app: Option<&CodexTranscriptUpdateTarget>,
+    assistant_message_id: &str,
+    last_source_sequence: u64,
+) {
+    let Some(app) = app else {
+        return;
+    };
+    if let Err(error) = app.emit(
+        "codex-transcript-updated",
+        CodexTranscriptUpdatedEvent {
+            assistant_message_id: assistant_message_id.to_owned(),
+            last_source_sequence,
+        },
+    ) {
+        log::warn!(
+            "failed to emit Codex transcript update for {}: {error}",
+            assistant_message_id
+        );
+    }
+}
+
+// Tauri embeds the Common Controls v6 manifest in the desktop binary, but Rust's unit-test
+// harness does not. Keeping the desktop-only emit call out of unit-test linkage avoids loading
+// the legacy comctl32 v5 entry points before the test harness can start.
+#[cfg(test)]
+fn emit_transcript_updated(
+    _app: Option<&CodexTranscriptUpdateTarget>,
+    _assistant_message_id: &str,
+    _last_source_sequence: u64,
+) {
+}
+
 impl CodexTranscriptRecorder {
     pub(super) fn start(
         db: Database,
         local_thread_id: String,
         assistant_message_id: String,
+        app: &AppHandle,
+    ) -> Self {
+        #[cfg(not(test))]
+        let update_target = Some(app.clone());
+        #[cfg(test)]
+        let update_target = {
+            let _ = app;
+            None
+        };
+        Self::start_with_target(db, local_thread_id, assistant_message_id, update_target)
+    }
+
+    fn start_with_target(
+        db: Database,
+        local_thread_id: String,
+        assistant_message_id: String,
+        update_target: Option<CodexTranscriptUpdateTarget>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(RECORDER_QUEUE_CAPACITY);
         let worker = tokio::spawn(run_recorder(
             db,
             local_thread_id,
             assistant_message_id,
+            update_target,
             receiver,
         ));
         Self {
             sender: Some(sender),
             worker,
         }
+    }
+
+    #[cfg(test)]
+    fn start_for_test(db: Database, local_thread_id: String, assistant_message_id: String) -> Self {
+        Self::start_with_target(db, local_thread_id, assistant_message_id, None)
     }
 
     pub(super) async fn record(&self, event: CodexNativeEvent) -> anyhow::Result<()> {
@@ -65,6 +140,7 @@ async fn run_recorder(
     db: Database,
     local_thread_id: String,
     assistant_message_id: String,
+    app: Option<CodexTranscriptUpdateTarget>,
     mut receiver: mpsc::Receiver<CodexNativeEvent>,
 ) -> anyhow::Result<()> {
     while let Some(first) = receiver.recv().await {
@@ -95,6 +171,11 @@ async fn run_recorder(
             }
         }
 
+        let last_source_sequence = batch
+            .iter()
+            .map(|event| event.source_sequence)
+            .max()
+            .context("Codex transcript batch unexpectedly empty")?;
         let batch_db = db.clone();
         let batch_thread_id = local_thread_id.clone();
         let batch_message_id = assistant_message_id.clone();
@@ -108,6 +189,8 @@ async fn run_recorder(
         })
         .await
         .context("Codex transcript database task failed to join")??;
+
+        emit_transcript_updated(app.as_ref(), &assistant_message_id, last_source_sequence);
 
         if channel_closed {
             break;
@@ -131,10 +214,14 @@ fn event_size(event: &CodexNativeEvent) -> usize {
 pub async fn get_codex_turn_snapshot(
     state: tauri::State<'_, AppState>,
     assistant_message_id: String,
+    after_source_sequence: Option<u64>,
 ) -> Result<Option<CodexTurnSnapshot>, String> {
     let database = state.db.clone();
-    tokio::task::spawn_blocking(move || {
-        db::codex_transcript::load_turn_snapshot(&database, &assistant_message_id)
+    tokio::task::spawn_blocking(move || match after_source_sequence {
+        Some(cursor) => {
+            db::codex_transcript::load_turn_snapshot_after(&database, &assistant_message_id, cursor)
+        }
+        None => db::codex_transcript::load_turn_snapshot(&database, &assistant_message_id),
     })
     .await
     .map_err(|error| format!("Codex snapshot task failed to join: {error}"))?
@@ -180,8 +267,11 @@ mod tests {
             .expect("message fixture");
         drop(connection);
 
-        let recorder =
-            CodexTranscriptRecorder::start(database.clone(), "thread".into(), "message".into());
+        let recorder = CodexTranscriptRecorder::start_for_test(
+            database.clone(),
+            "thread".into(),
+            "message".into(),
+        );
         for source_sequence in 1..=3 {
             recorder
                 .record(CodexNativeEvent {
