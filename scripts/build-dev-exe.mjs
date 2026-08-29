@@ -163,6 +163,8 @@ await run(
     "build",
     "--debug",
     "--no-bundle",
+    "--features",
+    "windowed-dev-exe",
     "--config",
     devConfigPath,
   ],

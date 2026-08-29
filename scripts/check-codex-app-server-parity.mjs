@@ -96,7 +96,7 @@ function quoteCmdArgument(value) {
 }
 
 function generateSchema(outputDirectory) {
-  const args = ["app-server", "generate-json-schema", "--out", outputDirectory];
+  const args = ["app-server", "generate-json-schema", "--out", outputDirectory, "--experimental"];
   if (process.platform === "win32") {
     // npm installs Codex as a .cmd shim on Windows. execFileSync cannot launch .cmd files
     // directly, while execSync intentionally resolves the shim through cmd.exe.
@@ -119,8 +119,49 @@ if (!schemaRoot) {
 
 try {
   const threadRead = loadJson(requireFile(schemaRoot, join("v2", "ThreadReadResponse.json")));
+  const turnStart = loadJson(requireFile(schemaRoot, join("v2", "TurnStartParams.json")));
+  const turnPlanUpdated = loadJson(requireFile(schemaRoot, join("v2", "TurnPlanUpdatedNotification.json")));
+  const toolRequestUserInput = loadJson(requireFile(schemaRoot, "ToolRequestUserInputParams.json"));
+  const toolRequestUserInputResponse = loadJson(requireFile(schemaRoot, "ToolRequestUserInputResponse.json"));
   const serverNotifications = loadJson(requireFile(schemaRoot, "ServerNotification.json"));
   const serverRequests = loadJson(requireFile(schemaRoot, "ServerRequest.json"));
+
+  assert(turnStart.properties?.collaborationMode, "TurnStartParams has no collaborationMode");
+  assertContainsAll(
+    turnStart.definitions?.ModeKind?.enum ?? [],
+    ["plan", "default"],
+    "TurnStartParams collaboration modes",
+  );
+  assertContainsAll(
+    Object.keys(turnStart.definitions?.Settings?.properties ?? {}),
+    ["model", "reasoning_effort", "developer_instructions"],
+    "TurnStartParams collaboration settings",
+  );
+  assertContainsAll(
+    toolRequestUserInput.required ?? [],
+    ["isBlocking", "itemId", "questions", "threadId", "turnId"],
+    "ToolRequestUserInputParams required fields",
+  );
+  assertContainsAll(
+    toolRequestUserInput.definitions?.ToolRequestUserInputQuestion?.required ?? [],
+    ["header", "id", "question"],
+    "ToolRequestUserInputQuestion required fields",
+  );
+  assertContainsAll(
+    Object.keys(toolRequestUserInput.definitions?.ToolRequestUserInputQuestion?.properties ?? {}),
+    ["isOther", "isSecret", "options"],
+    "ToolRequestUserInputQuestion fields",
+  );
+  assertContainsAll(
+    toolRequestUserInputResponse.required ?? [],
+    ["answers"],
+    "ToolRequestUserInputResponse required fields",
+  );
+  assertContainsAll(
+    turnPlanUpdated.definitions?.TurnPlanStepStatus?.enum ?? [],
+    ["pending", "inProgress", "completed"],
+    "TurnPlanUpdatedNotification statuses",
+  );
 
   const reviewedItemTypes = Object.keys(contract.threadItemTypes ?? {});
   for (const [itemType, projection] of Object.entries(contract.threadItemTypes ?? {})) {

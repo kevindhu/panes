@@ -63,7 +63,7 @@ Panes is a local-first desktop client for Codex. It keeps workspaces, threads, s
 | Rust toolchain | stable |
 | Node.js | 20+ |
 | pnpm | 9+ |
-| Codex CLI | Required for the Codex chat engine; setup can install it via npm |
+| Codex CLI | 0.150.1+; required for durable sub-second forks |
 | Tauri v2 prerequisites | [See Tauri docs](https://v2.tauri.app/start/prerequisites/) |
 
 ### Install on macOS

@@ -55,6 +55,9 @@ tauri-plugin-single-instance = "2"
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+# Used by the cached development-executable helper so its debug binary behaves
+# like a normal windowed Windows app without hiding `tauri dev` diagnostics.
+windowed-dev-exe = []
 
 [profile.dev]
 # Keep local debug builds inspectable without letting `target/` explode as quickly.
