@@ -837,7 +837,7 @@ export function interleaveLegacyTranscriptBlocks(
     if (errorMessage !== null) nativeErrors.push({ event, message: errorMessage });
   }
   (blocks ?? []).forEach((block, blockIndex) => {
-    if (block.type === "notice" && block.kind !== "turn_status") {
+    if (block.type === "notice") {
       const event = noticeEventByKind.get(block.kind);
       if (!event) return;
       consumedNoticeKinds.add(block.kind);

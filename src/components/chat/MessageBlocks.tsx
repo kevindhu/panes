@@ -87,7 +87,6 @@ import { webSearchDetails } from "../../lib/codexTranscript";
 interface Props {
   blocks?: ContentBlock[];
   status?: MessageStatus;
-  messageRole?: "user" | "assistant";
   workspaceRootPath?: string | null;
   selectionNamespace?: string;
   onApproval: (approvalId: string, response: ApprovalResponse) => void;
@@ -502,300 +501,7 @@ function ThinkingBlockView({
   );
 }
 
-function buildFallbackTurnStatusNotice(
-  blocks: ContentBlock[],
-  status: MessageStatus,
-): NoticeBlock {
-  let actionsTotal = 0;
-  let actionsDone = 0;
-  let actionsError = 0;
-  let actionsRunning = 0;
-  let actionsPending = 0;
-  let approvalsPending = 0;
-  let approvalsAnswered = 0;
-  let diffBlocks = 0;
-  let errorBlocks = 0;
-
-  for (const block of blocks) {
-    if (block.type === "action") {
-      actionsTotal += 1;
-      if (block.status === "done") {
-        actionsDone += 1;
-      } else if (block.status === "error") {
-        actionsError += 1;
-      } else if (block.status === "pending") {
-        actionsPending += 1;
-      } else {
-        actionsRunning += 1;
-      }
-      continue;
-    }
-
-    if (block.type === "approval") {
-      if (block.status === "pending") {
-        approvalsPending += 1;
-      } else {
-        approvalsAnswered += 1;
-      }
-      continue;
-    }
-
-    if (block.type === "diff") {
-      diffBlocks += 1;
-      continue;
-    }
-
-    if (block.type === "error") {
-      errorBlocks += 1;
-    }
-  }
-
-  const details: string[] = [];
-  if (actionsTotal > 0) {
-    details.push(
-      `Actions: ${actionsTotal} total, ${actionsDone} done, ${actionsError} error, ${actionsRunning} running, ${actionsPending} pending`,
-    );
-  }
-  if (approvalsPending > 0 || approvalsAnswered > 0) {
-    details.push(`Approvals: ${approvalsPending} pending, ${approvalsAnswered} answered`);
-  }
-  if (diffBlocks > 0) {
-    details.push(`Diff blocks: ${diffBlocks}`);
-  }
-  if (errorBlocks > 0) {
-    details.push(`Error blocks: ${errorBlocks}`);
-  }
-  if (details.length === 0) {
-    details.push("No tool, approval, diff, or error activity has been recorded yet.");
-  }
-
-  if (approvalsPending > 0) {
-    return {
-      type: "notice",
-      kind: "turn_status",
-      level: "warning",
-      title: status === "streaming" ? "Waiting for approval" : "Approval still pending",
-      message:
-        status === "streaming"
-          ? "Waiting for approval before the turn can continue."
-          : "The turn reached a terminal state while an approval was still unresolved.",
-      details,
-      status: "awaiting_approval",
-    };
-  }
-
-  const terminalPresentation =
-    status === "completed"
-      ? {
-          level: "info" as const,
-          title: "Turn completed",
-          message: "The turn reached a terminal completion.",
-          noticeStatus: "completed",
-        }
-      : status === "interrupted"
-        ? {
-            level: "warning" as const,
-            title: "Turn interrupted",
-            message: "The turn ended before a normal completion.",
-            noticeStatus: "interrupted",
-          }
-        : status === "error"
-          ? {
-              level: "error" as const,
-              title: "Turn failed",
-              message: "The turn ended with an error.",
-              noticeStatus: "failed",
-            }
-          : {
-              level: "info" as const,
-              title: "Turn still open",
-              message: "No terminal completion event has been recorded yet.",
-              noticeStatus: "streaming",
-            };
-
-  return {
-    type: "notice",
-    kind: "turn_status",
-    level: terminalPresentation.level,
-    title: terminalPresentation.title,
-    message: terminalPresentation.message,
-    details,
-    status: terminalPresentation.noticeStatus,
-  };
-}
-
-function humanizeTurnStatusSource(source?: string): string | null {
-  switch (source) {
-    case "engine":
-      return "engine";
-    case "reconciled_stream_lost":
-      return "reconciled after stream loss";
-    case "reconciled_timeout":
-      return "reconciled after timeout";
-    case "timeout_fallback":
-      return "timeout fallback";
-    default:
-      return null;
-  }
-}
-
-function formatTaskDuration(durationMs?: number): string | null {
-  if (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs < 0) {
-    return null;
-  }
-
-  if (durationMs < 1000) {
-    return `${Math.max(0, Math.round(durationMs))}ms`;
-  }
-
-  const totalSeconds = Math.max(1, Math.round(durationMs / 1000));
-  if (totalSeconds < 60) {
-    return `${totalSeconds}s`;
-  }
-
-  const totalMinutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  if (totalMinutes < 60) {
-    return seconds > 0 ? `${totalMinutes}m ${seconds}s` : `${totalMinutes}m`;
-  }
-
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
-  return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
-}
-
-function TurnStatusNoticeView({ block }: { block: NoticeBlock }) {
-  const { t } = useTranslation("chat");
-  const [expanded, setExpanded] = useState(() => block.level !== "info");
-
-  useEffect(() => {
-    if (block.level !== "info") {
-      setExpanded(true);
-    }
-  }, [block.level, block.message]);
-
-  const toggleExpanded = useCallback(() => setExpanded((value) => !value), []);
-  const status = String(block.status ?? "");
-  const sourceLabel = humanizeTurnStatusSource(block.source);
-  const details = Array.isArray(block.details) ? block.details : [];
-  const durationLabel = formatTaskDuration(block.durationMs);
-
-  let Icon = Info;
-  let accent = "var(--info)";
-  let background = "rgba(56, 189, 248, 0.10)";
-  let border = "rgba(56, 189, 248, 0.18)";
-
-  if (status === "completed") {
-    Icon = CheckCircle2;
-    accent = "var(--success)";
-    background = "rgba(34, 197, 94, 0.10)";
-    border = "rgba(34, 197, 94, 0.18)";
-  } else if (status === "failed") {
-    Icon = XCircle;
-    accent = "var(--danger)";
-    background = "rgba(248, 113, 113, 0.10)";
-    border = "rgba(248, 113, 113, 0.18)";
-  } else if (status === "interrupted" || status === "awaiting_approval") {
-    Icon = AlertTriangle;
-    accent = "var(--warning)";
-    background = "rgba(245, 158, 11, 0.10)";
-    border = "rgba(245, 158, 11, 0.18)";
-  } else if (status === "streaming") {
-    Icon = Loader2;
-  }
-
-  return (
-    <div
-      className="msg-notice-block"
-      style={{
-        border: `1px solid ${border}`,
-        background,
-        alignItems: "flex-start",
-      }}
-    >
-      <Icon
-        size={14}
-        className={status === "streaming" ? "animate-spin" : undefined}
-        style={{
-          flexShrink: 0,
-          color: accent,
-          marginTop: 1,
-        }}
-      />
-      <div style={{ minWidth: 0, flex: 1, display: "flex", flexDirection: "column", gap: 6 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-          <div style={{ fontSize: 11, fontWeight: 600, color: accent }}>
-            {block.title}
-          </div>
-          {sourceLabel && (
-            <span
-              style={{
-                fontSize: 10,
-                lineHeight: 1.4,
-                padding: "1px 6px",
-                borderRadius: 999,
-                border: `1px solid ${border}`,
-                color: "var(--text-3)",
-              }}
-            >
-              {sourceLabel}
-            </span>
-          )}
-        </div>
-        <div style={{ color: "var(--text-2)" }}>{block.message}</div>
-        {details.length > 0 && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            <button
-              type="button"
-              className="acard-toggle"
-              onClick={toggleExpanded}
-              style={{ alignSelf: "flex-start" }}
-            >
-              {expanded
-                ? t("messageBlocks.approval.hideDetails")
-                : t("messageBlocks.approval.showDetails")}
-            </button>
-            {expanded && (
-              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                {details.map((detail, index) => (
-                  <div
-                    key={`${detail}:${index}`}
-                    style={{
-                      fontSize: 11.5,
-                      color: "var(--text-2)",
-                      fontFamily: '"JetBrains Mono", monospace',
-                      whiteSpace: "pre-wrap",
-                      wordBreak: "break-word",
-                    }}
-                  >
-                    <LinkifiedPlainText text={detail} />
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-        {durationLabel && (
-          <div
-            style={{
-              color: "var(--text-3)",
-              fontSize: 11,
-              fontFamily: '"JetBrains Mono", monospace',
-            }}
-          >
-            Task took {durationLabel}.
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
 function NoticeBlockView({ block }: { block: NoticeBlock }) {
-  if (block.kind === "turn_status") {
-    return <TurnStatusNoticeView block={block} />;
-  }
-
   if (
     block.kind === "context_compacted" ||
     block.kind.startsWith("codex_context_compaction_")
@@ -2015,7 +1721,6 @@ function renderSingleBlock(
 function MessageBlocksView({
   blocks = [],
   status,
-  messageRole = "assistant",
   workspaceRootPath,
   selectionNamespace,
   onApproval,
@@ -2029,27 +1734,17 @@ function MessageBlocksView({
         .filter(isBlockLike)
         .filter(
           (block) =>
-            messageRole === "assistant" ||
             block.type !== "notice" ||
             block.kind !== "turn_status",
         ) as ContentBlock[],
     ),
-    [blocks, messageRole],
+    [blocks],
   );
 
   const isStreaming = status === "streaming";
-  const renderedBlocks = useMemo(() => {
-    const hasTurnStatus = safeBlocks.some(
-      (block) => block.type === "notice" && block.kind === "turn_status",
-    );
-    if (messageRole !== "assistant" || hasTurnStatus || !status) {
-      return safeBlocks;
-    }
-    return [...safeBlocks, buildFallbackTurnStatusNotice(safeBlocks, status)];
-  }, [messageRole, safeBlocks, status]);
   const blockSegments = useMemo(
-    () => buildBlockSegments(renderedBlocks, isStreaming),
-    [renderedBlocks, isStreaming],
+    () => buildBlockSegments(safeBlocks, isStreaming),
+    [safeBlocks, isStreaming],
   );
 
   return (
@@ -2161,7 +1856,6 @@ export const MessageBlocks = memo(
   (prev, next) =>
     prev.blocks === next.blocks &&
     prev.status === next.status &&
-    prev.messageRole === next.messageRole &&
     prev.workspaceRootPath === next.workspaceRootPath &&
     prev.selectionNamespace === next.selectionNamespace &&
     prev.onApproval === next.onApproval &&

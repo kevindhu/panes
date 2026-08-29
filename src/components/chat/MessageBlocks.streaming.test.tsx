@@ -90,7 +90,7 @@ describe("MessageBlocks streaming text", () => {
     document.body.innerHTML = "";
   });
 
-  it("opens a plain-text web link on Ctrl-click despite an unrelated text selection", async () => {
+  it("opens a plain-text web link on a plain click despite an unrelated text selection", async () => {
     const selectedText = document.createElement("div");
     selectedText.textContent = "previous selection";
     document.body.appendChild(selectedText);
@@ -114,7 +114,6 @@ describe("MessageBlocks streaming text", () => {
         bubbles: true,
         cancelable: true,
         button: 0,
-        ctrlKey: true,
         clientX: 20,
         clientY: 10,
         detail: 1,
@@ -125,7 +124,7 @@ describe("MessageBlocks streaming text", () => {
     expect(mockOpenExternal).toHaveBeenCalledWith("https://example.com/docs");
   });
 
-  it("does not open a plain-text web link on an unmodified click", async () => {
+  it("opens a plain-text web link on an unmodified click", async () => {
     await act(async () => {
       root.render(<LinkifiedPlainText text="https://example.com/docs" />);
     });
@@ -141,7 +140,7 @@ describe("MessageBlocks streaming text", () => {
       await Promise.resolve();
     });
 
-    expect(mockOpenExternal).not.toHaveBeenCalled();
+    expect(mockOpenExternal).toHaveBeenCalledWith("https://example.com/docs");
   });
 
   it("keeps a text selection scope stable when another block is inserted before it", async () => {
@@ -184,7 +183,7 @@ describe("MessageBlocks streaming text", () => {
       ?.getAttribute("data-transcript-selection-scope")).toBe(initialScope);
   });
 
-  it("keeps the final real text block in streaming mode when a live status notice is appended", async () => {
+  it("keeps the final real text block in streaming mode without synthesizing a status card", async () => {
     const blocks: ContentBlock[] = [{ type: "text", content: "partial response" }];
 
     await act(async () => {
@@ -201,8 +200,8 @@ describe("MessageBlocks streaming text", () => {
 
     const renderedMarkdown = container.querySelector("[data-markdown-streaming]");
     expect(renderedMarkdown?.getAttribute("data-markdown-streaming")).toBe("true");
-    expect(container.textContent).toContain("Turn still open");
-    expect(container.querySelector("svg.animate-spin")).not.toBeNull();
+    expect(container.textContent).toContain("partial response");
+    expect(container.textContent).not.toContain("Turn still open");
   });
 
   it("never reveals answered secret tool-input values", async () => {
@@ -253,7 +252,7 @@ describe("MessageBlocks streaming text", () => {
     expect(container.textContent).not.toContain("super-secret");
   });
 
-  it("does not render turn status for a completed user message", async () => {
+  it("does not render a removed status notice from persisted blocks", async () => {
     const blocks: ContentBlock[] = [
       { type: "text", content: "This is only the user prompt" },
       {
@@ -262,7 +261,6 @@ describe("MessageBlocks streaming text", () => {
         level: "info",
         title: "Turn completed",
         message: "The turn reached a terminal completion.",
-        status: "completed",
       },
     ];
 
@@ -271,7 +269,6 @@ describe("MessageBlocks streaming text", () => {
         <MessageBlocks
           blocks={blocks}
           status="completed"
-          messageRole="user"
           onApproval={vi.fn()}
           onLoadActionOutput={vi.fn(async () => undefined)}
         />,
@@ -283,15 +280,11 @@ describe("MessageBlocks streaming text", () => {
     expect(container.textContent).not.toContain("terminal completion");
   });
 
-  it.each([
-    ["completed", "Turn completed", "The turn reached a terminal completion."],
-    ["interrupted", "Turn interrupted", "The turn ended before a normal completion."],
-    ["error", "Turn failed", "The turn ended with an error."],
-  ] as const)(
-    "shows a %s terminal card for legacy messages without a status notice",
-    async (status, title, message) => {
+  it.each(["completed", "interrupted", "error"] as const)(
+    "does not synthesize a terminal card for a %s compatibility message",
+    async (status) => {
       const blocks: ContentBlock[] = [
-        { type: "text", content: "Response stored before terminal notices were persisted" },
+        { type: "text", content: "Stored response" },
       ];
 
       await act(async () => {
@@ -306,20 +299,22 @@ describe("MessageBlocks streaming text", () => {
         );
       });
 
-      expect(container.textContent).toContain(title);
-      expect(container.textContent).toContain(message);
+      expect(container.textContent).toContain("Stored response");
+      expect(container.textContent).not.toContain("Turn completed");
+      expect(container.textContent).not.toContain("Turn interrupted");
+      expect(container.textContent).not.toContain("Turn failed");
     },
   );
 
-  it("keeps a persisted terminal notice authoritative over the compatibility fallback", async () => {
+  it("ignores a persisted legacy terminal notice", async () => {
     const blocks: ContentBlock[] = [
+      { type: "text", content: "Stored response" },
       {
         type: "notice",
         kind: "turn_status",
         level: "warning",
         title: "Persisted terminal outcome",
         message: "Loaded from the backend snapshot.",
-        status: "interrupted",
       },
     ];
 
@@ -335,8 +330,9 @@ describe("MessageBlocks streaming text", () => {
       );
     });
 
-    expect(container.textContent).toContain("Persisted terminal outcome");
-    expect(container.textContent).not.toContain("The turn ended before a normal completion.");
+    expect(container.textContent).toContain("Stored response");
+    expect(container.textContent).not.toContain("Persisted terminal outcome");
+    expect(container.textContent).not.toContain("Loaded from the backend snapshot.");
   });
 
   it("never groups completed actions across intervening thought boundaries", async () => {

@@ -44,8 +44,6 @@ interface ResolvedSelectionPoint {
 
 interface TranscriptLinkActivationEvent {
   button: number;
-  ctrlKey: boolean;
-  metaKey: boolean;
   detail: number;
 }
 
@@ -386,7 +384,6 @@ export function transcriptLinkShouldNavigate(
   if (event.detail === 0) return true;
   return (
     event.button === 0 &&
-    (event.ctrlKey || event.metaKey) &&
     !selectionIntersectedAtPointerDown &&
     !selectionIntersectsNode(anchor)
   );

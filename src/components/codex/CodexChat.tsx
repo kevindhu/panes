@@ -960,7 +960,6 @@ export function CodexChat() {
                   <MessageBlocks
                     blocks={blocks}
                     status={message.status}
-                    messageRole={message.role}
                     workspaceRootPath={workspace.rootPath}
                     selectionNamespace={`message:${message.id}:blocks`}
                     onApproval={approval}

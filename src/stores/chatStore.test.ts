@@ -291,14 +291,7 @@ describe("chatStore send", () => {
     expect(useChatStore.getState().messages[0]).toMatchObject({
       id: "assistant-message-id",
       status: "completed",
-      blocks: expect.arrayContaining([
-        expect.objectContaining({
-          type: "notice",
-          kind: "turn_status",
-          status: "completed",
-          title: "Turn completed",
-        }),
-      ]),
+      blocks: [{ type: "text", content: "Finished work" }],
     });
   });
 
@@ -624,6 +617,45 @@ describe("chatStore send", () => {
     await expect(cancelPromise).resolves.toBeUndefined();
   });
 
+  it("retains an empty assistant turn so an early stop can show confirmation", async () => {
+    useChatStore.setState({
+      threadId: "thread-1",
+      status: "streaming",
+      streaming: true,
+      messages: [
+        {
+          id: "user-1",
+          threadId: "thread-1",
+          role: "user",
+          content: "start",
+          blocks: [{ type: "text", content: "start" }],
+          status: "completed",
+          schemaVersion: 1,
+          createdAt: new Date().toISOString(),
+        },
+        {
+          id: "assistant-1",
+          threadId: "thread-1",
+          role: "assistant",
+          status: "streaming",
+          schemaVersion: 1,
+          createdAt: new Date().toISOString(),
+          blocks: [],
+        },
+      ],
+    });
+
+    await useChatStore.getState().cancel();
+
+    expect(useChatStore.getState().messages).toHaveLength(2);
+    expect(useChatStore.getState().messages[1]).toMatchObject({
+      id: "assistant-1",
+      role: "assistant",
+      status: "interrupted",
+      blocks: [],
+    });
+  });
+
   it("reloads the current thread when forceReload is requested", async () => {
     const firstUnlisten = vi.fn();
     const secondUnlisten = vi.fn();
@@ -855,7 +887,7 @@ describe("chatStore send", () => {
     vi.useRealTimers();
   });
 
-  it("stores turn completion diagnostics as terminal notice blocks", async () => {
+  it("completes a turn without creating a terminal notice block", async () => {
     vi.useFakeTimers();
 
     let streamHandler: ((event: StreamEvent) => void) | null = null;
@@ -891,29 +923,14 @@ describe("chatStore send", () => {
 
     const assistant = useChatStore
       .getState()
-      .messages.find((message) => message.role === "assistant" && message.blocks?.length);
+      .messages.find((message) => message.role === "assistant");
     expect(assistant?.status).toBe("completed");
-    expect(assistant?.blocks).toEqual([
-      expect.objectContaining({
-        type: "notice",
-        kind: "turn_status",
-        level: "info",
-        title: "Turn completed",
-        message: "Codex reported a normal terminal completion.",
-        status: "completed",
-        source: "engine",
-        durationMs: 123456,
-        details: expect.arrayContaining([
-          "Completion source: explicit engine terminal event",
-          "Token usage: 12 input, 34 output",
-        ]),
-      }),
-    ]);
+    expect(assistant?.blocks).toEqual([]);
 
     vi.useRealTimers();
   });
 
-  it("terminalizes unresolved action blocks before turn completion stats are stored", async () => {
+  it("terminalizes unresolved action blocks without adding a terminal notice", async () => {
     vi.useFakeTimers();
 
     let streamHandler: ((event: StreamEvent) => void) | null = null;
@@ -986,25 +1003,13 @@ describe("chatStore send", () => {
         durationMs: 0,
       },
     });
-    expect(assistant?.blocks).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "notice",
-          kind: "turn_status",
-          title: "Turn interrupted",
-          status: "interrupted",
-          source: "reconciled_stream_lost",
-          details: expect.arrayContaining([
-            "Actions: 2 total, 1 done, 1 error, 0 running, 0 pending",
-          ]),
-        }),
-      ]),
-    );
+    expect(assistant?.status).toBe("interrupted");
+    expect(assistant?.blocks?.some((block) => block.type === "notice")).toBe(false);
 
     vi.useRealTimers();
   });
 
-  it("uses recovered turn snapshots before terminal completion stats are stored", async () => {
+  it("uses recovered turn snapshots without adding a terminal notice", async () => {
     vi.useFakeTimers();
 
     let streamHandler: ((event: StreamEvent) => void) | null = null;
@@ -1067,22 +1072,8 @@ describe("chatStore send", () => {
         durationMs: 25,
       },
     });
-    expect(assistant?.blocks).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "notice",
-          kind: "turn_status",
-          level: "info",
-          title: "Turn completed",
-          status: "completed",
-          source: "recovered_snapshot",
-          details: expect.arrayContaining([
-            "Completion source: recovered from Codex thread history",
-            "Actions: 1 total, 1 done, 0 error, 0 running, 0 pending",
-          ]),
-        }),
-      ]),
-    );
+    expect(assistant?.blocks).toHaveLength(1);
+    expect(assistant?.blocks?.some((block) => block.type === "notice")).toBe(false);
 
     vi.useRealTimers();
   });
@@ -1114,8 +1105,6 @@ describe("chatStore send", () => {
           level: "warning",
           title: "Turn interrupted",
           message: "The turn ended before a normal completion.",
-          status: "interrupted",
-          source: "reconciled_stream_lost",
           details: [
             "Completion source: reconciled from thread history after live stream loss",
             "Actions: 1 total, 0 done, 0 error, 1 running, 0 pending",
@@ -1138,18 +1127,11 @@ describe("chatStore send", () => {
       status: "error",
       result: {
         success: false,
-        error: "Panes lost the live Codex stream before this action reported completion.",
+        error: "The turn was interrupted before this action reported completion.",
         durationMs: 0,
       },
     });
-    expect(assistant.blocks?.[1]).toMatchObject({
-      type: "notice",
-      kind: "turn_status",
-      details: [
-        "Completion source: reconciled from thread history after live stream loss",
-        "Actions: 1 total, 0 done, 1 error, 0 running, 0 pending",
-      ],
-    });
+    expect(assistant.blocks).toHaveLength(1);
   });
 
   it("normalizes stale pending approval blocks when terminal messages are loaded", async () => {
@@ -1176,8 +1158,6 @@ describe("chatStore send", () => {
           title: "Approval still pending",
           message:
             "A terminal result was recorded, but Panes still has unresolved approvals. The turn may have ended early or the approval protocol may be out of sync.",
-          status: "awaiting_approval",
-          source: "engine",
           details: [
             "Completion source: explicit engine terminal event",
             "Approvals: 1 pending, 0 answered",
@@ -1201,19 +1181,7 @@ describe("chatStore send", () => {
       status: "answered",
       decision: "cancel",
     });
-    expect(assistant.blocks?.[1]).toMatchObject({
-      type: "notice",
-      kind: "turn_status",
-      level: "info",
-      title: "Turn completed",
-      message: "Codex reported a normal terminal completion.",
-      status: "completed",
-      source: "engine",
-      details: [
-        "Completion source: explicit engine terminal event",
-        "Approvals: 0 pending, 1 answered",
-      ],
-    });
+    expect(assistant.blocks).toHaveLength(1);
   });
 
   it("derives context usage from current context tokens instead of cumulative totals", async () => {
@@ -1970,20 +1938,6 @@ describe("chatStore send", () => {
               details: {},
               status: "pending",
             },
-            {
-              type: "notice",
-              kind: "turn_status",
-              level: "warning",
-              title: "Approval still pending",
-              message:
-                "A terminal result was recorded, but Panes still has unresolved approvals. The turn may have ended early or the approval protocol may be out of sync.",
-              status: "awaiting_approval",
-              source: "engine",
-              details: [
-                "Completion source: explicit engine terminal event",
-                "Approvals: 1 pending, 0 answered",
-              ],
-            },
           ],
           createdAt: new Date().toISOString(),
           hydration: "full",
@@ -2626,7 +2580,6 @@ describe("chatStore send", () => {
               level: "info",
               title: "Turn completed",
               message: "The turn reached a terminal completion.",
-              status: "completed",
             },
           ],
           status: "completed",
@@ -2654,6 +2607,7 @@ describe("chatStore send", () => {
     expect(useChatStore.getState().messages.at(-1)).toMatchObject({
       id: "assistant-completed-turn",
       status: "completed",
+      blocks: [{ type: "text", content: "Final persisted response" }],
     });
     expect(
       useThreadStore.getState().threads.find((item) => item.id === "thread-1")?.status,
@@ -2717,9 +2671,7 @@ describe("chatStore send", () => {
     expect(useChatStore.getState().messages.at(-1)).toMatchObject({
       id: "assistant-message-id",
       status: "completed",
-      blocks: expect.arrayContaining([
-        expect.objectContaining({ kind: "turn_status", status: "completed" }),
-      ]),
+      blocks: [{ type: "text", content: "Finishing now" }],
     });
     useChatStore.getState().unlisten?.();
     expect(freshUnlisten).toHaveBeenCalledTimes(1);
@@ -2771,9 +2723,7 @@ describe("chatStore send", () => {
     expect(useChatStore.getState().messages.at(-1)).toMatchObject({
       id: "assistant-b",
       status: "completed",
-      blocks: expect.arrayContaining([
-        expect.objectContaining({ kind: "turn_status", status: "completed" }),
-      ]),
+      blocks: [{ type: "text", content: "Finishing in the background" }],
     });
     expect(
       useThreadStore.getState().threads.find((thread) => thread.id === "thread-2")?.status,
@@ -2882,9 +2832,7 @@ describe("chatStore send", () => {
     expect(useChatStore.getState().messages.at(-1)).toMatchObject({
       id: "assistant-b",
       status: "completed",
-      blocks: expect.arrayContaining([
-        expect.objectContaining({ kind: "turn_status", status: "completed" }),
-      ]),
+      blocks: [{ type: "text", content: "Almost done" }],
     });
   });
 
@@ -3264,19 +3212,7 @@ describe("chatStore send", () => {
         }),
       ]),
     );
-    expect(assistant?.blocks).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "notice",
-          kind: "turn_status",
-          level: "info",
-          title: "Turn completed",
-          status: "completed",
-          source: "engine",
-          details: expect.arrayContaining(["Approvals: 0 pending, 1 answered"]),
-        }),
-      ]),
-    );
+    expect(assistant?.blocks).toHaveLength(1);
 
     vi.useRealTimers();
   });

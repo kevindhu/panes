@@ -113,9 +113,6 @@ export interface NoticeBlock {
   title: string;
   message: string;
   details?: string[];
-  status?: string;
-  source?: TurnCompletionSource;
-  durationMs?: number;
 }
 
 export interface ActionBlock {

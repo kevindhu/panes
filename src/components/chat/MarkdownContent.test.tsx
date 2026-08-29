@@ -183,7 +183,7 @@ describe("MarkdownContent local images", () => {
     expect(copyButtons[0]?.getAttribute("aria-label")).toBe("Copy code");
   });
 
-  it("opens a markdown web link on Ctrl-click when unrelated text remains selected", async () => {
+  it("opens a markdown web link on a plain click when unrelated text remains selected", async () => {
     const selectedText = document.createElement("div");
     selectedText.textContent = "previous selection";
     document.body.appendChild(selectedText);
@@ -211,7 +211,6 @@ describe("MarkdownContent local images", () => {
         bubbles: true,
         cancelable: true,
         button: 0,
-        ctrlKey: true,
         clientX: 20,
         clientY: 10,
         detail: 1,
@@ -225,7 +224,7 @@ describe("MarkdownContent local images", () => {
     );
   });
 
-  it("keeps a plain click on markdown link text available for selection", async () => {
+  it("opens a markdown web link on a plain click", async () => {
     await act(async () => {
       root.render(<MarkdownContent content="[Demo footage](https://example.com/demo)" />);
     });
@@ -249,10 +248,10 @@ describe("MarkdownContent local images", () => {
       await Promise.resolve();
     });
 
-    expect(mockOpenExternal).not.toHaveBeenCalled();
+    expect(mockOpenExternal).toHaveBeenCalledWith("https://example.com/demo");
   });
 
-  it("does not open a Ctrl-clicked markdown link when the selection intersects it", async () => {
+  it("does not open a markdown link when the selection intersects it", async () => {
     await act(async () => {
       root.render(<MarkdownContent content="[Demo footage](https://example.com/demo)" />);
     });
@@ -275,7 +274,6 @@ describe("MarkdownContent local images", () => {
         bubbles: true,
         cancelable: true,
         button: 0,
-        ctrlKey: true,
         detail: 1,
       }));
       await Promise.resolve();

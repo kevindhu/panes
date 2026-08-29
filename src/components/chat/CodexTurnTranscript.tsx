@@ -113,6 +113,20 @@ interface CodexTranscriptRendererProps {
   onPlanText?: (planText: string | null) => void;
 }
 
+type TurnDisplayStatus = "running" | "completed" | "error" | "interrupted";
+type ActivityDisplayStatus = CodexTranscriptActivity["status"] | "interrupted";
+
+function activityDisplayStatus(
+  activity: CodexTranscriptActivity,
+  turnStatus: TurnDisplayStatus,
+): ActivityDisplayStatus {
+  if (activity.status === "done" || activity.status === "error") return activity.status;
+  if (turnStatus === "interrupted") return "interrupted";
+  if (turnStatus === "error") return "error";
+  if (turnStatus === "completed") return "done";
+  return activity.status;
+}
+
 function useCodexTurnSnapshot(
   messageId: string,
   refreshSequence: number,
@@ -428,8 +442,15 @@ function ToolDetails({ activity }: { activity: CodexTranscriptActivity }) {
   );
 }
 
-function WebSearchDetails({ activity }: { activity: CodexTranscriptActivity }) {
+function WebSearchDetails({
+  activity,
+  turnStatus,
+}: {
+  activity: CodexTranscriptActivity;
+  turnStatus: TurnDisplayStatus;
+}) {
   const details = webSearchDetails(activity.payload);
+  const displayStatus = activityDisplayStatus(activity, turnStatus);
   const operation = details.actionType
     ?? (details.queries.length > 0 ? "search" : details.results.length > 0 ? "browse" : null);
   return (
@@ -475,9 +496,13 @@ function WebSearchDetails({ activity }: { activity: CodexTranscriptActivity }) {
           </div>
         ) : (
           <div className="codex-native-empty-output">
-            {activity.status === "running"
+            {displayStatus === "running" || displayStatus === "pending"
               ? "Search started; waiting for the completed search payload."
-              : "Codex completed this web action without emitting search results."}
+              : displayStatus === "interrupted"
+                ? "Search stopped before Codex returned results."
+                : displayStatus === "error"
+                  ? "Search failed before Codex returned results."
+                  : "Codex completed this web action without emitting search results."}
           </div>
         )}
       </DetailSection>
@@ -508,13 +533,19 @@ function ReasoningDetails({ activity }: { activity: CodexTranscriptActivity }) {
   );
 }
 
-function ActivityDetails({ activity }: { activity: CodexTranscriptActivity }) {
+function ActivityDetails({
+  activity,
+  turnStatus,
+}: {
+  activity: CodexTranscriptActivity;
+  turnStatus: TurnDisplayStatus;
+}) {
   return (
     <div className="codex-native-activity-details">
       {activity.activityKind === "command" && <CommandDetails activity={activity} />}
       {activity.activityKind === "file" && <FileChangeDetails activity={activity} />}
       {activity.activityKind === "mcp" && <ToolDetails activity={activity} />}
-      {activity.activityKind === "search" && <WebSearchDetails activity={activity} />}
+      {activity.activityKind === "search" && <WebSearchDetails activity={activity} turnStatus={turnStatus} />}
       {(activity.activityKind === "reasoning" || activity.activityKind === "plan") && <ReasoningDetails activity={activity} />}
       {activity.activityKind === "diff" && <DiffText diff={recordString(activity.payload, "diff") ?? ""} />}
       {!["command", "file", "mcp", "search", "reasoning", "plan", "diff"].includes(activity.activityKind) && (
@@ -545,19 +576,29 @@ const activityIcons: Record<CodexActivityKind, LucideIcon> = {
   other: Circle,
 };
 
-function ActivityStatus({ activity }: { activity: CodexTranscriptActivity }) {
-  if (activity.status === "running") return <Loader2 size={12} className="animate-spin codex-native-running" />;
-  if (activity.status === "error") return <XCircle size={12} className="codex-native-error" />;
-  if (activity.status === "done") return <CheckCircle2 size={12} />;
+function ActivityStatus({
+  activity,
+  turnStatus,
+}: {
+  activity: CodexTranscriptActivity;
+  turnStatus: TurnDisplayStatus;
+}) {
+  const displayStatus = activityDisplayStatus(activity, turnStatus);
+  if (displayStatus === "running") return <Loader2 size={12} aria-label="Running" className="animate-spin codex-native-running" />;
+  if (displayStatus === "interrupted") return <AlertTriangle size={12} aria-label="Stopped" className="codex-native-interrupted" />;
+  if (displayStatus === "error") return <XCircle size={12} aria-label="Failed" className="codex-native-error" />;
+  if (displayStatus === "done") return <CheckCircle2 size={12} aria-label="Completed" />;
   return <Circle size={12} />;
 }
 
 function ActivityRow({
   activity,
   selectionNamespace,
+  turnStatus,
 }: {
   activity: CodexTranscriptActivity;
   selectionNamespace: string;
+  turnStatus: TurnDisplayStatus;
 }) {
   const [expanded, setExpanded] = useState(false);
   const Icon = activityIcons[activity.activityKind];
@@ -577,10 +618,10 @@ function ActivityRow({
         <Icon size={13} className="codex-native-activity-icon" />
         <span className="codex-native-activity-title" title={activity.title}>{truncateActionHeader(activity.title)}</span>
         {activity.subtitle && <span className="codex-native-activity-subtitle" title={activity.subtitle}>{activity.subtitle}</span>}
-        <ActivityStatus activity={activity} />
+        <ActivityStatus activity={activity} turnStatus={turnStatus} />
         {activity.durationMs !== null && <span className="codex-native-duration">{formatDuration(activity.durationMs)}</span>}
       </button>
-      {expanded && <ActivityDetails activity={activity} />}
+      {expanded && <ActivityDetails activity={activity} turnStatus={turnStatus} />}
     </div>
   );
 }
@@ -604,18 +645,18 @@ function nativePlanText(entries: CodexTranscriptEntry[]): string | null {
 
 function NativePlanEntry({
   entry,
-  status,
+  turnStatus,
   workspaceRootPath,
   selectionNamespace,
 }: {
   entry: CodexTranscriptActivity;
-  status: MessageStatus;
+  turnStatus: TurnDisplayStatus;
   workspaceRootPath?: string | null;
   selectionNamespace: string;
 }) {
   const text = stripProposedPlanEnvelope(reasoningText(entry).plan);
   const [expanded, setExpanded] = useState(true);
-  if (!text) return <ActivityRow activity={entry} selectionNamespace={selectionNamespace} />;
+  if (!text) return <ActivityRow activity={entry} selectionNamespace={selectionNamespace} turnStatus={turnStatus} />;
 
   return (
     <section
@@ -636,13 +677,13 @@ function NativePlanEntry({
           />
           <ListChecks size={14} />
           <strong>Plan</strong>
-          <ActivityStatus activity={entry} />
+          <ActivityStatus activity={entry} turnStatus={turnStatus} />
         </button>
       </header>
       {expanded && (
         <MarkdownContent
           content={text}
-          streaming={entry.status === "running" && status === "streaming"}
+          streaming={entry.status === "running" && turnStatus === "running"}
           className="prose chat-message-prose codex-native-final-plan-content"
           workspaceRootPath={workspaceRootPath}
           selectionScopeId={`${selectionNamespace}:plan:${entry.id}:content`}
@@ -656,10 +697,12 @@ function NativePlanProgress({
   plan,
   sourceSequence,
   selectionScopeId,
+  turnStatus,
 }: {
   plan: CodexPlanProgress;
   sourceSequence: number;
   selectionScopeId: string;
+  turnStatus: TurnDisplayStatus;
 }) {
   return (
     <section
@@ -678,13 +721,17 @@ function NativePlanProgress({
         {plan.steps.map((step, index) => {
           const status = step.status.replace(/[_-]/g, "").toLowerCase();
           const completed = status === "completed";
-          const running = status === "inprogress" || status === "running";
+          const unfinished = status === "inprogress" || status === "running";
+          const running = unfinished && turnStatus === "running";
+          const interrupted = unfinished && turnStatus === "interrupted";
           return (
-            <li className={completed ? "completed" : running ? "running" : "pending"} key={`${index}:${step.step}`}>
+            <li className={completed ? "completed" : running ? "running" : interrupted ? "interrupted" : "pending"} key={`${index}:${step.step}`}>
               {completed
                 ? <CheckCircle2 size={12} />
                 : running
                   ? <Loader2 size={12} className="animate-spin" />
+                  : interrupted
+                    ? <AlertTriangle size={12} aria-label="Stopped" />
                   : <Circle size={12} />}
               <span>{step.step}</span>
             </li>
@@ -709,21 +756,27 @@ function activityTypeBreakdown(activities: CodexTranscriptActivity[]): string {
 function ActivityGroup({
   activities,
   selectionNamespace,
+  turnStatus,
 }: {
   activities: CodexTranscriptActivity[];
   selectionNamespace: string;
+  turnStatus: TurnDisplayStatus;
 }) {
-  const running = activities.some((activity) => activity.status === "running" || activity.status === "pending");
-  const failures = activities.filter((activity) => activity.status === "error").length;
+  const displayStatuses = activities.map((activity) => activityDisplayStatus(activity, turnStatus));
+  const running = displayStatuses.some((status) => status === "running" || status === "pending");
+  const interrupted = displayStatuses.some((status) => status === "interrupted");
+  const failures = displayStatuses.filter((status) => status === "error").length;
   const [expanded, setExpanded] = useState(true);
   const toolKinds = new Set<CodexActivityKind>(["command", "file", "mcp", "search", "image", "diff"]);
   const toolCount = activities.filter((activity) => toolKinds.has(activity.activityKind)).length;
   const thoughtCount = activities.filter((activity) => activity.activityKind === "reasoning").length;
   const summary = toolCount === activities.length
-    ? `${running ? "Using" : "Used"} ${activities.length} ${activities.length === 1 ? "tool" : "tools"}`
+    ? interrupted
+      ? `Stopped while using ${activities.length} ${activities.length === 1 ? "tool" : "tools"}`
+      : `${running ? "Using" : "Used"} ${activities.length} ${activities.length === 1 ? "tool" : "tools"}`
     : thoughtCount === activities.length
-      ? running ? "Thinking" : thoughtCount === 1 ? "Thought" : `${thoughtCount} thoughts`
-      : `${running ? "Running" : "Completed"} ${activities.length} activities`;
+      ? interrupted ? "Thinking stopped" : running ? "Thinking" : thoughtCount === 1 ? "Thought" : `${thoughtCount} thoughts`
+      : `${interrupted ? "Stopped with" : running ? "Running" : "Completed"} ${activities.length} activities`;
   return (
     <section className="codex-native-group">
       <button
@@ -738,11 +791,13 @@ function ActivityGroup({
         <span className="codex-native-group-breakdown">{activityTypeBreakdown(activities)}</span>
         {running
           ? <Loader2 size={13} className="animate-spin codex-native-running" />
+          : interrupted
+            ? <AlertTriangle size={13} aria-label="Stopped" className="codex-native-interrupted" />
           : failures > 0
             ? <AlertTriangle size={13} className="codex-native-error" />
             : <CheckCircle2 size={13} />}
       </button>
-      {expanded && <div className="codex-native-group-body">{activities.map((activity) => <ActivityRow key={activity.id} activity={activity} selectionNamespace={selectionNamespace} />)}</div>}
+      {expanded && <div className="codex-native-group-body">{activities.map((activity) => <ActivityRow key={activity.id} activity={activity} selectionNamespace={selectionNamespace} turnStatus={turnStatus} />)}</div>}
     </section>
   );
 }
@@ -810,7 +865,6 @@ function NativeLegacyBlockTimelineEntry({
     >
       <MessageBlocks
         blocks={[entry.block]}
-        messageRole="assistant"
         workspaceRootPath={workspaceRootPath}
         selectionNamespace={`${selectionNamespace}:entry:${entry.id}:blocks`}
         onApproval={onApproval}
@@ -839,7 +893,6 @@ function ApprovalTimelineEntry({
     >
       <MessageBlocks
         blocks={[entry.block]}
-        messageRole="assistant"
         workspaceRootPath={workspaceRootPath}
         selectionNamespace={`${selectionNamespace}:entry:${entry.id}:blocks`}
         onApproval={onApproval}
@@ -868,7 +921,6 @@ function SteerTimelineEntry({
     >
       <MessageBlocks
         blocks={[entry.block]}
-        messageRole="assistant"
         workspaceRootPath={workspaceRootPath}
         selectionNamespace={`${selectionNamespace}:entry:${entry.id}:blocks`}
         onApproval={onApproval}
@@ -924,12 +976,21 @@ function NativeEventsDrawer({ events }: { events: CodexTurnEventRecord[] }) {
   );
 }
 
-function statusFromTurn(snapshot: CodexTurnSnapshot, messageStatus: MessageStatus) {
+function statusFromTurn(
+  snapshot: CodexTurnSnapshot,
+  messageStatus: MessageStatus,
+): TurnDisplayStatus {
   const normalized = snapshot.turn.status.replace(/[_-]/g, "").toLowerCase();
-  if (messageStatus === "streaming" || normalized === "inprogress" || normalized === "running") return "running";
-  if (messageStatus === "error" || normalized === "failed" || normalized === "error") return "error";
-  if (messageStatus === "interrupted" || normalized === "interrupted" || normalized === "cancelled") return "interrupted";
-  return "completed";
+  // The persisted message is updated immediately when Stop succeeds, while the
+  // native transcript can briefly (or permanently, if no final native event is
+  // emitted) retain its last in-progress snapshot. A terminal message must win.
+  if (messageStatus === "error") return "error";
+  if (messageStatus === "interrupted") return "interrupted";
+  if (messageStatus === "completed") return "completed";
+  if (normalized === "failed" || normalized === "error") return "error";
+  if (normalized === "interrupted" || normalized === "cancelled" || normalized === "canceled") return "interrupted";
+  if (normalized === "completed") return "completed";
+  return "running";
 }
 
 function liveActivityLabel(
@@ -940,7 +1001,7 @@ function liveActivityLabel(
 ): string {
   if (finalStatus === "completed") return "Completed";
   if (finalStatus === "error") return "Failed";
-  if (finalStatus === "interrupted") return "Interrupted";
+  if (finalStatus === "interrupted") return "Stopped";
   const active = [...entries].reverse().find((entry): entry is CodexTranscriptActivity => entry.kind === "activity" && entry.status === "running");
   if (active) {
     switch (active.activityKind) {
@@ -1037,9 +1098,7 @@ function supplementaryBlocks(
     if (block.type === "approval") return !consumedApprovalIds.has(block.approvalId);
     if (block.type === "error") return !consumedErrorBlockIndexes.has(blockIndex);
     if (block.type === "attachment") return true;
-    return block.type === "notice"
-      && block.kind !== "turn_status"
-      && !consumedNoticeKinds.has(block.kind);
+    return block.type === "notice" && !consumedNoticeKinds.has(block.kind);
   });
 }
 
@@ -1054,6 +1113,7 @@ export function CodexTranscriptRenderer({
   onPlanText,
 }: CodexTranscriptRendererProps) {
   const projection = useMemo(() => readCodexTranscriptProjection(snapshot), [snapshot]);
+  const turnStatus = statusFromTurn(snapshot, status);
   const finalPlanText = useMemo(() => nativePlanText(projection.entries), [projection.entries]);
   useEffect(() => {
     onPlanText?.(finalPlanText);
@@ -1093,6 +1153,7 @@ export function CodexTranscriptRenderer({
               key={`activities:${segment.entries[0]?.id ?? "empty"}`}
               activities={segment.entries}
               selectionNamespace={selectionNamespace}
+              turnStatus={turnStatus}
             />
           );
         }
@@ -1101,7 +1162,7 @@ export function CodexTranscriptRenderer({
             <NativePlanEntry
               key={segment.entry.id}
               entry={segment.entry}
-              status={status}
+              turnStatus={turnStatus}
               workspaceRootPath={workspaceRootPath}
               selectionNamespace={selectionNamespace}
             />
@@ -1114,6 +1175,7 @@ export function CodexTranscriptRenderer({
               plan={segment.entry.plan}
               sourceSequence={segment.entry.sequence}
               selectionScopeId={`${selectionNamespace}:entry:${segment.entry.id}:plan-progress`}
+              turnStatus={turnStatus}
             />
           );
         }
@@ -1165,7 +1227,6 @@ export function CodexTranscriptRenderer({
         <div className="codex-native-supplements">
           <MessageBlocks
             blocks={supplements}
-            messageRole="assistant"
             workspaceRootPath={workspaceRootPath}
             selectionNamespace={`${selectionNamespace}:supplements`}
             onApproval={onApproval}
@@ -1177,6 +1238,7 @@ export function CodexTranscriptRenderer({
           plan={projection.plan}
           sourceSequence={snapshot.turn.lastSourceSequence + 0.5}
           selectionScopeId={`${selectionNamespace}:plan-progress`}
+          turnStatus={turnStatus}
         />
       )}
       {loadError && <div className="codex-native-sync-warning"><AlertTriangle size={12} /> Transcript refresh failed: {loadError}</div>}
@@ -1225,7 +1287,6 @@ export function CodexTurnTranscript({
         <MessageBlocks
           blocks={blocks}
           status={status}
-          messageRole="assistant"
           workspaceRootPath={workspaceRootPath}
           selectionNamespace={`message:${messageId}:fallback`}
           onApproval={onApproval}

@@ -136,6 +136,95 @@ pub fn record_native_event_batch(
     Ok(())
 }
 
+/// Clones the lossless native transcript for a copied assistant message.
+///
+/// Branch messages receive new local IDs, so every ledger foreign key must be
+/// remapped while the original Codex event payload and ordering stay intact.
+pub(super) fn clone_turn_snapshot_for_message(
+    transaction: &Transaction<'_>,
+    source_message_id: &str,
+    target_thread_id: &str,
+    target_message_id: &str,
+) -> anyhow::Result<bool> {
+    let inserted = transaction
+        .execute(
+            "INSERT INTO codex_turns (
+               id, thread_id, message_id, native_thread_id, native_turn_id, status,
+               started_at_ms, completed_at_ms, first_event_at_ms, last_event_at_ms,
+               last_source_sequence, started_json, completed_json, plan_json, usage_json,
+               created_at, updated_at
+             )
+             SELECT ?3, ?2, ?3, native_thread_id, native_turn_id, status,
+                    started_at_ms, completed_at_ms, first_event_at_ms, last_event_at_ms,
+                    last_source_sequence, started_json, completed_json, plan_json, usage_json,
+                    created_at, updated_at
+             FROM codex_turns
+             WHERE message_id = ?1",
+            params![source_message_id, target_thread_id, target_message_id],
+        )
+        .context("failed to clone Codex turn ledger row")?;
+    if inserted == 0 {
+        return Ok(false);
+    }
+
+    transaction
+        .execute(
+            "INSERT INTO codex_turn_events (
+               turn_id, source_sequence, event_kind, method, request_id,
+               native_thread_id, native_turn_id, params_json, observed_at_ms, created_at
+             )
+             SELECT ?2, source_sequence, event_kind, method, request_id,
+                    native_thread_id, native_turn_id, params_json, observed_at_ms, created_at
+             FROM codex_turn_events
+             WHERE turn_id = (SELECT id FROM codex_turns WHERE message_id = ?1)
+             ORDER BY source_sequence ASC",
+            params![source_message_id, target_message_id],
+        )
+        .context("failed to clone Codex turn events")?;
+
+    transaction
+        .execute(
+            "INSERT INTO codex_turn_items (
+               turn_id, item_id, item_type, status, phase, first_source_sequence,
+               last_source_sequence, started_at_ms, completed_at_ms, started_json,
+               completed_json, created_at, updated_at
+             )
+             SELECT ?2, item_id, item_type, status, phase, first_source_sequence,
+                    last_source_sequence, started_at_ms, completed_at_ms, started_json,
+                    completed_json, created_at, updated_at
+             FROM codex_turn_items
+             WHERE turn_id = (SELECT id FROM codex_turns WHERE message_id = ?1)
+             ORDER BY first_source_sequence ASC, item_id ASC",
+            params![source_message_id, target_message_id],
+        )
+        .context("failed to clone Codex turn items")?;
+
+    transaction
+        .execute(
+            "INSERT INTO codex_item_stream_chunks (
+               turn_id, event_id, item_id, source_sequence, chunk_index, stream_kind,
+               summary_index, content, metadata_json, observed_at_ms, created_at
+             )
+             SELECT ?2, target_event.id, source_chunk.item_id, source_chunk.source_sequence,
+                    source_chunk.chunk_index, source_chunk.stream_kind,
+                    source_chunk.summary_index, source_chunk.content,
+                    source_chunk.metadata_json, source_chunk.observed_at_ms,
+                    source_chunk.created_at
+             FROM codex_item_stream_chunks AS source_chunk
+             JOIN codex_turn_events AS target_event
+               ON target_event.turn_id = ?2
+              AND target_event.source_sequence = source_chunk.source_sequence
+             WHERE source_chunk.turn_id = (
+               SELECT id FROM codex_turns WHERE message_id = ?1
+             )
+             ORDER BY source_chunk.source_sequence ASC, source_chunk.chunk_index ASC",
+            params![source_message_id, target_message_id],
+        )
+        .context("failed to clone Codex turn stream chunks")?;
+
+    Ok(true)
+}
+
 fn ensure_turn_row(
     transaction: &Transaction<'_>,
     local_thread_id: &str,

@@ -356,6 +356,8 @@ button:disabled { cursor: default; }
 .codex-native-plan-progress li.completed svg { color: var(--success); }
 .codex-native-plan-progress li.running { color: var(--text-1); }
 .codex-native-plan-progress li.running svg { color: var(--accent); }
+.codex-native-plan-progress li.interrupted { color: var(--text-2); }
+.codex-native-plan-progress li.interrupted svg { color: var(--warning); }
 .codex-native-activity-row + .codex-native-activity-row { border-top: 1px solid var(--border); }
 .codex-native-activity-header {
   min-height: 39px;
@@ -386,6 +388,7 @@ button:disabled { cursor: default; }
 }
 .codex-native-duration { flex: 0 0 auto; color: var(--text-3); font-size: 9.5px; font-variant-numeric: tabular-nums; }
 .codex-native-running { color: var(--accent); }
+.codex-native-interrupted { color: var(--warning); }
 .codex-native-error { color: var(--danger); }
 .codex-native-activity-details { display: grid; gap: 10px; padding: 11px 13px 13px 40px; border-top: 1px solid var(--border); background: color-mix(in srgb, var(--bg-2) 58%, transparent); }
 .codex-native-detail-section { min-width: 0; display: grid; gap: 5px; }
@@ -460,6 +463,7 @@ button:disabled { cursor: default; }
 .codex-native-fallback { display: grid; gap: 7px; }
 .codex-native-footer { min-height: 30px; display: flex; align-items: center; gap: 7px; padding: 5px 10px; color: var(--text-3); font-size: 10px; font-variant-numeric: tabular-nums; }
 .codex-native-footer.completed > svg { color: var(--success); }
+.codex-native-footer.interrupted > svg { color: var(--warning); }
 .codex-native-footer.error > svg { color: var(--danger); }
 .codex-native-separator { opacity: .58; }
 .codex-native-live-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

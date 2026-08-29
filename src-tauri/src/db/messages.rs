@@ -146,6 +146,7 @@ fn clone_message_slice(
         .context("failed to start thread message clone transaction")?;
 
     for message in messages.iter() {
+        let target_message_id = Uuid::new_v4().to_string();
         let token_usage = message
             .token_usage
             .as_ref()
@@ -162,7 +163,7 @@ fn clone_message_slice(
                 token_output, created_at, native_turn_id
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14)",
             params![
-                Uuid::new_v4().to_string(),
+                target_message_id,
                 target_thread_id,
                 message.role,
                 message.content,
@@ -179,6 +180,15 @@ fn clone_message_slice(
             ],
         )
         .context("failed to clone thread message")?;
+
+        if message.role == "assistant" {
+            super::codex_transcript::clone_turn_snapshot_for_message(
+                &tx,
+                &message.id,
+                target_thread_id,
+                &target_message_id,
+            )?;
+        }
     }
 
     tx.commit()
@@ -809,6 +819,7 @@ pub fn get_message_blocks(db: &Database, message_id: &str) -> anyhow::Result<Opt
     let mut blocks = raw_blocks
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_else(|| serde_json::json!([]));
+    remove_legacy_turn_status_notices(&mut blocks);
     reconcile_answered_approvals_for_message(&conn, message_id, &mut blocks)?;
     Ok(Some(blocks))
 }
@@ -1208,12 +1219,18 @@ fn map_message_row(row: &Row<'_>) -> rusqlite::Result<MessageDto> {
     let blocks_raw: Option<String> = row.get(4)?;
     let token_input: i64 = row.get(7)?;
     let token_output: i64 = row.get(8)?;
+    let blocks = blocks_raw
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .map(|mut blocks| {
+            remove_legacy_turn_status_notices(&mut blocks);
+            blocks
+        });
     Ok(MessageDto {
         id: row.get(0)?,
         thread_id: row.get(1)?,
         role: row.get(2)?,
         content: row.get(3)?,
-        blocks: blocks_raw.and_then(|raw| serde_json::from_str(&raw).ok()),
+        blocks,
         native_turn_id: row.get("native_turn_id")?,
         turn_engine_id: row.get(9)?,
         turn_model_id: row.get(10)?,
@@ -1230,6 +1247,18 @@ fn map_message_row(row: &Row<'_>) -> rusqlite::Result<MessageDto> {
         },
         created_at: row.get(12)?,
     })
+}
+
+fn remove_legacy_turn_status_notices(blocks: &mut Value) -> bool {
+    let Some(items) = blocks.as_array_mut() else {
+        return false;
+    };
+    let original_len = items.len();
+    items.retain(|block| {
+        block.get("type").and_then(Value::as_str) != Some("notice")
+            || block.get("kind").and_then(Value::as_str) != Some("turn_status")
+    });
+    items.len() != original_len
 }
 
 fn apply_resolved_approvals_to_blocks(
@@ -1465,8 +1494,10 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        db::{actions, threads, workspaces, ConnectionPool, SQLITE_POOL_MAX_IDLE},
-        engines::events::ActionType,
+        db::{
+            actions, codex_transcript, threads, workspaces, ConnectionPool, SQLITE_POOL_MAX_IDLE,
+        },
+        engines::events::{ActionType, CodexNativeEvent, CodexNativeEventKind},
     };
 
     use super::*;
@@ -2206,11 +2237,80 @@ mod tests {
             &source_thread_id,
             "assistant",
             Some("Created branch preview".to_string()),
-            Some(json!([{ "type": "text", "content": "Created branch preview" }])),
+            Some(json!([
+                { "type": "text", "content": "Created branch preview" },
+                {
+                    "type": "notice",
+                    "kind": "turn_status",
+                    "level": "info",
+                    "title": "Turn completed",
+                    "message": "Legacy terminal card"
+                }
+            ])),
             MessageStatusDto::Completed,
             Some("codex"),
             Some("gpt-5.3-codex"),
             Some("medium"),
+        )
+        .unwrap();
+        let native_thread_id = "native-thread-for-branch";
+        let native_turn_id = "native-turn-for-branch";
+        let native_event = |source_sequence, method: &str, params: Value| CodexNativeEvent {
+            source_sequence,
+            observed_at_ms: 1_700_000_000_000 + source_sequence as i64,
+            event_kind: CodexNativeEventKind::Notification,
+            method: method.to_string(),
+            request_id: None,
+            native_thread_id: native_thread_id.to_string(),
+            native_turn_id: Some(native_turn_id.to_string()),
+            params_json: params.to_string(),
+        };
+        codex_transcript::record_native_event_batch(
+            &db,
+            &source_thread_id,
+            &assistant_message.id,
+            &[
+                native_event(
+                    1,
+                    "turn/started",
+                    json!({ "turn": { "id": native_turn_id, "status": "inProgress" } }),
+                ),
+                native_event(
+                    2,
+                    "item/started",
+                    json!({
+                        "item": {
+                            "id": "answer-1",
+                            "type": "agentMessage",
+                            "status": "inProgress",
+                            "phase": "final"
+                        }
+                    }),
+                ),
+                native_event(
+                    3,
+                    "item/agentMessage/delta",
+                    json!({ "itemId": "answer-1", "delta": "Created branch preview" }),
+                ),
+                native_event(
+                    4,
+                    "item/completed",
+                    json!({
+                        "item": {
+                            "id": "answer-1",
+                            "type": "agentMessage",
+                            "status": "completed",
+                            "phase": "final",
+                            "text": "Created branch preview"
+                        }
+                    }),
+                ),
+                native_event(
+                    5,
+                    "turn/completed",
+                    json!({ "turn": { "id": native_turn_id, "status": "completed" } }),
+                ),
+            ],
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -2260,6 +2360,26 @@ mod tests {
         );
         assert_eq!(target_messages[1].status, MessageStatusDto::Completed);
         assert_eq!(
+            source_messages[1]
+                .blocks
+                .as_ref()
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            target_messages[1]
+                .blocks
+                .as_ref()
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
             target_messages[1]
                 .token_usage
                 .as_ref()
@@ -2268,6 +2388,70 @@ mod tests {
         );
         assert_eq!(target_messages[0].created_at, "2026-05-19 12:00:00.000");
         assert_eq!(target_messages[1].created_at, "2026-05-19 12:00:01.000");
+
+        let source_snapshot = codex_transcript::load_turn_snapshot(&db, &source_messages[1].id)
+            .unwrap()
+            .expect("source native transcript");
+        let target_snapshot = codex_transcript::load_turn_snapshot(&db, &target_messages[1].id)
+            .unwrap()
+            .expect("cloned native transcript");
+        assert_eq!(target_snapshot.turn.id, target_messages[1].id);
+        assert_eq!(target_snapshot.turn.message_id, target_messages[1].id);
+        assert_eq!(target_snapshot.turn.thread_id, target_thread_id);
+        assert_eq!(
+            target_snapshot.turn.native_thread_id,
+            source_snapshot.turn.native_thread_id
+        );
+        assert_eq!(
+            target_snapshot.turn.native_turn_id,
+            source_snapshot.turn.native_turn_id
+        );
+        assert_eq!(target_snapshot.turn.status, "completed");
+        assert_eq!(target_snapshot.events.len(), source_snapshot.events.len());
+        assert_eq!(target_snapshot.items, source_snapshot.items);
+        assert_eq!(target_snapshot.chunks.len(), source_snapshot.chunks.len());
+        assert_eq!(
+            target_snapshot
+                .events
+                .iter()
+                .map(|event| (
+                    event.source_sequence,
+                    event.method.as_str(),
+                    event.params_json.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            source_snapshot
+                .events
+                .iter()
+                .map(|event| (
+                    event.source_sequence,
+                    event.method.as_str(),
+                    event.params_json.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            target_snapshot
+                .chunks
+                .iter()
+                .map(|chunk| (
+                    chunk.source_sequence,
+                    chunk.chunk_index,
+                    chunk.stream_kind.as_str(),
+                    chunk.content.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            source_snapshot
+                .chunks
+                .iter()
+                .map(|chunk| (
+                    chunk.source_sequence,
+                    chunk.chunk_index,
+                    chunk.stream_kind.as_str(),
+                    chunk.content.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+        );
     }
 
     #[test]

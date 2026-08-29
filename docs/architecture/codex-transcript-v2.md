@@ -7,7 +7,8 @@ Status: Phase 1 capture/replay and Phase 2 native presentation implemented on
 
 Panes must be able to reconstruct a Codex turn after a restart without depending on the
 lossy legacy `ContentBlock` projection. The native app-server stream is the durable source;
-the existing message blocks remain a compatibility projection until the v2 renderer ships.
+message blocks remain only as a compatibility projection for pre-v2 history and non-native
+events.
 
 The current Codex app-server contract defines `item/*` notifications as the source of truth
 for turn items. `item/started` carries the initial item and `item/completed` carries the
@@ -36,6 +37,9 @@ completed item.
    by renderers. They never mutate or replace the native ledger.
 10. **One projector.** Live rendering, history reload, recovery, and deterministic fixture
     replay will consume the same ordered snapshot API.
+11. **Branch parity.** Forking a conversation clones each retained assistant message's native
+    turn ledger in the same transaction and remaps its local message/thread ownership. A fork
+    must not silently fall back to a different transcript renderer.
 
 ## Durability boundary
 
@@ -59,8 +63,8 @@ Codex JSONL stdout
   -> CodexNativeEvent (ordered)
   -> batched SQLite recorder
   -> codex_turns / codex_turn_events / codex_turn_items / codex_item_stream_chunks
-  -> legacy EngineEvent mapper (temporary dual-write)
-  -> current ContentBlock renderer (temporary)
+  -> native snapshot projector and renderer
+  -> EngineEvent / ContentBlock compatibility projection (dual-write fallback)
 ```
 
 The legacy mapper may continue to trim data for an in-memory preview. It must never be the only
@@ -108,7 +112,8 @@ inventory is nevertheless required so schema changes are visible during developm
 
 Phase 1 remains additive and dual-write; it does not delete legacy blocks or rewrite existing
 messages. Phase 2 selects the native renderer whenever a v2 ledger exists. The legacy reader
-remains the compatibility path for pre-v2 history.
+remains the compatibility path for pre-v2 history. Conversation forks copy the retained v2
+ledger alongside their messages so renderer selection remains stable after branching.
 
 ## Phase 2 presentation contract
 
@@ -130,6 +135,12 @@ An exact native-event drawer exposes every retained JSON-RPC params string. Larg
 collapsed to a bounded DOM preview but can be fully revealed or copied; this is a presentation
 limit only and does not mutate the snapshot. The turn footer derives elapsed time, per-turn token
 usage, structured plan progress, lifecycle state, and current activity from the same snapshot.
+Message status is authoritative when a locally stopped turn has a stale in-progress native
+snapshot, so activity spinners settle immediately and the footer reports `Stopped`.
+
+Terminal lifecycle is not duplicated into a `ContentBlock` notice. Message status and the native
+turn record are authoritative; unfinished action and approval blocks are terminalized in place.
+Historical terminal-status notice blocks are discarded at compatibility read/render boundaries.
 
 Messages without a v2 ledger continue through the legacy reader. Its action rows remain
 expandable and expose whatever command/search input the older message retained, including an
@@ -157,4 +168,6 @@ discarded.
 - All reviewed item types and an unknown future item receive a visible semantic or raw activity.
 - The footer updates elapsed time, current activity, token usage, and plan completion without
   depending on legacy blocks.
+- Forked turns replay the same native events, items, and chunks under remapped local IDs.
+- Stopping a turn settles unfinished native activities and the footer without a legacy status card.
 - Pre-v2 zero-output command/search rows remain expandable as a compatibility fallback.

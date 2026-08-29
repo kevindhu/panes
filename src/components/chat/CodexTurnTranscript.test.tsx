@@ -453,6 +453,47 @@ describe("CodexTranscriptRenderer", () => {
     expect(footer?.textContent).toContain("Completed");
   });
 
+  it("settles stale native activity when the message has been stopped", async () => {
+    const stoppedSnapshot = snapshot();
+    stoppedSnapshot.turn.status = "in_progress";
+    stoppedSnapshot.turn.completedAtMs = null;
+    stoppedSnapshot.turn.completedJson = null;
+    stoppedSnapshot.turn.lastEventAtMs = 2_400;
+    stoppedSnapshot.turn.lastSourceSequence = 4;
+    stoppedSnapshot.events = [stoppedSnapshot.events[0]!];
+    stoppedSnapshot.items = [{
+      ...stoppedSnapshot.items[1]!,
+      status: "in_progress",
+      lastSourceSequence: 4,
+      completedAtMs: null,
+      completedJson: null,
+    }];
+
+    await act(async () => {
+      root.render(
+        <CodexTranscriptRenderer
+          snapshot={stoppedSnapshot}
+          status="interrupted"
+          onApproval={vi.fn()}
+        />,
+      );
+    });
+
+    expect(container.querySelector(".codex-native-group-header")?.textContent)
+      .toContain("Stopped while using 1 tool");
+    expect(container.querySelectorAll(".animate-spin")).toHaveLength(0);
+    expect(container.querySelectorAll('[aria-label="Stopped"]')).not.toHaveLength(0);
+
+    const footer = container.querySelector(".codex-native-footer");
+    expect(footer?.classList.contains("interrupted")).toBe(true);
+    expect(footer?.textContent).toContain("Stopped");
+    expect(footer?.textContent).not.toContain("Searching the web");
+
+    const searchRow = container.querySelector<HTMLElement>('[data-item-type="webSearch"]');
+    await act(async () => searchRow?.querySelector<HTMLButtonElement>("button")?.click());
+    expect(searchRow?.textContent).toContain("Search stopped before Codex returned results.");
+  });
+
   it("renders the authoritative completed plan prominently and reports it to the handoff", async () => {
     const planSnapshot = snapshot();
     planSnapshot.items = [{
@@ -564,7 +605,6 @@ describe("CodexTranscriptRenderer", () => {
       root.render(
         <MessageBlocks
           status="completed"
-          messageRole="assistant"
           onApproval={vi.fn()}
           blocks={[
             {
@@ -626,7 +666,6 @@ describe("CodexTranscriptRenderer", () => {
     await act(async () => {
       root.render(
         <MessageBlocks
-          messageRole="assistant"
           onApproval={vi.fn()}
           blocks={[{
             type: "action",

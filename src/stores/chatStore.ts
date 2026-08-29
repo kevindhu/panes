@@ -32,7 +32,6 @@ import type {
   SkillBlock,
   SteerBlock,
   SteerMessageReceipt,
-  StreamTokenUsage,
   StreamEvent,
   Thread,
   TurnCompletionSource,
@@ -235,7 +234,7 @@ function assistantMessageMatchesFinishedEvent(
 interface TurnFinishedProjection {
   messageStatus: Message["status"];
   runtimeStatus: ThreadStatus;
-  turnStatus: TurnStatusState;
+  terminalState: TerminalTurnState;
 }
 
 function projectTurnFinishedEvent(event: ChatTurnFinishedEvent): TurnFinishedProjection {
@@ -245,7 +244,7 @@ function projectTurnFinishedEvent(event: ChatTurnFinishedEvent): TurnFinishedPro
       : event.status === "interrupted"
         ? "interrupted"
         : "completed";
-  const turnStatus: TurnStatusState =
+  const terminalState: TerminalTurnState =
     event.status === "error"
       ? "failed"
       : event.status === "interrupted"
@@ -258,7 +257,7 @@ function projectTurnFinishedEvent(event: ChatTurnFinishedEvent): TurnFinishedPro
         ? "idle"
         : "completed";
 
-  return { messageStatus, runtimeStatus, turnStatus };
+  return { messageStatus, runtimeStatus, terminalState };
 }
 
 function applyTurnFinishedEventToMessages(
@@ -285,22 +284,13 @@ function applyTurnFinishedEventToMessages(
     return { matched: false, messages };
   }
 
-  const { messageStatus, turnStatus } = projectTurnFinishedEvent(event);
+  const { messageStatus, terminalState } = projectTurnFinishedEvent(event);
   let nextAssistant = assistant;
   if (assistant.status === "streaming") {
-    const source = turnStatusSourceFromBlocks(assistant.blocks);
-    const terminalizedBlocks = terminalizeUnresolvedTurnBlocks(
+    const blocks = terminalizeUnresolvedTurnBlocks(
       assistant.blocks ?? [],
-      turnStatus,
-      source,
+      terminalState,
     ) ?? [];
-    const blocks = upsertNoticeBlock(
-      terminalizedBlocks,
-      buildTurnStatusNotice(terminalizedBlocks, {
-        state: turnStatus,
-        source,
-      }),
-    );
     nextAssistant = {
       ...assistant,
       status: messageStatus,
@@ -1760,80 +1750,13 @@ function upsertNoticeBlock(blocks: ContentBlock[], block: NoticeBlock): ContentB
   return [...blocks, block];
 }
 
-type TurnStatusState =
-  | "streaming"
-  | "awaiting_approval"
-  | "completed"
-  | "interrupted"
-  | "failed";
-
-interface TurnBlockStats {
-  actionsTotal: number;
-  actionsDone: number;
-  actionsError: number;
-  actionsRunning: number;
-  actionsPending: number;
-  approvalsPending: number;
-  approvalsAnswered: number;
-  diffBlocks: number;
-  errorBlocks: number;
-}
+type TerminalTurnState = "completed" | "interrupted" | "failed";
 
 function messagesHavePendingApprovals(messages: Message[]): boolean {
   return messages.some((message) =>
     message.role === "assistant" &&
     (message.blocks ?? []).some((block) => block.type === "approval" && block.status === "pending"),
   );
-}
-
-function collectTurnBlockStats(blocks: ContentBlock[]): TurnBlockStats {
-  const stats: TurnBlockStats = {
-    actionsTotal: 0,
-    actionsDone: 0,
-    actionsError: 0,
-    actionsRunning: 0,
-    actionsPending: 0,
-    approvalsPending: 0,
-    approvalsAnswered: 0,
-    diffBlocks: 0,
-    errorBlocks: 0,
-  };
-
-  for (const block of blocks) {
-    if (block.type === "action") {
-      stats.actionsTotal += 1;
-      if (block.status === "done") {
-        stats.actionsDone += 1;
-      } else if (block.status === "error") {
-        stats.actionsError += 1;
-      } else if (block.status === "pending") {
-        stats.actionsPending += 1;
-      } else {
-        stats.actionsRunning += 1;
-      }
-      continue;
-    }
-
-    if (block.type === "approval") {
-      if (block.status === "pending") {
-        stats.approvalsPending += 1;
-      } else {
-        stats.approvalsAnswered += 1;
-      }
-      continue;
-    }
-
-    if (block.type === "diff") {
-      stats.diffBlocks += 1;
-      continue;
-    }
-
-    if (block.type === "error") {
-      stats.errorBlocks += 1;
-    }
-  }
-
-  return stats;
 }
 
 function deriveRuntimeStateFromMessages(
@@ -1914,123 +1837,8 @@ function resolveBoundThreadRuntimeState(
   };
 }
 
-function describeTurnCompletionSource(source?: TurnCompletionSource | null): string | null {
-  switch (source) {
-    case "engine":
-      return "explicit engine terminal event";
-    case "recovered_snapshot":
-      return "recovered from Codex thread history";
-    case "reconciled_stream_lost":
-      return "reconciled from thread history after live stream loss";
-    case "reconciled_timeout":
-      return "reconciled from thread history after completion timeout";
-    case "timeout_fallback":
-      return "Panes timeout fallback";
-    default:
-      return null;
-  }
-}
-
-function turnStatusNoticeHasPendingApprovalConflict(
-  state: TurnStatusState,
-  stats: TurnBlockStats,
-  source?: TurnCompletionSource | null,
-): boolean {
-  return state !== "streaming" && stats.approvalsPending > 0 && Boolean(source);
-}
-
-function turnStatusNoticeLevel(state: TurnStatusState): NoticeBlock["level"] {
-  if (state === "failed") {
-    return "error";
-  }
-  if (state === "interrupted" || state === "awaiting_approval") {
-    return "warning";
-  }
-  return "info";
-}
-
-function turnStatusNoticeTitle(state: TurnStatusState): string {
-  switch (state) {
-    case "completed":
-      return "Turn completed";
-    case "interrupted":
-      return "Turn interrupted";
-    case "failed":
-      return "Turn failed";
-    case "awaiting_approval":
-      return "Waiting for approval";
-    default:
-      return "Turn still open";
-  }
-}
-
-function turnStatusNoticeMessage(
-  state: TurnStatusState,
-  source?: TurnCompletionSource | null,
-  hasPendingApprovalConflict = false,
-): string {
-  if (hasPendingApprovalConflict) {
-    return "A terminal result was recorded, but Panes still has unresolved approvals. The turn may have ended early or the approval protocol may be out of sync.";
-  }
-
-  switch (state) {
-    case "completed":
-      if (source === "engine") {
-        return "Codex reported a normal terminal completion.";
-      }
-      if (source === "recovered_snapshot") {
-        return "Panes recovered the completed turn from Codex thread history.";
-      }
-      if (source === "reconciled_timeout") {
-        return "Panes recovered the completed turn from thread history after the live completion timed out.";
-      }
-      return "The turn reached a terminal completion.";
-    case "interrupted":
-      return "The turn ended before a normal completion.";
-    case "failed":
-      if (source === "reconciled_stream_lost") {
-        return "Panes recovered the turn after losing the live Codex stream. The transcript may be incomplete.";
-      }
-      if (source === "timeout_fallback") {
-        return "Panes timed out waiting for Codex to finish and marked the turn as failed.";
-      }
-      return "The turn ended with a terminal failure.";
-    case "awaiting_approval":
-      return "Waiting for approval before the turn can continue.";
-    default:
-      return "No terminal completion event has been recorded yet.";
-  }
-}
-
-function normalizeDurationMs(value: unknown): number | null {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    return null;
-  }
-
-  return Math.round(value);
-}
-
-function resolveTurnDurationMs(threadId: string, event: StreamEvent): number | null {
-  if (event.type !== "TurnCompleted") {
-    return null;
-  }
-
-  const eventDurationMs =
-    normalizeDurationMs(event.duration_ms) ?? normalizeDurationMs(event.durationMs);
-  if (eventDurationMs !== null) {
-    return eventDurationMs;
-  }
-
-  const pendingTurnMeta = pendingTurnMetaByThread.get(threadId);
-  if (!pendingTurnMeta) {
-    return null;
-  }
-
-  return Math.max(0, Math.round(performance.now() - pendingTurnMeta.startedAt));
-}
-
 function unresolvedActionTerminalError(
-  state: TurnStatusState,
+  state: TerminalTurnState,
   source?: TurnCompletionSource | null,
 ): string {
   if (source === "reconciled_stream_lost") {
@@ -2054,10 +1862,10 @@ function unresolvedActionTerminalError(
 
 function terminalizeUnresolvedActionBlocks(
   blocks: ContentBlock[] | undefined,
-  state: TurnStatusState,
+  state: TerminalTurnState,
   source?: TurnCompletionSource | null,
 ): ContentBlock[] | undefined {
-  if (!Array.isArray(blocks) || state === "streaming" || state === "awaiting_approval") {
+  if (!Array.isArray(blocks)) {
     return blocks;
   }
 
@@ -2089,9 +1897,9 @@ function terminalizeUnresolvedActionBlocks(
 
 function terminalizePendingApprovalBlocks(
   blocks: ContentBlock[] | undefined,
-  state: TurnStatusState,
+  state: TerminalTurnState,
 ): ContentBlock[] | undefined {
-  if (!Array.isArray(blocks) || state === "streaming" || state === "awaiting_approval") {
+  if (!Array.isArray(blocks)) {
     return blocks;
   }
 
@@ -2114,7 +1922,7 @@ function terminalizePendingApprovalBlocks(
 
 function terminalizeUnresolvedTurnBlocks(
   blocks: ContentBlock[] | undefined,
-  state: TurnStatusState,
+  state: TerminalTurnState,
   source?: TurnCompletionSource | null,
 ): ContentBlock[] | undefined {
   return terminalizePendingApprovalBlocks(
@@ -2123,27 +1931,10 @@ function terminalizeUnresolvedTurnBlocks(
   );
 }
 
-function assistantMessageHasMeaningfulContent(message: Message | undefined): boolean {
-  return Boolean(
-    message?.role === "assistant" &&
-      (message.blocks ?? []).some((block) => {
-        if (block.type === "text") return Boolean(block.content?.trim());
-        if (block.type === "action" || block.type === "diff" || block.type === "code" || block.type === "approval") {
-          return true;
-        }
-        return false;
-      }),
-  );
-}
-
 function cancelActiveAssistantMessage(messages: Message[]): Message[] {
   const last = messages[messages.length - 1];
   if (last?.role !== "assistant") {
     return messages;
-  }
-
-  if (!assistantMessageHasMeaningfulContent(last)) {
-    return messages.slice(0, -1);
   }
 
   if (last.status !== "streaming") {
@@ -2160,101 +1951,7 @@ function cancelActiveAssistantMessage(messages: Message[]): Message[] {
   ];
 }
 
-function formatTurnActionStats(stats: TurnBlockStats): string | null {
-  if (stats.actionsTotal <= 0) {
-    return null;
-  }
-
-  return `Actions: ${stats.actionsTotal} total, ${stats.actionsDone} done, ${stats.actionsError} error, ${stats.actionsRunning} running, ${stats.actionsPending} pending`;
-}
-
-function formatTurnApprovalStats(stats: TurnBlockStats): string | null {
-  if (stats.approvalsPending <= 0 && stats.approvalsAnswered <= 0) {
-    return null;
-  }
-
-  return `Approvals: ${stats.approvalsPending} pending, ${stats.approvalsAnswered} answered`;
-}
-
-function stringArraysEqual(left: string[] | undefined, right: string[] | undefined): boolean {
-  if (left === right) {
-    return true;
-  }
-  if (!left || !right || left.length !== right.length) {
-    return false;
-  }
-
-  return left.every((value, index) => value === right[index]);
-}
-
-function refreshTurnStatusNotice(
-  blocks: ContentBlock[] | undefined,
-  state: TurnStatusState,
-  source?: TurnCompletionSource | null,
-): ContentBlock[] | undefined {
-  if (!Array.isArray(blocks)) {
-    return blocks;
-  }
-
-  const noticeIndex = blocks.findIndex(
-    (block) => block.type === "notice" && block.kind === "turn_status",
-  );
-  if (noticeIndex < 0) {
-    return blocks;
-  }
-
-  const notice = blocks[noticeIndex] as NoticeBlock;
-  const details = Array.isArray(notice.details) ? notice.details : [];
-  const stats = collectTurnBlockStats(blocks);
-  const resolvedSource = source ?? notice.source ?? null;
-  const hasPendingApprovalConflict = turnStatusNoticeHasPendingApprovalConflict(
-    state,
-    stats,
-    resolvedSource,
-  );
-  const actionStats = formatTurnActionStats(stats);
-  const approvalStats = formatTurnApprovalStats(stats);
-  const nextDetails = details.filter(
-    (detail) =>
-      !detail.startsWith("Actions: ") &&
-      !detail.startsWith("Approvals: ") &&
-      !detail.startsWith("Protocol warning: terminal result arrived while "),
-  );
-  if (actionStats) {
-    nextDetails.push(actionStats);
-  }
-  if (approvalStats) {
-    nextDetails.push(approvalStats);
-  }
-
-  const normalizedDetails = nextDetails.length > 0 ? nextDetails : undefined;
-  const nextNotice: NoticeBlock = {
-    ...notice,
-    level: hasPendingApprovalConflict ? "warning" : turnStatusNoticeLevel(state),
-    title: hasPendingApprovalConflict ? "Approval still pending" : turnStatusNoticeTitle(state),
-    message: turnStatusNoticeMessage(state, resolvedSource, hasPendingApprovalConflict),
-    details: normalizedDetails,
-    status: hasPendingApprovalConflict ? "awaiting_approval" : state,
-    source: resolvedSource ?? undefined,
-  };
-
-  if (
-    nextNotice.level === notice.level &&
-    nextNotice.title === notice.title &&
-    nextNotice.message === notice.message &&
-    nextNotice.status === notice.status &&
-    nextNotice.source === notice.source &&
-    stringArraysEqual(normalizedDetails, notice.details)
-  ) {
-    return blocks;
-  }
-
-  const nextBlocks = [...blocks];
-  nextBlocks[noticeIndex] = nextNotice;
-  return nextBlocks;
-}
-
-function terminalStateFromMessageStatus(status: Message["status"]): TurnStatusState | null {
+function terminalStateFromMessageStatus(status: Message["status"]): TerminalTurnState | null {
   switch (status) {
     case "completed":
       return "completed";
@@ -2267,21 +1964,6 @@ function terminalStateFromMessageStatus(status: Message["status"]): TurnStatusSt
   }
 }
 
-function turnStatusSourceFromBlocks(blocks: ContentBlock[] | undefined): TurnCompletionSource | null {
-  if (!Array.isArray(blocks)) {
-    return null;
-  }
-
-  for (let index = blocks.length - 1; index >= 0; index -= 1) {
-    const block = blocks[index];
-    if (block.type === "notice" && block.kind === "turn_status") {
-      return block.source ?? null;
-    }
-  }
-
-  return null;
-}
-
 function normalizeTerminalTurnBlocks(message: Message): Message {
   if (message.role !== "assistant") {
     return message;
@@ -2292,13 +1974,7 @@ function normalizeTerminalTurnBlocks(message: Message): Message {
     return message;
   }
 
-  const source = turnStatusSourceFromBlocks(message.blocks);
-  const terminalizedBlocks = terminalizeUnresolvedTurnBlocks(
-    message.blocks,
-    state,
-    source,
-  );
-  const nextBlocks = refreshTurnStatusNotice(terminalizedBlocks, state, source);
+  const nextBlocks = terminalizeUnresolvedTurnBlocks(message.blocks, state);
   if (nextBlocks === message.blocks) {
     return message;
   }
@@ -2309,73 +1985,6 @@ function normalizeTerminalTurnBlocks(message: Message): Message {
   };
 }
 
-function buildTurnStatusNotice(
-  blocks: ContentBlock[],
-  options: {
-    state: TurnStatusState;
-    source?: TurnCompletionSource | null;
-    tokenUsage?: StreamTokenUsage | null;
-    durationMs?: number | null;
-  },
-): NoticeBlock {
-  const { state, source, tokenUsage, durationMs } = options;
-  const stats = collectTurnBlockStats(blocks);
-  const details: string[] = [];
-  const sourceLabel = describeTurnCompletionSource(source);
-  const hasPendingApprovalConflict = turnStatusNoticeHasPendingApprovalConflict(
-    state,
-    stats,
-    source,
-  );
-
-  if (sourceLabel) {
-    details.push(`Completion source: ${sourceLabel}`);
-  }
-
-  if (tokenUsage) {
-    details.push(`Token usage: ${tokenUsage.input} input, ${tokenUsage.output} output`);
-  }
-
-  if (stats.actionsTotal > 0) {
-    details.push(formatTurnActionStats(stats)!);
-  }
-
-  if (stats.approvalsPending > 0 || stats.approvalsAnswered > 0) {
-    details.push(
-      `Approvals: ${stats.approvalsPending} pending, ${stats.approvalsAnswered} answered`,
-    );
-    if (hasPendingApprovalConflict) {
-      details.push(
-        `Protocol warning: terminal result arrived while ${stats.approvalsPending} approval(s) were still pending.`,
-      );
-    }
-  }
-
-  if (stats.diffBlocks > 0) {
-    details.push(`Diff blocks: ${stats.diffBlocks}`);
-  }
-
-  if (stats.errorBlocks > 0) {
-    details.push(`Error blocks: ${stats.errorBlocks}`);
-  }
-
-  if (state === "streaming" && details.length === 0) {
-    details.push("No tool, approval, diff, or error activity has been recorded yet.");
-  }
-
-  return {
-    type: "notice",
-    kind: "turn_status",
-    level: hasPendingApprovalConflict ? "warning" : turnStatusNoticeLevel(state),
-    title: hasPendingApprovalConflict ? "Approval still pending" : turnStatusNoticeTitle(state),
-    message: turnStatusNoticeMessage(state, source, hasPendingApprovalConflict),
-    details: details.length > 0 ? details : undefined,
-    status: hasPendingApprovalConflict ? "awaiting_approval" : state,
-    source: source ?? undefined,
-    durationMs: normalizeDurationMs(durationMs) ?? undefined,
-  };
-}
-
 function normalizeBlocks(blocks?: ContentBlock[]): ContentBlock[] | undefined {
   if (!Array.isArray(blocks)) {
     return blocks;
@@ -2383,6 +1992,11 @@ function normalizeBlocks(blocks?: ContentBlock[]): ContentBlock[] | undefined {
 
   const normalized: ContentBlock[] = [];
   for (const block of blocks) {
+    // Historical messages may still contain the removed terminal-status card.
+    // Drop it at the compatibility boundary instead of letting it reappear.
+    if (block.type === "notice" && block.kind === "turn_status") {
+      continue;
+    }
     const last = normalized[normalized.length - 1];
     if (block.type === "text" && last?.type === "text") {
       normalized[normalized.length - 1] = {
@@ -2996,19 +2610,20 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
   }
 
   if (event.type === "Notice") {
-    assistant.blocks = upsertNoticeBlock(assistant.blocks ?? [], {
-      type: "notice",
-      kind: String(event.kind ?? "notice"),
-      level:
-        event.level === "warning" || event.level === "error"
-          ? event.level
-          : "info",
-      title: String(event.title ?? "Notice"),
-      message: String(event.message ?? ""),
-      details: normalizeNoticeDetails(event.details),
-      status: undefined,
-      source: undefined,
-    });
+    const kind = String(event.kind ?? "notice");
+    if (kind !== "turn_status") {
+      assistant.blocks = upsertNoticeBlock(assistant.blocks ?? [], {
+        type: "notice",
+        kind,
+        level:
+          event.level === "warning" || event.level === "error"
+            ? event.level
+            : "info",
+        title: String(event.title ?? "Notice"),
+        message: String(event.message ?? ""),
+        details: normalizeNoticeDetails(event.details),
+      });
+    }
   }
 
   if (event.type === "Error") {
@@ -3033,17 +2648,6 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
       terminalState,
       source,
     ) ?? [];
-    const blockStats = collectTurnBlockStats(assistant.blocks ?? []);
-    const nextState = blockStats.approvalsPending > 0 ? "awaiting_approval" : terminalState;
-    assistant.blocks = upsertNoticeBlock(
-      assistant.blocks ?? [],
-      buildTurnStatusNotice(assistant.blocks ?? [], {
-        state: nextState,
-        source,
-        tokenUsage: event.token_usage ?? undefined,
-        durationMs: resolveTurnDurationMs(threadId, event),
-      }),
-    );
     if (status === "failed") {
       assistant.status = "error";
     } else if (status === "interrupted") {
