@@ -47,6 +47,7 @@ use super::{
 const INITIALIZE_METHODS: &[&str] = &["initialize"];
 const THREAD_START_METHODS: &[&str] = &["thread/start"];
 const THREAD_RESUME_METHODS: &[&str] = &["thread/resume"];
+const THREAD_UNSUBSCRIBE_METHODS: &[&str] = &["thread/unsubscribe"];
 const THREAD_READ_METHODS: &[&str] = &["thread/read"];
 const THREAD_TURNS_LIST_METHODS: &[&str] = &["thread/turns/list"];
 const THREAD_ARCHIVE_METHODS: &[&str] = &["thread/archive"];
@@ -74,6 +75,7 @@ const MODEL_LIST_METHODS: &[&str] = &["model/list", "models/list"];
 const ACCOUNT_RATE_LIMITS_READ_METHODS: &[&str] = &["account/rateLimits/read"];
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const THREAD_UNSUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
 const TURN_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const HEALTH_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(12);
 #[cfg(not(target_os = "windows"))]
@@ -235,6 +237,14 @@ struct ReconciledTurnCompletion {
 enum TurnCompletionRecoveryMode {
     CompletionTimeout,
     StreamLost,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadUnsubscribeOutcome {
+    Unsubscribed,
+    NotSubscribed,
+    NotLoaded,
+    TransportUnavailable,
 }
 
 fn gpt56_reasoning_efforts(include_ultra: bool) -> Vec<ReasoningEffortOption> {
@@ -725,6 +735,7 @@ impl Engine for CodexEngine {
         event_tx: mpsc::Sender<EngineEvent>,
         cancellation: CancellationToken,
     ) -> Result<(), anyhow::Error> {
+        let result = async {
         let transport = self.ensure_ready_transport().await?;
         if let Some(message) = self.unsupported_external_auth_tokens_message().await {
             return Err(anyhow::anyhow!(message));
@@ -1197,6 +1208,22 @@ impl Engine for CodexEngine {
 
         self.clear_active_turn(&thread_id).await;
         Ok(())
+        }
+        .await;
+
+        // A completed/failed/interrupted turn no longer needs a live app-server subscription.
+        // Codex deliberately keeps the now-unsubscribed runtime warm for 30 minutes, so a quick
+        // follow-up resumes without paying MCP startup cost while abandoned threads can expire.
+        self.clear_active_turn(engine_thread_id).await;
+        if let Err(error) = self.release_thread_subscription(engine_thread_id).await {
+            // Cleanup must never turn an otherwise successful model turn into a user-facing
+            // failure. Keeping the runtime cached is safer than assuming an unsubscribe worked.
+            log::warn!(
+                "failed to release idle codex thread subscription {engine_thread_id}: {error:#}"
+            );
+        }
+
+        result
     }
 
     async fn steer_message(
@@ -1476,15 +1503,26 @@ impl CodexEngine {
         self.store_thread_runtime(&new_engine_thread_id, runtime)
             .await;
 
-        Ok(CodexForkedThread {
-            engine_thread_id: new_engine_thread_id,
+        let forked_thread = CodexForkedThread {
+            engine_thread_id: new_engine_thread_id.clone(),
             model_id: extract_any_string(&response, &["model"])
                 .unwrap_or_else(|| model.to_string()),
             title: extract_thread_title(&response),
             preview: extract_thread_preview(&response),
             raw_status: extract_thread_runtime_status_type(&response),
             active_flags: extract_thread_runtime_active_flags(&response),
-        })
+        };
+
+        if let Err(error) = self
+            .release_thread_subscription(&new_engine_thread_id)
+            .await
+        {
+            log::warn!(
+                "failed to release idle forked codex thread subscription {new_engine_thread_id}: {error:#}"
+            );
+        }
+
+        Ok(forked_thread)
     }
 
     pub async fn rollback_thread(
@@ -1546,14 +1584,22 @@ impl CodexEngine {
                     self.store_thread_runtime(engine_thread_id, runtime).await;
                 }
 
-                request_with_fallback(
+                let retry_result = request_with_fallback(
                     transport.as_ref(),
                     THREAD_ROLLBACK_METHODS,
                     rollback_params,
                     DEFAULT_TIMEOUT,
                 )
                 .await
-                .context("failed to rollback codex thread after resuming it")?
+                .context("failed to rollback codex thread after resuming it");
+
+                if let Err(error) = self.release_thread_subscription(engine_thread_id).await {
+                    log::warn!(
+                        "failed to release codex thread subscription after rollback {engine_thread_id}: {error:#}"
+                    );
+                }
+
+                retry_result?
             }
             Err(error) => return Err(error).context("failed to rollback codex thread"),
         };
@@ -1594,17 +1640,20 @@ impl CodexEngine {
         cancellation: CancellationToken,
         started_tx: oneshot::Sender<CodexReviewStarted>,
     ) -> Result<(), anyhow::Error> {
+        let source_thread_id = source_engine_thread_id.to_string();
+        let mut active_thread_id = source_thread_id.clone();
+        let result = async {
         let transport = self.ensure_ready_transport().await?;
         if let Some(message) = self.unsupported_external_auth_tokens_message().await {
             return Err(anyhow::anyhow!(message));
         }
+        self.ensure_thread_subscription(&transport, &source_thread_id)
+            .await?;
 
         let mut mapper = TurnEventMapper::default();
-        let source_thread_id = source_engine_thread_id.to_string();
         let mut subscription = transport
             .subscribe_thread(&source_thread_id, &event_tx)
             .await;
-        let mut active_thread_id = source_thread_id.clone();
         let requested_delivery = delivery.map(str::to_string);
 
         let transport_for_rate_limits = transport.clone();
@@ -2077,6 +2126,23 @@ impl CodexEngine {
 
         self.clear_active_turn(&active_thread_id).await;
         Ok(())
+        }
+        .await;
+
+        let mut cleanup_thread_ids = vec![source_thread_id];
+        if !cleanup_thread_ids.contains(&active_thread_id) {
+            cleanup_thread_ids.push(active_thread_id);
+        }
+        for thread_id in cleanup_thread_ids {
+            self.clear_active_turn(&thread_id).await;
+            if let Err(error) = self.release_thread_subscription(&thread_id).await {
+                log::warn!(
+                    "failed to release idle codex review subscription {thread_id}: {error:#}"
+                );
+            }
+        }
+
+        result
     }
 
     pub async fn health_report(&self) -> CodexHealthReport {
@@ -2967,6 +3033,11 @@ impl CodexEngine {
                                         extract_thread_active_flags_from_status_value(
                                             params.get("status"),
                                         );
+                                    if status_type == "notLoaded" {
+                                        let mut engine_state = state.lock().await;
+                                        engine_state.active_turn_ids.remove(&engine_thread_id);
+                                        engine_state.thread_runtimes.remove(&engine_thread_id);
+                                    }
                                     let _ = runtime_events.send(
                                         CodexRuntimeEvent::ThreadStatusChanged {
                                             engine_thread_id,
@@ -3000,6 +3071,11 @@ impl CodexEngine {
                                 if let Some(engine_thread_id) =
                                     extract_any_string(&params, &["threadId", "thread_id"])
                                 {
+                                    {
+                                        let mut engine_state = state.lock().await;
+                                        engine_state.active_turn_ids.remove(&engine_thread_id);
+                                        engine_state.thread_runtimes.remove(&engine_thread_id);
+                                    }
                                     let _ = runtime_events.send(
                                         CodexRuntimeEvent::ThreadSnapshotUpdated {
                                             engine_thread_id,
@@ -3421,6 +3497,83 @@ impl CodexEngine {
     async fn clear_active_turn(&self, engine_thread_id: &str) {
         let mut state = self.state.lock().await;
         state.active_turn_ids.remove(engine_thread_id);
+    }
+
+    async fn release_thread_subscription(
+        &self,
+        engine_thread_id: &str,
+    ) -> anyhow::Result<ThreadUnsubscribeOutcome> {
+        let transport = {
+            let mut state = self.state.lock().await;
+            state.active_turn_ids.remove(engine_thread_id);
+
+            let Some(transport) = state.transport.clone() else {
+                state.thread_runtimes.remove(engine_thread_id);
+                return Ok(ThreadUnsubscribeOutcome::TransportUnavailable);
+            };
+            transport
+        };
+
+        let response = request_with_fallback(
+            transport.as_ref(),
+            THREAD_UNSUBSCRIBE_METHODS,
+            serde_json::json!({
+                "threadId": engine_thread_id,
+            }),
+            THREAD_UNSUBSCRIBE_TIMEOUT,
+        )
+        .await
+        .with_context(|| format!("failed to unsubscribe codex thread {engine_thread_id}"))?;
+        let outcome = parse_thread_unsubscribe_outcome(&response)?;
+
+        let mut state = self.state.lock().await;
+        let same_transport = state
+            .transport
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &transport));
+        if same_transport && !state.active_turn_ids.contains_key(engine_thread_id) {
+            // `thread_runtimes` doubles as the local "loaded and subscribed" cache. Removing
+            // this entry forces the next turn to call `thread/resume`, which both reloads an
+            // expired thread and re-subscribes this app-server connection during the 30-minute
+            // upstream grace period.
+            state.thread_runtimes.remove(engine_thread_id);
+        }
+
+        log::debug!("released idle codex thread subscription {engine_thread_id}: {outcome:?}");
+
+        Ok(outcome)
+    }
+
+    async fn ensure_thread_subscription(
+        &self,
+        transport: &Arc<CodexTransport>,
+        engine_thread_id: &str,
+    ) -> anyhow::Result<()> {
+        if self.can_reuse_live_thread(engine_thread_id).await {
+            return Ok(());
+        }
+
+        let response = request_with_fallback(
+            transport.as_ref(),
+            THREAD_RESUME_METHODS,
+            serde_json::json!({
+                "threadId": engine_thread_id,
+                "excludeTurns": true,
+            }),
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .with_context(|| format!("failed to resume codex thread {engine_thread_id}"))?;
+
+        if let Some(resumed_thread_id) = extract_thread_id(&response) {
+            if resumed_thread_id != engine_thread_id {
+                anyhow::bail!(
+                    "codex resumed thread {resumed_thread_id} instead of {engine_thread_id}"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     async fn active_turn_id(&self, engine_thread_id: &str) -> Option<String> {
@@ -4940,6 +5093,20 @@ fn extract_thread_id(value: &serde_json::Value) -> Option<String> {
     }
 
     None
+}
+
+fn parse_thread_unsubscribe_outcome(
+    value: &serde_json::Value,
+) -> anyhow::Result<ThreadUnsubscribeOutcome> {
+    match extract_any_string(value, &["status"]).as_deref() {
+        Some("unsubscribed") => Ok(ThreadUnsubscribeOutcome::Unsubscribed),
+        Some("notSubscribed") | Some("not_subscribed") => {
+            Ok(ThreadUnsubscribeOutcome::NotSubscribed)
+        }
+        Some("notLoaded") | Some("not_loaded") => Ok(ThreadUnsubscribeOutcome::NotLoaded),
+        Some(status) => anyhow::bail!("unknown thread/unsubscribe status `{status}`"),
+        None => anyhow::bail!("thread/unsubscribe response did not include a status"),
+    }
 }
 
 fn extract_turn_id(value: &serde_json::Value) -> Option<String> {
@@ -7669,6 +7836,61 @@ fn is_known_codex_notification_method(normalized_method: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn parses_documented_thread_unsubscribe_statuses() {
+        assert_eq!(
+            parse_thread_unsubscribe_outcome(&json!({ "status": "unsubscribed" }))
+                .expect("unsubscribed should parse"),
+            ThreadUnsubscribeOutcome::Unsubscribed
+        );
+        assert_eq!(
+            parse_thread_unsubscribe_outcome(&json!({ "status": "notSubscribed" }))
+                .expect("notSubscribed should parse"),
+            ThreadUnsubscribeOutcome::NotSubscribed
+        );
+        assert_eq!(
+            parse_thread_unsubscribe_outcome(&json!({ "status": "notLoaded" }))
+                .expect("notLoaded should parse"),
+            ThreadUnsubscribeOutcome::NotLoaded
+        );
+        assert!(parse_thread_unsubscribe_outcome(&json!({ "status": "unexpected" })).is_err());
+        assert!(parse_thread_unsubscribe_outcome(&json!({})).is_err());
+    }
+
+    #[tokio::test]
+    async fn releasing_without_a_transport_forgets_the_cached_runtime() {
+        let engine = CodexEngine::default();
+        let thread_id = "thread-to-release";
+        engine
+            .store_thread_runtime(
+                thread_id,
+                ThreadRuntime {
+                    cwd: "/tmp/project".to_string(),
+                    model_id: "gpt-5.6-terra".to_string(),
+                    approval_policy: json!("never"),
+                    permission_profile: None,
+                    approvals_reviewer: None,
+                    sandbox_policy: json!({ "type": "workspaceWrite" }),
+                    reasoning_effort: Some("medium".to_string()),
+                    service_tier: None,
+                    personality: None,
+                    output_schema: None,
+                    native_plan_mode_active: false,
+                },
+            )
+            .await;
+        engine.set_active_turn(thread_id, "turn-1").await;
+
+        let outcome = engine
+            .release_thread_subscription(thread_id)
+            .await
+            .expect("release without a transport should be local-only");
+
+        assert_eq!(outcome, ThreadUnsubscribeOutcome::TransportUnavailable);
+        assert!(engine.thread_runtime(thread_id).await.is_none());
+        assert!(engine.active_turn_id(thread_id).await.is_none());
+    }
 
     #[test]
     fn normalize_modern_accept_with_execpolicy_from_top_level() {
