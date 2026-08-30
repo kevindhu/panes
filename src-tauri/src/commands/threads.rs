@@ -4165,7 +4165,6 @@ mod tests {
     use crate::{
         config::app_config::AppConfig,
         engines::EngineManager,
-        file_tree::FileTreeCache,
         power::KeepAwakeManager,
         state::{AppState, TurnManager},
     };
@@ -4182,7 +4181,6 @@ mod tests {
             engines: Arc::new(EngineManager::new()),
             keep_awake: Arc::new(KeepAwakeManager::new()),
             turns: Arc::new(TurnManager::default()),
-            file_tree_cache: Arc::new(FileTreeCache::new()),
             pending_forks: Arc::new(crate::state::PendingThreadMutationManager::default()),
             pending_rollbacks: Arc::new(crate::state::PendingThreadMutationManager::default()),
         }

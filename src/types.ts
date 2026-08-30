@@ -588,11 +588,6 @@ export interface SearchResult {
   snippet: string;
 }
 
-export interface EditorRevealLocation {
-  line: number;
-  column?: number | null;
-}
-
 // ── Stream Events ───────────────────────────────────────────────────
 
 export type TurnCompletionStatus = "completed" | "interrupted" | "failed";

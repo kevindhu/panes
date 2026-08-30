@@ -5536,7 +5536,6 @@ mod tests {
         config::app_config::AppConfig,
         db,
         engines::EngineManager,
-        file_tree::FileTreeCache,
         models::{EngineCapabilitiesDto, ReasoningEffortOptionDto},
         power::KeepAwakeManager,
         state::{AppState, TurnManager},
@@ -5555,7 +5554,6 @@ mod tests {
             engines: Arc::new(EngineManager::new()),
             keep_awake: Arc::new(KeepAwakeManager::new()),
             turns: Arc::new(TurnManager::default()),
-            file_tree_cache: Arc::new(FileTreeCache::new()),
             pending_forks: Arc::new(crate::state::PendingThreadMutationManager::default()),
             pending_rollbacks: Arc::new(crate::state::PendingThreadMutationManager::default()),
         }

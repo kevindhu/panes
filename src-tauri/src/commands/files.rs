@@ -1,260 +1,8 @@
 use std::{
     ffi::OsString,
-    fs,
     path::{Path, PathBuf},
     process::Command,
 };
-
-use anyhow::Context;
-use tauri::State;
-
-use crate::{
-    db, fs_ops,
-    models::{FileTreeEntryDto, ReadFileResultDto, ResolvedEditorFileReferenceDto, TrustLevelDto},
-    path_utils,
-    state::AppState,
-};
-
-#[tauri::command]
-pub async fn list_dir(
-    repo_path: String,
-    dir_path: String,
-) -> Result<Vec<FileTreeEntryDto>, String> {
-    tokio::task::spawn_blocking(move || {
-        fs_ops::list_dir(&repo_path, &dir_path).map_err(err_to_string)
-    })
-    .await
-    .map_err(|error| error.to_string())?
-}
-
-#[tauri::command]
-pub async fn read_file(repo_path: String, file_path: String) -> Result<ReadFileResultDto, String> {
-    tokio::task::spawn_blocking(move || {
-        fs_ops::read_file(&repo_path, &file_path).map_err(err_to_string)
-    })
-    .await
-    .map_err(|error| error.to_string())?
-}
-
-#[tauri::command]
-pub async fn resolve_editor_file_reference(
-    state: State<'_, AppState>,
-    workspace_id: String,
-    raw_reference: String,
-    preferred_repo_path: Option<String>,
-    current_cwd: Option<String>,
-) -> Result<Option<ResolvedEditorFileReferenceDto>, String> {
-    let db = state.db.clone();
-    tokio::task::spawn_blocking(move || {
-        let workspace = db::workspaces::find_workspace_by_id(&db, &workspace_id)
-            .map_err(err_to_string)?
-            .ok_or_else(|| "workspace not found".to_string())?;
-        let repos = db::repos::get_repos(&db, &workspace_id).map_err(err_to_string)?;
-        resolve_editor_file_reference_impl(
-            &workspace.root_path,
-            &repos,
-            &raw_reference,
-            preferred_repo_path.as_deref(),
-            current_cwd.as_deref(),
-        )
-        .map_err(err_to_string)
-    })
-    .await
-    .map_err(|error| error.to_string())?
-}
-
-#[tauri::command]
-pub async fn write_file(
-    state: State<'_, AppState>,
-    repo_path: String,
-    file_path: String,
-    content: String,
-    workspace_id: Option<String>,
-) -> Result<(), String> {
-    let db = state.db.clone();
-    let cache = state.file_tree_cache.clone();
-    tokio::task::spawn_blocking(move || {
-        let access_root = PathBuf::from(&repo_path)
-            .canonicalize()
-            .map_err(err_to_string)?;
-        let target_for_repo_lookup =
-            resolve_target_path_for_repo_lookup(&access_root, &file_path).map_err(err_to_string)?;
-
-        // Trust level check for user-initiated writes from the editor:
-        // - Restricted: blocked — explicit opt-in required (must change trust level first)
-        // - Standard/Trusted: allowed — these are direct user actions, not agent-initiated,
-        //   so they don't require approval flow (approval is for agent operations)
-        if let Some(repo) = db::repos::find_deepest_repo_containing_path(
-            &db,
-            target_for_repo_lookup.to_string_lossy().as_ref(),
-            workspace_id.as_deref(),
-        )
-        .map_err(err_to_string)?
-        {
-            if matches!(repo.trust_level, TrustLevelDto::Restricted) {
-                return Err(
-                    "cannot write to a restricted repository; change the trust level first"
-                        .to_string(),
-                );
-            }
-        }
-        fs_ops::write_file(&repo_path, &file_path, &content).map_err(err_to_string)?;
-        cache.invalidate_containing_path(target_for_repo_lookup.to_string_lossy().as_ref());
-        Ok(())
-    })
-    .await
-    .map_err(|error| error.to_string())?
-}
-
-#[tauri::command]
-pub async fn create_file(
-    state: State<'_, AppState>,
-    repo_path: String,
-    file_path: String,
-    workspace_id: Option<String>,
-) -> Result<(), String> {
-    let db = state.db.clone();
-    let cache = state.file_tree_cache.clone();
-    tokio::task::spawn_blocking(move || {
-        let access_root = PathBuf::from(&repo_path)
-            .canonicalize()
-            .map_err(err_to_string)?;
-        let target_for_repo_lookup =
-            resolve_target_path_for_repo_lookup(&access_root, &file_path).map_err(err_to_string)?;
-
-        if let Some(repo) = db::repos::find_deepest_repo_containing_path(
-            &db,
-            target_for_repo_lookup.to_string_lossy().as_ref(),
-            workspace_id.as_deref(),
-        )
-        .map_err(err_to_string)?
-        {
-            if matches!(repo.trust_level, TrustLevelDto::Restricted) {
-                return Err("cannot modify a restricted repository".to_string());
-            }
-        }
-        fs_ops::create_file(&repo_path, &file_path).map_err(err_to_string)?;
-        cache.invalidate_containing_path(target_for_repo_lookup.to_string_lossy().as_ref());
-        Ok(())
-    })
-    .await
-    .map_err(|error| error.to_string())?
-}
-
-#[tauri::command]
-pub async fn create_dir(
-    state: State<'_, AppState>,
-    repo_path: String,
-    dir_path: String,
-    workspace_id: Option<String>,
-) -> Result<(), String> {
-    let db = state.db.clone();
-    let cache = state.file_tree_cache.clone();
-    tokio::task::spawn_blocking(move || {
-        let access_root = PathBuf::from(&repo_path)
-            .canonicalize()
-            .map_err(err_to_string)?;
-        let target_for_repo_lookup =
-            resolve_target_path_for_repo_lookup(&access_root, &dir_path).map_err(err_to_string)?;
-
-        if let Some(repo) = db::repos::find_deepest_repo_containing_path(
-            &db,
-            target_for_repo_lookup.to_string_lossy().as_ref(),
-            workspace_id.as_deref(),
-        )
-        .map_err(err_to_string)?
-        {
-            if matches!(repo.trust_level, TrustLevelDto::Restricted) {
-                return Err("cannot modify a restricted repository".to_string());
-            }
-        }
-        fs_ops::create_dir(&repo_path, &dir_path).map_err(err_to_string)?;
-        cache.invalidate_containing_path(target_for_repo_lookup.to_string_lossy().as_ref());
-        Ok(())
-    })
-    .await
-    .map_err(|error| error.to_string())?
-}
-
-#[tauri::command]
-pub async fn rename_path(
-    state: State<'_, AppState>,
-    repo_path: String,
-    old_path: String,
-    new_name: String,
-    workspace_id: Option<String>,
-) -> Result<(), String> {
-    let db = state.db.clone();
-    let cache = state.file_tree_cache.clone();
-    tokio::task::spawn_blocking(move || {
-        let access_root = PathBuf::from(&repo_path)
-            .canonicalize()
-            .map_err(err_to_string)?;
-        let target_for_repo_lookup =
-            resolve_target_path_for_repo_lookup(&access_root, &old_path).map_err(err_to_string)?;
-
-        if let Some(repo) = db::repos::find_deepest_repo_containing_path(
-            &db,
-            target_for_repo_lookup.to_string_lossy().as_ref(),
-            workspace_id.as_deref(),
-        )
-        .map_err(err_to_string)?
-        {
-            if matches!(repo.trust_level, TrustLevelDto::Restricted) {
-                return Err("cannot modify a restricted repository".to_string());
-            }
-        }
-        fs_ops::rename_path(&repo_path, &old_path, &new_name).map_err(err_to_string)?;
-        cache.invalidate_containing_path(target_for_repo_lookup.to_string_lossy().as_ref());
-        Ok(())
-    })
-    .await
-    .map_err(|error| error.to_string())?
-}
-
-#[tauri::command]
-pub async fn delete_path(
-    state: State<'_, AppState>,
-    repo_path: String,
-    file_path: String,
-    workspace_id: Option<String>,
-) -> Result<(), String> {
-    let db = state.db.clone();
-    let cache = state.file_tree_cache.clone();
-    tokio::task::spawn_blocking(move || {
-        let access_root = PathBuf::from(&repo_path)
-            .canonicalize()
-            .map_err(err_to_string)?;
-        let target_for_repo_lookup =
-            resolve_target_path_for_repo_lookup(&access_root, &file_path).map_err(err_to_string)?;
-
-        if let Some(repo) = db::repos::find_deepest_repo_containing_path(
-            &db,
-            target_for_repo_lookup.to_string_lossy().as_ref(),
-            workspace_id.as_deref(),
-        )
-        .map_err(err_to_string)?
-        {
-            if matches!(repo.trust_level, TrustLevelDto::Restricted) {
-                return Err("cannot modify a restricted repository".to_string());
-            }
-        }
-        fs_ops::delete_path(&repo_path, &file_path).map_err(err_to_string)?;
-        cache.invalidate_containing_path(target_for_repo_lookup.to_string_lossy().as_ref());
-        Ok(())
-    })
-    .await
-    .map_err(|error| error.to_string())?
-}
-
-#[tauri::command]
-pub async fn reveal_path(path: String) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || {
-        reveal_path_impl(PathBuf::from(path)).map_err(err_to_string)
-    })
-    .await
-    .map_err(|error| error.to_string())?
-}
 
 #[tauri::command]
 pub async fn open_path_with_default_app(path: String) -> Result<(), String> {
@@ -266,7 +14,7 @@ pub async fn open_path_with_default_app(path: String) -> Result<(), String> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RevealCommandPlan {
+struct OpenCommandPlan {
     program: OsString,
     args: Vec<OsString>,
     display_target: PathBuf,
@@ -274,28 +22,11 @@ struct RevealCommandPlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-enum RevealPlatform {
+enum OpenPlatform {
     Macos,
     Windows,
     Linux,
     Unsupported,
-}
-
-fn reveal_path_impl(path: PathBuf) -> anyhow::Result<()> {
-    if !path.exists() {
-        anyhow::bail!("path does not exist: {}", path.display());
-    }
-
-    let platform = reveal_platform();
-    let (xdg_open, gio) = resolve_linux_openers(platform);
-
-    let Some(plan) = build_reveal_command_plan(&path, platform, xdg_open, gio)? else {
-        return Ok(());
-    };
-
-    let mut command = Command::new(&plan.program);
-    command.args(&plan.args);
-    spawn_path_command(command, &plan.display_target, "reveal")
 }
 
 fn open_path_with_default_app_impl(path: PathBuf) -> anyhow::Result<()> {
@@ -303,7 +34,7 @@ fn open_path_with_default_app_impl(path: PathBuf) -> anyhow::Result<()> {
         anyhow::bail!("path does not exist: {}", path.display());
     }
 
-    let platform = reveal_platform();
+    let platform = open_platform();
     let (xdg_open, gio) = resolve_linux_openers(platform);
 
     let Some(plan) = build_open_command_plan(&path, platform, xdg_open, gio)? else {
@@ -312,33 +43,33 @@ fn open_path_with_default_app_impl(path: PathBuf) -> anyhow::Result<()> {
 
     let mut command = Command::new(&plan.program);
     command.args(&plan.args);
-    spawn_path_command(command, &plan.display_target, "open")
+    spawn_open_command(command, &plan.display_target)
 }
 
-fn reveal_platform() -> RevealPlatform {
+fn open_platform() -> OpenPlatform {
     #[cfg(target_os = "macos")]
     {
-        return RevealPlatform::Macos;
+        OpenPlatform::Macos
     }
 
     #[cfg(target_os = "windows")]
     {
-        return RevealPlatform::Windows;
+        OpenPlatform::Windows
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        return RevealPlatform::Linux;
+        OpenPlatform::Linux
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
     {
-        RevealPlatform::Unsupported
+        OpenPlatform::Unsupported
     }
 }
 
-fn resolve_linux_openers(platform: RevealPlatform) -> (Option<PathBuf>, Option<PathBuf>) {
-    if platform == RevealPlatform::Linux {
+fn resolve_linux_openers(platform: OpenPlatform) -> (Option<PathBuf>, Option<PathBuf>) {
+    if platform == OpenPlatform::Linux {
         (
             crate::runtime_env::resolve_executable("xdg-open"),
             crate::runtime_env::resolve_executable("gio"),
@@ -348,91 +79,21 @@ fn resolve_linux_openers(platform: RevealPlatform) -> (Option<PathBuf>, Option<P
     }
 }
 
-fn build_reveal_command_plan(
-    path: &Path,
-    platform: RevealPlatform,
-    xdg_open: Option<PathBuf>,
-    gio: Option<PathBuf>,
-) -> anyhow::Result<Option<RevealCommandPlan>> {
-    let path_arg = path.as_os_str().to_os_string();
-
-    match platform {
-        RevealPlatform::Macos => {
-            let mut args = Vec::with_capacity(2);
-            if path.is_file() {
-                args.push(OsString::from("-R"));
-            }
-            args.push(path_arg);
-            Ok(Some(RevealCommandPlan {
-                program: OsString::from("open"),
-                args,
-                display_target: path.to_path_buf(),
-            }))
-        }
-        RevealPlatform::Windows => {
-            let args = if path.is_file() {
-                let mut select_arg = OsString::from("/select,");
-                select_arg.push(path.as_os_str());
-                vec![select_arg]
-            } else {
-                vec![path_arg]
-            };
-
-            Ok(Some(RevealCommandPlan {
-                program: OsString::from("explorer"),
-                args,
-                display_target: path.to_path_buf(),
-            }))
-        }
-        RevealPlatform::Linux => {
-            let target = if path.is_dir() {
-                path.to_path_buf()
-            } else {
-                path.parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| path.to_path_buf())
-            };
-
-            if let Some(program) = xdg_open {
-                return Ok(Some(RevealCommandPlan {
-                    program: program.into_os_string(),
-                    args: vec![target.as_os_str().to_os_string()],
-                    display_target: target,
-                }));
-            }
-
-            if let Some(program) = gio {
-                return Ok(Some(RevealCommandPlan {
-                    program: program.into_os_string(),
-                    args: vec![OsString::from("open"), target.as_os_str().to_os_string()],
-                    display_target: target,
-                }));
-            }
-
-            anyhow::bail!(
-                "failed to reveal {}: neither xdg-open nor gio open is available",
-                target.display()
-            );
-        }
-        RevealPlatform::Unsupported => Ok(None),
-    }
-}
-
 fn build_open_command_plan(
     path: &Path,
-    platform: RevealPlatform,
+    platform: OpenPlatform,
     xdg_open: Option<PathBuf>,
     gio: Option<PathBuf>,
-) -> anyhow::Result<Option<RevealCommandPlan>> {
+) -> anyhow::Result<Option<OpenCommandPlan>> {
     let path_arg = path.as_os_str().to_os_string();
 
     match platform {
-        RevealPlatform::Macos => Ok(Some(RevealCommandPlan {
+        OpenPlatform::Macos => Ok(Some(OpenCommandPlan {
             program: OsString::from("open"),
             args: vec![path_arg],
             display_target: path.to_path_buf(),
         })),
-        RevealPlatform::Windows => Ok(Some(RevealCommandPlan {
+        OpenPlatform::Windows => Ok(Some(OpenCommandPlan {
             program: OsString::from("cmd"),
             args: vec![
                 OsString::from("/C"),
@@ -442,9 +103,9 @@ fn build_open_command_plan(
             ],
             display_target: path.to_path_buf(),
         })),
-        RevealPlatform::Linux => {
+        OpenPlatform::Linux => {
             if let Some(program) = xdg_open {
-                return Ok(Some(RevealCommandPlan {
+                return Ok(Some(OpenCommandPlan {
                     program: program.into_os_string(),
                     args: vec![path.as_os_str().to_os_string()],
                     display_target: path.to_path_buf(),
@@ -452,7 +113,7 @@ fn build_open_command_plan(
             }
 
             if let Some(program) = gio {
-                return Ok(Some(RevealCommandPlan {
+                return Ok(Some(OpenCommandPlan {
                     program: program.into_os_string(),
                     args: vec![OsString::from("open"), path.as_os_str().to_os_string()],
                     display_target: path.to_path_buf(),
@@ -464,206 +125,15 @@ fn build_open_command_plan(
                 path.display()
             );
         }
-        RevealPlatform::Unsupported => Ok(None),
+        OpenPlatform::Unsupported => Ok(None),
     }
 }
 
-fn spawn_path_command(
-    mut command: Command,
-    path: &std::path::Path,
-    action: &str,
-) -> anyhow::Result<()> {
+fn spawn_open_command(mut command: Command, path: &Path) -> anyhow::Result<()> {
     command
         .spawn()
         .map(|_| ())
-        .map_err(|error| anyhow::anyhow!("failed to {action} {}: {error}", path.display()))
-}
-
-fn resolve_target_path_for_repo_lookup(
-    access_root: &Path,
-    file_path: &str,
-) -> anyhow::Result<PathBuf> {
-    let target = access_root.join(fs_ops::validate_repo_relative_path(file_path)?);
-
-    if target.exists() {
-        let metadata = fs::symlink_metadata(&target).context("failed to resolve file path")?;
-        let parent = target.parent().context("invalid file path")?;
-        let parent_canonical = parent
-            .canonicalize()
-            .context("failed to resolve file path")?;
-        anyhow::ensure!(
-            parent_canonical.starts_with(access_root),
-            "path traversal not allowed"
-        );
-
-        if metadata.file_type().is_symlink() {
-            return Ok(target);
-        }
-
-        let canonical = target
-            .canonicalize()
-            .context("failed to resolve file path")?;
-        anyhow::ensure!(
-            canonical.starts_with(access_root),
-            "path traversal not allowed"
-        );
-        return Ok(canonical);
-    }
-
-    let mut ancestor = target.parent().context("invalid file path")?;
-    while !ancestor.exists() {
-        ancestor = ancestor.parent().context("invalid file path")?;
-    }
-
-    let ancestor_canonical = ancestor
-        .canonicalize()
-        .context("ancestor directory not found")?;
-    anyhow::ensure!(
-        ancestor_canonical.starts_with(access_root),
-        "path traversal not allowed"
-    );
-
-    let remainder = target
-        .strip_prefix(ancestor)
-        .context("failed to resolve target path")?;
-    Ok(ancestor_canonical.join(remainder))
-}
-
-fn resolve_editor_file_reference_impl(
-    workspace_root: &str,
-    repos: &[crate::models::RepoDto],
-    raw_reference: &str,
-    preferred_repo_path: Option<&str>,
-    current_cwd: Option<&str>,
-) -> anyhow::Result<Option<ResolvedEditorFileReferenceDto>> {
-    let Some(parsed) = parse_editor_file_reference(raw_reference) else {
-        return Ok(None);
-    };
-
-    let workspace_root = path_utils::canonicalize_path(Path::new(workspace_root))
-        .context("failed to canonicalize workspace root")?;
-    let ordered_roots =
-        ordered_editor_reference_roots(&workspace_root, repos, preferred_repo_path, current_cwd);
-
-    for root in ordered_roots {
-        let candidate = if parsed.path.is_absolute() {
-            parsed.path.clone()
-        } else {
-            root.join(&parsed.path)
-        };
-        let Ok(resolved) = candidate.canonicalize() else {
-            continue;
-        };
-        if !resolved.is_file() || !resolved.starts_with(&root) {
-            continue;
-        }
-        let Ok(relative) = resolved.strip_prefix(&root) else {
-            continue;
-        };
-        return Ok(Some(ResolvedEditorFileReferenceDto {
-            repo_path: root.to_string_lossy().to_string(),
-            file_path: relative.to_string_lossy().to_string(),
-            line: parsed.line,
-            column: parsed.column,
-        }));
-    }
-
-    Ok(None)
-}
-
-#[derive(Debug)]
-struct ParsedEditorFileReference {
-    path: PathBuf,
-    line: Option<u32>,
-    column: Option<u32>,
-}
-
-fn parse_editor_file_reference(raw_reference: &str) -> Option<ParsedEditorFileReference> {
-    let trimmed = raw_reference.trim();
-    if trimmed.is_empty() || trimmed.contains("://") {
-        return None;
-    }
-
-    let (path, line, column) = split_editor_reference_location(trimmed);
-    let path = path.trim_start_matches("./");
-    if path.is_empty() || path.contains('\0') {
-        return None;
-    }
-    if !Path::new(path).is_absolute() {
-        fs_ops::validate_repo_relative_path(path).ok()?;
-    }
-
-    Some(ParsedEditorFileReference {
-        path: PathBuf::from(path),
-        line,
-        column,
-    })
-}
-
-fn split_editor_reference_location(value: &str) -> (&str, Option<u32>, Option<u32>) {
-    if let Some((path, suffix)) = value.rsplit_once("#L") {
-        if let Some((line, column)) = parse_line_column(suffix, '-') {
-            return (path, line, column);
-        }
-    }
-
-    let Some((path, line)) = value.rsplit_once(':') else {
-        return (value, None, None);
-    };
-    let Some(line) = line.parse::<u32>().ok().filter(|line| *line > 0) else {
-        return (value, None, None);
-    };
-    if let Some((path, column)) = path.rsplit_once(':') {
-        if let Some(column) = column.parse::<u32>().ok().filter(|column| *column > 0) {
-            return (path, Some(line), Some(column));
-        }
-    }
-    (path, Some(line), None)
-}
-
-fn parse_line_column(value: &str, separator: char) -> Option<(Option<u32>, Option<u32>)> {
-    let (line, column) = value
-        .split_once(separator)
-        .map_or((value, None), |(line, column)| (line, Some(column)));
-    let line = line.parse::<u32>().ok().filter(|line| *line > 0)?;
-    let column = column.and_then(|value| value.parse::<u32>().ok().filter(|column| *column > 0));
-    Some((Some(line), column))
-}
-
-fn ordered_editor_reference_roots(
-    workspace_root: &Path,
-    repos: &[crate::models::RepoDto],
-    preferred_repo_path: Option<&str>,
-    current_cwd: Option<&str>,
-) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    push_editor_reference_root(&mut roots, current_cwd);
-    push_editor_reference_root(&mut roots, preferred_repo_path);
-
-    for repo in repos.iter().filter(|repo| repo.is_active) {
-        push_editor_reference_root(&mut roots, Some(repo.path.as_str()));
-    }
-    for repo in repos.iter().filter(|repo| !repo.is_active) {
-        push_editor_reference_root(&mut roots, Some(repo.path.as_str()));
-    }
-    push_editor_reference_path_root(&mut roots, workspace_root.to_path_buf());
-    roots
-}
-
-fn push_editor_reference_root(roots: &mut Vec<PathBuf>, path: Option<&str>) {
-    let Some(path) = path else {
-        return;
-    };
-    let Ok(root) = path_utils::canonicalize_path(Path::new(path)) else {
-        return;
-    };
-    push_editor_reference_path_root(roots, root);
-}
-
-fn push_editor_reference_path_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
-    if !roots.iter().any(|existing| existing == &root) {
-        roots.push(root);
-    }
+        .map_err(|error| anyhow::anyhow!("failed to open {}: {error}", path.display()))
 }
 
 fn err_to_string(error: impl std::fmt::Display) -> String {
@@ -672,134 +142,25 @@ fn err_to_string(error: impl std::fmt::Display) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{ffi::OsString, fs, path::PathBuf};
 
-    use super::{
-        build_open_command_plan, build_reveal_command_plan, resolve_target_path_for_repo_lookup,
-        RevealPlatform,
-    };
+    use super::{build_open_command_plan, OpenPlatform};
     use uuid::Uuid;
 
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink;
-
-    fn with_temp_path<T>(f: impl FnOnce(PathBuf, PathBuf) -> T) -> T {
-        let root = std::env::temp_dir().join(format!("panes-reveal-path-{}", Uuid::new_v4()));
-        let dir = root.join("nested");
-        let file = dir.join("file.txt");
-        fs::create_dir_all(&dir).expect("temp dir should exist");
+    fn with_temp_file<T>(f: impl FnOnce(PathBuf) -> T) -> T {
+        let root = std::env::temp_dir().join(format!("panes-open-path-{}", Uuid::new_v4()));
+        let file = root.join("file.txt");
+        fs::create_dir_all(&root).expect("temp dir should exist");
         fs::write(&file, "hello").expect("temp file should exist");
-        let result = f(dir.clone(), file.clone());
+        let result = f(file);
         let _ = fs::remove_dir_all(&root);
         result
     }
 
     #[test]
-    fn windows_files_use_explorer_select_args() {
-        with_temp_path(|_dir, file| {
-            let plan = build_reveal_command_plan(&file, RevealPlatform::Windows, None, None)
-                .expect("plan should build")
-                .expect("plan should exist");
-
-            assert_eq!(plan.program.to_string_lossy(), "explorer");
-            assert_eq!(plan.args.len(), 1);
-            assert_eq!(
-                plan.args[0].to_string_lossy(),
-                format!("/select,{}", file.display())
-            );
-            assert_eq!(plan.display_target, file);
-        });
-    }
-
-    #[test]
-    fn windows_directories_open_in_explorer() {
-        with_temp_path(|dir, _file| {
-            let plan = build_reveal_command_plan(&dir, RevealPlatform::Windows, None, None)
-                .expect("plan should build")
-                .expect("plan should exist");
-
-            assert_eq!(plan.program.to_string_lossy(), "explorer");
-            assert_eq!(plan.args, vec![dir.as_os_str().to_os_string()]);
-            assert_eq!(plan.display_target, dir);
-        });
-    }
-
-    #[test]
-    fn mac_files_use_open_reveal_flag() {
-        with_temp_path(|_dir, file| {
-            let plan = build_reveal_command_plan(&file, RevealPlatform::Macos, None, None)
-                .expect("plan should build")
-                .expect("plan should exist");
-
-            assert_eq!(plan.program.to_string_lossy(), "open");
-            assert_eq!(
-                plan.args,
-                vec![
-                    std::ffi::OsString::from("-R"),
-                    file.as_os_str().to_os_string()
-                ]
-            );
-        });
-    }
-
-    #[test]
-    fn linux_prefers_xdg_open_for_parent_directory() {
-        with_temp_path(|dir, file| {
-            let plan = build_reveal_command_plan(
-                &file,
-                RevealPlatform::Linux,
-                Some(PathBuf::from("/usr/bin/xdg-open")),
-                Some(PathBuf::from("/usr/bin/gio")),
-            )
-            .expect("plan should build")
-            .expect("plan should exist");
-
-            assert_eq!(plan.program.to_string_lossy(), "/usr/bin/xdg-open");
-            assert_eq!(plan.args, vec![dir.as_os_str().to_os_string()]);
-            assert_eq!(plan.display_target, dir);
-        });
-    }
-
-    #[test]
-    fn linux_falls_back_to_gio_when_xdg_open_is_missing() {
-        with_temp_path(|dir, _file| {
-            let plan = build_reveal_command_plan(
-                &dir,
-                RevealPlatform::Linux,
-                None,
-                Some(PathBuf::from("/usr/bin/gio")),
-            )
-            .expect("plan should build")
-            .expect("plan should exist");
-
-            assert_eq!(plan.program.to_string_lossy(), "/usr/bin/gio");
-            assert_eq!(
-                plan.args,
-                vec![
-                    std::ffi::OsString::from("open"),
-                    dir.as_os_str().to_os_string()
-                ]
-            );
-            assert_eq!(plan.display_target, dir);
-        });
-    }
-
-    #[test]
-    fn linux_returns_a_clear_error_without_openers() {
-        with_temp_path(|dir, _file| {
-            let error = build_reveal_command_plan(&dir, RevealPlatform::Linux, None, None)
-                .expect_err("missing openers should fail");
-
-            assert!(error
-                .to_string()
-                .contains("neither xdg-open nor gio open is available"));
-        });
-    }
-
-    #[test]
     fn mac_files_use_open_for_default_app() {
-        with_temp_path(|_dir, file| {
-            let plan = build_open_command_plan(&file, RevealPlatform::Macos, None, None)
+        with_temp_file(|file| {
+            let plan = build_open_command_plan(&file, OpenPlatform::Macos, None, None)
                 .expect("plan should build")
                 .expect("plan should exist");
 
@@ -811,8 +172,8 @@ mod tests {
 
     #[test]
     fn windows_files_use_cmd_start_for_default_app() {
-        with_temp_path(|_dir, file| {
-            let plan = build_open_command_plan(&file, RevealPlatform::Windows, None, None)
+        with_temp_file(|file| {
+            let plan = build_open_command_plan(&file, OpenPlatform::Windows, None, None)
                 .expect("plan should build")
                 .expect("plan should exist");
 
@@ -820,9 +181,9 @@ mod tests {
             assert_eq!(
                 plan.args,
                 vec![
-                    std::ffi::OsString::from("/C"),
-                    std::ffi::OsString::from("start"),
-                    std::ffi::OsString::from(""),
+                    OsString::from("/C"),
+                    OsString::from("start"),
+                    OsString::from(""),
                     file.as_os_str().to_os_string(),
                 ]
             );
@@ -832,10 +193,10 @@ mod tests {
 
     #[test]
     fn linux_prefers_xdg_open_for_default_app() {
-        with_temp_path(|_dir, file| {
+        with_temp_file(|file| {
             let plan = build_open_command_plan(
                 &file,
-                RevealPlatform::Linux,
+                OpenPlatform::Linux,
                 Some(PathBuf::from("/usr/bin/xdg-open")),
                 Some(PathBuf::from("/usr/bin/gio")),
             )
@@ -849,65 +210,35 @@ mod tests {
     }
 
     #[test]
-    fn resolve_target_path_for_repo_lookup_allows_nested_missing_parents() {
-        with_temp_path(|dir, _file| {
-            let root = dir.parent().expect("root should exist").to_path_buf();
-            let canonical_root = root.canonicalize().expect("root should resolve");
-
-            let resolved = resolve_target_path_for_repo_lookup(
-                &canonical_root,
-                "src/components/FileExplorer.tsx",
+    fn linux_falls_back_to_gio_for_default_app() {
+        with_temp_file(|file| {
+            let plan = build_open_command_plan(
+                &file,
+                OpenPlatform::Linux,
+                None,
+                Some(PathBuf::from("/usr/bin/gio")),
             )
-            .expect("nested path should resolve");
+            .expect("plan should build")
+            .expect("plan should exist");
 
+            assert_eq!(plan.program.to_string_lossy(), "/usr/bin/gio");
             assert_eq!(
-                resolved,
-                canonical_root.join("src/components/FileExplorer.tsx")
+                plan.args,
+                vec![OsString::from("open"), file.as_os_str().to_os_string()]
             );
+            assert_eq!(plan.display_target, file);
         });
     }
 
     #[test]
-    fn resolve_target_path_for_repo_lookup_rejects_missing_parent_traversal() {
-        with_temp_path(|dir, _file| {
-            let root = dir.parent().expect("root should exist").to_path_buf();
-            let canonical_root = root.canonicalize().expect("root should resolve");
+    fn linux_returns_a_clear_error_without_openers() {
+        with_temp_file(|file| {
+            let error = build_open_command_plan(&file, OpenPlatform::Linux, None, None)
+                .expect_err("missing openers should fail");
 
-            let error =
-                resolve_target_path_for_repo_lookup(&canonical_root, "../outside/FileExplorer.tsx")
-                    .expect_err("path traversal should fail");
-
-            assert!(error.to_string().contains("invalid file or directory path"));
-        });
-    }
-
-    #[test]
-    fn resolve_target_path_for_repo_lookup_rejects_parent_dir_components_inside_missing_ancestors()
-    {
-        with_temp_path(|dir, _file| {
-            let root = dir.parent().expect("root should exist").to_path_buf();
-            let canonical_root = root.canonicalize().expect("root should resolve");
-
-            let error =
-                resolve_target_path_for_repo_lookup(&canonical_root, "missing/../nested/file.txt")
-                    .expect_err("unresolved parent segments should be rejected");
-
-            assert!(error.to_string().contains("invalid file or directory path"));
-        });
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn resolve_target_path_for_repo_lookup_preserves_symlink_entries() {
-        with_temp_path(|dir, _file| {
-            let root = dir.parent().expect("root should exist").to_path_buf();
-            let canonical_root = root.canonicalize().expect("root should resolve");
-            symlink("nested/file.txt", root.join("link.txt")).expect("symlink should exist");
-
-            let resolved = resolve_target_path_for_repo_lookup(&canonical_root, "link.txt")
-                .expect("symlink path should resolve");
-
-            assert_eq!(resolved, canonical_root.join("link.txt"));
+            assert!(error
+                .to_string()
+                .contains("neither xdg-open nor gio open is available"));
         });
     }
 }

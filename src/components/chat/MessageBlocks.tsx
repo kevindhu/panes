@@ -76,7 +76,6 @@ import MarkdownContent from "./MarkdownContent";
 import { AttachmentChip } from "./AttachmentChip";
 import {
   extractTextLinkMatches,
-  getWorkspacePaneLeafIdFromEventTarget,
   navigateLinkTarget,
 } from "../../lib/fileLinkNavigation";
 import {
@@ -185,10 +184,7 @@ function handlePlainTextLinkClick(
   event.preventDefault();
   if (!transcriptLinkShouldNavigate(event, event.currentTarget)) return;
   event.stopPropagation();
-  void navigateLinkTarget(target, {
-    shiftKey: event.shiftKey,
-    sourceLeafId: getWorkspacePaneLeafIdFromEventTarget(event.currentTarget),
-  });
+  void navigateLinkTarget(target);
 }
 
 export const ACTION_HEADER_MAX_CHARS = 160;

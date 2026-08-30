@@ -11,10 +11,6 @@
     "retry": "Try again",
     "save": "Save"
   },
-  "fileReferences": {
-    "resolveFailed": "Could not find {{reference}} in this workspace.",
-    "shiftClickHint": "Shift-click to open in the editor"
-  },
   "labels": {
     "settings": "Settings"
   }

@@ -4,8 +4,6 @@ mod config;
 mod db;
 mod diagnostic_logs;
 mod engines;
-mod file_tree;
-mod fs_ops;
 #[cfg(any(target_os = "linux", test))]
 mod linux_appimage;
 mod linux_webkit;
@@ -25,7 +23,6 @@ use rusqlite::OptionalExtension;
 use config::app_config::AppConfig;
 use db::Database;
 use engines::{CodexRuntimeEvent, EngineManager};
-use file_tree::FileTreeCache;
 #[cfg(target_os = "macos")]
 use locale::native_strings;
 use models::{
@@ -81,7 +78,6 @@ fn initialize_app_state() -> anyhow::Result<AppState> {
         engines: Arc::new(EngineManager::new()),
         keep_awake,
         turns: Arc::new(TurnManager::default()),
-        file_tree_cache: Arc::new(FileTreeCache::new()),
         pending_forks: Arc::new(crate::state::PendingThreadMutationManager::default()),
         pending_rollbacks: Arc::new(crate::state::PendingThreadMutationManager::default()),
     })
@@ -212,19 +208,7 @@ pub fn run() {
             commands::workspace::archive_workspace,
             commands::workspace::restore_workspace,
             commands::workspace::delete_workspace,
-            commands::workspace::list_workspace_dirs,
-            commands::workspace::get_workspace_file_tree_page,
-            commands::workspace::search_workspace_files,
             commands::app::show_agent_notification,
-            commands::files::list_dir,
-            commands::files::read_file,
-            commands::files::resolve_editor_file_reference,
-            commands::files::write_file,
-            commands::files::create_file,
-            commands::files::create_dir,
-            commands::files::rename_path,
-            commands::files::delete_path,
-            commands::files::reveal_path,
             commands::files::open_path_with_default_app,
             commands::engines::list_engines,
             commands::engines::engine_health,

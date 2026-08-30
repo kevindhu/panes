@@ -17,7 +17,6 @@ import { createChatImageDescriptor } from "../../lib/chatImageSources";
 import { recordPerfMetric } from "../../lib/perfTelemetry";
 import {
   classifyLinkTarget,
-  getWorkspacePaneLeafIdFromEventTarget,
   navigateLinkTarget,
 } from "../../lib/fileLinkNavigation";
 import {
@@ -246,10 +245,7 @@ function handleMarkdownLinkClick(event: ReactMouseEvent<HTMLDivElement>): void {
   if (targetKind === "local") {
     event.stopPropagation();
   }
-  void navigateLinkTarget(rawHref, {
-    shiftKey: event.shiftKey,
-    sourceLeafId: getWorkspacePaneLeafIdFromEventTarget(event.currentTarget),
-  });
+  void navigateLinkTarget(rawHref);
 }
 
 function handleMarkdownLinkMouseDown(event: ReactMouseEvent<HTMLDivElement>): void {

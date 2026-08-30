@@ -1,8 +1,11 @@
-import type { EditorRevealLocation } from "../types";
+export interface FileLinkLocation {
+  line: number;
+  column?: number | null;
+}
 
 export interface ParsedLocalPathTarget {
   path: string;
-  reveal: EditorRevealLocation | null;
+  reveal: FileLinkLocation | null;
 }
 
 const KNOWN_ROOT_FILE_EXTENSIONS = new Set([
@@ -119,7 +122,7 @@ export function trimLinkText(value: string): string {
   return value.replace(TRAILING_LINK_PUNCTUATION_RE, "");
 }
 
-export function parseHashReveal(hash: string): EditorRevealLocation | null {
+export function parseHashReveal(hash: string): FileLinkLocation | null {
   const normalized = hash.replace(/^#/, "");
   const match = /^L(\d+)(?:C(\d+))?(?:[-:].*)?$/i.exec(normalized);
   if (!match) {

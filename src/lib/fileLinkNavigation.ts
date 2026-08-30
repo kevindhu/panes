@@ -27,14 +27,6 @@ export interface LinkResolutionContext {
   activeRepoId?: string | null;
 }
 
-export interface ResolvedLocalFileLink {
-  rootPath: string;
-  filePath: string;
-  absolutePath: string;
-  line?: number;
-  column?: number;
-}
-
 export interface TextLinkMatch {
   text: string;
   startIndex: number;
@@ -43,7 +35,7 @@ export interface TextLinkMatch {
 }
 
 export type LinkTargetKind = "local" | "external" | "other";
-export type LinkNavigationResult = "internal" | "system" | "external" | "ignored";
+export type LinkNavigationResult = "system" | "external" | "ignored";
 
 export function classifyLinkTarget(rawTarget: string): LinkTargetKind {
   if (isLocalFileLinkSyntax(rawTarget)) {
@@ -114,10 +106,10 @@ function getOrderedRelativeRoots(context: LinkResolutionContext): string[] {
   return [...new Set(roots)];
 }
 
-export function resolveLocalFileLinkTarget(
+export function resolveLocalFileLinkPath(
   rawTarget: string,
   context: LinkResolutionContext,
-): ResolvedLocalFileLink | null {
+): string | null {
   const absoluteTarget = parseLocalAbsolutePathTarget(rawTarget) ?? parseLocalUrlTarget(rawTarget);
 
   const workspaceRoot = context.workspaceRoot ? normalizeAbsolutePath(context.workspaceRoot) : null;
@@ -142,13 +134,7 @@ export function resolveLocalFileLinkTarget(
       return null;
     }
 
-    return {
-      rootPath: matchedRoot,
-      filePath: relativePath,
-      absolutePath,
-      line: absoluteTarget.reveal?.line,
-      column: absoluteTarget.reveal?.column ?? undefined,
-    };
+    return absolutePath;
   }
 
   const relativeTarget = parseLocalRelativePathTarget(rawTarget);
@@ -162,37 +148,13 @@ export function resolveLocalFileLinkTarget(
       continue;
     }
 
-    return {
-      rootPath: root,
-      filePath: relativeTarget.path,
-      absolutePath,
-      line: relativeTarget.reveal?.line,
-      column: relativeTarget.reveal?.column ?? undefined,
-    };
+    return absolutePath;
   }
 
   return null;
 }
 
-export interface LinkNavigationOptions {
-  shiftKey: boolean;
-  sourceLeafId?: string | null;
-}
-
-export function getWorkspacePaneLeafIdFromEventTarget(target: EventTarget | null): string | null {
-  const element = target instanceof Element
-    ? target
-    : target instanceof Node
-      ? target.parentElement
-      : null;
-  const leaf = element?.closest("[data-workspace-pane-leaf-id]");
-  return leaf instanceof HTMLElement ? leaf.dataset.workspacePaneLeafId ?? null : null;
-}
-
-export async function navigateLinkTarget(
-  rawTarget: string,
-  options: LinkNavigationOptions,
-): Promise<LinkNavigationResult> {
+export async function navigateLinkTarget(rawTarget: string): Promise<LinkNavigationResult> {
   const targetKind = classifyLinkTarget(rawTarget);
   if (targetKind === "external") {
     await openExternal(rawTarget);
@@ -212,36 +174,14 @@ export async function navigateLinkTarget(
     ? workspaceState.repos.filter((repo) => repo.workspaceId === activeWorkspaceId)
     : workspaceState.repos;
 
-  const localTarget = resolveLocalFileLinkTarget(rawTarget, {
+  const localPath = resolveLocalFileLinkPath(rawTarget, {
     workspaceRoot: activeWorkspace?.rootPath ?? null,
     repos,
     activeRepoId: workspaceState.activeRepoId,
   });
 
-  if (localTarget && options.shiftKey) {
-    const reveal = localTarget.line
-      ? {
-          line: localTarget.line,
-          column: localTarget.column,
-        }
-      : null;
-
-    window.dispatchEvent(
-      new CustomEvent("codex-open-file", {
-        detail: {
-          rootPath: localTarget.rootPath,
-          filePath: localTarget.filePath,
-          line: reveal?.line,
-          column: reveal?.column,
-        },
-      }),
-    );
-
-    return "internal";
-  }
-
   const absoluteTarget =
-    localTarget?.absolutePath ??
+    localPath ??
     (parseLocalAbsolutePathTarget(rawTarget) ?? parseLocalUrlTarget(rawTarget))?.path;
   if (absoluteTarget) {
     await ipc.openPathWithDefaultApp(normalizeAbsolutePath(absoluteTarget));

@@ -4,8 +4,8 @@ use tokio::sync::{Mutex, OnceCell, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::app_config::AppConfig, db::Database, engines::EngineManager, file_tree::FileTreeCache,
-    models::ThreadDto, power::KeepAwakeManager,
+    config::app_config::AppConfig, db::Database, engines::EngineManager, models::ThreadDto,
+    power::KeepAwakeManager,
 };
 
 #[derive(Clone)]
@@ -15,7 +15,6 @@ pub struct AppState {
     pub engines: Arc<EngineManager>,
     pub keep_awake: Arc<KeepAwakeManager>,
     pub turns: Arc<TurnManager>,
-    pub file_tree_cache: Arc<FileTreeCache>,
     pub pending_forks: Arc<PendingThreadMutationManager>,
     pub pending_rollbacks: Arc<PendingThreadMutationManager>,
 }
