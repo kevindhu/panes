@@ -3266,6 +3266,9 @@ async fn create_pending_codex_branch_thread(
                 );
             }
             db::threads::refresh_thread_message_stats(db, &created.id)?;
+            // Cloned messages retain their original timestamps, but creating the branch is
+            // fresh activity and should place it at the top of the sessions list.
+            db::threads::touch_thread_activity(db, &created.id)?;
 
             let metadata = clone_codex_branch_metadata(
                 source_thread.engine_metadata.as_ref(),
@@ -4960,7 +4963,7 @@ mod tests {
             turn_reasoning_effort: None,
             token_input: u64::from(role == "user"),
             token_output: u64::from(role == "assistant"),
-            created_at: None,
+            created_at: Some("2020-01-01 00:00:00.000".to_string()),
         })
         .collect::<Vec<_>>();
         db::messages::replace_thread_messages(&state.db, &source.id, &imported)
@@ -4989,6 +4992,10 @@ mod tests {
         );
         // The transcript was cloned locally so the branch is immediately readable.
         assert_eq!(branch.message_count, 4);
+        assert!(branch.last_activity_at > source.last_activity_at);
+        let listed = db::threads::list_threads_for_workspace(&state.db, &source.workspace_id)
+            .expect("expected workspace threads to be listed");
+        assert_eq!(listed.first().map(|thread| thread.id.as_str()), Some(branch.id.as_str()));
     }
 
     #[tokio::test]
