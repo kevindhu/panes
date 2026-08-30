@@ -133,12 +133,22 @@ fn usage_snapshot_missing_context(usage: Option<&crate::engines::UsageLimitsSnap
     usage.current_tokens.is_none()
         && usage.max_context_tokens.is_none()
         && usage.context_window_percent.is_none()
+        && usage.input_tokens.is_none()
+        && usage.cached_input_tokens.is_none()
+        && usage.cache_write_input_tokens.is_none()
+        && usage.output_tokens.is_none()
+        && usage.reasoning_output_tokens.is_none()
 }
 
 fn usage_snapshot_has_context_metrics(usage: &crate::engines::UsageLimitsSnapshot) -> bool {
     usage.current_tokens.is_some()
         || usage.max_context_tokens.is_some()
         || usage.context_window_percent.is_some()
+        || usage.input_tokens.is_some()
+        || usage.cached_input_tokens.is_some()
+        || usage.cache_write_input_tokens.is_some()
+        || usage.output_tokens.is_some()
+        || usage.reasoning_output_tokens.is_some()
 }
 
 fn cached_context_usage_from_metadata(
@@ -155,8 +165,20 @@ fn cached_context_usage_from_metadata(
         .get("contextWindowPercent")
         .and_then(Value::as_u64)
         .and_then(|value| u8::try_from(value).ok());
+    let input_tokens = cache.get("inputTokens").and_then(Value::as_u64);
+    let cached_input_tokens = cache.get("cachedInputTokens").and_then(Value::as_u64);
+    let cache_write_input_tokens = cache.get("cacheWriteInputTokens").and_then(Value::as_u64);
+    let output_tokens = cache.get("outputTokens").and_then(Value::as_u64);
+    let reasoning_output_tokens = cache.get("reasoningOutputTokens").and_then(Value::as_u64);
 
-    if current_tokens.is_none() && max_context_tokens.is_none() && context_window_percent.is_none()
+    if current_tokens.is_none()
+        && max_context_tokens.is_none()
+        && context_window_percent.is_none()
+        && input_tokens.is_none()
+        && cached_input_tokens.is_none()
+        && cache_write_input_tokens.is_none()
+        && output_tokens.is_none()
+        && reasoning_output_tokens.is_none()
     {
         return None;
     }
@@ -165,6 +187,11 @@ fn cached_context_usage_from_metadata(
         current_tokens,
         max_context_tokens,
         context_window_percent,
+        input_tokens,
+        cached_input_tokens,
+        cache_write_input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
         ..crate::engines::UsageLimitsSnapshot::default()
     })
 }
@@ -182,6 +209,21 @@ fn merge_cached_context_usage(
     }
     if merged.context_window_percent.is_none() {
         merged.context_window_percent = cached.context_window_percent;
+    }
+    if merged.input_tokens.is_none() {
+        merged.input_tokens = cached.input_tokens;
+    }
+    if merged.cached_input_tokens.is_none() {
+        merged.cached_input_tokens = cached.cached_input_tokens;
+    }
+    if merged.cache_write_input_tokens.is_none() {
+        merged.cache_write_input_tokens = cached.cache_write_input_tokens;
+    }
+    if merged.output_tokens.is_none() {
+        merged.output_tokens = cached.output_tokens;
+    }
+    if merged.reasoning_output_tokens.is_none() {
+        merged.reasoning_output_tokens = cached.reasoning_output_tokens;
     }
     merged
 }
@@ -202,6 +244,11 @@ fn merge_context_usage_cache_into_metadata(
                 "currentTokens": usage.current_tokens,
                 "maxContextTokens": usage.max_context_tokens,
                 "contextWindowPercent": usage.context_window_percent,
+                "inputTokens": usage.input_tokens,
+                "cachedInputTokens": usage.cached_input_tokens,
+                "cacheWriteInputTokens": usage.cache_write_input_tokens,
+                "outputTokens": usage.output_tokens,
+                "reasoningOutputTokens": usage.reasoning_output_tokens,
             }),
         );
     }
@@ -4858,6 +4905,11 @@ mod tests {
                 "currentTokens": 42000,
                 "maxContextTokens": 200000,
                 "contextWindowPercent": 84,
+                "inputTokens": 34000,
+                "cachedInputTokens": 12000,
+                "cacheWriteInputTokens": 2000,
+                "outputTokens": 8000,
+                "reasoningOutputTokens": 3000,
             }
         })))
         .expect("expected cached context usage to deserialize");
@@ -4865,6 +4917,11 @@ mod tests {
         assert_eq!(cached.current_tokens, Some(42000));
         assert_eq!(cached.max_context_tokens, Some(200000));
         assert_eq!(cached.context_window_percent, Some(84));
+        assert_eq!(cached.input_tokens, Some(34000));
+        assert_eq!(cached.cached_input_tokens, Some(12000));
+        assert_eq!(cached.cache_write_input_tokens, Some(2000));
+        assert_eq!(cached.output_tokens, Some(8000));
+        assert_eq!(cached.reasoning_output_tokens, Some(3000));
     }
 
     #[test]
@@ -4873,6 +4930,11 @@ mod tests {
             current_tokens: Some(42000),
             max_context_tokens: Some(200000),
             context_window_percent: Some(84),
+            input_tokens: Some(34000),
+            cached_input_tokens: Some(12000),
+            cache_write_input_tokens: Some(2000),
+            output_tokens: Some(8000),
+            reasoning_output_tokens: Some(3000),
             ..crate::engines::UsageLimitsSnapshot::default()
         };
         let usage = crate::engines::UsageLimitsSnapshot {
@@ -4888,6 +4950,11 @@ mod tests {
         assert_eq!(merged.current_tokens, Some(42000));
         assert_eq!(merged.max_context_tokens, Some(160000));
         assert_eq!(merged.context_window_percent, Some(84));
+        assert_eq!(merged.input_tokens, Some(34000));
+        assert_eq!(merged.cached_input_tokens, Some(12000));
+        assert_eq!(merged.cache_write_input_tokens, Some(2000));
+        assert_eq!(merged.output_tokens, Some(8000));
+        assert_eq!(merged.reasoning_output_tokens, Some(3000));
         assert_eq!(merged.five_hour_percent, Some(11));
     }
 }

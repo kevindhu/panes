@@ -121,6 +121,9 @@ try {
   const threadRead = loadJson(requireFile(schemaRoot, join("v2", "ThreadReadResponse.json")));
   const turnStart = loadJson(requireFile(schemaRoot, join("v2", "TurnStartParams.json")));
   const turnPlanUpdated = loadJson(requireFile(schemaRoot, join("v2", "TurnPlanUpdatedNotification.json")));
+  const threadTokenUsageUpdated = loadJson(
+    requireFile(schemaRoot, join("v2", "ThreadTokenUsageUpdatedNotification.json")),
+  );
   const toolRequestUserInput = loadJson(requireFile(schemaRoot, "ToolRequestUserInputParams.json"));
   const toolRequestUserInputResponse = loadJson(requireFile(schemaRoot, "ToolRequestUserInputResponse.json"));
   const serverNotifications = loadJson(requireFile(schemaRoot, "ServerNotification.json"));
@@ -161,6 +164,23 @@ try {
     turnPlanUpdated.definitions?.TurnPlanStepStatus?.enum ?? [],
     ["pending", "inProgress", "completed"],
     "TurnPlanUpdatedNotification statuses",
+  );
+  assertContainsAll(
+    Object.keys(threadTokenUsageUpdated.definitions?.ThreadTokenUsage?.properties ?? {}),
+    ["last", "modelContextWindow", "total"],
+    "ThreadTokenUsage fields",
+  );
+  assertContainsAll(
+    Object.keys(threadTokenUsageUpdated.definitions?.TokenUsageBreakdown?.properties ?? {}),
+    [
+      "cacheWriteInputTokens",
+      "cachedInputTokens",
+      "inputTokens",
+      "outputTokens",
+      "reasoningOutputTokens",
+      "totalTokens",
+    ],
+    "TokenUsageBreakdown fields",
   );
 
   const reviewedItemTypes = Object.keys(contract.threadItemTypes ?? {});

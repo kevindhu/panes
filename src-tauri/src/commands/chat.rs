@@ -74,6 +74,11 @@ fn usage_snapshot_has_context_metrics(usage: &crate::engines::UsageLimitsSnapsho
     usage.current_tokens.is_some()
         || usage.max_context_tokens.is_some()
         || usage.context_window_percent.is_some()
+        || usage.input_tokens.is_some()
+        || usage.cached_input_tokens.is_some()
+        || usage.cache_write_input_tokens.is_some()
+        || usage.output_tokens.is_some()
+        || usage.reasoning_output_tokens.is_some()
 }
 
 fn merge_context_usage_cache_into_metadata(
@@ -92,6 +97,11 @@ fn merge_context_usage_cache_into_metadata(
                 "currentTokens": usage.current_tokens,
                 "maxContextTokens": usage.max_context_tokens,
                 "contextWindowPercent": usage.context_window_percent,
+                "inputTokens": usage.input_tokens,
+                "cachedInputTokens": usage.cached_input_tokens,
+                "cacheWriteInputTokens": usage.cache_write_input_tokens,
+                "outputTokens": usage.output_tokens,
+                "reasoningOutputTokens": usage.reasoning_output_tokens,
             }),
         );
     }

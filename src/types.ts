@@ -713,6 +713,11 @@ export interface UsageLimitsUpdatedEvent {
     current_tokens?: number | null;
     max_context_tokens?: number | null;
     context_window_percent?: number | null;
+    input_tokens?: number | null;
+    cached_input_tokens?: number | null;
+    cache_write_input_tokens?: number | null;
+    output_tokens?: number | null;
+    reasoning_output_tokens?: number | null;
     five_hour_percent?: number | null;
     weekly_percent?: number | null;
     five_hour_resets_at?: number | null;
@@ -788,10 +793,19 @@ export type ChatInputItem =
 
 // ── Context Usage ───────────────────────────────────────────────────
 
+export interface ContextTokenBreakdown {
+  inputTokens: number | null;
+  cachedInputTokens: number | null;
+  cacheWriteInputTokens: number | null;
+  outputTokens: number | null;
+  reasoningOutputTokens: number | null;
+}
+
 export interface ContextUsage {
   currentTokens: number | null;
   maxContextTokens: number | null;
   contextPercent: number | null;
+  breakdown: ContextTokenBreakdown | null;
   windowFiveHourPercent: number | null;
   windowWeeklyPercent: number | null;
   windowFiveHourResetsAt: string | null;

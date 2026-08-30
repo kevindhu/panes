@@ -24,6 +24,7 @@ import type {
   ChatAttachment,
   ChatInputItem,
   ContentBlock,
+  ContextTokenBreakdown,
   ContextUsage,
   MentionBlock,
   Message,
@@ -448,12 +449,31 @@ function normalizeContextUsageCachePercent(value: unknown): number | null {
   return Math.max(0, Math.min(100, Math.round(value)));
 }
 
+function normalizeContextTokenBreakdown(
+  inputTokensValue: unknown,
+  cachedInputTokensValue: unknown,
+  cacheWriteInputTokensValue: unknown,
+  outputTokensValue: unknown,
+  reasoningOutputTokensValue: unknown,
+): ContextTokenBreakdown | null {
+  const breakdown: ContextTokenBreakdown = {
+    inputTokens: normalizeContextUsageCacheInteger(inputTokensValue),
+    cachedInputTokens: normalizeContextUsageCacheInteger(cachedInputTokensValue),
+    cacheWriteInputTokens: normalizeContextUsageCacheInteger(cacheWriteInputTokensValue),
+    outputTokens: normalizeContextUsageCacheInteger(outputTokensValue),
+    reasoningOutputTokens: normalizeContextUsageCacheInteger(reasoningOutputTokensValue),
+  };
+
+  return Object.values(breakdown).some((value) => value !== null) ? breakdown : null;
+}
+
 function hasContextUsageMetrics(usage: ContextUsage | null | undefined): usage is ContextUsage {
   return Boolean(
     usage &&
       (usage.currentTokens !== null ||
         usage.maxContextTokens !== null ||
-        usage.contextPercent !== null),
+        usage.contextPercent !== null ||
+        usage.breakdown !== null),
   );
 }
 
@@ -468,12 +488,24 @@ function contextUsageFromThreadMetadata(
   const cacheRecord = cache as Record<string, unknown>;
   const currentTokens = normalizeContextUsageCacheInteger(cacheRecord.currentTokens);
   const maxContextTokens = normalizeContextUsageCacheInteger(cacheRecord.maxContextTokens);
+  const breakdown = normalizeContextTokenBreakdown(
+    cacheRecord.inputTokens,
+    cacheRecord.cachedInputTokens,
+    cacheRecord.cacheWriteInputTokens,
+    cacheRecord.outputTokens,
+    cacheRecord.reasoningOutputTokens,
+  );
   let contextPercent = calculateContextPercentRemaining(currentTokens, maxContextTokens);
   if (contextPercent === null) {
     contextPercent = normalizeContextUsageCachePercent(cacheRecord.contextWindowPercent);
   }
 
-  if (currentTokens === null && maxContextTokens === null && contextPercent === null) {
+  if (
+    currentTokens === null &&
+    maxContextTokens === null &&
+    contextPercent === null &&
+    breakdown === null
+  ) {
     return null;
   }
 
@@ -481,6 +513,7 @@ function contextUsageFromThreadMetadata(
     currentTokens,
     maxContextTokens,
     contextPercent,
+    breakdown,
     windowFiveHourPercent: null,
     windowWeeklyPercent: null,
     windowFiveHourResetsAt: null,
@@ -503,6 +536,7 @@ function accountUsageWindowsFromUsageLimits(usage: ContextUsage | null): Context
     currentTokens: null,
     maxContextTokens: null,
     contextPercent: null,
+    breakdown: null,
     windowFiveHourPercent: usage.windowFiveHourPercent,
     windowWeeklyPercent: usage.windowWeeklyPercent,
     windowFiveHourResetsAt: usage.windowFiveHourResetsAt,
@@ -522,6 +556,11 @@ function mergeContextUsageCacheIntoThread(thread: Thread, usage: ContextUsage): 
     currentTokens: usage.currentTokens,
     maxContextTokens: usage.maxContextTokens,
     contextWindowPercent: usage.contextPercent,
+    inputTokens: usage.breakdown?.inputTokens ?? null,
+    cachedInputTokens: usage.breakdown?.cachedInputTokens ?? null,
+    cacheWriteInputTokens: usage.breakdown?.cacheWriteInputTokens ?? null,
+    outputTokens: usage.breakdown?.outputTokens ?? null,
+    reasoningOutputTokens: usage.breakdown?.reasoningOutputTokens ?? null,
   };
 
   if (
@@ -529,7 +568,15 @@ function mergeContextUsageCacheIntoThread(thread: Thread, usage: ContextUsage): 
     normalizeContextUsageCacheInteger(currentCache?.maxContextTokens) ===
       nextCache.maxContextTokens &&
     normalizeContextUsageCachePercent(currentCache?.contextWindowPercent) ===
-      nextCache.contextWindowPercent
+      nextCache.contextWindowPercent &&
+    normalizeContextUsageCacheInteger(currentCache?.inputTokens) === nextCache.inputTokens &&
+    normalizeContextUsageCacheInteger(currentCache?.cachedInputTokens) ===
+      nextCache.cachedInputTokens &&
+    normalizeContextUsageCacheInteger(currentCache?.cacheWriteInputTokens) ===
+      nextCache.cacheWriteInputTokens &&
+    normalizeContextUsageCacheInteger(currentCache?.outputTokens) === nextCache.outputTokens &&
+    normalizeContextUsageCacheInteger(currentCache?.reasoningOutputTokens) ===
+      nextCache.reasoningOutputTokens
   ) {
     return thread;
   }
@@ -2240,6 +2287,13 @@ function mapUsageLimitsFromEvent(event: Extract<StreamEvent, { type: "UsageLimit
   const currentTokensRaw = usage.current_tokens;
   const maxContextTokensRaw = usage.max_context_tokens;
   const contextPercentRaw = usage.context_window_percent;
+  const breakdown = normalizeContextTokenBreakdown(
+    usage.input_tokens,
+    usage.cached_input_tokens,
+    usage.cache_write_input_tokens,
+    usage.output_tokens,
+    usage.reasoning_output_tokens,
+  );
   const fiveHourPercentRaw = usage.five_hour_percent;
   const weeklyPercentRaw = usage.weekly_percent;
 
@@ -2259,6 +2313,7 @@ function mapUsageLimitsFromEvent(event: Extract<StreamEvent, { type: "UsageLimit
 
   const hasAnyMetric =
     hasContextMetrics ||
+    breakdown !== null ||
     typeof contextPercentRaw === "number" ||
     typeof fiveHourPercentRaw === "number" ||
     typeof weeklyPercentRaw === "number";
@@ -2282,6 +2337,7 @@ function mapUsageLimitsFromEvent(event: Extract<StreamEvent, { type: "UsageLimit
     maxContextTokens,
     contextPercent:
       contextPercent === null ? null : Math.max(0, Math.min(100, contextPercent)),
+    breakdown,
     windowFiveHourPercent: toRemainingPercent(fiveHourPercentRaw),
     windowWeeklyPercent: toRemainingPercent(weeklyPercentRaw),
     windowFiveHourResetsAt: toIsoTimestamp(usage.five_hour_resets_at),
@@ -2305,6 +2361,7 @@ function mergeUsageLimits(
     currentTokens: next.currentTokens ?? previous.currentTokens,
     maxContextTokens: next.maxContextTokens ?? previous.maxContextTokens,
     contextPercent: next.contextPercent ?? previous.contextPercent,
+    breakdown: next.breakdown ?? previous.breakdown,
     windowFiveHourPercent: next.windowFiveHourPercent ?? previous.windowFiveHourPercent,
     windowWeeklyPercent: next.windowWeeklyPercent ?? previous.windowWeeklyPercent,
     windowFiveHourResetsAt: next.windowFiveHourResetsAt ?? previous.windowFiveHourResetsAt,

@@ -1329,20 +1329,18 @@ struct RateLimitWindowInfo {
 
 const CONTEXT_WINDOW_BASELINE_TOKENS: u64 = 12_000;
 
-fn extract_context_tokens(token_usage: &Value) -> Option<u64> {
+fn context_token_bucket(token_usage: &Value) -> &Value {
     token_usage
         .get("last")
-        .and_then(|last| {
-            extract_any_u64(last, &["totalTokens", "total_tokens"])
-                .or_else(|| extract_any_u64(last, &["inputTokens", "input_tokens"]))
-        })
-        .or_else(|| {
-            token_usage.get("total").and_then(|total| {
-                extract_any_u64(total, &["totalTokens", "total_tokens"])
-                    .or_else(|| extract_any_u64(total, &["inputTokens", "input_tokens"]))
-            })
-        })
-        .or_else(|| extract_any_u64(token_usage, &["totalTokens", "total_tokens"]))
+        .filter(|value| value.is_object())
+        .or_else(|| token_usage.get("total").filter(|value| value.is_object()))
+        .unwrap_or(token_usage)
+}
+
+fn extract_context_tokens(token_usage: &Value) -> Option<u64> {
+    let bucket = context_token_bucket(token_usage);
+    extract_any_u64(bucket, &["totalTokens", "total_tokens"])
+        .or_else(|| extract_any_u64(bucket, &["inputTokens", "input_tokens"]))
 }
 
 fn calculate_context_window_percent_remaining(
@@ -1369,6 +1367,19 @@ fn extract_context_usage_limits(value: &Value) -> Option<UsageLimitsSnapshot> {
         .or_else(|| value.get("turn").and_then(|turn| turn.get("tokenUsage")))?;
 
     let current_tokens = extract_context_tokens(token_usage);
+    let bucket = context_token_bucket(token_usage);
+    let input_tokens = extract_any_u64(bucket, &["inputTokens", "input_tokens"]);
+    let cached_input_tokens =
+        extract_any_u64(bucket, &["cachedInputTokens", "cached_input_tokens"]);
+    let cache_write_input_tokens = extract_any_u64(
+        bucket,
+        &["cacheWriteInputTokens", "cache_write_input_tokens"],
+    );
+    let output_tokens = extract_any_u64(bucket, &["outputTokens", "output_tokens"]);
+    let reasoning_output_tokens = extract_any_u64(
+        bucket,
+        &["reasoningOutputTokens", "reasoning_output_tokens"],
+    );
 
     let max_context_tokens =
         extract_any_u64(token_usage, &["modelContextWindow", "model_context_window"]);
@@ -1388,6 +1399,11 @@ fn extract_context_usage_limits(value: &Value) -> Option<UsageLimitsSnapshot> {
         current_tokens,
         max_context_tokens,
         context_window_percent,
+        input_tokens,
+        cached_input_tokens,
+        cache_write_input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
         ..UsageLimitsSnapshot::default()
     })
 }
@@ -1396,6 +1412,11 @@ fn has_usage_limit_metrics(snapshot: &UsageLimitsSnapshot) -> bool {
     snapshot.current_tokens.is_some()
         || snapshot.max_context_tokens.is_some()
         || snapshot.context_window_percent.is_some()
+        || snapshot.input_tokens.is_some()
+        || snapshot.cached_input_tokens.is_some()
+        || snapshot.cache_write_input_tokens.is_some()
+        || snapshot.output_tokens.is_some()
+        || snapshot.reasoning_output_tokens.is_some()
         || snapshot.five_hour_percent.is_some()
         || snapshot.weekly_percent.is_some()
         || snapshot.five_hour_resets_at.is_some()
@@ -1420,6 +1441,26 @@ fn merge_context_usage_snapshot(
 
     if target.context_window_percent != context_update.context_window_percent {
         target.context_window_percent = context_update.context_window_percent;
+        changed = true;
+    }
+    if target.input_tokens != context_update.input_tokens {
+        target.input_tokens = context_update.input_tokens;
+        changed = true;
+    }
+    if target.cached_input_tokens != context_update.cached_input_tokens {
+        target.cached_input_tokens = context_update.cached_input_tokens;
+        changed = true;
+    }
+    if target.cache_write_input_tokens != context_update.cache_write_input_tokens {
+        target.cache_write_input_tokens = context_update.cache_write_input_tokens;
+        changed = true;
+    }
+    if target.output_tokens != context_update.output_tokens {
+        target.output_tokens = context_update.output_tokens;
+        changed = true;
+    }
+    if target.reasoning_output_tokens != context_update.reasoning_output_tokens {
+        target.reasoning_output_tokens = context_update.reasoning_output_tokens;
         changed = true;
     }
 
@@ -2258,6 +2299,11 @@ mod tests {
             "turnId": "turn_123",
             "tokenUsage": {
                 "last": {
+                    "inputTokens": 24000,
+                    "cachedInputTokens": 10000,
+                    "cacheWriteInputTokens": 1000,
+                    "outputTokens": 6000,
+                    "reasoningOutputTokens": 2000,
                     "totalTokens": 30000
                 },
                 "total": {
@@ -2275,6 +2321,11 @@ mod tests {
                 assert_eq!(usage.current_tokens, Some(30000));
                 assert_eq!(usage.max_context_tokens, Some(200000));
                 assert_eq!(usage.context_window_percent, Some(90));
+                assert_eq!(usage.input_tokens, Some(24000));
+                assert_eq!(usage.cached_input_tokens, Some(10000));
+                assert_eq!(usage.cache_write_input_tokens, Some(1000));
+                assert_eq!(usage.output_tokens, Some(6000));
+                assert_eq!(usage.reasoning_output_tokens, Some(2000));
             }
             _ => panic!("expected usage limits update"),
         }

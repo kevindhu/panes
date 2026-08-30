@@ -18,6 +18,13 @@ const usage: ContextUsage = {
   currentTokens: 42_000,
   maxContextTokens: 200_000,
   contextPercent: 84,
+  breakdown: {
+    inputTokens: 34_000,
+    cachedInputTokens: 12_000,
+    cacheWriteInputTokens: 2_000,
+    outputTokens: 8_000,
+    reasoningOutputTokens: 3_000,
+  },
   windowFiveHourPercent: 83,
   windowWeeklyPercent: 58,
   windowFiveHourResetsAt: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
