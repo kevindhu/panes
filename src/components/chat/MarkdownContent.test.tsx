@@ -552,6 +552,59 @@ describe("MarkdownContent", () => {
     );
   });
 
+  it("promotes a standalone local GIF from a fenced Markdown example", async () => {
+    await act(async () => {
+      root.render(
+        <MarkdownContent
+          content={[
+            "```md",
+            "![image](</C:/Users/lemondoo/Downloads/dva.gif>)",
+            "```",
+          ].join("\n")}
+        />,
+      );
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const button = container.querySelector(".markdown-local-image-button");
+    expect(container.querySelector("pre")).toBeNull();
+    expect(button?.getAttribute("data-panes-markdown-local-image-path")).toBe(
+      "C:\\Users\\lemondoo\\Downloads\\dva.gif",
+    );
+    expect(button?.getAttribute("data-panes-markdown-local-image-mime")).toBe("image/gif");
+    expect(mockPrepareAttachmentImageAsset).toHaveBeenCalledWith(
+      "C:\\Users\\lemondoo\\Downloads\\dva.gif",
+      "image/gif",
+      null,
+      null,
+    );
+    expect(container.querySelector(".markdown-local-image-thumbnail")?.getAttribute("src")).toBe(
+      "asset://C:/Users/lemondoo/Downloads/dva.gif?v=full",
+    );
+  });
+
+  it("keeps remote Markdown image examples fenced as code", async () => {
+    await act(async () => {
+      root.render(
+        <MarkdownContent
+          content={[
+            "```md",
+            "![example](https://example.com/image.gif)",
+            "```",
+          ].join("\n")}
+        />,
+      );
+    });
+
+    expect(container.querySelector("pre code")?.textContent).toContain(
+      "![example](https://example.com/image.gif)",
+    );
+    expect(container.querySelector(".markdown-local-image-button")).toBeNull();
+  });
+
   it("routes remote images through the shared viewer without native file APIs", async () => {
     await act(async () => {
       root.render(
@@ -599,8 +652,10 @@ describe("MarkdownContent", () => {
 
     const button = container.querySelector(".markdown-local-image-button") as HTMLButtonElement | null;
     const image = container.querySelector(".markdown-local-image-thumbnail") as HTMLImageElement | null;
+    const figure = container.querySelector(".chat-image-figure-markdown") as HTMLElement | null;
     expect(button).not.toBeNull();
     expect(image).not.toBeNull();
+    expect(figure).not.toBeNull();
 
     await act(async () => {
       if (image) {
@@ -609,6 +664,7 @@ describe("MarkdownContent", () => {
       }
     });
     expect(button?.style.getPropertyValue("--markdown-local-image-frame-width")).toBe("120px");
+    expect(figure?.style.getPropertyValue("--markdown-local-image-frame-width")).toBe("120px");
 
     await act(async () => {
       if (image) {

@@ -21,6 +21,7 @@ describe("local image sources", () => {
 
   it("recognizes absolute Windows drive and canonical UNC image sources", () => {
     expect(isAbsoluteWindowsLocalImageSource("C:/repo/translated%20pages/page.PNG")).toBe(true);
+    expect(isAbsoluteWindowsLocalImageSource("/C:/Users/dev/Downloads/preview.gif")).toBe(true);
     expect(isAbsoluteWindowsLocalImageSource(String.raw`C:\repo\page.webp?cache=1`)).toBe(true);
     expect(
       isAbsoluteWindowsLocalImageSource(String.raw`\\media-server\translations\page 11.png`),
@@ -88,6 +89,9 @@ describe("local image sources", () => {
         "C:\\Users\\dev\\PROJECTS\\current-repo",
       ),
     ).toBe("C:\\Users\\dev\\Downloads\\translated panels\\page.png");
+    expect(resolveLocalImagePath("/C:/Users/dev/Downloads/preview.gif", null)).toBe(
+      "C:\\Users\\dev\\Downloads\\preview.gif",
+    );
     expect(
       resolveLocalImagePath("C:%5CUsers%5Cdev%5CDownloads%5Cpage%2007.png", null),
     ).toBe("C:\\Users\\dev\\Downloads\\page 07.png");

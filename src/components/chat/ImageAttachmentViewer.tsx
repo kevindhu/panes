@@ -452,12 +452,24 @@ export function ImageAttachmentViewer({
     changeScale(1, anchor);
   }
 
+  function handleStageClick(event: ReactMouseEvent<HTMLDivElement>) {
+    if (event.target === imageRef.current) {
+      return;
+    }
+    onClose();
+  }
+
   function handlePointerDown(event: ReactPointerEvent<HTMLDivElement>) {
-    if (scale <= fitScale + SCALE_EPSILON || !currentSrc || event.button !== 0) {
+    if (
+      event.target !== imageRef.current
+      || scale <= fitScale + SCALE_EPSILON
+      || !currentSrc
+      || event.button !== 0
+    ) {
       return;
     }
     event.preventDefault();
-    event.currentTarget.setPointerCapture?.(event.pointerId);
+    imageRef.current.setPointerCapture?.(event.pointerId);
     dragStateRef.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
@@ -484,8 +496,8 @@ export function ImageAttachmentViewer({
     if (dragStateRef.current?.pointerId !== event.pointerId) {
       return;
     }
-    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
-      event.currentTarget.releasePointerCapture?.(event.pointerId);
+    if (imageRef.current?.hasPointerCapture?.(event.pointerId)) {
+      imageRef.current.releasePointerCapture?.(event.pointerId);
     }
     setDragging(false);
     dragStateRef.current = null;
@@ -565,6 +577,11 @@ export function ImageAttachmentViewer({
         aria-modal="true"
         aria-labelledby={titleId}
         tabIndex={-1}
+        onClick={(event) => {
+          if (event.target === event.currentTarget) {
+            onClose();
+          }
+        }}
       >
         <div className="chat-image-viewer-toolbar">
           <div className="chat-image-viewer-meta">
@@ -630,6 +647,7 @@ export function ImageAttachmentViewer({
         <div
           ref={stageRef}
           className={`chat-image-viewer-stage${scale > fitScale + SCALE_EPSILON ? " is-zoomed" : ""}${dragging ? " is-dragging" : ""}`}
+          onClick={handleStageClick}
           onWheel={handleWheel}
           onDoubleClick={handleDoubleClick}
           onPointerDown={handlePointerDown}

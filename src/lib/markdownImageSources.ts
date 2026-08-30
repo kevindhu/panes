@@ -22,6 +22,49 @@ const IMAGE_MIME_TYPES_BY_EXTENSION: Record<string, string> = {
   webp: "image/webp",
 };
 
+const STANDALONE_MARKDOWN_IMAGE_RE =
+  /^!\[([^\]\r\n]*)\]\(\s*(?:<([^>\r\n]+)>|([^\s)\r\n]+))\s*\)$/;
+
+function promoteStandaloneLocalImageFences(
+  root: DocumentFragment,
+  workspaceRootPath?: string | null,
+): boolean {
+  let changed = false;
+
+  for (const code of root.querySelectorAll("pre > code")) {
+    const isMarkdownFence = Array.from(code.classList).some(
+      (className) => className === "language-md" || className === "language-markdown",
+    );
+    if (!isMarkdownFence) {
+      continue;
+    }
+
+    const match = code.textContent?.trim().match(STANDALONE_MARKDOWN_IMAGE_RE);
+    const source = match?.[2]?.trim() || match?.[3]?.trim();
+    if (!match || !source) {
+      continue;
+    }
+
+    const descriptor = createChatImageDescriptor({
+      origin: "markdown",
+      source,
+      alt: match[1]?.trim(),
+      workspaceRootPath,
+    });
+    if (!descriptor?.filePath) {
+      continue;
+    }
+
+    const image = document.createElement("img");
+    image.setAttribute("src", source);
+    image.setAttribute("alt", match[1]?.trim() || descriptor.fileName);
+    code.parentElement?.replaceWith(image);
+    changed = true;
+  }
+
+  return changed;
+}
+
 function guessImageMimeType(filePath: string): string | null {
   const normalizedPath = filePath.replace(/\\/g, "/");
   const filename = normalizedPath.split("/").filter(Boolean).pop() ?? "";
@@ -69,7 +112,7 @@ export function rewriteMarkdownImageSources(
   const template = document.createElement("template");
   template.innerHTML = html;
 
-  let changed = false;
+  let changed = promoteStandaloneLocalImageFences(template.content, workspaceRootPath);
 
   for (const anchor of template.content.querySelectorAll("a[href]")) {
     const source = anchor.getAttribute("href")?.trim() ?? "";

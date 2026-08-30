@@ -22,6 +22,7 @@ import {
 import { ImageAttachmentViewer } from "./ImageAttachmentViewer";
 
 const DEFAULT_THUMBNAIL_OPTIONS = { maxWidth: 1120, maxHeight: 840 };
+const ORIGINAL_IMAGE_OPTIONS: AttachmentImageAssetOptions = {};
 const INLINE_MAX_WIDTH = 560;
 const INLINE_MAX_HEIGHT = 420;
 const IMAGE_FRAME_CACHE_LIMIT = 256;
@@ -330,7 +331,13 @@ export function ChatImagePreview({
   variant = "gallery",
   thumbnailOptions = DEFAULT_THUMBNAIL_OPTIONS,
 }: ChatImagePreviewProps) {
-  const asset = useChatImageAsset(image, thumbnailOptions, false);
+  const shouldAnimateInline =
+    variant === "markdown" && image.mimeType?.trim().toLowerCase() === "image/gif";
+  const asset = useChatImageAsset(
+    image,
+    shouldAnimateInline ? ORIGINAL_IMAGE_OPTIONS : thumbnailOptions,
+    false,
+  );
   const [viewerOpen, setViewerOpen] = useState(false);
   const frameKey = chatImageKey(image);
   const [frame, setFrame] = useState<ImageFrame | null>(() => imageFrameCache.get(frameKey) ?? null);
@@ -424,7 +431,10 @@ export function ChatImagePreview({
 
   if (variant === "markdown") {
     return (
-      <span className="chat-image-figure chat-image-figure-markdown">
+      <span
+        className="chat-image-figure chat-image-figure-markdown"
+        style={frameStyle}
+      >
         {previewButton}
         {viewer}
       </span>

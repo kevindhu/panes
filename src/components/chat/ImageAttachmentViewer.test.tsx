@@ -295,7 +295,7 @@ describe("ImageAttachmentViewer", () => {
     cancelAnimationFrameSpy.mockRestore();
   });
 
-  it("closes only when the backdrop itself is clicked", async () => {
+  it("closes from translucent space outside the image", async () => {
     const onClose = vi.fn();
     await renderViewer({
       originalSrc: "asset://thumbnail",
@@ -304,14 +304,29 @@ describe("ImageAttachmentViewer", () => {
     });
 
     await act(async () => {
-      document.body.querySelector<HTMLElement>(".chat-image-viewer-dialog")?.click();
+      document.body.querySelector<HTMLElement>(".chat-image-viewer-toolbar")?.click();
     });
     expect(onClose).not.toHaveBeenCalled();
 
     await act(async () => {
-      document.body.querySelector<HTMLElement>(".chat-image-viewer-backdrop")?.click();
+      document.body.querySelector<HTMLElement>(".chat-image-viewer-image")?.click();
+    });
+    expect(onClose).not.toHaveBeenCalled();
+
+    await act(async () => {
+      document.body.querySelector<HTMLElement>(".chat-image-viewer-dialog")?.click();
     });
     expect(onClose).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      document.body.querySelector<HTMLElement>(".chat-image-viewer-stage")?.click();
+    });
+    expect(onClose).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      document.body.querySelector<HTMLElement>(".chat-image-viewer-backdrop")?.click();
+    });
+    expect(onClose).toHaveBeenCalledTimes(3);
   });
 
   it("locks background scrolling while open", async () => {

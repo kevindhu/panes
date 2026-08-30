@@ -51,9 +51,12 @@ function isPosixAbsolutePath(path: string): boolean {
 
 function normalizeAbsoluteWindowsImagePath(sourcePath: string): string | null {
   const decodedPath = safeDecodePath(sourcePath);
+  const drivePath = /^\/[a-z]:[\\/]/i.test(decodedPath)
+    ? decodedPath.slice(1)
+    : decodedPath;
 
-  if (isWindowsDriveAbsolutePath(decodedPath)) {
-    return decodedPath.replace(/\//g, "\\");
+  if (isWindowsDriveAbsolutePath(drivePath)) {
+    return drivePath.replace(/\//g, "\\");
   }
 
   if (isWindowsUncPath(decodedPath)) {
