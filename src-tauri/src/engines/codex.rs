@@ -179,6 +179,9 @@ pub struct CodexHealthReport {
 }
 
 #[derive(Debug, Clone)]
+// Runtime events are infrequent control-plane messages. Boxing the diagnostics
+// variant would complicate every consumer without reducing retained payloads.
+#[allow(clippy::large_enum_variant)]
 pub enum CodexRuntimeEvent {
     DiagnosticsUpdated {
         diagnostics: CodexProtocolDiagnosticsDto,
@@ -1186,8 +1189,8 @@ impl Engine for CodexEngine {
             rate_limits_task.abort();
         }
 
-        if !completion_seen {
-            if !self
+        if !completion_seen
+            && !self
                 .try_emit_reconciled_turn_completion(
                     &thread_id,
                     expected_turn_id.as_deref(),
@@ -1196,26 +1199,25 @@ impl Engine for CodexEngine {
                     TurnCompletionRecoveryMode::CompletionTimeout,
                 )
                 .await
-            {
-                event_tx
-                    .send(EngineEvent::Error {
-                        message: "Timed out waiting for `turn/completed` from codex app-server"
-                            .to_string(),
-                        recoverable: false,
-                    })
-                    .await
-                    .ok();
-                event_tx
-                    .send(EngineEvent::TurnCompleted {
-                        token_usage: None,
-                        status: TurnCompletionStatus::Failed,
-                        diagnostics: Some(TurnCompletionDiagnostics {
-                            source: TurnCompletionSource::TimeoutFallback,
-                        }),
-                    })
-                    .await
-                    .ok();
-            }
+        {
+            event_tx
+                .send(EngineEvent::Error {
+                    message: "Timed out waiting for `turn/completed` from codex app-server"
+                        .to_string(),
+                    recoverable: false,
+                })
+                .await
+                .ok();
+            event_tx
+                .send(EngineEvent::TurnCompleted {
+                    token_usage: None,
+                    status: TurnCompletionStatus::Failed,
+                    diagnostics: Some(TurnCompletionDiagnostics {
+                        source: TurnCompletionSource::TimeoutFallback,
+                    }),
+                })
+                .await
+                .ok();
         }
 
         self.clear_active_turn(&thread_id).await;
@@ -1461,12 +1463,14 @@ impl CodexEngine {
     ) -> anyhow::Result<super::UsageLimitsReadResult> {
         let transport = self.ensure_ready_transport().await?;
         let mut mapper = TurnEventMapper::default();
-        let mut diagnostics = super::UsageLimitsReadDiagnostics::default();
+        let mut diagnostics = super::UsageLimitsReadDiagnostics {
+            account_read_attempted: true,
+            ..Default::default()
+        };
 
         // Upstream Codex restores thread-scoped context usage via `thread/resume` replay, not
         // `thread/read`. Refresh only reads account windows here; callers merge persisted thread
         // context from local metadata/cache.
-        diagnostics.account_read_attempted = true;
         match request_with_fallback(
             transport.as_ref(),
             ACCOUNT_RATE_LIMITS_READ_METHODS,
@@ -1543,9 +1547,7 @@ impl CodexEngine {
 
         for _ in 0..64 {
             if !visited.insert(current_thread_id.clone()) {
-                anyhow::bail!(
-                    "cycle detected in Codex fork lineage at thread {current_thread_id}"
-                );
+                anyhow::bail!("cycle detected in Codex fork lineage at thread {current_thread_id}");
             }
             let cached_requirement = {
                 let state = self.state.lock().await;
@@ -1557,9 +1559,7 @@ impl CodexEngine {
             if let Some(required) = cached_requirement {
                 let mut state = self.state.lock().await;
                 for thread_id in inspected {
-                    state
-                        .fork_compatibility_cache
-                        .insert(thread_id, required);
+                    state.fork_compatibility_cache.insert(thread_id, required);
                 }
                 return Ok(required);
             }
@@ -1575,9 +1575,7 @@ impl CodexEngine {
             )
             .await
             .with_context(|| {
-                format!(
-                    "failed to inspect Codex fork lineage at thread {current_thread_id}"
-                )
+                format!("failed to inspect Codex fork lineage at thread {current_thread_id}")
             })?;
             let thread = response.get("thread").unwrap_or(&response);
             inspected.push(current_thread_id.clone());
@@ -1738,19 +1736,14 @@ impl CodexEngine {
         let response = request_with_fallback(
             transport.as_ref(),
             THREAD_START_METHODS,
-            build_thread_start_params(
-                model,
-                cwd,
-                &approval_policy,
-                &sandbox_mode,
-                &sandbox,
-            ),
+            build_thread_start_params(model, cwd, &approval_policy, &sandbox_mode, &sandbox),
             DEFAULT_TIMEOUT,
         )
         .await
         .context("failed to start Codex compatibility fork")?;
-        let new_engine_thread_id = extract_thread_id(&response)
-            .ok_or_else(|| anyhow::anyhow!("missing thread id in compatibility thread/start response"))?;
+        let new_engine_thread_id = extract_thread_id(&response).ok_or_else(|| {
+            anyhow::anyhow!("missing thread id in compatibility thread/start response")
+        })?;
 
         if !history_items.is_empty() {
             if let Err(error) = request_with_fallback(
@@ -2449,8 +2442,8 @@ impl CodexEngine {
             rate_limits_task.abort();
         }
 
-        if !completion_seen {
-            if !self
+        if !completion_seen
+            && !self
                 .try_emit_reconciled_turn_completion(
                     &active_thread_id,
                     expected_turn_id.as_deref(),
@@ -2459,26 +2452,24 @@ impl CodexEngine {
                     TurnCompletionRecoveryMode::CompletionTimeout,
                 )
                 .await
-            {
-                event_tx
-                    .send(EngineEvent::Error {
-                        message: "Timed out waiting for `turn/completed` from codex review"
-                            .to_string(),
-                        recoverable: false,
-                    })
-                    .await
-                    .ok();
-                event_tx
-                    .send(EngineEvent::TurnCompleted {
-                        token_usage: None,
-                        status: TurnCompletionStatus::Failed,
-                        diagnostics: Some(TurnCompletionDiagnostics {
-                            source: TurnCompletionSource::TimeoutFallback,
-                        }),
-                    })
-                    .await
-                    .ok();
-            }
+        {
+            event_tx
+                .send(EngineEvent::Error {
+                    message: "Timed out waiting for `turn/completed` from codex review".to_string(),
+                    recoverable: false,
+                })
+                .await
+                .ok();
+            event_tx
+                .send(EngineEvent::TurnCompleted {
+                    token_usage: None,
+                    status: TurnCompletionStatus::Failed,
+                    diagnostics: Some(TurnCompletionDiagnostics {
+                        source: TurnCompletionSource::TimeoutFallback,
+                    }),
+                })
+                .await
+                .ok();
         }
 
         self.clear_active_turn(&active_thread_id).await;
@@ -4261,8 +4252,7 @@ impl CompatibilityRolloutHistory {
         model_id: Option<&str>,
     ) -> anyhow::Result<()> {
         if !self.injection_closed
-            && record.get("type").and_then(serde_json::Value::as_str)
-                == Some("turn_context")
+            && record.get("type").and_then(serde_json::Value::as_str) == Some("turn_context")
         {
             self.injection_started = true;
             return Ok(());
@@ -4304,10 +4294,7 @@ impl CompatibilityRolloutHistory {
                     turn.push(message);
                 }
             }
-        } else if self.injection_closed
-            && self.awaiting_native_user
-            && message.role == "user"
-        {
+        } else if self.injection_closed && self.awaiting_native_user && message.role == "user" {
             self.current_turns
                 .push(CompatibilityHistoryTurnOrigin::Native);
             self.awaiting_native_user = false;
@@ -4349,8 +4336,9 @@ async fn read_compatibility_rollout_history(
         .await
         .with_context(|| format!("failed to read Codex compatibility rollout {rollout_path}"))?
     {
-        let record: serde_json::Value = serde_json::from_str(&line)
-            .with_context(|| format!("failed to parse Codex compatibility rollout {rollout_path}"))?;
+        let record: serde_json::Value = serde_json::from_str(&line).with_context(|| {
+            format!("failed to parse Codex compatibility rollout {rollout_path}")
+        })?;
         history.observe(&record, model_id)?;
     }
     history.finish()
@@ -5276,6 +5264,9 @@ fn scope_cwd(scope: &ThreadScope) -> String {
     }
 }
 
+// The app-server protocol exposes these as independent optional fields. Keeping
+// the builder explicit makes omissions visible at each call site.
+#[allow(clippy::too_many_arguments)]
 fn build_thread_resume_params(
     thread_id: &str,
     model: &str,
@@ -5940,7 +5931,7 @@ fn is_provisional_stream_lost_interrupted_recovery(
 }
 
 #[cfg(test)]
-fn extract_thread_turns<'a>(value: &'a serde_json::Value) -> Option<&'a Vec<serde_json::Value>> {
+fn extract_thread_turns(value: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
     if let Some(turns) = value.get("turns").and_then(serde_json::Value::as_array) {
         return Some(turns);
     }
@@ -5984,6 +5975,9 @@ fn extract_thread_preview(value: &serde_json::Value) -> Option<String> {
     None
 }
 
+// Start responses can omit any runtime field, so each fallback is represented
+// explicitly instead of hidden inside an untyped map.
+#[allow(clippy::too_many_arguments)]
 fn thread_runtime_from_start_response(
     response: &serde_json::Value,
     fallback_cwd: &str,
@@ -10404,9 +10398,7 @@ mod tests {
         assert!(!codex_version_supports_safe_durable_history_forks(
             "0.144.0"
         ));
-        assert!(codex_version_supports_safe_durable_history_forks(
-            "0.150.1"
-        ));
+        assert!(codex_version_supports_safe_durable_history_forks("0.150.1"));
     }
 
     #[test]

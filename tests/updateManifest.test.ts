@@ -10,6 +10,18 @@ import {
   resolveReleaseTag,
 } from "../scripts/generate-update-manifest.mjs";
 
+function requestUrl(input: RequestInfo | URL): string {
+  if (typeof input === "string") return input;
+  return input instanceof URL ? input.href : input.url;
+}
+
+function jsonResponse(value: unknown): Response {
+  return new Response(JSON.stringify(value), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
 describe("resolveUpdaterAssetPairs", () => {
   it("maps one universal macOS updater asset to both darwin targets", () => {
     const resolved = resolveUpdaterAssetPairs([
@@ -169,32 +181,27 @@ describe("generate-update-manifest", () => {
   });
 
   it("builds the updater manifest from a GitHub release payload", async () => {
-    const fetchImpl = vi.fn(async (url: string) => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = requestUrl(input);
       if (url.endsWith("/releases/tags/v0.38.0")) {
-        return {
-          ok: true,
-          json: async () => ({
-            published_at: "2026-03-12T00:00:00.000Z",
-            body: "Release notes",
-            assets: [
-              {
-                name: "Panes_0.38.0_x64-setup.exe",
-                browser_download_url: "https://example.com/Panes_0.38.0_x64-setup.exe",
-              },
-              {
-                name: "Panes_0.38.0_x64-setup.exe.sig",
-                browser_download_url: "https://example.com/Panes_0.38.0_x64-setup.exe.sig",
-              },
-            ],
-          }),
-        };
+        return jsonResponse({
+          published_at: "2026-03-12T00:00:00.000Z",
+          body: "Release notes",
+          assets: [
+            {
+              name: "Panes_0.38.0_x64-setup.exe",
+              browser_download_url: "https://example.com/Panes_0.38.0_x64-setup.exe",
+            },
+            {
+              name: "Panes_0.38.0_x64-setup.exe.sig",
+              browser_download_url: "https://example.com/Panes_0.38.0_x64-setup.exe.sig",
+            },
+          ],
+        });
       }
 
       if (url === "https://example.com/Panes_0.38.0_x64-setup.exe.sig") {
-        return {
-          ok: true,
-          text: async () => "windows-signature\n",
-        };
+        return new Response("windows-signature\n", { status: 200 });
       }
 
       throw new Error(`unexpected URL: ${url}`);
@@ -230,47 +237,39 @@ describe("generate-update-manifest", () => {
   });
 
   it("builds bundle-aware Linux updater targets when AppImage and Debian assets are present", async () => {
-    const fetchImpl = vi.fn(async (url: string) => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = requestUrl(input);
       if (url.endsWith("/releases/tags/v0.42.0")) {
-        return {
-          ok: true,
-          json: async () => ({
-            published_at: "2026-03-12T00:00:00.000Z",
-            body: "Linux release notes",
-            assets: [
-              {
-                name: "Panes.AppImage",
-                browser_download_url: "https://example.com/Panes.AppImage",
-              },
-              {
-                name: "Panes.AppImage.sig",
-                browser_download_url: "https://example.com/Panes.AppImage.sig",
-              },
-              {
-                name: "Panes_0.42.0_amd64.deb",
-                browser_download_url: "https://example.com/Panes_0.42.0_amd64.deb",
-              },
-              {
-                name: "Panes_0.42.0_amd64.deb.sig",
-                browser_download_url: "https://example.com/Panes_0.42.0_amd64.deb.sig",
-              },
-            ],
-          }),
-        };
+        return jsonResponse({
+          published_at: "2026-03-12T00:00:00.000Z",
+          body: "Linux release notes",
+          assets: [
+            {
+              name: "Panes.AppImage",
+              browser_download_url: "https://example.com/Panes.AppImage",
+            },
+            {
+              name: "Panes.AppImage.sig",
+              browser_download_url: "https://example.com/Panes.AppImage.sig",
+            },
+            {
+              name: "Panes_0.42.0_amd64.deb",
+              browser_download_url: "https://example.com/Panes_0.42.0_amd64.deb",
+            },
+            {
+              name: "Panes_0.42.0_amd64.deb.sig",
+              browser_download_url: "https://example.com/Panes_0.42.0_amd64.deb.sig",
+            },
+          ],
+        });
       }
 
       if (url === "https://example.com/Panes.AppImage.sig") {
-        return {
-          ok: true,
-          text: async () => "linux-signature\n",
-        };
+        return new Response("linux-signature\n", { status: 200 });
       }
 
       if (url === "https://example.com/Panes_0.42.0_amd64.deb.sig") {
-        return {
-          ok: true,
-          text: async () => "deb-signature\n",
-        };
+        return new Response("deb-signature\n", { status: 200 });
       }
 
       throw new Error(`unexpected URL: ${url}`);
@@ -305,32 +304,27 @@ describe("generate-update-manifest", () => {
 
   it("writes latest.json using RELEASE_TAG when no CLI tag is provided", async () => {
     const writes: Array<{ path: string; contents: string }> = [];
-    const fetchImpl = vi.fn(async (url: string) => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = requestUrl(input);
       if (url.endsWith("/releases/tags/v0.38.0")) {
-        return {
-          ok: true,
-          json: async () => ({
-            published_at: "2026-03-12T00:00:00.000Z",
-            body: "",
-            assets: [
-              {
-                name: "Panes.AppImage",
-                browser_download_url: "https://example.com/Panes.AppImage",
-              },
-              {
-                name: "Panes.AppImage.sig",
-                browser_download_url: "https://example.com/Panes.AppImage.sig",
-              },
-            ],
-          }),
-        };
+        return jsonResponse({
+          published_at: "2026-03-12T00:00:00.000Z",
+          body: "",
+          assets: [
+            {
+              name: "Panes.AppImage",
+              browser_download_url: "https://example.com/Panes.AppImage",
+            },
+            {
+              name: "Panes.AppImage.sig",
+              browser_download_url: "https://example.com/Panes.AppImage.sig",
+            },
+          ],
+        });
       }
 
       if (url === "https://example.com/Panes.AppImage.sig") {
-        return {
-          ok: true,
-          text: async () => "linux-signature\n",
-        };
+        return new Response("linux-signature\n", { status: 200 });
       }
 
       throw new Error(`unexpected URL: ${url}`);

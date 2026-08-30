@@ -48,6 +48,14 @@ async function fetchText(fetchImpl, url, headers) {
   return (await response.text()).trim();
 }
 
+/**
+ * @param {{
+ *   tag?: string;
+ *   repo?: string;
+ *   token?: string;
+ *   fetchImpl?: typeof fetch;
+ * }} options
+ */
 export async function generateUpdateManifest({
   tag,
   repo = DEFAULT_REPO,
@@ -85,6 +93,14 @@ export async function generateUpdateManifest({
   };
 }
 
+/**
+ * @param {{
+ *   argv?: string[];
+ *   env?: Record<string, string | undefined>;
+ *   fetchImpl?: typeof fetch;
+ *   writeFile?: (path: string, contents: string) => void;
+ * }} [options]
+ */
 export async function main({
   argv = process.argv,
   env = process.env,

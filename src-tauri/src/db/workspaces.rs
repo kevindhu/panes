@@ -705,7 +705,7 @@ mod tests {
             .to_string()
             .contains("workspace order contains a duplicate workspace"));
 
-        let inactive_error = set_workspace_order(&db, &[workspace_b.id.clone()])
+        let inactive_error = set_workspace_order(&db, std::slice::from_ref(&workspace_b.id))
             .expect_err("inactive order should fail");
         assert!(inactive_error
             .to_string()

@@ -2,7 +2,7 @@
 
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ContentBlock, Message, Thread } from "../../types";
 
 const mockIpc = vi.hoisted(() => ({
@@ -52,6 +52,7 @@ import { useEngineStore } from "../../stores/engineStore";
 import { useThreadPlanModeStore } from "../../stores/threadPlanModeStore";
 import { useThreadStore } from "../../stores/threadStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
+import { initializeCodexI18n } from "../../i18n/codex";
 import { CodexChat } from "./CodexChat";
 
 const thread: Thread = {
@@ -71,6 +72,10 @@ const thread: Thread = {
 
 let container: HTMLDivElement;
 let root: Root;
+
+beforeAll(async () => {
+  await initializeCodexI18n();
+});
 
 beforeEach(() => {
   vi.clearAllMocks();

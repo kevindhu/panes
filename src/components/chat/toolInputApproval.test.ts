@@ -43,7 +43,11 @@ const nativeDetails = {
   ],
 };
 
-function assistantMessage(id: string, details = nativeDetails, status: "pending" | "answered" = "pending"): Message {
+function assistantMessage(
+  id: string,
+  details: Record<string, unknown> = nativeDetails,
+  status: "pending" | "answered" = "pending",
+): Message {
   return {
     id,
     threadId: "thread-1",

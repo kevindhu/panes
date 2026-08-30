@@ -819,6 +819,8 @@ fn invert_timestamp(value: &str) -> String {
 }
 
 #[cfg(test)]
+// The shared legacy-migration helper follows the inline migration test module.
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};

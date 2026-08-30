@@ -29,6 +29,18 @@ use super::{CodexNativeEvent, CodexNativeEventKind, EngineEvent};
 const TURN_EVENT_QUEUE_CAPACITY: usize = 1024;
 const RUNTIME_EVENT_QUEUE_CAPACITY: usize = 512;
 const BEST_EFFORT_QUEUE_RESERVE: usize = 64;
+const _: () = assert!(
+    TURN_EVENT_QUEUE_CAPACITY <= 1024,
+    "Codex turn event queues are live buffers; raising this can retain large protocol payloads"
+);
+const _: () = assert!(
+    RUNTIME_EVENT_QUEUE_CAPACITY <= 512,
+    "Codex runtime event queues should stay best-effort and bounded"
+);
+const _: () = assert!(
+    BEST_EFFORT_QUEUE_RESERVE < TURN_EVENT_QUEUE_CAPACITY,
+    "best-effort reserve must leave room for lossless turn events"
+);
 const TRANSPORT_ERROR_LINE_MAX_CHARS: usize = 16 * 1024;
 const TRANSPORT_ERROR_LINE_TRUNCATED_PREFIX: &str = "... [protocol line truncated; showing tail]\n";
 
@@ -1088,22 +1100,6 @@ fn codex_augmented_path(executable: &str) -> Option<OsString> {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
-
-    #[test]
-    fn event_queue_capacities_bound_idle_retention() {
-        assert!(
-            TURN_EVENT_QUEUE_CAPACITY <= 1024,
-            "Codex turn event queues are live buffers; raising this can retain large protocol payloads"
-        );
-        assert!(
-            RUNTIME_EVENT_QUEUE_CAPACITY <= 512,
-            "Codex runtime event queues should stay best-effort and bounded"
-        );
-        assert!(
-            BEST_EFFORT_QUEUE_RESERVE < TURN_EVENT_QUEUE_CAPACITY,
-            "best-effort reserve must leave room for lossless turn events"
-        );
-    }
 
     #[test]
     fn transport_parse_error_payload_trims_large_protocol_lines() {

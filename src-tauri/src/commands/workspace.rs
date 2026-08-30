@@ -2,9 +2,7 @@ use tauri::State;
 
 use crate::{
     db,
-    models::{
-        RepoDto, TrustLevelDto, WorkspaceDto,
-    },
+    models::{RepoDto, TrustLevelDto, WorkspaceDto},
     state::AppState,
 };
 
@@ -31,8 +29,19 @@ pub async fn open_workspace(
     let scan_depth = normalize_scan_depth(scan_depth);
     run_db(state.db.clone(), move |db| {
         let workspace = db::workspaces::upsert_workspace(db, &path, scan_depth)?;
-        db::repos::reconcile_workspace_repos(db, &workspace.id, std::slice::from_ref(&workspace.root_path))?;
-        let _ = db::repos::upsert_repo(db, &workspace.id, &workspace.name, &workspace.root_path, "", true)?;
+        db::repos::reconcile_workspace_repos(
+            db,
+            &workspace.id,
+            std::slice::from_ref(&workspace.root_path),
+        )?;
+        let _ = db::repos::upsert_repo(
+            db,
+            &workspace.id,
+            &workspace.name,
+            &workspace.root_path,
+            "",
+            true,
+        )?;
 
         Ok(workspace)
     })
@@ -63,8 +72,19 @@ pub async fn retarget_workspace(
 ) -> Result<WorkspaceDto, String> {
     run_db(state.db.clone(), move |db| {
         let workspace = db::workspaces::retarget_workspace(db, &workspace_id, &path)?;
-        db::repos::reconcile_workspace_repos(db, &workspace.id, std::slice::from_ref(&workspace.root_path))?;
-        let _ = db::repos::upsert_repo(db, &workspace.id, &workspace.name, &workspace.root_path, "", true)?;
+        db::repos::reconcile_workspace_repos(
+            db,
+            &workspace.id,
+            std::slice::from_ref(&workspace.root_path),
+        )?;
+        let _ = db::repos::upsert_repo(
+            db,
+            &workspace.id,
+            &workspace.name,
+            &workspace.root_path,
+            "",
+            true,
+        )?;
 
         Ok(workspace)
     })

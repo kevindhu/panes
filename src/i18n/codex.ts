@@ -25,6 +25,7 @@ export async function initializeCodexI18n() {
       escapeValue: false,
     },
     returnNull: false,
+    showSupportNotice: false,
   });
 
   initialized = true;

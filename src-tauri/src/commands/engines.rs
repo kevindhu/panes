@@ -7,9 +7,7 @@ use tokio::process::Command;
 #[cfg(not(target_os = "windows"))]
 use crate::runtime_env;
 use crate::{
-    models::{
-        CodexAppDto, CodexSkillDto, EngineCheckResultDto, EngineHealthDto, EngineInfoDto,
-    },
+    models::{CodexAppDto, CodexSkillDto, EngineCheckResultDto, EngineHealthDto, EngineInfoDto},
     process_utils,
     state::AppState,
 };

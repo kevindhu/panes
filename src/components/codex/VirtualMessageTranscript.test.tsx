@@ -79,9 +79,13 @@ describe("VirtualMessageTranscript", () => {
       offsetWidth: { configurable: true, value: 820 },
       scrollHeight: { configurable: true, value: 24_000 },
     });
-    viewport.scrollTo = ({ top }: ScrollToOptions) => {
+    function scrollTo(options?: ScrollToOptions): void;
+    function scrollTo(x: number, y: number): void;
+    function scrollTo(optionsOrX?: ScrollToOptions | number, y?: number): void {
+      const top = typeof optionsOrX === "number" ? y : optionsOrX?.top;
       if (typeof top === "number") viewport.scrollTop = top;
-    };
+    }
+    viewport.scrollTo = scrollTo;
     const viewportRef = createRef<HTMLDivElement>();
     viewportRef.current = viewport;
     const messages = Array.from({ length: 100 }, (_, index) => message(index));

@@ -94,12 +94,9 @@ pub fn append_codex_event_routing_drop_log(message: &str) -> bool {
 #[cfg(not(test))]
 fn append_codex_event_routing_drop_log_inner(message: &str) -> io::Result<bool> {
     let previous_suppressed = {
-        let mut state = codex_event_routing_drop_log_state().lock().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                "codex event routing drop log lock poisoned",
-            )
-        })?;
+        let mut state = codex_event_routing_drop_log_state()
+            .lock()
+            .map_err(|_| io::Error::other("codex event routing drop log lock poisoned"))?;
         let now = Instant::now();
 
         if now.duration_since(state.window_started_at) >= Duration::from_secs(1) {
@@ -131,12 +128,9 @@ fn append_codex_event_routing_drop_log_inner(message: &str) -> io::Result<bool> 
 
 #[cfg(not(test))]
 fn append_codex_event_routing_log_inner(message: &str) -> io::Result<bool> {
-    let mut state = codex_event_routing_log_state().lock().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            "codex event routing log lock poisoned",
-        )
-    })?;
+    let mut state = codex_event_routing_log_state()
+        .lock()
+        .map_err(|_| io::Error::other("codex event routing log lock poisoned"))?;
 
     let now = Instant::now();
     let suppressed = if now.duration_since(state.window_started_at) >= Duration::from_secs(1) {

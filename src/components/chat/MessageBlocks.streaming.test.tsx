@@ -191,7 +191,6 @@ describe("MessageBlocks streaming text", () => {
         <MessageBlocks
           blocks={blocks}
           status="streaming"
-          engineId="codex"
           onApproval={vi.fn()}
           onLoadActionOutput={vi.fn(async () => undefined)}
         />,
@@ -235,7 +234,6 @@ describe("MessageBlocks streaming text", () => {
         <MessageBlocks
           blocks={blocks}
           status="completed"
-          engineId="codex"
           onApproval={vi.fn()}
           onLoadActionOutput={vi.fn(async () => undefined)}
         />,
@@ -292,7 +290,6 @@ describe("MessageBlocks streaming text", () => {
           <MessageBlocks
             blocks={blocks}
             status={status}
-            engineId="codex"
             onApproval={vi.fn()}
             onLoadActionOutput={vi.fn(async () => undefined)}
           />,
@@ -323,7 +320,6 @@ describe("MessageBlocks streaming text", () => {
         <MessageBlocks
           blocks={blocks}
           status="interrupted"
-          engineId="codex"
           onApproval={vi.fn()}
           onLoadActionOutput={vi.fn(async () => undefined)}
         />,
@@ -359,7 +355,6 @@ describe("MessageBlocks streaming text", () => {
         <MessageBlocks
           blocks={blocks}
           status="completed"
-          engineId="codex"
           onApproval={vi.fn()}
           onLoadActionOutput={vi.fn(async () => undefined)}
         />,

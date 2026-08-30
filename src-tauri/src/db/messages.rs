@@ -1065,17 +1065,16 @@ fn build_search_result_snippet(content: &str, query: &str) -> String {
 
     let context_before = 48usize;
     let context_after = 120usize;
-    let start;
-    if match_index > context_before {
-        start = trimmed
+    let start = if match_index > context_before {
+        trimmed
             .char_indices()
             .take_while(|(idx, _)| *idx <= match_index.saturating_sub(context_before))
             .last()
             .map(|(idx, _)| idx)
-            .unwrap_or(0);
+            .unwrap_or(0)
     } else {
-        start = 0;
-    }
+        0
+    };
 
     let end_target = (match_index + context_after).min(trimmed.len());
     let end = trimmed
@@ -1563,7 +1562,7 @@ mod tests {
         ))
     }
 
-    fn approval_block_response_data<'a>(blocks: &'a Value) -> Option<&'a Value> {
+    fn approval_block_response_data(blocks: &Value) -> Option<&Value> {
         let items = blocks.as_array()?;
         let approval = items.first()?.as_object()?;
         approval.get("responseData")

@@ -9,10 +9,8 @@ use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    engines::{
-        codex::{
-            CodexEngine, CodexForkedThread, CodexReviewStarted, CodexRollbackMarkerState,
-        },
+    engines::codex::{
+        CodexEngine, CodexForkedThread, CodexReviewStarted, CodexRollbackMarkerState,
     },
     models::{
         CodexAppDto, CodexSkillDto, EngineCapabilitiesDto, EngineHealthDto, EngineInfoDto,
@@ -370,11 +368,11 @@ impl EngineManager {
             }
         };
         Ok(vec![EngineInfoDto {
-                id: self.codex.id().to_string(),
-                name: self.codex.name().to_string(),
-                models: codex_models.into_iter().map(map_model_info).collect(),
-                capabilities: map_engine_capabilities(capabilities_for_engine(self.codex.id())),
-            }])
+            id: self.codex.id().to_string(),
+            name: self.codex.name().to_string(),
+            models: codex_models.into_iter().map(map_model_info).collect(),
+            capabilities: map_engine_capabilities(capabilities_for_engine(self.codex.id())),
+        }])
     }
 
     pub async fn health(&self, engine_id: &str) -> anyhow::Result<EngineHealthDto> {

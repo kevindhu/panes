@@ -252,15 +252,6 @@ function prettyJson(value: unknown): string {
   }
 }
 
-function textValue(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (Array.isArray(value)) return value.map(textValue).filter(Boolean).join("\n");
-  if (isRecord(value)) {
-    return recordString(value, "text", "content", "message") ?? prettyJson(value);
-  }
-  return value == null ? "" : String(value);
-}
-
 function formatCount(value: number): string {
   return new Intl.NumberFormat(undefined, { notation: value >= 10_000 ? "compact" : "standard" }).format(value);
 }

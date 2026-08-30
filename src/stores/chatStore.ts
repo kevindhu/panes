@@ -1944,7 +1944,6 @@ function terminalizeUnresolvedActionBlocks(
 
 function terminalizePendingApprovalBlocks(
   blocks: ContentBlock[] | undefined,
-  state: TerminalTurnState,
 ): ContentBlock[] | undefined {
   if (!Array.isArray(blocks)) {
     return blocks;
@@ -1972,10 +1971,7 @@ function terminalizeUnresolvedTurnBlocks(
   state: TerminalTurnState,
   source?: TurnCompletionSource | null,
 ): ContentBlock[] | undefined {
-  return terminalizePendingApprovalBlocks(
-    terminalizeUnresolvedActionBlocks(blocks, state, source),
-    state,
-  );
+  return terminalizePendingApprovalBlocks(terminalizeUnresolvedActionBlocks(blocks, state, source));
 }
 
 function cancelActiveAssistantMessage(messages: Message[]): Message[] {

@@ -6,6 +6,7 @@ import type {
   CodexTurnSnapshot,
 } from "../types";
 import {
+  type CodexTranscriptActivity,
   commandOutputParts,
   interleaveLegacyTranscriptBlocks,
   mergeCodexTurnSnapshot,
@@ -417,7 +418,8 @@ describe("Codex transcript projection", () => {
     ];
     const snapshot: CodexTurnSnapshot = { turn: turn(8), items: [reasoning], chunks, events: [] };
     const activity = projectCodexTranscript(snapshot).entries.find(
-      (entry) => entry.kind === "activity" && entry.activityKind === "reasoning",
+      (entry): entry is CodexTranscriptActivity =>
+        entry.kind === "activity" && entry.activityKind === "reasoning",
     );
     expect(activity && reasoningText(activity)).toEqual({
       summarySections: ["Inspecting events.", "Checking ordering."],

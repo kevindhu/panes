@@ -20,8 +20,7 @@ use crate::{
     engines::ThreadSyncSnapshot,
     models::{
         CodexRemoteThreadDto, CodexRemoteThreadPageDto, MessageDto, MessageStatusDto,
-        ReasoningEffortOptionDto, RepoDto, ThreadDto,
-        ThreadStatusDto, TrustLevelDto,
+        ReasoningEffortOptionDto, RepoDto, ThreadDto, ThreadStatusDto, TrustLevelDto,
     },
     state::AppState,
 };
@@ -650,6 +649,9 @@ fn build_codex_remote_thread_metadata(thread: &CodexRemoteThreadSummary, model_i
     metadata
 }
 
+// Tauri maps these individually named fields directly from the existing IPC
+// request, so changing this to a nested DTO would be a wire-format change.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn create_thread(
     state: State<'_, AppState>,
@@ -674,6 +676,7 @@ pub async fn create_thread(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_thread_inner(
     state: &AppState,
     workspace_id: String,
@@ -1253,8 +1256,7 @@ const ENGINE_FORK_ERROR_KEY: &str = "engineForkError";
 const CODEX_COMPATIBILITY_FORK_KEY: &str = "codexCompatibilityFork";
 /// Confirms that the display mirror contains both the durable injected prefix and
 /// native app-server turns for a compatibility fork.
-const CODEX_COMPATIBILITY_HISTORY_COMPLETE_KEY: &str =
-    "codexCompatibilityHistoryComplete";
+const CODEX_COMPATIBILITY_HISTORY_COMPLETE_KEY: &str = "codexCompatibilityHistoryComplete";
 
 /// Everything the deferred background fork needs to materialize the engine thread for a
 /// branch, captured from the source thread at branch-creation time.
@@ -1427,10 +1429,7 @@ struct CodexHistoryMutationFailedEvent {
     message: String,
 }
 
-fn emit_codex_compatibility_fork_materialized(
-    app: &tauri::AppHandle,
-    thread_id: &str,
-) {
+fn emit_codex_compatibility_fork_materialized(app: &tauri::AppHandle, thread_id: &str) {
     if let Err(error) = app.emit(
         "codex-compatibility-fork-materialized",
         CodexCompatibilityForkMaterializedEvent {
@@ -1468,9 +1467,7 @@ fn emit_codex_history_mutation_failed(
             message: message.to_string(),
         },
     ) {
-        log::warn!(
-            "failed to emit Codex {operation} failure for thread {thread_id}: {error}"
-        );
+        log::warn!("failed to emit Codex {operation} failure for thread {thread_id}: {error}");
     }
 }
 
@@ -1584,13 +1581,19 @@ fn engine_rollback_marker_expectation(metadata: Option<&Value>) -> Option<(u64, 
     (before.checked_add(1) == Some(after)).then_some((before, after))
 }
 
-fn mark_engine_rollback_marker_expectation(mut metadata: Value, before: u64) -> Result<Value, String> {
+fn mark_engine_rollback_marker_expectation(
+    mut metadata: Value,
+    before: u64,
+) -> Result<Value, String> {
     let after = next_engine_rollback_marker_count(before)?;
     if !metadata.is_object() {
         metadata = json!({});
     }
     if let Some(object) = metadata.as_object_mut() {
-        object.insert(ENGINE_ROLLBACK_MARKERS_BEFORE_KEY.to_string(), json!(before));
+        object.insert(
+            ENGINE_ROLLBACK_MARKERS_BEFORE_KEY.to_string(),
+            json!(before),
+        );
         object.insert(ENGINE_ROLLBACK_MARKERS_AFTER_KEY.to_string(), json!(after));
     }
     Ok(metadata)
@@ -1898,10 +1901,7 @@ async fn perform_engine_fork(
                 Some(turns_after) if turns_after > 0 => Some(
                     state
                         .engines
-                        .resolve_codex_fork_turn_id(
-                            &intent.source_engine_thread_id,
-                            turns_after,
-                        )
+                        .resolve_codex_fork_turn_id(&intent.source_engine_thread_id, turns_after)
                         .await
                         .map_err(err_to_string)?,
                 ),
@@ -2015,8 +2015,9 @@ async fn persist_pending_mutation_error(
                 object.insert(metadata_key.to_string(), json!(message));
             }
             db::threads::update_engine_metadata(db, &thread_id, &metadata)?;
-            db::threads::get_thread(db, &thread_id)?
-                .ok_or_else(|| anyhow::anyhow!("thread not found after recording error: {thread_id}"))
+            db::threads::get_thread(db, &thread_id)?.ok_or_else(|| {
+                anyhow::anyhow!("thread not found after recording error: {thread_id}")
+            })
         }
     })
     .await
@@ -2024,11 +2025,7 @@ async fn persist_pending_mutation_error(
 
 /// Fires off the background prefetch that materializes a branch's engine thread. Errors
 /// are swallowed — the fork will simply be retried on first use of the branch.
-fn spawn_engine_fork_prefetch(
-    app: Option<tauri::AppHandle>,
-    state: AppState,
-    thread_id: String,
-) {
+fn spawn_engine_fork_prefetch(app: Option<tauri::AppHandle>, state: AppState, thread_id: String) {
     tokio::spawn(async move {
         match resolve_pending_engine_fork(&state, &thread_id).await {
             Ok(thread) => {
@@ -2203,11 +2200,7 @@ pub async fn rollback_codex_thread(
 
     // Match the fork path: native work is prefetched off the UI round trip, while
     // first use joins this exact single-flight operation if it is still running.
-    spawn_engine_rollback_prefetch(
-        app,
-        state.inner().clone(),
-        projected.id.clone(),
-    );
+    spawn_engine_rollback_prefetch(app, state.inner().clone(), projected.id.clone());
     Ok(projected)
 }
 
@@ -2229,8 +2222,10 @@ pub async fn resolve_pending_engine_rollback(
             if !is_engine_rollback_pending(thread.engine_metadata.as_ref()) {
                 return Ok(thread);
             }
-            let intent = engine_rollback_intent(thread.engine_metadata.as_ref())
-                .ok_or_else(|| format!("invalid pending rollback metadata for thread {thread_id}"))?;
+            let intent =
+                engine_rollback_intent(thread.engine_metadata.as_ref()).ok_or_else(|| {
+                    format!("invalid pending rollback metadata for thread {thread_id}")
+                })?;
             let updated = perform_engine_rollback(state, &thread, &intent).await?;
             if let Some(app) = app {
                 emit_codex_rollback_materialized(app, thread_id);
@@ -2300,9 +2295,7 @@ async fn perform_engine_rollback(
     };
 
     run_db(state.db.clone(), {
-        move |db| {
-            persist_codex_in_place_rollback(db, &persistence_thread, &rollback_snapshot)
-        }
+        move |db| persist_codex_in_place_rollback(db, &persistence_thread, &rollback_snapshot)
     })
     .await
 }
@@ -2332,8 +2325,7 @@ async fn perform_compatibility_engine_rollback(
                 true,
             )
             .await?;
-            let expected_marker_count =
-                next_engine_rollback_marker_count(marker_state.count)?;
+            let expected_marker_count = next_engine_rollback_marker_count(marker_state.count)?;
             execute_compatibility_engine_rollback(
                 state,
                 &persistence_thread,
@@ -2375,8 +2367,7 @@ async fn perform_compatibility_engine_rollback(
                     false,
                 )
                 .await?;
-                let expected_marker_count =
-                    next_engine_rollback_marker_count(marker_state.count)?;
+                let expected_marker_count = next_engine_rollback_marker_count(marker_state.count)?;
                 execute_compatibility_engine_rollback(
                     state,
                     &persistence_thread,
@@ -2411,10 +2402,7 @@ async fn persist_compatibility_rollback_marker_expectation(
                 })?
             };
             let metadata = mark_engine_rollback_marker_expectation(
-                current
-                    .engine_metadata
-                    .clone()
-                    .unwrap_or_else(|| json!({})),
+                current.engine_metadata.clone().unwrap_or_else(|| json!({})),
                 before,
             )
             .map_err(anyhow::Error::msg)?;
@@ -2542,11 +2530,7 @@ fn imported_turn_count(snapshot: &ThreadSyncSnapshot) -> Result<u32, String> {
     u32::try_from(count).map_err(|_| "Codex thread turn count exceeds u32".to_string())
 }
 
-fn spawn_engine_rollback_prefetch(
-    app: tauri::AppHandle,
-    state: AppState,
-    thread_id: String,
-) {
+fn spawn_engine_rollback_prefetch(app: tauri::AppHandle, state: AppState, thread_id: String) {
     tokio::spawn(async move {
         match resolve_pending_engine_rollback(&state, &thread_id, Some(&app)).await {
             Ok(thread) => emit_thread_updated(&app, thread),
@@ -2610,6 +2594,9 @@ pub async fn compact_codex_thread(
     Ok(thread)
 }
 
+// The paired update flags distinguish "leave unchanged" from "clear value" in
+// the current IPC contract.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn set_thread_execution_policy(
     state: State<'_, AppState>,
@@ -2642,6 +2629,7 @@ pub async fn set_thread_execution_policy(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn set_thread_execution_policy_inner(
     state: &AppState,
     thread_id: String,
@@ -2791,6 +2779,9 @@ async fn set_thread_execution_policy_inner(
     .ok_or_else(|| format!("thread not found after execution policy update: {thread_id}"))
 }
 
+// The paired update flags preserve patch semantics across Tauri's flat command
+// argument mapping.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn set_thread_codex_config(
     state: State<'_, AppState>,
@@ -2815,6 +2806,7 @@ pub async fn set_thread_codex_config(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn set_thread_codex_config_inner(
     state: &AppState,
     thread_id: String,
@@ -3877,7 +3869,7 @@ fn normalize_codex_approval_policy(value: Value) -> Result<Value, String> {
                 })?;
 
             for required_key in ["mcp_elicitations", "rules", "sandbox_approval"] {
-                if !reject.get(required_key).and_then(Value::as_bool).is_some() {
+                if reject.get(required_key).and_then(Value::as_bool).is_none() {
                     return Err(format!(
                         "invalid structured approval policy. missing boolean reject.{required_key}"
                     ));
@@ -4809,8 +4801,8 @@ mod tests {
             .expect("mark the persisted source runtime active");
         let persisted_active_error =
             fork_codex_thread_inner(&state, source.id.clone(), None, None, None)
-            .await
-            .expect_err("persisted active runtime must enforce the same stable boundary");
+                .await
+                .expect_err("persisted active runtime must enforce the same stable boundary");
         assert!(persisted_active_error.contains("cannot fork an active thread"));
     }
 
@@ -4870,8 +4862,7 @@ mod tests {
             target_turn_count: 3,
             phase: EngineRollbackPhase::Prepared,
         };
-        let metadata =
-            mark_engine_rollback_pending(json!({ "lastModelId": "gpt-5.4" }), &intent);
+        let metadata = mark_engine_rollback_pending(json!({ "lastModelId": "gpt-5.4" }), &intent);
 
         assert!(is_engine_rollback_pending(Some(&metadata)));
         assert_eq!(engine_rollback_intent(Some(&metadata)), Some(intent));
@@ -4895,7 +4886,10 @@ mod tests {
         )
         .expect("expected marker metadata");
 
-        assert_eq!(engine_rollback_marker_expectation(Some(&metadata)), Some((4, 5)));
+        assert_eq!(
+            engine_rollback_marker_expectation(Some(&metadata)),
+            Some((4, 5))
+        );
         let cleared = clear_engine_rollback_pending(metadata);
         assert_eq!(engine_rollback_marker_expectation(Some(&cleared)), None);
         assert_eq!(cleared.get(ENGINE_ROLLBACK_ERROR_KEY), None);
@@ -4975,9 +4969,7 @@ mod tests {
             last_turn_id: None,
             turns_after: None,
         };
-        let branch = create_pending_codex_branch_thread(
-            &state, &source, &intent, None, None, None,
-        )
+        let branch = create_pending_codex_branch_thread(&state, &source, &intent, None, None, None)
             .await
             .expect("expected pending branch creation to succeed");
 
@@ -4993,7 +4985,10 @@ mod tests {
         assert!(branch.last_activity_at > source.last_activity_at);
         let listed = db::threads::list_threads_for_workspace(&state.db, &source.workspace_id)
             .expect("expected workspace threads to be listed");
-        assert_eq!(listed.first().map(|thread| thread.id.as_str()), Some(branch.id.as_str()));
+        assert_eq!(
+            listed.first().map(|thread| thread.id.as_str()),
+            Some(branch.id.as_str())
+        );
     }
 
     #[tokio::test]
@@ -5017,24 +5012,26 @@ mod tests {
             ),
         ]
         .into_iter()
-        .map(|(role, content, status, native_turn_id)| db::messages::ImportedMessageRecord {
-            role: role.to_string(),
-            content: Some(content.to_string()),
-            blocks: json!([{ "type": "text", "content": content }]),
-            status,
-            native_turn_id: native_turn_id.map(str::to_string),
-            turn_engine_id: Some("codex".to_string()),
-            turn_model_id: Some("gpt-5.4".to_string()),
-            turn_reasoning_effort: None,
-            token_input: u64::from(role == "user"),
-            token_output: u64::from(role == "assistant"),
-            created_at: None,
-        })
+        .map(
+            |(role, content, status, native_turn_id)| db::messages::ImportedMessageRecord {
+                role: role.to_string(),
+                content: Some(content.to_string()),
+                blocks: json!([{ "type": "text", "content": content }]),
+                status,
+                native_turn_id: native_turn_id.map(str::to_string),
+                turn_engine_id: Some("codex".to_string()),
+                turn_model_id: Some("gpt-5.4".to_string()),
+                turn_reasoning_effort: None,
+                token_input: u64::from(role == "user"),
+                token_output: u64::from(role == "assistant"),
+                created_at: None,
+            },
+        )
         .collect::<Vec<_>>();
         db::messages::replace_thread_messages(&state.db, &source.id, &imported)
             .expect("expected source messages to be inserted");
-        let source_messages = db::messages::get_thread_messages(&state.db, &source.id)
-            .expect("load source messages");
+        let source_messages =
+            db::messages::get_thread_messages(&state.db, &source.id).expect("load source messages");
         let completed_assistant_id = source_messages[1].id.clone();
         let source = db::threads::get_thread(&state.db, &source.id)
             .expect("get source thread")
@@ -5057,8 +5054,8 @@ mod tests {
         .expect("expected exact pending branch creation to succeed");
 
         assert_eq!(branch.message_count, 2);
-        let branch_messages = db::messages::get_thread_messages(&state.db, &branch.id)
-            .expect("load branch messages");
+        let branch_messages =
+            db::messages::get_thread_messages(&state.db, &branch.id).expect("load branch messages");
         assert_eq!(branch_messages.len(), 2);
         assert_eq!(branch_messages[1].content.as_deref(), Some("Reply 1"));
         assert_eq!(
@@ -5124,9 +5121,7 @@ mod tests {
             .expect("load source")
             .expect("source exists");
             let branch =
-                create_pending_codex_branch_thread(
-                    &state, &source, &intent, None, None, None,
-                )
+                create_pending_codex_branch_thread(&state, &source, &intent, None, None, None)
                     .await
                     .expect("branch creation should succeed");
             let elapsed = started.elapsed();
@@ -5186,18 +5181,16 @@ mod tests {
             .expect("mark transcript imported");
 
             let started = Instant::now();
-            let source_turn_count = db::messages::thread_turn_count(&state.db, &source.id)
-                .expect("count source turns");
+            let source_turn_count =
+                db::messages::thread_turn_count(&state.db, &source.id).expect("count source turns");
             let intent = EngineRollbackIntent {
                 num_turns: 1,
                 source_turn_count,
                 target_turn_count: source_turn_count - 1,
                 phase: EngineRollbackPhase::Prepared,
             };
-            let pending_metadata = mark_engine_rollback_pending(
-                json!({ "codexTranscriptImported": true }),
-                &intent,
-            );
+            let pending_metadata =
+                mark_engine_rollback_pending(json!({ "codexTranscriptImported": true }), &intent);
             db::messages::prepare_pending_thread_rollback(
                 &state.db,
                 &source.id,

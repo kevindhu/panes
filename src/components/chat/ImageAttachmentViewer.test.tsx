@@ -283,7 +283,7 @@ describe("ImageAttachmentViewer", () => {
     expect(image.className).toContain("is-fit-ready");
     expect(image.className).not.toContain("can-transition");
 
-    const animationFrame = pendingAnimationFrame;
+    const animationFrame = pendingAnimationFrame as FrameRequestCallback | null;
     expect(animationFrame).not.toBeNull();
     await act(async () => {
       animationFrame?.(performance.now());

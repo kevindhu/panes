@@ -16,7 +16,25 @@ fn main() {
         compile_macos_helpers();
     }
 
-    tauri_build::build()
+    tauri_build::build();
+    expose_windows_resources_to_unit_tests();
+}
+
+fn expose_windows_resources_to_unit_tests() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+
+    // `tauri_build` generates the application manifest in this resource library,
+    // including the Common Controls v6 dependency required by Windows APIs used
+    // through Tauri. Tauri links it into binaries, but unit-test executables need
+    // it as well or they fail at process startup with STATUS_ENTRYPOINT_NOT_FOUND.
+    let output_dir = std::path::PathBuf::from(
+        std::env::var_os("OUT_DIR").expect("Cargo must provide OUT_DIR to build scripts"),
+    );
+    // `src/lib.rs` links the resource only when compiling the Windows unit-test
+    // harness. Normal binaries keep Tauri's standard single resource linkage.
+    println!("cargo:rustc-link-search=native={}", output_dir.display());
 }
 
 #[cfg(target_os = "macos")]

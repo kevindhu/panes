@@ -4,6 +4,7 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    "allowJs": true,
     "allowSyntheticDefaultImports": true,
     "esModuleInterop": true,
     "strict": true,
@@ -11,8 +12,16 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "jsx": "react-jsx",
     "types": ["vite/client"]
   },
-  "include": ["src/main.tsx"]
+  "include": [
+    "src/main.tsx",
+    "src/**/*.test.ts",
+    "src/**/*.test.tsx",
+    "tests/**/*.ts",
+    "tests/**/*.tsx"
+  ]
 }

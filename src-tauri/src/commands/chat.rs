@@ -482,13 +482,13 @@ pub async fn cache_embedded_chat_image(
         .map_err(|error| format!("failed to read cached embedded image: {error}"))?;
     let cache_dir_for_prune = cache_dir.clone();
     let file_path_for_prune = file_path.clone();
-    let _ = tokio::task::spawn_blocking(move || {
+    drop(tokio::task::spawn_blocking(move || {
         if let Err(error) =
             prune_embedded_chat_image_cache(&cache_dir_for_prune, &file_path_for_prune)
         {
             log::warn!("failed to prune embedded chat image cache: {error}");
         }
-    });
+    }));
 
     Ok(PreparedAttachmentImageAssetPayload {
         file_path: file_path.to_string_lossy().into_owned(),
@@ -796,7 +796,7 @@ fn attachment_image_signature_matches(header: &[u8], mime_type: &str) -> bool {
                 || header.starts_with(b"II+\0")
                 || header.starts_with(b"MM\0+")
         }
-        "image/svg+xml" => String::from_utf8_lossy(&header)
+        "image/svg+xml" => String::from_utf8_lossy(header)
             .to_ascii_lowercase()
             .contains("<svg"),
         _ => false,
@@ -1015,6 +1015,9 @@ where
         .map_err(err_to_string)
 }
 
+// Tauri exposes command arguments as individually named IPC fields. Keeping
+// this signature flat preserves the existing frontend contract.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn send_message(
     app: tauri::AppHandle,
@@ -1533,17 +1536,16 @@ pub async fn start_codex_review(
         }
     };
 
-    if matches!(effective_delivery, CodexReviewDeliveryPayload::Detached) {
-        if !state
+    if matches!(effective_delivery, CodexReviewDeliveryPayload::Detached)
+        && !state
             .turns
             .try_register(&review_thread.id, cancellation.clone())
             .await
-        {
-            log::warn!(
-                "failed to register cancellation token for detached review thread {}",
-                review_thread.id
-            );
-        }
+    {
+        log::warn!(
+            "failed to register cancellation token for detached review thread {}",
+            review_thread.id
+        );
     }
 
     let state_cloned = state.inner().clone();
@@ -2136,7 +2138,6 @@ async fn respond_to_approval_inner(
         let thread_id = thread_id.clone();
         let decision = decision.to_string();
         let normalized_response = normalized_response.clone();
-        let has_local_turn = has_local_turn;
         move |db| {
             db::actions::answer_approval_with_response(
                 db,
@@ -2404,6 +2405,9 @@ fn clone_codex_review_metadata(existing: Option<&Value>, model_id: &str) -> Opti
     Some(metadata)
 }
 
+// This is an internal orchestration boundary whose inputs deliberately make
+// turn ownership and persistence state explicit.
+#[allow(clippy::too_many_arguments)]
 async fn run_turn(
     app: tauri::AppHandle,
     state: AppState,
@@ -3008,6 +3012,9 @@ async fn run_turn(
     }
 }
 
+// Review execution mirrors the normal turn runner and keeps its runtime inputs
+// explicit until the two orchestration paths are consolidated.
+#[allow(clippy::too_many_arguments)]
 async fn run_codex_review_turn(
     app: tauri::AppHandle,
     state: AppState,
@@ -3978,25 +3985,23 @@ async fn process_stream_event(
                 }
             }
         }
-        EngineEvent::UsageLimitsUpdated { usage } => {
-            if usage_snapshot_has_context_metrics(usage) {
-                if let Err(error) = run_db(state.db.clone(), {
-                    let thread_id = thread.id.clone();
-                    let usage = usage.clone();
-                    move |db| {
-                        let current_thread = db::threads::get_thread(db, &thread_id)?
-                            .ok_or_else(|| anyhow::anyhow!("thread not found: {thread_id}"))?;
-                        let metadata = merge_context_usage_cache_into_metadata(
-                            current_thread.engine_metadata,
-                            &usage,
-                        );
-                        db::threads::update_engine_metadata(db, &thread_id, &metadata)
-                    }
-                })
-                .await
-                {
-                    log::warn!("failed to persist context usage cache: {error}");
+        EngineEvent::UsageLimitsUpdated { usage } if usage_snapshot_has_context_metrics(usage) => {
+            if let Err(error) = run_db(state.db.clone(), {
+                let thread_id = thread.id.clone();
+                let usage = usage.clone();
+                move |db| {
+                    let current_thread = db::threads::get_thread(db, &thread_id)?
+                        .ok_or_else(|| anyhow::anyhow!("thread not found: {thread_id}"))?;
+                    let metadata = merge_context_usage_cache_into_metadata(
+                        current_thread.engine_metadata,
+                        &usage,
+                    );
+                    db::threads::update_engine_metadata(db, &thread_id, &metadata)
                 }
+            })
+            .await
+            {
+                log::warn!("failed to persist context usage cache: {error}");
             }
         }
         _ => {}
@@ -5499,7 +5504,7 @@ fn normalize_codex_approval_policy_value(value: &Value) -> Result<Value, String>
                 })?;
 
             for required_key in ["mcp_elicitations", "rules", "sandbox_approval"] {
-                if !reject.get(required_key).and_then(Value::as_bool).is_some() {
+                if reject.get(required_key).and_then(Value::as_bool).is_none() {
                     return Err(format!(
                         "invalid structured approval policy. missing boolean reject.{required_key}"
                     ));
@@ -5528,6 +5533,8 @@ fn normalize_codex_approval_policy_value(value: &Value) -> Result<Value, String>
 }
 
 #[cfg(test)]
+// Catalog helpers follow this long-established inline command-test module.
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use std::{fs, sync::Arc};
 

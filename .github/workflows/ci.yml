@@ -15,6 +15,9 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CODEX_CLI_VERSION: "0.150.1"
+
 jobs:
   frontend:
     runs-on: ubuntu-latest
@@ -33,9 +36,9 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
       - name: Unit tests
-        run: pnpm test -- --passWithNoTests
+        run: pnpm run test -- --passWithNoTests
       - name: Install Codex CLI
-        run: npm install -g @openai/codex@0.125.0
+        run: npm install -g "@openai/codex@${CODEX_CLI_VERSION}"
       - name: Codex app-server schema parity
         run: pnpm check:codex-schema
       - name: Build frontend
@@ -67,9 +70,12 @@ jobs:
       - name: Rust fmt check
         working-directory: src-tauri
         run: cargo fmt -- --check
-      - name: Rust check
+      - name: Rust Clippy
         working-directory: src-tauri
-        run: cargo check
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test --locked --all-targets --all-features
 
   macos_compat:
     runs-on: macos-15
@@ -89,7 +95,7 @@ jobs:
           fi
       - name: Rust check for Intel macOS target
         working-directory: src-tauri
-        run: cargo check --target x86_64-apple-darwin
+        run: cargo check --locked --target x86_64-apple-darwin
 
   windows_compat:
     runs-on: windows-latest
@@ -106,27 +112,12 @@ jobs:
           if (-not (Test-Path dist/index.html)) {
             Set-Content -Path dist/index.html -Value '<!doctype html><html><body>CI placeholder</body></html>'
           }
-      - name: Rust check on Windows
+      - name: Rust Clippy on Windows
         working-directory: src-tauri
-        run: cargo check
-      - name: Windows runtime env tests
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Windows Rust tests
         working-directory: src-tauri
-        run: cargo test runtime_env --lib
-      - name: Windows app config tests
-        working-directory: src-tauri
-        run: cargo test app_config --lib
-      - name: Windows file command tests
-        working-directory: src-tauri
-        run: cargo test commands::files::tests --lib
-      - name: Windows keep awake tests
-        working-directory: src-tauri
-        run: cargo test commands::power::tests --lib
-      - name: Windows keep awake backend tests
-        working-directory: src-tauri
-        run: cargo test power::tests --lib
-      - name: Windows Codex engine tests
-        working-directory: src-tauri
-        run: cargo test codex::tests --lib
+        run: cargo test --locked --all-targets --all-features
 
   windows_bundle_check:
     runs-on: windows-latest

@@ -54,9 +54,10 @@ function makeWorkspace(id: string, name = id): Workspace {
 }
 
 function makeThread(overrides: Partial<Thread> & Pick<Thread, "id" | "workspaceId">): Thread {
+  const { id, workspaceId, ...rest } = overrides;
   return {
-    id: overrides.id,
-    workspaceId: overrides.workspaceId,
+    id,
+    workspaceId,
     repoId: null,
     engineId: "codex",
     modelId: "gpt-5.6-codex",
@@ -67,7 +68,7 @@ function makeThread(overrides: Partial<Thread> & Pick<Thread, "id" | "workspaceI
     totalTokens: 1,
     createdAt: "2026-08-01T00:00:00Z",
     lastActivityAt: "2026-08-01T00:00:00Z",
-    ...overrides,
+    ...rest,
   };
 }
 

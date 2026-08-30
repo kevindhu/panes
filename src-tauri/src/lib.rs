@@ -4,7 +4,7 @@ mod config;
 mod db;
 mod diagnostic_logs;
 mod engines;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 mod linux_appimage;
 mod linux_webkit;
 mod locale;
@@ -14,6 +14,13 @@ mod power;
 mod process_utils;
 mod runtime_env;
 mod state;
+
+// Tauri's generated manifest is normally linked only into application binaries.
+// The Windows unit-test harness also needs its Common Controls v6 dependency or
+// the process exits before running tests with STATUS_ENTRYPOINT_NOT_FOUND.
+#[cfg(all(test, target_os = "windows"))]
+#[link(name = "resource", kind = "static")]
+extern "C" {}
 
 use std::sync::Arc;
 
@@ -30,10 +37,10 @@ use models::{
 };
 use power::KeepAwakeManager;
 use state::{AppState, TurnManager};
-#[cfg(target_os = "macos")]
-use tauri::menu::{AboutMetadata, MenuItem, PredefinedMenuItem, SubmenuBuilder};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use tauri::image::Image;
+#[cfg(target_os = "macos")]
+use tauri::menu::{AboutMetadata, MenuItem, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{menu::Menu, Emitter, Manager, RunEvent, WebviewWindowBuilder};
 pub fn maybe_handle_cli_subcommand() -> anyhow::Result<bool> {
     Ok(false)
@@ -604,6 +611,9 @@ async fn resolve_codex_runtime_approval(
     }
 }
 
+// This helper mirrors the independent fields supplied by Codex runtime status
+// events; keeping them explicit avoids lossy intermediate JSON conversion.
+#[allow(clippy::too_many_arguments)]
 async fn apply_codex_runtime_thread_update(
     state: &AppState,
     engine_thread_id: &str,
@@ -939,6 +949,8 @@ fn resolve_codex_runtime_status_update(
 }
 
 #[cfg(test)]
+// Platform menu construction follows these runtime-status reducer tests.
+#[allow(clippy::items_after_test_module)]
 mod codex_runtime_status_tests {
     use super::*;
 

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::runtime_env;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub debug: DebugConfig,
@@ -23,7 +23,7 @@ pub struct DebugConfig {
     pub max_action_output_chars: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PowerConfig {
     pub keep_awake_enabled: bool,
@@ -42,29 +42,6 @@ impl Default for DebugConfig {
         Self {
             persist_engine_event_logs: false,
             max_action_output_chars: 20_000,
-        }
-    }
-}
-
-impl Default for PowerConfig {
-    fn default() -> Self {
-        Self {
-            keep_awake_enabled: false,
-            prevent_display_sleep: false,
-            prevent_screen_saver: false,
-            ac_only_mode: false,
-            battery_threshold: None,
-            session_duration_secs: None,
-            prevent_closed_display_sleep: false,
-        }
-    }
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            debug: DebugConfig::default(),
-            power: PowerConfig::default(),
         }
     }
 }
