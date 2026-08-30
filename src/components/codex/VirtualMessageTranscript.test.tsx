@@ -5,9 +5,15 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Message } from "../../types";
 import {
+  CHAT_TRANSCRIPT_VIRTUALIZATION_ENABLED,
   VirtualMessageTranscript,
   virtualRangeWithPinnedInterval,
 } from "./VirtualMessageTranscript";
+import {
+  cacheMeasuredMessageHeight,
+  cachedOrEstimatedMessageHeight,
+  estimateMessageHeight,
+} from "./virtualMessageSizing";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
   .IS_REACT_ACT_ENVIRONMENT = true;
@@ -53,6 +59,7 @@ describe("VirtualMessageTranscript", () => {
           restorePosition={null}
           selectedMessageRange={null}
           layoutRevision="stable"
+          virtualizationEnabled
           renderMessage={(item) => <article data-message-id={item.id}>{item.content}</article>}
         />,
       );
@@ -87,6 +94,7 @@ describe("VirtualMessageTranscript", () => {
           restorePosition={null}
           selectedMessageRange={null}
           layoutRevision="stable"
+          virtualizationEnabled
           renderMessage={(item) => <article data-message-id={item.id}>{item.content}</article>}
         />,
       );
@@ -100,6 +108,29 @@ describe("VirtualMessageTranscript", () => {
     expect(mounted.length).toBeLessThan(30);
   });
 
+  it("renders the complete transcript while the production virtualization switch is off", async () => {
+    const viewport = document.createElement("div");
+    const viewportRef = createRef<HTMLDivElement>();
+    viewportRef.current = viewport;
+    const messages = Array.from({ length: 100 }, (_, index) => message(index));
+
+    await act(async () => {
+      root.render(
+        <VirtualMessageTranscript
+          messages={messages}
+          viewportRef={viewportRef}
+          restorePosition={null}
+          selectedMessageRange={null}
+          layoutRevision="stable"
+          renderMessage={(item) => <article data-message-id={item.id}>{item.content}</article>}
+        />,
+      );
+    });
+
+    expect(CHAT_TRANSCRIPT_VIRTUALIZATION_ENABLED).toBe(false);
+    expect(container.querySelectorAll("[data-message-id]")).toHaveLength(100);
+  });
+
   it("adds the complete selected interval to the normal virtual range", () => {
     expect(virtualRangeWithPinnedInterval({
       startIndex: 40,
@@ -110,5 +141,56 @@ describe("VirtualMessageTranscript", () => {
       10, 11, 12,
       38, 39, 40, 41, 42, 43, 44, 45, 46,
     ]);
+  });
+
+  it("estimates short user rows near their compact rendered height", () => {
+    expect(estimateMessageHeight(message(0))).toBeGreaterThanOrEqual(78);
+    expect(estimateMessageHeight(message(0))).toBeLessThan(120);
+  });
+
+  it("accounts for large compatibility transcripts instead of assigning one flat row height", () => {
+    const largeTranscript: Message = {
+      ...message(1),
+      blocks: Array.from({ length: 100 }, (_, index) => ({
+        type: "text" as const,
+        content: `Transcript entry ${index}`,
+      })),
+    };
+
+    expect(estimateMessageHeight(largeTranscript)).toBeGreaterThan(4_000);
+  });
+
+  it("reserves inline space for image references before they load", () => {
+    const imageTranscript: Message = {
+      ...message(1),
+      blocks: [{
+        type: "thinking",
+        content: "![portrait](<C:\\Users\\tester\\Pictures\\folder (20)\\portrait (01).png>)",
+      }],
+    };
+
+    expect(estimateMessageHeight(imageTranscript)).toBeGreaterThan(400);
+  });
+
+  it("does not treat inline image payload bytes as thousands of text lines", () => {
+    const inlineImage: Message = {
+      ...message(1),
+      blocks: [{
+        type: "text",
+        content: `![inline](data:image/png;base64,${"A".repeat(20_000)})`,
+      }],
+    };
+
+    expect(estimateMessageHeight(inlineImage)).toBeGreaterThan(400);
+    expect(estimateMessageHeight(inlineImage)).toBeLessThan(1_000);
+  });
+
+  it("reuses a measured height only for the same message revision and width", () => {
+    const measured = { ...message(0), id: "measured-height-message" };
+    cacheMeasuredMessageHeight(measured, 777, 820);
+
+    expect(cachedOrEstimatedMessageHeight(measured, 820)).toBe(777);
+    expect(cachedOrEstimatedMessageHeight({ ...measured }, 820)).not.toBe(777);
+    expect(cachedOrEstimatedMessageHeight(measured, 500)).not.toBe(777);
   });
 });

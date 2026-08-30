@@ -30,6 +30,7 @@ import { AttachmentChip } from "../chat/AttachmentChip";
 import { ToolInputQuestionnaire } from "../chat/ToolInputQuestionnaire";
 import { CodexUsageLimits } from "./CodexUsageLimits";
 import {
+  CHAT_TRANSCRIPT_VIRTUALIZATION_ENABLED,
   VirtualMessageTranscript,
   type VirtualMessageTranscriptHandle,
 } from "./VirtualMessageTranscript";
@@ -916,7 +917,7 @@ export function CodexChat() {
 
       <div
         ref={viewportRef}
-        className={`codex-message-viewport ${showSpecialComposer ? "awaiting-input" : ""}`}
+        className={`codex-message-viewport ${showSpecialComposer ? "awaiting-input" : ""} ${CHAT_TRANSCRIPT_VIRTUALIZATION_ENABLED ? "is-virtualized" : ""}`}
         onWheelCapture={stopScrollRestoration}
         onPointerDownCapture={stopScrollRestoration}
         onTouchStartCapture={stopScrollRestoration}
@@ -951,6 +952,7 @@ export function CodexChat() {
           restorePosition={savedScrollPosition}
           selectedMessageRange={selectedMessageRange}
           layoutRevision={`${hasOlderMessages}:${loadingOlderMessages}:${showSpecialComposer}`}
+          virtualizationEnabled={CHAT_TRANSCRIPT_VIRTUALIZATION_ENABLED}
           renderMessage={renderMessage}
         />
         {error && <div className="codex-error">{error}</div>}

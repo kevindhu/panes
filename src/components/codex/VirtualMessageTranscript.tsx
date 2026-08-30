@@ -1,9 +1,12 @@
 import {
   defaultRangeExtractor,
+  measureElement as measureVirtualElement,
   useVirtualizer,
   type Range,
+  type Virtualizer,
 } from "@tanstack/react-virtual";
 import {
+  Fragment,
   forwardRef,
   useCallback,
   useImperativeHandle,
@@ -17,10 +20,16 @@ import {
 import type { ChatScrollPosition } from "../../lib/chatScrollPosition";
 import type { TranscriptSelectionMessageRange } from "../../lib/transcriptSelection";
 import type { Message } from "../../types";
+import {
+  cacheMeasuredMessageHeight,
+  cachedOrEstimatedMessageHeight,
+  DEFAULT_TRANSCRIPT_WIDTH,
+  normalizedTranscriptWidth,
+} from "./virtualMessageSizing";
 
-const USER_MESSAGE_ESTIMATE = 120;
-const ASSISTANT_MESSAGE_ESTIMATE = 360;
 const RESTORE_SETTLE_MS = 2_500;
+
+export const CHAT_TRANSCRIPT_VIRTUALIZATION_ENABLED: boolean = false;
 
 export interface VirtualMessageTranscriptHandle {
   cancelRestore: () => void;
@@ -33,6 +42,7 @@ interface VirtualMessageTranscriptProps {
   restorePosition: ChatScrollPosition | null;
   selectedMessageRange: TranscriptSelectionMessageRange | null;
   layoutRevision: string;
+  virtualizationEnabled?: boolean;
   renderMessage: (message: Message) => ReactNode;
 }
 
@@ -69,37 +79,66 @@ export const VirtualMessageTranscript = forwardRef<
   restorePosition,
   selectedMessageRange,
   layoutRevision,
+  virtualizationEnabled = CHAT_TRANSCRIPT_VIRTUALIZATION_ENABLED,
   renderMessage,
 }, forwardedRef) {
   const sizeContainerRef = useRef<HTMLDivElement | null>(null);
   const restoreCleanupRef = useRef<(() => void) | null>(null);
   const restoredRef = useRef(false);
   const [scrollMargin, setScrollMargin] = useState(0);
-  const [virtualizationEnabled, setVirtualizationEnabled] = useState(false);
+  const [transcriptWidth, setTranscriptWidth] = useState(DEFAULT_TRANSCRIPT_WIDTH);
+  const [viewportReady, setViewportReady] = useState(false);
+  const virtualizationActive = virtualizationEnabled && viewportReady;
+  const messagesRef = useRef(messages);
+  const sizeEstimatesRef = useRef<number[]>([]);
+  messagesRef.current = messages;
   const pinnedInterval = useMemo(
     () => selectedIndexInterval(messages, selectedMessageRange),
     [messages, selectedMessageRange],
   );
+  const sizeEstimates = useMemo(
+    () => virtualizationEnabled
+      ? messages.map((message) => cachedOrEstimatedMessageHeight(message, transcriptWidth))
+      : [],
+    [messages, transcriptWidth, virtualizationEnabled],
+  );
+  sizeEstimatesRef.current = sizeEstimates;
   const estimatedTotalSize = useMemo(
-    () => messages.reduce(
-      (total, message) => total + (message.role === "user" ? USER_MESSAGE_ESTIMATE : ASSISTANT_MESSAGE_ESTIMATE),
-      0,
-    ),
-    [messages],
+    () => sizeEstimates.reduce((total, size) => total + size, 0),
+    [sizeEstimates],
   );
   const rangeExtractor = useCallback(
     (range: Range) => virtualRangeWithPinnedInterval(range, pinnedInterval),
     [pinnedInterval],
   );
+  const getItemKey = useCallback(
+    (index: number) => messagesRef.current[index]?.id ?? index,
+    [],
+  );
+  const estimateSize = useCallback((index: number) => {
+    return sizeEstimatesRef.current[index] ?? 112;
+  }, []);
+  const measureElement = useCallback((
+    element: HTMLDivElement,
+    entry: ResizeObserverEntry | undefined,
+    instance: Virtualizer<HTMLDivElement, HTMLDivElement>,
+  ) => {
+    const size = measureVirtualElement(element, entry, instance);
+    const index = instance.indexFromElement(element);
+    const message = messagesRef.current[index];
+    const borderBox = entry?.borderBoxSize?.[0];
+    const width = borderBox?.inlineSize ?? element.offsetWidth;
+    if (message) cacheMeasuredMessageHeight(message, size, width);
+    return size;
+  }, []);
 
   const virtualizer = useVirtualizer<HTMLDivElement, HTMLDivElement>({
     count: messages.length,
     getScrollElement: () => viewportRef.current,
-    getItemKey: (index) => messages[index]?.id ?? index,
-    estimateSize: (index) => messages[index]?.role === "user"
-      ? USER_MESSAGE_ESTIMATE
-      : ASSISTANT_MESSAGE_ESTIMATE,
-    overscan: 4,
+    getItemKey,
+    estimateSize,
+    measureElement,
+    overscan: 6,
     scrollMargin,
     rangeExtractor,
     anchorTo: "end",
@@ -112,7 +151,8 @@ export const VirtualMessageTranscript = forwardRef<
     directDomUpdates: true,
     directDomUpdatesMode: "position",
     useFlushSync: false,
-    enabled: virtualizationEnabled,
+    useAnimationFrameWithResizeObserver: true,
+    enabled: virtualizationActive,
   });
 
   const cancelRestore = useCallback(() => {
@@ -124,7 +164,7 @@ export const VirtualMessageTranscript = forwardRef<
     cancelRestore();
     const viewport = viewportRef.current;
     if (!viewport) return;
-    if (virtualizationEnabled) {
+    if (virtualizationActive) {
       virtualizer.scrollToEnd({ behavior: "auto" });
       window.requestAnimationFrame(() => {
         viewport.scrollTop = viewport.scrollHeight;
@@ -132,7 +172,7 @@ export const VirtualMessageTranscript = forwardRef<
       return;
     }
     viewport.scrollTop = viewport.scrollHeight;
-  }, [cancelRestore, viewportRef, virtualizationEnabled, virtualizer]);
+  }, [cancelRestore, viewportRef, virtualizationActive, virtualizer]);
 
   useImperativeHandle(forwardedRef, () => ({ cancelRestore, scrollToEnd }), [cancelRestore, scrollToEnd]);
 
@@ -142,6 +182,7 @@ export const VirtualMessageTranscript = forwardRef<
   }, [virtualizer]);
 
   useLayoutEffect(() => {
+    if (!virtualizationActive) return;
     const viewport = viewportRef.current;
     const container = sizeContainerRef.current;
     if (!viewport || !container) return;
@@ -149,20 +190,28 @@ export const VirtualMessageTranscript = forwardRef<
       - viewport.getBoundingClientRect().top
       + viewport.scrollTop;
     setScrollMargin((current) => Math.abs(current - nextMargin) > 0.5 ? nextMargin : current);
-  }, [layoutRevision, viewportRef, virtualizationEnabled]);
+  }, [layoutRevision, viewportRef, virtualizationActive]);
 
   useLayoutEffect(() => {
+    if (!virtualizationEnabled) return;
     const viewport = viewportRef.current;
     if (!viewport) return;
     const enableWhenVisible = () => {
-      if (viewport.clientHeight > 0) setVirtualizationEnabled(true);
+      if (viewport.clientHeight > 0) {
+        const width = sizeContainerRef.current?.clientWidth || viewport.clientWidth;
+        if (width > 0) {
+          const normalizedWidth = normalizedTranscriptWidth(width);
+          setTranscriptWidth((current) => current === normalizedWidth ? current : normalizedWidth);
+        }
+        setViewportReady(true);
+      }
     };
     enableWhenVisible();
     if (typeof ResizeObserver !== "function") return;
     const observer = new ResizeObserver(enableWhenVisible);
     observer.observe(viewport);
     return () => observer.disconnect();
-  }, [viewportRef]);
+  }, [viewportRef, virtualizationEnabled]);
 
   useLayoutEffect(() => {
     if (restoredRef.current) return;
@@ -170,6 +219,13 @@ export const VirtualMessageTranscript = forwardRef<
     const viewport = viewportRef.current;
     if (!viewport || messages.length === 0) return;
     if (!virtualizationEnabled) {
+      restoredRef.current = true;
+      viewport.scrollTop = restorePosition && !restorePosition.nearBottom
+        ? restorePosition.scrollTop
+        : viewport.scrollHeight;
+      return;
+    }
+    if (!virtualizationActive) {
       if (viewport.clientHeight > 0) return;
       restoredRef.current = true;
       viewport.scrollTop = restorePosition && !restorePosition.nearBottom
@@ -231,9 +287,19 @@ export const VirtualMessageTranscript = forwardRef<
       cleanup();
     }, RESTORE_SETTLE_MS);
     return cleanup;
-  }, [cancelRestore, messages, restorePosition, viewportRef, virtualizationEnabled, virtualizer]);
+  }, [cancelRestore, messages, restorePosition, viewportRef, virtualizationActive, virtualizationEnabled, virtualizer]);
 
   useLayoutEffect(() => cancelRestore, [cancelRestore]);
+
+  if (!virtualizationEnabled) {
+    return (
+      <>
+        {messages.map((message) => (
+          <Fragment key={message.id}>{renderMessage(message)}</Fragment>
+        ))}
+      </>
+    );
+  }
 
   const virtualItems = virtualizer.getVirtualItems();
   const coldStartIndexes = virtualItems.length === 0 && messages.length > 0
