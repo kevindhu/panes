@@ -9,6 +9,7 @@ const mockIpc = vi.hoisted(() => ({
   sendMessage: vi.fn(),
   savePastedImageAttachment: vi.fn(),
   forkCodexThreadAtTurn: vi.fn(),
+  setThreadCodexConfig: vi.fn(),
 }));
 const mockListeners = vi.hoisted(() => ({
   transcriptUpdated: null as null | ((event: {
@@ -73,6 +74,7 @@ let root: Root;
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockIpc.setThreadCodexConfig.mockResolvedValue(thread);
   mockListeners.transcriptUpdated = null;
   mockListeners.assistantTurnRenderCount = 0;
   localStorage.clear();
@@ -158,6 +160,46 @@ afterEach(async () => {
 });
 
 describe("CodexChat submission", () => {
+  it("toggles Fast mode from the composer toolbar", async () => {
+    mockIpc.setThreadCodexConfig.mockResolvedValueOnce({
+      ...thread,
+      engineMetadata: { serviceTier: "fast" },
+    });
+
+    await act(async () => root.render(<CodexChat />));
+    const fastButton = container.querySelector<HTMLButtonElement>('[aria-label="Fast mode"]');
+
+    expect(fastButton).not.toBeNull();
+    expect(fastButton?.getAttribute("aria-pressed")).toBe("false");
+
+    await act(async () => {
+      fastButton?.click();
+      await Promise.resolve();
+    });
+
+    expect(mockIpc.setThreadCodexConfig).toHaveBeenCalledWith(thread.id, {
+      serviceTier: "fast",
+    });
+    expect(fastButton?.getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("lets a new conversation select Fast mode before its first message", async () => {
+    useThreadStore.setState({
+      threads: [],
+      threadsByWorkspace: { "workspace-1": [] },
+      activeThreadId: null,
+    });
+    useChatStore.setState({ threadId: null });
+
+    await act(async () => root.render(<CodexChat />));
+    const fastButton = container.querySelector<HTMLButtonElement>('[aria-label="Fast mode"]');
+
+    expect(fastButton?.getAttribute("aria-pressed")).toBe("false");
+    await act(async () => fastButton?.click());
+    expect(fastButton?.getAttribute("aria-pressed")).toBe("true");
+    expect(mockIpc.setThreadCodexConfig).not.toHaveBeenCalled();
+  });
+
   it("does not rerender the visible transcript for a background thread status update", async () => {
     const backgroundThread: Thread = {
       ...thread,

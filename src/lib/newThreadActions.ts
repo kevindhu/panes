@@ -1,9 +1,15 @@
 import { useThreadStore } from "../stores/threadStore";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { activateThreadContext } from "./threadActivation";
+import type { NewThreadServiceTier } from "./newThreadRuntime";
+
+interface CreateWorkspaceThreadOptions {
+  serviceTier?: NewThreadServiceTier | null;
+}
 
 export async function createAndActivateWorkspaceThread(
   workspaceId: string | null | undefined,
+  options: CreateWorkspaceThreadOptions = {},
 ): Promise<string | null> {
   if (!workspaceId) {
     return null;
@@ -25,6 +31,7 @@ export async function createAndActivateWorkspaceThread(
     workspaceId,
     repoId: null,
     engineId: "codex",
+    serviceTier: options.serviceTier,
     title: "New conversation",
   });
 

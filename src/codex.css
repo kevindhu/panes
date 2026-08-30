@@ -132,8 +132,8 @@ button { color: inherit; }
 .codex-effort { display: flex; align-items: center; gap: 2px; }
 .codex-effort select { max-width: 75px; }
 .codex-composer-toolbar .spacer { flex: 1; }
-.codex-fast { display: flex; align-items: center; gap: 3px; color: var(--text-3); font-size: 9px; white-space: nowrap; }
-.codex-fast { color: var(--accent); }
+.codex-composer-toolbar button.codex-fast { color: var(--text-3); white-space: nowrap; }
+.codex-composer-toolbar button.codex-fast.active { color: var(--accent); }
 .codex-usage-control { display: flex; align-items: center; }
 .codex-composer-toolbar .codex-usage-trigger { width: 27px; min-width: 27px; padding: 0; }
 .codex-usage-trigger:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }

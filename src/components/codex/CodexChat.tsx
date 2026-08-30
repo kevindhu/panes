@@ -165,6 +165,7 @@ export function CodexChat() {
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [selectedModelId, setSelectedModelId] = useState("");
   const [reasoningEffort, setReasoningEffort] = useState<string | null>(null);
+  const [newThreadServiceTier, setNewThreadServiceTier] = useState<"fast" | null>(null);
   const [policyOpen, setPolicyOpen] = useState(false);
   const [forkingMessageId, setForkingMessageId] = useState<string | null>(null);
   const [rollingBackMessageId, setRollingBackMessageId] = useState<string | null>(null);
@@ -223,6 +224,10 @@ export function CodexChat() {
     composerModeScope,
   ) === "plan";
   const composerModeScopeReady = composerModeScope.kind === "thread" || composerModeScope.kind === "new-thread";
+  const serviceTier = activeThread
+    ? readMetadataString(activeThread, "serviceTier")
+    : newThreadServiceTier;
+  const fastMode = serviceTier === "fast";
   const planModeThreadIsBound = composerModeScope.kind === "thread" && composerModeScope.threadId === boundThreadId;
   const canForkMessages = canForkCodexMessageHistory(activeThread);
   const canRollbackMessages = canEditCodexMessageHistory(activeThread, streaming);
@@ -408,6 +413,10 @@ export function CodexChat() {
   useEffect(() => {
     setReferenceCatalog(null);
   }, [workspace?.rootPath]);
+
+  useEffect(() => {
+    setNewThreadServiceTier(null);
+  }, [activeThreadId]);
 
   useEffect(() => {
     setForkingMessageId(null);
@@ -683,7 +692,11 @@ export function CodexChat() {
     if (rollingBackMessageId || (!text && !attachments.length) || !activeWorkspaceId || !composerModeScopeReady) return;
     let targetThreadId = activeThreadId;
     const creatingThread = !targetThreadId;
-    if (creatingThread) targetThreadId = await createAndActivateWorkspaceThread(activeWorkspaceId);
+    if (creatingThread) {
+      targetThreadId = await createAndActivateWorkspaceThread(activeWorkspaceId, {
+        serviceTier: fastMode ? "fast" : null,
+      });
+    }
     if (!targetThreadId) return;
     if (creatingThread) clearNewThreadMode(activeWorkspaceId);
 
@@ -830,6 +843,14 @@ export function CodexChat() {
     } catch (configError) {
       toast.error(`Could not update Codex mode: ${String(configError)}`);
     }
+  }
+
+  function setFastMode(enabled: boolean) {
+    if (!activeThread) {
+      setNewThreadServiceTier(enabled ? "fast" : null);
+      return;
+    }
+    void updateServiceTier(enabled ? "fast" : "inherit");
   }
 
   if (!workspace) {
@@ -1060,7 +1081,17 @@ export function CodexChat() {
                     {selectedModel.supportedReasoningEfforts.map((option) => <option key={option.reasoningEffort} value={option.reasoningEffort}>{option.reasoningEffort}</option>)}
                   </select></label>
                 )}
-                {readMetadataString(activeThread, "serviceTier") === "fast" && <span className="codex-fast"><Zap size={12} /> Fast</span>}
+                <button
+                  type="button"
+                  className={`codex-fast ${fastMode ? "active" : ""}`}
+                  aria-label="Fast mode"
+                  aria-pressed={fastMode}
+                  onClick={() => setFastMode(!fastMode)}
+                  disabled={streaming || !composerModeScopeReady}
+                  title={`${fastMode ? "Disable" : "Enable"} Fast mode`}
+                >
+                  <Zap size={12} /> Fast
+                </button>
                 <CodexUsageLimits
                   usage={usage}
                   threadId={activeThreadId === boundThreadId ? activeThreadId : null}
