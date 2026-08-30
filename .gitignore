@@ -4,6 +4,7 @@ dist/
 .DS_Store
 src-tauri/target/
 src-tauri/target-*/
+src-tauri/OLD/
 src-tauri/gen/
 src-tauri/sidecar-dist/
 src-tauri/helper/build/
