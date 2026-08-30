@@ -11,15 +11,9 @@ import {
   type CSSProperties,
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
-  type SyntheticEvent,
 } from "react";
 import { Check, Copy } from "lucide-react";
-import {
-  getCachedAttachmentImageAssetUrl,
-  getCachedAttachmentImageFallbackUrl,
-  loadAttachmentImageAssetUrl,
-  loadAttachmentImageFallbackUrl,
-} from "../../lib/attachmentImages";
+import { createChatImageDescriptor } from "../../lib/chatImageSources";
 import { recordPerfMetric } from "../../lib/perfTelemetry";
 import {
   classifyLinkTarget,
@@ -31,6 +25,7 @@ import {
   transcriptLinkShouldNavigate,
 } from "../../lib/transcriptSelection";
 import {
+  MARKDOWN_CHAT_IMAGE_SOURCE_ATTR,
   MARKDOWN_LOCAL_IMAGE_MIME_ATTR,
   MARKDOWN_LOCAL_IMAGE_PATH_ATTR,
   rewriteMarkdownImageSources,
@@ -40,19 +35,13 @@ import type {
   MarkdownParseWorkerRequest,
   MarkdownParseWorkerResponse,
 } from "../../workers/markdownParser.types";
-import { ImageAttachmentViewer } from "./ImageAttachmentViewer";
+import { ChatImagePreview } from "./ChatImage";
 
 const MARKDOWN_WORKER_THRESHOLD_CHARS = 1000;
 const STREAMING_MARKDOWN_INLINE_LIMIT_CHARS = 6000;
 const MARKDOWN_CACHE_LIMIT = 280;
 const MARKDOWN_CACHE_MAX_BYTES = 8 * 1024 * 1024;
-const MARKDOWN_LOCAL_IMAGE_THUMBNAIL_MAX_WIDTH = 720;
-const MARKDOWN_LOCAL_IMAGE_THUMBNAIL_MAX_HEIGHT = 440;
-const MARKDOWN_LOCAL_IMAGE_INLINE_MAX_WIDTH = 360;
-const MARKDOWN_LOCAL_IMAGE_INLINE_MAX_HEIGHT = 220;
-
 const markdownHtmlCache = new Map<string, string>();
-const markdownLocalImageFrameCache = new Map<string, MarkdownLocalImageFrame>();
 let markdownHtmlCacheBytes = 0;
 let markdownWorkerInstance: Worker | null = null;
 let markdownWorkerRequestSeq = 0;
@@ -268,240 +257,6 @@ function handleMarkdownLinkMouseDown(event: ReactMouseEvent<HTMLDivElement>): vo
   if (anchor) recordTranscriptLinkPointerDown(event, anchor);
 }
 
-function getFileNameFromPath(filePath: string): string {
-  const normalizedPath = filePath.replace(/\\/g, "/");
-  return normalizedPath.split("/").filter(Boolean).pop() ?? "image";
-}
-
-interface MarkdownLocalImageProps {
-  filePath: string;
-  mimeType?: string;
-  alt?: string;
-}
-
-interface MarkdownLocalImageFrame {
-  width: number;
-  height: number;
-  aspectRatio: string;
-}
-
-function getThumbnailPreviewOptions() {
-  return {
-    maxWidth: MARKDOWN_LOCAL_IMAGE_THUMBNAIL_MAX_WIDTH,
-    maxHeight: MARKDOWN_LOCAL_IMAGE_THUMBNAIL_MAX_HEIGHT,
-  };
-}
-
-function getMarkdownLocalImageFrameCacheKey(filePath: string, mimeType?: string): string {
-  return `${filePath}\u0000${mimeType ?? ""}`;
-}
-
-function fitMarkdownLocalImageFrame(naturalWidth: number, naturalHeight: number): MarkdownLocalImageFrame | null {
-  if (naturalWidth <= 0 || naturalHeight <= 0) {
-    return null;
-  }
-
-  const aspect = naturalWidth / naturalHeight;
-  let width = MARKDOWN_LOCAL_IMAGE_INLINE_MAX_WIDTH;
-  let height = width / aspect;
-
-  if (height > MARKDOWN_LOCAL_IMAGE_INLINE_MAX_HEIGHT) {
-    height = MARKDOWN_LOCAL_IMAGE_INLINE_MAX_HEIGHT;
-    width = height * aspect;
-  }
-
-  return {
-    width: Math.max(1, Math.round(width)),
-    height: Math.max(1, Math.round(height)),
-    aspectRatio: `${naturalWidth} / ${naturalHeight}`,
-  };
-}
-
-function MarkdownLocalImage({ filePath, mimeType, alt }: MarkdownLocalImageProps) {
-  const fileName = getFileNameFromPath(filePath);
-  const thumbnailOptions = getThumbnailPreviewOptions();
-  const frameCacheKey = getMarkdownLocalImageFrameCacheKey(filePath, mimeType);
-  const [thumbnailSrc, setThumbnailSrc] = useState<string | null>(() => (
-    getCachedAttachmentImageAssetUrl(filePath, mimeType, thumbnailOptions)
-      ?? getCachedAttachmentImageFallbackUrl(filePath, mimeType)
-      ?? null
-  ));
-  const [fullSrc, setFullSrc] = useState<string | null>(() => (
-    getCachedAttachmentImageAssetUrl(filePath, mimeType) ?? null
-  ));
-  const [thumbnailFrame, setThumbnailFrame] = useState<MarkdownLocalImageFrame | null>(() => (
-    markdownLocalImageFrameCache.get(frameCacheKey) ?? null
-  ));
-  const [thumbnailFailed, setThumbnailFailed] = useState(false);
-  const [viewerOpen, setViewerOpen] = useState(false);
-
-  useEffect(() => {
-    let disposed = false;
-    setThumbnailFailed(false);
-    setThumbnailFrame(markdownLocalImageFrameCache.get(frameCacheKey) ?? null);
-
-    const cachedThumbnail = getCachedAttachmentImageAssetUrl(filePath, mimeType, thumbnailOptions);
-    if (cachedThumbnail !== undefined) {
-      setThumbnailSrc(cachedThumbnail);
-      setThumbnailFailed(!cachedThumbnail);
-      return () => {
-        disposed = true;
-      };
-    }
-
-    setThumbnailSrc(null);
-    void loadAttachmentImageAssetUrl(filePath, mimeType, thumbnailOptions)
-      .then((nextThumbnailSrc) => {
-        if (disposed) {
-          return;
-        }
-        setThumbnailSrc(nextThumbnailSrc);
-        setThumbnailFailed(!nextThumbnailSrc);
-      })
-      .catch(() => {
-        if (!disposed) {
-          setThumbnailSrc(null);
-          const cachedFallback = getCachedAttachmentImageFallbackUrl(filePath, mimeType);
-          if (cachedFallback) {
-            setThumbnailSrc(cachedFallback);
-            setFullSrc(null);
-            return;
-          }
-          void loadAttachmentImageFallbackUrl(filePath, mimeType)
-            .then((fallbackSrc) => {
-              if (!disposed) {
-                setThumbnailSrc(fallbackSrc);
-                setFullSrc(null);
-                setThumbnailFailed(!fallbackSrc);
-              }
-            })
-            .catch(() => {
-              if (!disposed) {
-                setThumbnailFailed(true);
-              }
-            });
-        }
-      });
-
-    return () => {
-      disposed = true;
-    };
-  }, [filePath, frameCacheKey, mimeType]);
-
-  useEffect(() => {
-    let disposed = false;
-    const cachedFullSrc = getCachedAttachmentImageAssetUrl(filePath, mimeType);
-    setFullSrc(cachedFullSrc ?? null);
-    if (cachedFullSrc === undefined) {
-      void loadAttachmentImageAssetUrl(filePath, mimeType)
-        .then((nextFullSrc) => {
-          if (!disposed) {
-            setFullSrc(nextFullSrc);
-          }
-        })
-        .catch(() => {
-          if (!disposed) {
-            setFullSrc(null);
-          }
-        });
-    }
-    return () => {
-      disposed = true;
-    };
-  }, [filePath, mimeType]);
-
-  const requestViewerFallback = useCallback(async (): Promise<string | null> => {
-    const cachedFallback = getCachedAttachmentImageFallbackUrl(filePath, mimeType);
-    if (cachedFallback !== undefined) {
-      if (cachedFallback) {
-        setThumbnailSrc(cachedFallback);
-        setFullSrc(null);
-      }
-      return cachedFallback;
-    }
-    const fallbackSrc = await loadAttachmentImageFallbackUrl(filePath, mimeType);
-    if (fallbackSrc) {
-      setThumbnailSrc(fallbackSrc);
-      setFullSrc(null);
-    }
-    return fallbackSrc;
-  }, [filePath, mimeType]);
-
-  function openViewer() {
-    setViewerOpen(true);
-  }
-
-  function handleThumbnailError() {
-    setFullSrc(null);
-    void requestViewerFallback()
-      .then((fallbackSrc) => setThumbnailFailed(!fallbackSrc))
-      .catch(() => setThumbnailFailed(true));
-  }
-
-  function handleThumbnailLoad(event: SyntheticEvent<HTMLImageElement>) {
-    const nextFrame = fitMarkdownLocalImageFrame(
-      event.currentTarget.naturalWidth,
-      event.currentTarget.naturalHeight,
-    );
-    if (!nextFrame) {
-      return;
-    }
-
-    markdownLocalImageFrameCache.set(frameCacheKey, nextFrame);
-    setThumbnailFrame(nextFrame);
-  }
-
-  const thumbnailFrameStyle = thumbnailFrame
-    ? ({
-        "--markdown-local-image-frame-width": `${thumbnailFrame.width}px`,
-        "--markdown-local-image-frame-height": "auto",
-        "--markdown-local-image-aspect": thumbnailFrame.aspectRatio,
-      } as CSSProperties)
-    : undefined;
-
-  return (
-    <>
-      <button
-        type="button"
-        className="markdown-local-image-button"
-        style={thumbnailFrameStyle}
-        data-panes-markdown-local-image-path={filePath}
-        data-panes-markdown-local-image-mime={mimeType}
-        aria-label="Open image"
-        onClick={openViewer}
-      >
-        {thumbnailSrc ? (
-          <img
-            src={thumbnailSrc}
-            alt={alt ?? fileName}
-            className="markdown-local-image-thumbnail"
-            draggable={false}
-            decoding="async"
-            onLoad={handleThumbnailLoad}
-            onError={handleThumbnailError}
-          />
-        ) : (
-          <span className="markdown-local-image-placeholder">
-            {thumbnailFailed ? "Image unavailable" : "Loading image"}
-          </span>
-        )}
-      </button>
-      {viewerOpen && (
-        <ImageAttachmentViewer
-          open
-          filePath={filePath}
-          fileName={fileName}
-          mimeType={mimeType}
-          originalSrc={fullSrc}
-          previewSrc={thumbnailSrc}
-          requestPreview={requestViewerFallback}
-          onClose={() => setViewerOpen(false)}
-        />
-      )}
-    </>
-  );
-}
-
 function isVoidElement(tagName: string): boolean {
   return tagName === "br" || tagName === "hr" || tagName === "img";
 }
@@ -635,13 +390,21 @@ function convertHtmlNodeToReact(
   const tagName = node.tagName.toLowerCase();
   if (tagName === "img") {
     const filePath = node.getAttribute(MARKDOWN_LOCAL_IMAGE_PATH_ATTR)?.trim();
-    if (filePath) {
+    const source = node.getAttribute(MARKDOWN_CHAT_IMAGE_SOURCE_ATTR)?.trim();
+    const image = createChatImageDescriptor({
+      id: `markdown:${key}`,
+      origin: "markdown",
+      source,
+      filePath,
+      mimeType: node.getAttribute(MARKDOWN_LOCAL_IMAGE_MIME_ATTR)?.trim(),
+      alt: node.getAttribute("alt")?.trim(),
+    });
+    if (image) {
       return (
-        <MarkdownLocalImage
+        <ChatImagePreview
           key={key}
-          filePath={filePath}
-          mimeType={node.getAttribute(MARKDOWN_LOCAL_IMAGE_MIME_ATTR)?.trim() || undefined}
-          alt={node.getAttribute("alt")?.trim() || undefined}
+          image={image}
+          variant="markdown"
         />
       );
     }
@@ -691,7 +454,7 @@ function renderMarkdownHtmlAsReact(html: string, forceReactTree = false): ReactN
   template.innerHTML = html;
 
   const containsInteractiveContent =
-    template.content.querySelector(`img[${MARKDOWN_LOCAL_IMAGE_PATH_ATTR}]`) !== null ||
+    template.content.querySelector(`img[${MARKDOWN_CHAT_IMAGE_SOURCE_ATTR}]`) !== null ||
     template.content.querySelector("pre > code") !== null;
   if (!forceReactTree && !containsInteractiveContent) {
     return null;

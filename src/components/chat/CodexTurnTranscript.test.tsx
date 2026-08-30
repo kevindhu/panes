@@ -432,6 +432,137 @@ describe("CodexTranscriptRenderer", () => {
     expect(directChildren[progress]?.getAttribute("data-source-sequence")).toBe("4");
   });
 
+  it("embeds generated, viewed, dynamic-tool, and MCP images in native activity rows", async () => {
+    const imageSnapshot = snapshot();
+    imageSnapshot.turn.planJson = null;
+    imageSnapshot.items = [
+      {
+        itemId: "generated-1",
+        itemType: "imageGeneration",
+        status: "completed",
+        phase: null,
+        firstSourceSequence: 1,
+        lastSourceSequence: 1,
+        startedAtMs: 1_000,
+        completedAtMs: 1_100,
+        startedJson: null,
+        completedJson: JSON.stringify({
+          id: "generated-1",
+          type: "imageGeneration",
+          status: "completed",
+          result: "https://cdn.example.com/generated.png",
+          revisedPrompt: "Generated poster",
+        }),
+      },
+      {
+        itemId: "view-1",
+        itemType: "imageView",
+        status: "completed",
+        phase: null,
+        firstSourceSequence: 2,
+        lastSourceSequence: 2,
+        startedAtMs: 1_100,
+        completedAtMs: 1_200,
+        startedJson: null,
+        completedJson: JSON.stringify({
+          id: "view-1",
+          type: "imageView",
+          path: "C:\\workspace\\screenshots\\page.png",
+        }),
+      },
+      {
+        itemId: "dynamic-1",
+        itemType: "dynamicToolCall",
+        status: "completed",
+        phase: null,
+        firstSourceSequence: 3,
+        lastSourceSequence: 3,
+        startedAtMs: 1_200,
+        completedAtMs: 1_300,
+        startedJson: null,
+        completedJson: JSON.stringify({
+          id: "dynamic-1",
+          type: "dynamicToolCall",
+          tool: "render",
+          status: "completed",
+          contentItems: [{
+            type: "inputImage",
+            imageUrl: "https://cdn.example.com/dynamic.webp",
+          }],
+        }),
+      },
+      {
+        itemId: "mcp-1",
+        itemType: "mcpToolCall",
+        status: "completed",
+        phase: null,
+        firstSourceSequence: 4,
+        lastSourceSequence: 4,
+        startedAtMs: 1_300,
+        completedAtMs: 1_400,
+        startedJson: null,
+        completedJson: JSON.stringify({
+          id: "mcp-1",
+          type: "mcpToolCall",
+          server: "design",
+          tool: "preview",
+          status: "completed",
+          result: {
+            content: [{
+              type: "image",
+              imageUrl: "https://cdn.example.com/mcp.jpg",
+              mimeType: "image/jpeg",
+            }],
+          },
+        }),
+      },
+    ];
+    imageSnapshot.events = [];
+    imageSnapshot.chunks = [];
+
+    await act(async () => {
+      root.render(
+        <CodexTranscriptRenderer
+          snapshot={imageSnapshot}
+          status="completed"
+          workspaceRootPath="C:\\workspace"
+          onApproval={vi.fn()}
+        />,
+      );
+      await Promise.resolve();
+    });
+
+    expect(container.querySelectorAll(".chat-image-gallery")).toHaveLength(4);
+    expect(
+      [...container.querySelectorAll<HTMLImageElement>(".chat-image-gallery-thumbnail")]
+        .map((image) => image.src),
+    ).toEqual([
+      "https://cdn.example.com/generated.png",
+      "https://cdn.example.com/dynamic.webp",
+      "https://cdn.example.com/mcp.jpg",
+    ]);
+    expect(container.querySelector('[data-item-type="imageView"] .chat-image-gallery-card')).not.toBeNull();
+
+    const imageViewHeader = container.querySelector<HTMLButtonElement>(
+      '[data-item-type="imageView"] .codex-native-activity-header',
+    );
+    expect(imageViewHeader?.getAttribute("aria-expanded")).toBe("true");
+    await act(async () => imageViewHeader?.click());
+    expect(imageViewHeader?.getAttribute("aria-expanded")).toBe("false");
+    expect(container.querySelector('[data-item-type="imageView"] .chat-image-gallery-card')).toBeNull();
+    await act(async () => imageViewHeader?.click());
+    expect(container.querySelector('[data-item-type="imageView"] .chat-image-gallery-card')).not.toBeNull();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(
+        '[data-item-type="imageGeneration"] .chat-image-gallery-card',
+      )?.click();
+    });
+    expect(document.body.querySelector(".chat-image-viewer-image")?.getAttribute("src")).toBe(
+      "https://cdn.example.com/generated.png",
+    );
+  });
+
   it("renders elapsed time, per-turn tokens, plan progress, and completion state", async () => {
     await act(async () => {
       root.render(
@@ -659,6 +790,45 @@ describe("CodexTranscriptRenderer", () => {
     expect(container.textContent).toContain("Codex app server");
     expect(container.textContent).toContain("Official protocol documentation.");
     expect(container.textContent).toContain("No output was emitted.");
+  });
+
+  it("embeds image results retained in pre-v2 action details", async () => {
+    await act(async () => {
+      root.render(
+        <MessageBlocks
+          status="completed"
+          onApproval={vi.fn()}
+          blocks={[{
+            type: "action",
+            actionId: "legacy-generated",
+            engineActionId: "generated-legacy-1",
+            actionType: "other",
+            summary: "Generate image",
+            details: {
+              id: "generated-legacy-1",
+              type: "imageGeneration",
+              status: "completed",
+              result: "https://cdn.example.com/legacy-generated.png",
+              revisedPrompt: "Legacy generated image",
+            },
+            outputChunks: [{
+              stream: "stdout",
+              content: "data:image/png;base64," + "A".repeat(256),
+            }],
+            status: "done",
+          }]}
+        />,
+      );
+    });
+
+    expect(container.querySelector(".legacy-action-images img")?.getAttribute("src")).toBe(
+      "https://cdn.example.com/legacy-generated.png",
+    );
+    const groupHeader = container.querySelector<HTMLElement>(".action-group > .msg-block-header");
+    await act(async () => groupHeader?.click());
+    const actionHeader = container.querySelector<HTMLElement>(".msg-block-header--compact");
+    await act(async () => actionHeader?.click());
+    expect(container.textContent).not.toContain("AAAA");
   });
 
   it("bounds long action headers while keeping the complete command in expanded details", async () => {

@@ -7,6 +7,7 @@ import {
   Circle,
   Copy,
   FileDiff,
+  Image as ImageIcon,
   Layers,
   ListChecks,
   Loader2,
@@ -25,6 +26,10 @@ import {
   type ReactNode,
 } from "react";
 import { ipc } from "../../lib/codexIpc";
+import {
+  extractChatImagesFromPayload,
+  redactChatImagePayload,
+} from "../../lib/chatImageSources";
 import {
   authoritativeCodexItem,
   commandOutputParts,
@@ -48,6 +53,7 @@ import type {
 } from "../../types";
 import MarkdownContent from "./MarkdownContent";
 import { LinkifiedPlainText, MessageBlocks, truncateActionHeader } from "./MessageBlocks";
+import { ChatImageGallery } from "./ChatImage";
 
 const LARGE_TEXT_PREVIEW_CHARS = 160_000;
 const MAX_CACHED_CODEX_TURN_SNAPSHOTS = 120;
@@ -240,7 +246,7 @@ function recordNumber(record: Record<string, unknown>, ...keys: string[]): numbe
 
 function prettyJson(value: unknown): string {
   try {
-    return JSON.stringify(value, null, 2) ?? String(value);
+    return JSON.stringify(redactChatImagePayload(value), null, 2) ?? String(value);
   } catch {
     return String(value);
   }
@@ -569,7 +575,7 @@ const activityIcons: Record<CodexActivityKind, LucideIcon> = {
   reasoning: Brain,
   plan: MessageSquare,
   agent: MessageSquare,
-  image: MessageSquare,
+  image: ImageIcon,
   review: MessageSquare,
   compaction: Layers,
   diff: FileDiff,
@@ -595,13 +601,31 @@ function ActivityRow({
   activity,
   selectionNamespace,
   turnStatus,
+  workspaceRootPath,
 }: {
   activity: CodexTranscriptActivity;
   selectionNamespace: string;
   turnStatus: TurnDisplayStatus;
+  workspaceRootPath?: string | null;
 }) {
-  const [expanded, setExpanded] = useState(false);
   const Icon = activityIcons[activity.activityKind];
+  const images = useMemo(
+    () => extractChatImagesFromPayload(activity.payload, {
+      itemType: activity.itemType,
+      itemId: activity.itemId ?? activity.id,
+      title: activity.title,
+      workspaceRootPath,
+    }),
+    [activity.id, activity.itemId, activity.itemType, activity.payload, activity.title, workspaceRootPath],
+  );
+  const [expanded, setExpanded] = useState(() => images.length > 0);
+  const previousImageCountRef = useRef(images.length);
+  useEffect(() => {
+    if (previousImageCountRef.current === 0 && images.length > 0) {
+      setExpanded(true);
+    }
+    previousImageCountRef.current = images.length;
+  }, [images.length]);
   return (
     <div
       className={`codex-native-activity-row ${expanded ? "expanded" : ""}`}
@@ -621,6 +645,9 @@ function ActivityRow({
         <ActivityStatus activity={activity} turnStatus={turnStatus} />
         {activity.durationMs !== null && <span className="codex-native-duration">{formatDuration(activity.durationMs)}</span>}
       </button>
+      {expanded && images.length > 0 && (
+        <ChatImageGallery images={images} className="codex-native-activity-images" />
+      )}
       {expanded && <ActivityDetails activity={activity} turnStatus={turnStatus} />}
     </div>
   );
@@ -656,7 +683,14 @@ function NativePlanEntry({
 }) {
   const text = stripProposedPlanEnvelope(reasoningText(entry).plan);
   const [expanded, setExpanded] = useState(true);
-  if (!text) return <ActivityRow activity={entry} selectionNamespace={selectionNamespace} turnStatus={turnStatus} />;
+  if (!text) return (
+    <ActivityRow
+      activity={entry}
+      selectionNamespace={selectionNamespace}
+      turnStatus={turnStatus}
+      workspaceRootPath={workspaceRootPath}
+    />
+  );
 
   return (
     <section
@@ -757,10 +791,12 @@ function ActivityGroup({
   activities,
   selectionNamespace,
   turnStatus,
+  workspaceRootPath,
 }: {
   activities: CodexTranscriptActivity[];
   selectionNamespace: string;
   turnStatus: TurnDisplayStatus;
+  workspaceRootPath?: string | null;
 }) {
   const displayStatuses = activities.map((activity) => activityDisplayStatus(activity, turnStatus));
   const running = displayStatuses.some((status) => status === "running" || status === "pending");
@@ -797,7 +833,19 @@ function ActivityGroup({
             ? <AlertTriangle size={13} className="codex-native-error" />
             : <CheckCircle2 size={13} />}
       </button>
-      {expanded && <div className="codex-native-group-body">{activities.map((activity) => <ActivityRow key={activity.id} activity={activity} selectionNamespace={selectionNamespace} turnStatus={turnStatus} />)}</div>}
+      {expanded && (
+        <div className="codex-native-group-body">
+          {activities.map((activity) => (
+            <ActivityRow
+              key={activity.id}
+              activity={activity}
+              selectionNamespace={selectionNamespace}
+              turnStatus={turnStatus}
+              workspaceRootPath={workspaceRootPath}
+            />
+          ))}
+        </div>
+      )}
     </section>
   );
 }
@@ -1154,6 +1202,7 @@ export function CodexTranscriptRenderer({
               activities={segment.entries}
               selectionNamespace={selectionNamespace}
               turnStatus={turnStatus}
+              workspaceRootPath={workspaceRootPath}
             />
           );
         }

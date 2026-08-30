@@ -84,6 +84,12 @@ import {
   transcriptLinkShouldNavigate,
 } from "../../lib/transcriptSelection";
 import { webSearchDetails } from "../../lib/codexTranscript";
+import {
+  extractChatImagesFromPayload,
+  isLikelyInlineImagePayload,
+  redactChatImagePayload,
+} from "../../lib/chatImageSources";
+import { ChatImageGallery } from "./ChatImage";
 interface Props {
   blocks?: ContentBlock[];
   status?: MessageStatus;
@@ -703,12 +709,29 @@ function ActionStatusBadge({ status }: { status: string }) {
 function ActionBlockView({
   block,
   onLoadDeferredOutput,
+  workspaceRootPath,
 }: {
   block: ActionBlock;
   onLoadDeferredOutput?: () => Promise<void>;
+  workspaceRootPath?: string | null;
 }) {
   const { t } = useTranslation("chat");
-  const outputChunks = Array.isArray(block.outputChunks) ? block.outputChunks : [];
+  const actionDetails = (block.details ?? {}) as Record<string, unknown>;
+  const images = useMemo(
+    () => extractChatImagesFromPayload(actionDetails, {
+      itemId: block.engineActionId ?? block.actionId,
+      title: block.summary,
+      workspaceRootPath,
+    }),
+    [actionDetails, block.actionId, block.engineActionId, block.summary, workspaceRootPath],
+  );
+  const outputChunks = useMemo(() => {
+    const chunks = Array.isArray(block.outputChunks) ? block.outputChunks : [];
+    if (images.length === 0) {
+      return chunks;
+    }
+    return chunks.filter((chunk) => !isLikelyInlineImagePayload(String(chunk.content ?? "")));
+  }, [block.outputChunks, images.length]);
   const outputDeferred = block.outputDeferred === true;
   const outputText = useMemo(
     () => {
@@ -731,7 +754,6 @@ function ActionBlockView({
     [outputChunks],
   );
   const Icon = actionIcons[block.actionType] ?? Terminal;
-  const actionDetails = (block.details ?? {}) as Record<string, unknown>;
   const searchDetails = useMemo(
     () => block.actionType === "search" ? webSearchDetails(actionDetails) : null,
     [actionDetails, block.actionType],
@@ -750,7 +772,7 @@ function ActionBlockView({
   const inputDetail = useMemo(() => {
     const pretty = (value: unknown) => {
       try {
-        return JSON.stringify(value, null, 2) ?? String(value);
+        return JSON.stringify(redactChatImagePayload(value), null, 2) ?? String(value);
       } catch {
         return String(value);
       }
@@ -778,7 +800,8 @@ function ActionBlockView({
     actionDetails.progressKind === "mcp" && typeof actionDetails.progressMessage === "string"
       ? actionDetails.progressMessage
       : null;
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(() => images.length > 0);
+  const previousImageCountRef = useRef(images.length);
   const [loadingDeferredOutput, setLoadingDeferredOutput] = useState(false);
   const [deferredOutputError, setDeferredOutputError] = useState<string | null>(null);
   const deferredOutputRequestedRef = useRef(false);
@@ -801,6 +824,13 @@ function ActionBlockView({
         setLoadingDeferredOutput(false);
       });
   }, [onLoadDeferredOutput]);
+
+  useEffect(() => {
+    if (previousImageCountRef.current === 0 && images.length > 0) {
+      setExpanded(true);
+    }
+    previousImageCountRef.current = images.length;
+  }, [images.length]);
 
   useEffect(() => {
     if (!expanded || !outputDeferred || outputChunks.length > 0) {
@@ -860,6 +890,10 @@ function ActionBlockView({
         >
           {progressMessage}
         </div>
+      )}
+
+      {expanded && images.length > 0 && (
+        <ChatImageGallery images={images} className="legacy-action-images" />
       )}
 
       {expanded && (
@@ -1002,9 +1036,11 @@ const actionTypeLabels: Record<string, string> = {
 function ActionGroupView({
   blocks,
   onLoadActionOutput,
+  workspaceRootPath,
 }: {
   blocks: ActionBlock[];
   onLoadActionOutput?: (actionId: string) => Promise<void>;
+  workspaceRootPath?: string | null;
 }) {
   const { t } = useTranslation("chat");
   const [expanded, setExpanded] = useState(false);
@@ -1084,6 +1120,7 @@ function ActionGroupView({
               <ActionBlockView
                 key={block.actionId}
                 block={block}
+                workspaceRootPath={workspaceRootPath}
                 onLoadDeferredOutput={
                   onLoadActionOutput ? () => onLoadActionOutput(block.actionId) : undefined
                 }
@@ -1660,6 +1697,7 @@ function renderSingleBlock(
       <div key={blockKey} >
         <ActionBlockView
           block={block}
+          workspaceRootPath={workspaceRootPath}
           onLoadDeferredOutput={
             onLoadActionOutput ? () => onLoadActionOutput(block.actionId) : undefined
           }
@@ -1770,6 +1808,7 @@ function MessageBlocksView({
                       key={`action-group:${first.actionId}:${last.actionId}`}
                       blocks={inner.blocks}
                       onLoadActionOutput={onLoadActionOutput}
+                      workspaceRootPath={workspaceRootPath}
                     />
                   );
                 }
@@ -1814,6 +1853,7 @@ function MessageBlocksView({
                   <ActionBlockView
                     key={inner.block.type === "action" ? (inner.block as ActionBlock).actionId : `inner-${innerIdx}`}
                     block={inner.block as ActionBlock}
+                    workspaceRootPath={workspaceRootPath}
                     onLoadDeferredOutput={
                       onLoadActionOutput ? () => onLoadActionOutput((inner.block as ActionBlock).actionId) : undefined
                     }
@@ -1832,6 +1872,7 @@ function MessageBlocksView({
               key={`action-group:${first.actionId}:${last.actionId}`}
               blocks={segment.blocks}
               onLoadActionOutput={onLoadActionOutput}
+              workspaceRootPath={workspaceRootPath}
             />
           );
         }

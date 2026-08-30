@@ -89,10 +89,15 @@ describe("renderMarkdownToHtml", () => {
   });
 
   it("preserves explicit markdown links to local files", () => {
-    const html = renderMarkdownToHtml("[readme](README.md) [file](file:///repo/README.md#L4)");
+    const html = renderMarkdownToHtml([
+      "[readme](README.md)",
+      "[file](file:///repo/README.md#L4)",
+      String.raw`[image](<C:\Users\dev\Pictures\page (01).png>)`,
+    ].join(" "));
 
     expect(html).toContain('href="README.md"');
     expect(html).toContain('href="file:///repo/README.md#L4"');
+    expect(html).toContain('href="C:%5CUsers%5Cdev%5CPictures%5Cpage%20(01).png"');
   });
 
   it("preserves the encoded target for an absolute folder link containing spaces", () => {
@@ -105,23 +110,28 @@ describe("renderMarkdownToHtml", () => {
     );
   });
 
-  it("does not allow local file URLs in image sources", () => {
-    const html = renderMarkdownToHtml("![local](file:///repo/secret.png)");
+  it("allows image file URLs but still rejects non-image file sources", () => {
+    const html = renderMarkdownToHtml(
+      "![local](file:///repo/preview.png) ![notes](file:///repo/notes.txt)",
+    );
 
-    expect(html).toContain('src="#"');
-    expect(html).not.toContain('src="file:///repo/secret.png"');
+    expect(html).toContain('src="file:///repo/preview.png"');
+    expect(html).toContain('src="#" alt="notes"');
+    expect(html).not.toContain('src="file:///repo/notes.txt"');
   });
 
-  it("preserves absolute Windows drive and UNC image sources for native resolution", () => {
+  it("preserves absolute local image sources for native resolution", () => {
     const html = renderMarkdownToHtml([
       "![drive](<C:/Users/dev/translated panels/page.png>)",
       String.raw`![drive-backslash](<C:\Users\dev\translated.webp>)`,
       String.raw`![network](<\\media-server\translations\page.webp>)`,
+      "![posix](</Users/dev/translated panels/page.png>)",
     ].join(" "));
 
     expect(html).toContain('src="C:/Users/dev/translated%20panels/page.png"');
     expect(html).toContain('src="C:%5CUsers%5Cdev%5Ctranslated.webp"');
     expect(html).toContain('src="%5C%5Cmedia-server%5Ctranslations%5Cpage.webp"');
+    expect(html).toContain('src="/Users/dev/translated%20panels/page.png"');
   });
 
   it("leaves remote and protocol-relative image sources on the browser path", () => {
