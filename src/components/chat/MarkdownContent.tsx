@@ -1,8 +1,10 @@
 import {
+  Fragment,
   createElement,
   useCallback,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -580,9 +582,50 @@ function MarkdownCodeBlock({ content, preProps, children }: MarkdownCodeBlockPro
   );
 }
 
-function convertHtmlNodeToReact(node: ChildNode, key: string): ReactNode {
+interface StableStreamingTextState {
+  content: string;
+  chunks: string[];
+  version: number;
+}
+
+function StableStreamingText({ text }: { text: string }) {
+  // Native selections are anchored to Text nodes. Keep committed stream
+  // chunks immutable and represent later output with newly appended nodes.
+  const committedRef = useRef<StableStreamingTextState>({
+    content: "",
+    chunks: [],
+    version: 0,
+  });
+  const committed = committedRef.current;
+  const candidate = text === committed.content
+    ? committed
+    : text.startsWith(committed.content)
+      ? {
+          content: text,
+          chunks: [...committed.chunks, text.slice(committed.content.length)],
+          version: committed.version,
+        }
+      : { content: text, chunks: [text], version: committed.version + 1 };
+
+  useLayoutEffect(() => {
+    committedRef.current = candidate;
+  }, [candidate]);
+
+  return candidate.chunks.map((chunk, index) => (
+    <Fragment key={`${candidate.version}:${index}`}>{chunk}</Fragment>
+  ));
+}
+
+function convertHtmlNodeToReact(
+  node: ChildNode,
+  key: string,
+  preserveStreamingText: boolean,
+): ReactNode {
   if (node.nodeType === Node.TEXT_NODE) {
-    return node.textContent;
+    const text = node.textContent ?? "";
+    return preserveStreamingText
+      ? <StableStreamingText key={`${key}:streaming-text`} text={text} />
+      : text;
   }
 
   if (!(node instanceof Element)) {
@@ -618,7 +661,7 @@ function convertHtmlNodeToReact(node: ChildNode, key: string): ReactNode {
   }
 
   const children = Array.from(node.childNodes).map((childNode, childIndex) =>
-    convertHtmlNodeToReact(childNode, `${key}.${childIndex}`),
+    convertHtmlNodeToReact(childNode, `${key}.${childIndex}`, preserveStreamingText),
   );
 
   if (
@@ -655,7 +698,7 @@ function renderMarkdownHtmlAsReact(html: string, forceReactTree = false): ReactN
   }
 
   return Array.from(template.content.childNodes).map((node, index) =>
-    convertHtmlNodeToReact(node, `${index}`),
+    convertHtmlNodeToReact(node, `${index}`, forceReactTree),
   );
 }
 
@@ -808,7 +851,7 @@ export default function MarkdownContent({
             fontFamily: "inherit",
           }}
         >
-          {content}
+          {hasStreamed ? <StableStreamingText text={content} /> : content}
         </pre>
       </div>
     );

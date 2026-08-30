@@ -140,6 +140,31 @@ describe("transcript selection", () => {
     expect(document.getSelection()?.toString()).toBe("persistent selection");
   });
 
+  it("restores a structurally replaced selection before pointer release", async () => {
+    const onActiveChange = vi.fn();
+    await act(async () => {
+      root.render(
+        <SelectionHarness live={false} resetKey="thread:1" onActiveChange={onActiveChange} />,
+      );
+    });
+
+    const scope = container.querySelector('[data-transcript-selection-scope="turn:stable"]') as HTMLDivElement;
+    const text = textNodeContaining(scope, "persistent selection");
+    const start = text.data.indexOf("persistent selection");
+    selectText(text, start, start + "persistent selection".length);
+    await act(async () => {
+      document.dispatchEvent(new Event("selectionchange"));
+      scope.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+      root.render(
+        <SelectionHarness live resetKey="thread:1" onActiveChange={onActiveChange} />,
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(document.getSelection()?.toString()).toBe("persistent selection");
+  });
+
   it("clears the logical and native selection when the transcript identity changes", async () => {
     const onActiveChange = vi.fn();
     await act(async () => {
