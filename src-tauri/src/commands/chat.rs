@@ -2459,6 +2459,17 @@ async fn run_turn(
             .await
     });
 
+    let codex_title_generation_started = should_generate_codex_thread_title(&thread);
+    if codex_title_generation_started {
+        spawn_codex_thread_title_generation(
+            app.clone(),
+            state.clone(),
+            thread.clone(),
+            engine_thread_id.clone(),
+            turn_input.message.clone(),
+        );
+    }
+
     let mut blocks: Vec<ContentBlock> = Vec::new();
     let mut action_index: HashMap<String, usize> = HashMap::new();
     let mut approval_index: HashMap<String, usize> = HashMap::new();
@@ -2965,8 +2976,10 @@ async fn run_turn(
         }
     }
 
-    let _ =
-        maybe_update_thread_title(&state, &thread, &engine_thread_id, &turn_input.message).await;
+    if !codex_title_generation_started {
+        let _ = maybe_update_thread_title(&state, &thread, &engine_thread_id, &turn_input.message)
+            .await;
+    }
 
     let latest_thread = run_db(state.db.clone(), {
         let thread_id = thread.id.clone();
@@ -4210,16 +4223,23 @@ async fn maybe_update_thread_title(
 
     let updated_thread = match run_db(state.db.clone(), {
         let thread_id = thread.id.clone();
+        let expected_title = thread.title.clone();
         let candidate = candidate.clone();
         move |db| {
+            let current_thread = db::threads::get_thread(db, &thread_id)?
+                .ok_or_else(|| anyhow::anyhow!("thread not found: {thread_id}"))?;
+            if !should_replace_automatic_thread_title(&current_thread, &expected_title) {
+                return Ok(None);
+            }
+
             db::threads::update_thread_title(db, &thread_id, &candidate)?;
-            db::threads::get_thread(db, &thread_id)?
-                .ok_or_else(|| anyhow::anyhow!("thread not found after title update: {thread_id}"))
+            db::threads::get_thread(db, &thread_id)
         }
     })
     .await
     {
-        Ok(updated_thread) => updated_thread,
+        Ok(Some(updated_thread)) => updated_thread,
+        Ok(None) => return None,
         Err(error) => {
             log::warn!("failed to update thread title: {error}");
             return None;
@@ -4235,6 +4255,110 @@ async fn maybe_update_thread_title(
     }
 
     Some(updated_thread)
+}
+
+fn spawn_codex_thread_title_generation(
+    app: tauri::AppHandle,
+    state: AppState,
+    thread: ThreadDto,
+    engine_thread_id: String,
+    opening_message: String,
+) {
+    tokio::spawn(async move {
+        let generated = maybe_generate_thread_title(
+            &app,
+            &state,
+            &thread,
+            &engine_thread_id,
+            &opening_message,
+            &thread.title,
+        )
+        .await;
+
+        if !generated
+            && maybe_update_thread_title(&state, &thread, &engine_thread_id, &opening_message)
+                .await
+                .is_some()
+        {
+            emit_latest_thread_updated(&app, &state, &thread, "fallback title update").await;
+        }
+    });
+}
+
+async fn maybe_generate_thread_title(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    thread: &ThreadDto,
+    engine_thread_id: &str,
+    opening_message: &str,
+    expected_title: &str,
+) -> bool {
+    let generated_title = match state
+        .engines
+        .generate_codex_thread_title(opening_message)
+        .await
+    {
+        Ok(title) => title,
+        Err(error) => {
+            log::debug!("failed to generate AI thread title: {error:#}");
+            return false;
+        }
+    };
+    let Some(candidate) = normalize_thread_title(&generated_title) else {
+        return false;
+    };
+    if candidate == expected_title {
+        return false;
+    }
+
+    let applied = match run_db(state.db.clone(), {
+        let thread_id = thread.id.clone();
+        let expected_title = expected_title.to_string();
+        let candidate = candidate.clone();
+        move |db| {
+            let current_thread = db::threads::get_thread(db, &thread_id)?
+                .ok_or_else(|| anyhow::anyhow!("thread not found: {thread_id}"))?;
+            if !should_replace_automatic_thread_title(&current_thread, &expected_title) {
+                return Ok(false);
+            }
+
+            db::threads::update_thread_title(db, &thread_id, &candidate)?;
+            Ok(true)
+        }
+    })
+    .await
+    {
+        Ok(applied) => applied,
+        Err(error) => {
+            log::warn!("failed to apply AI thread title: {error}");
+            return false;
+        }
+    };
+    if !applied {
+        return false;
+    }
+
+    emit_latest_thread_updated(app, state, thread, "AI title update").await;
+
+    if let Err(error) = state
+        .engines
+        .set_thread_name(thread, engine_thread_id, &candidate)
+        .await
+    {
+        log::debug!("failed to sync AI thread title with engine: {error}");
+    }
+
+    emit_latest_thread_updated(app, state, thread, "AI title sync completion").await;
+
+    true
+}
+
+fn should_replace_automatic_thread_title(thread: &ThreadDto, expected_title: &str) -> bool {
+    thread.title == expected_title && !thread_manual_title_locked(thread.engine_metadata.as_ref())
+}
+
+fn should_generate_codex_thread_title(thread: &ThreadDto) -> bool {
+    thread.engine_id == "codex" && should_autotitle_thread(thread)
 }
 
 fn should_autotitle_thread(thread: &ThreadDto) -> bool {
@@ -5456,6 +5580,50 @@ mod tests {
             "Thread",
         )
         .expect("failed to create thread")
+    }
+
+    #[test]
+    fn automatic_title_only_replaces_the_untouched_title() {
+        let state = test_app_state();
+        let mut thread = test_thread(&state, "codex", "gpt-test");
+        thread.title = "Opening prompt".to_string();
+
+        assert!(should_replace_automatic_thread_title(
+            &thread,
+            "Opening prompt"
+        ));
+
+        thread.title = "A newer title".to_string();
+        assert!(!should_replace_automatic_thread_title(
+            &thread,
+            "Opening prompt"
+        ));
+
+        thread.title = "Opening prompt".to_string();
+        thread.engine_metadata = Some(json!({ "manualTitle": true }));
+        assert!(!should_replace_automatic_thread_title(
+            &thread,
+            "Opening prompt"
+        ));
+    }
+
+    #[test]
+    fn codex_title_generation_only_starts_for_an_unrenamed_first_turn() {
+        let state = test_app_state();
+        let mut thread = test_thread(&state, "codex", "gpt-test");
+
+        assert!(should_generate_codex_thread_title(&thread));
+
+        thread.message_count = 1;
+        assert!(!should_generate_codex_thread_title(&thread));
+
+        thread.message_count = 0;
+        thread.engine_metadata = Some(json!({ "manualTitle": true }));
+        assert!(!should_generate_codex_thread_title(&thread));
+
+        thread.engine_metadata = None;
+        thread.engine_id = "claude".to_string();
+        assert!(!should_generate_codex_thread_title(&thread));
     }
 
     fn attachment_validation_catalog(attachment_modalities: Vec<&str>) -> Vec<EngineInfoDto> {
