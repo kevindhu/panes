@@ -12,7 +12,7 @@ const mockIpc = vi.hoisted(() => ({
 
 vi.mock("../lib/codexIpc", () => ({ ipc: mockIpc }));
 
-import { useThreadStore } from "./threadStore";
+import { hasUnreadFinishedTurn, useThreadStore } from "./threadStore";
 
 function makeThread(overrides: Partial<Thread> = {}): Thread {
   return {
@@ -40,6 +40,7 @@ beforeEach(() => {
     threads: [thread],
     threadsByWorkspace: { [thread.workspaceId]: [thread] },
     archivedThreadsByWorkspace: {},
+    finishedTurnNotifications: {},
     activeThreadId: thread.id,
     loading: false,
     archivedLoading: false,
@@ -48,6 +49,56 @@ beforeEach(() => {
 });
 
 describe("threadStore sidebar operations", () => {
+  it("clears finished-turn notifications monotonically across selection races", () => {
+    useThreadStore.setState({ activeThreadId: "another-thread" });
+
+    expect(useThreadStore.getState().recordFinishedTurn("thread-1", "assistant-1"))
+      .toBe(true);
+    expect(hasUnreadFinishedTurn(
+      useThreadStore.getState().finishedTurnNotifications,
+      "thread-1",
+    )).toBe(true);
+
+    useThreadStore.getState().setActiveThread("thread-1");
+    expect(hasUnreadFinishedTurn(
+      useThreadStore.getState().finishedTurnNotifications,
+      "thread-1",
+    )).toBe(false);
+
+    useThreadStore.getState().setActiveThread("another-thread");
+    expect(useThreadStore.getState().recordFinishedTurn("thread-1", "assistant-1"))
+      .toBe(false);
+    expect(hasUnreadFinishedTurn(
+      useThreadStore.getState().finishedTurnNotifications,
+      "thread-1",
+    )).toBe(false);
+
+    useThreadStore.getState().setActiveThread("thread-1");
+    expect(useThreadStore.getState().recordFinishedTurn("thread-1", "assistant-2"))
+      .toBe(true);
+    useThreadStore.getState().setActiveThread("another-thread");
+    expect(useThreadStore.getState().recordFinishedTurn("thread-1", "assistant-2"))
+      .toBe(false);
+    expect(hasUnreadFinishedTurn(
+      useThreadStore.getState().finishedTurnNotifications,
+      "thread-1",
+    )).toBe(false);
+
+    expect(JSON.parse(localStorage.getItem("panes:finished-turn-notifications") ?? "{}"))
+      .toEqual({ "thread-1": { "assistant-1": false, "assistant-2": false } });
+  });
+
+  it("keeps a later background finish unread after earlier turns were cleared", () => {
+    useThreadStore.getState().recordFinishedTurn("thread-1", "assistant-1");
+    useThreadStore.getState().setActiveThread("another-thread");
+    useThreadStore.getState().recordFinishedTurn("thread-1", "assistant-2");
+
+    expect(hasUnreadFinishedTurn(
+      useThreadStore.getState().finishedTurnNotifications,
+      "thread-1",
+    )).toBe(true);
+  });
+
   it("returns the renamed thread and updates every active index", async () => {
     const renamed = makeThread({ title: "Renamed" });
     mockIpc.renameThread.mockResolvedValue(renamed);

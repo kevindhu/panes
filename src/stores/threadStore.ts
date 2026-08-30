@@ -22,6 +22,7 @@ interface ThreadState {
   threads: Thread[];
   threadsByWorkspace: Record<string, Thread[]>;
   archivedThreadsByWorkspace: Record<string, Thread[]>;
+  finishedTurnNotifications: FinishedTurnNotifications;
   activeThreadId: string | null;
   startupRestorePending: boolean;
   loading: boolean;
@@ -57,6 +58,7 @@ interface ThreadState {
   setActiveThread: (threadId: string | null) => void;
   setStartupRestorePending: (pending: boolean) => void;
   applyThreadUpdateLocal: (thread: Thread) => boolean;
+  recordFinishedTurn: (threadId: string, assistantMessageId: string) => boolean;
   setThreadStatusLocal: (threadId: string, status: ThreadStatus) => void;
   setThreadReasoningEffortLocal: (threadId: string, reasoningEffort: string | null) => void;
   setThreadLastModelLocal: (threadId: string, modelId: string | null) => void;
@@ -64,6 +66,61 @@ interface ThreadState {
 
 const DEFAULT_ENGINE = NEW_THREAD_FALLBACK_RUNTIME.engineId;
 const DEFAULT_MODEL = NEW_THREAD_FALLBACK_RUNTIME.modelId;
+const FINISHED_TURN_NOTIFICATIONS_KEY = "panes:finished-turn-notifications";
+
+type FinishedTurnNotifications = Record<string, Record<string, boolean>>;
+
+function loadFinishedTurnNotifications(): FinishedTurnNotifications {
+  if (typeof localStorage === "undefined") return {};
+  try {
+    const parsed = JSON.parse(
+      localStorage.getItem(FINISHED_TURN_NOTIFICATIONS_KEY) ?? "{}",
+    ) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+
+    return Object.fromEntries(
+      Object.entries(parsed).flatMap(([threadId, turns]) => {
+        if (!turns || typeof turns !== "object" || Array.isArray(turns)) return [];
+        const validTurns = Object.fromEntries(
+          Object.entries(turns).filter((entry): entry is [string, boolean] => (
+            typeof entry[1] === "boolean"
+          )),
+        );
+        return [[threadId, validTurns]];
+      }),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function persistFinishedTurnNotifications(notifications: FinishedTurnNotifications) {
+  if (typeof localStorage === "undefined") return;
+  try {
+    localStorage.setItem(FINISHED_TURN_NOTIFICATIONS_KEY, JSON.stringify(notifications));
+  } catch {
+    // Notification state remains correct in memory when storage is unavailable.
+  }
+}
+
+export function hasUnreadFinishedTurn(
+  notifications: FinishedTurnNotifications,
+  threadId: string,
+): boolean {
+  return Object.values(notifications[threadId] ?? {}).some(Boolean);
+}
+
+function markFinishedTurnsSeen(
+  notifications: FinishedTurnNotifications,
+  threadId: string,
+): FinishedTurnNotifications {
+  const turns = notifications[threadId];
+  if (!turns || !Object.values(turns).some(Boolean)) return notifications;
+  return {
+    ...notifications,
+    [threadId]: Object.fromEntries(Object.keys(turns).map((turnId) => [turnId, false])),
+  };
+}
 
 function mergeWorkspaceThreads(
   current: Record<string, Thread[]>,
@@ -130,6 +187,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
   threads: [],
   threadsByWorkspace: {},
   archivedThreadsByWorkspace: {},
+  finishedTurnNotifications: loadFinishedTurnNotifications(),
   activeThreadId: null,
   startupRestorePending: true,
   loading: false,
@@ -585,7 +643,15 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
     } else {
       localStorage.removeItem(LAST_THREAD_KEY);
     }
-    set({ activeThreadId: threadId });
+    set((state) => {
+      const finishedTurnNotifications = threadId
+        ? markFinishedTurnsSeen(state.finishedTurnNotifications, threadId)
+        : state.finishedTurnNotifications;
+      if (finishedTurnNotifications !== state.finishedTurnNotifications) {
+        persistFinishedTurnNotifications(finishedTurnNotifications);
+      }
+      return { activeThreadId: threadId, finishedTurnNotifications };
+    });
   },
   setStartupRestorePending: (pending) => {
     set({ startupRestorePending: pending });
@@ -628,6 +694,25 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
     });
 
     return applied;
+  },
+  recordFinishedTurn: (threadId, assistantMessageId) => {
+    let isNew = false;
+    set((state) => {
+      const turns = state.finishedTurnNotifications[threadId] ?? {};
+      if (assistantMessageId in turns) return state;
+
+      isNew = true;
+      const finishedTurnNotifications = {
+        ...state.finishedTurnNotifications,
+        [threadId]: {
+          ...turns,
+          [assistantMessageId]: state.activeThreadId !== threadId,
+        },
+      };
+      persistFinishedTurnNotifications(finishedTurnNotifications);
+      return { finishedTurnNotifications };
+    });
+    return isNew;
   },
   setThreadStatusLocal: (threadId, status) =>
     set((state) => {

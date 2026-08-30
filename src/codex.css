@@ -89,6 +89,10 @@ button { color: inherit; }
 }
 .codex-workspace-add:hover:not(:disabled) { background: var(--surface-hover); color: var(--text-1); opacity: 1; }
 .codex-workspace-add:disabled { opacity: .42; }
+.codex-workspace-notification {
+  width: 7px; height: 7px; flex: 0 0 7px; margin: 0 7px; border-radius: 50%;
+  background: var(--success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 14%, transparent);
+}
 .codex-session-list { min-width: 0; display: grid; gap: 1px; padding: 0 0 1px 3px; }
 .codex-session-list[hidden] { display: none; }
 .codex-session-show-more {
@@ -117,6 +121,8 @@ button { color: inherit; }
 .codex-session-status.attention,
 .codex-session-status.awaiting_approval { border-color: var(--warning); background: var(--warning); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warning) 14%, transparent); }
 .codex-session-status.error { border-color: var(--danger); background: var(--danger); }
+.codex-session-status.notification { border-color: var(--success); background: var(--success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 14%, transparent); }
+.codex-session-status.error.notification { border-color: var(--danger); background: var(--danger); box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 14%, transparent); }
 .codex-session-title { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.75px; font-weight: 450; }
 .codex-session-row.active .codex-session-title { font-weight: 520; }
 .codex-session-menu-button {

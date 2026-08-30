@@ -31,7 +31,10 @@ import { activateThreadContext } from "../../lib/threadActivation";
 import { useCodexUiStore } from "../../stores/codexUiStore";
 import { useEngineStore } from "../../stores/engineStore";
 import { useThreadPlanModeStore } from "../../stores/threadPlanModeStore";
-import { useThreadStore } from "../../stores/threadStore";
+import {
+  hasUnreadFinishedTurn,
+  useThreadStore,
+} from "../../stores/threadStore";
 import { toast } from "../../stores/toastStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
 import type { Thread } from "../../types";
@@ -347,6 +350,7 @@ function SessionRow({
   thread,
   active,
   planMode,
+  unreadFinishedTurn,
   menuOpen,
   editing,
   busy,
@@ -362,6 +366,7 @@ function SessionRow({
   thread: Thread;
   active: boolean;
   planMode: boolean;
+  unreadFinishedTurn: boolean;
   menuOpen: boolean;
   editing: boolean;
   busy: boolean;
@@ -384,7 +389,7 @@ function SessionRow({
   const statusClassName = `codex-session-status ${codexThreadStatusTone(
     thread.status,
     planMode,
-  )}`;
+  )}${unreadFinishedTurn ? " notification" : ""}`;
 
   return (
     <div
@@ -394,7 +399,11 @@ function SessionRow({
     >
       {editing ? (
         <div className="codex-session-edit-main">
-          <span className={statusClassName} aria-hidden="true" />
+          <span
+            className={statusClassName}
+            title={unreadFinishedTurn ? "New finished turn" : undefined}
+            aria-hidden="true"
+          />
           <SessionRenameInput
             value={renameValue}
             busy={busy}
@@ -411,7 +420,11 @@ function SessionRow({
           aria-current={active ? "page" : undefined}
           onClick={onSelect}
         >
-          <span className={statusClassName} aria-hidden="true" />
+          <span
+            className={statusClassName}
+            title={unreadFinishedTurn ? "New finished turn" : undefined}
+            aria-hidden="true"
+          />
           <span className="codex-session-title">{thread.title || "Untitled"}</span>
         </button>
       )}
@@ -470,6 +483,9 @@ export function CodexSidebar() {
   const openWorkspace = useWorkspaceStore((state) => state.openWorkspace);
   const reorderWorkspaces = useWorkspaceStore((state) => state.reorderWorkspaces);
   const threadsByWorkspace = useThreadStore((state) => state.threadsByWorkspace);
+  const finishedTurnNotifications = useThreadStore(
+    (state) => state.finishedTurnNotifications,
+  );
   const archivedThreadsByWorkspace = useThreadStore(
     (state) => state.archivedThreadsByWorkspace,
   );
@@ -1086,6 +1102,13 @@ export function CodexSidebar() {
               const collapsed = collapsedWorkspaceIds.has(workspace.id);
               const dragPlaceholder = draggingWorkspaceId === workspace.id;
               const visuallyCollapsed = collapsed || dragPlaceholder;
+              const unreadFinishedThreadCount = threads.reduce(
+                (count, thread) => count + Number(hasUnreadFinishedTurn(
+                  finishedTurnNotifications,
+                  thread.id,
+                )),
+                0,
+              );
               const workspaceClassName = [
                 "codex-workspace-group",
                 activeWorkspaceId === workspace.id ? "active-workspace" : "",
@@ -1141,6 +1164,13 @@ export function CodexSidebar() {
                       {visuallyCollapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
                       <span>{workspace.name}</span>
                     </button>
+                    {unreadFinishedThreadCount > 0 && (
+                      <span
+                        className="codex-workspace-notification"
+                        title={`${unreadFinishedThreadCount} ${unreadFinishedThreadCount === 1 ? "conversation has" : "conversations have"} a finished turn not viewed`}
+                        aria-hidden="true"
+                      />
+                    )}
                     <button
                       className="codex-workspace-add"
                       type="button"
@@ -1166,6 +1196,10 @@ export function CodexSidebar() {
                         thread={thread}
                         active={activeThreadId === thread.id}
                         planMode={threadModes[thread.id] === "plan"}
+                        unreadFinishedTurn={hasUnreadFinishedTurn(
+                          finishedTurnNotifications,
+                          thread.id,
+                        )}
                         menuOpen={sessionMenu?.thread.id === thread.id}
                         editing={editingThreadId === thread.id}
                         busy={busyThreadId === thread.id}

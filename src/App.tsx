@@ -103,12 +103,19 @@ export function App() {
     }).then((unlisten) => unlisteners.push(unlisten));
     void listenChatTurnFinished((event) => {
       if (event.engineId !== "codex") return;
+      const isNewFinish = useThreadStore.getState().recordFinishedTurn(
+        event.threadId,
+        event.assistantMessageId,
+      );
       acceptTurnFinishedRuntimeEvent(event);
       useThreadStore.getState().setThreadStatusLocal(
         event.threadId,
         event.status === "error" ? "error" : "completed",
       );
-      if (!document.hasFocus() || useThreadStore.getState().activeThreadId !== event.threadId) {
+      if (
+        isNewFinish
+        && (!document.hasFocus() || useThreadStore.getState().activeThreadId !== event.threadId)
+      ) {
         void ipc.showAgentNotification("Codex", event.preview?.trim() || (event.status === "error" ? "The turn failed." : "The turn finished."));
       }
     }).then((unlisten) => unlisteners.push(unlisten));

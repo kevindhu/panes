@@ -93,6 +93,7 @@ function setThreadState(
     threads: Object.values(threadsByWorkspace).flat(),
     threadsByWorkspace,
     archivedThreadsByWorkspace,
+    finishedTurnNotifications: {},
     activeThreadId,
     loading: false,
     archivedLoading: false,
@@ -274,6 +275,43 @@ describe("CodexSidebar", () => {
     expect(container.querySelectorAll(".codex-session-status.streaming")).toHaveLength(1);
     expect(container.querySelector(".codex-session-row.active")?.textContent).toContain("Plan session");
     expect(container.querySelector(".codex-session-row small")).toBeNull();
+  });
+
+  it("shows finished-turn notifications in inactive workspaces and their session rows", async () => {
+    const workspaceA = makeWorkspace("workspace-a", "Alpha");
+    const workspaceB = makeWorkspace("workspace-b", "Beta");
+    const backgroundThread = makeThread({
+      id: "background-thread",
+      workspaceId: workspaceA.id,
+      title: "Background session",
+    });
+    const activeThread = makeThread({
+      id: "active-thread",
+      workspaceId: workspaceB.id,
+      title: "Active session",
+    });
+    setWorkspaceState([workspaceA, workspaceB], workspaceB.id);
+    setThreadState({
+      [workspaceA.id]: [backgroundThread],
+      [workspaceB.id]: [activeThread],
+    }, activeThread.id);
+    useThreadStore.setState({
+      finishedTurnNotifications: {
+        [backgroundThread.id]: { "assistant-1": true },
+      },
+    });
+
+    await renderSidebar();
+
+    const groups = container.querySelectorAll<HTMLElement>(".codex-workspace-group");
+    expect(groups[0]?.querySelector(".codex-workspace-notification")).not.toBeNull();
+    expect(groups[1]?.querySelector(".codex-workspace-notification")).toBeNull();
+    expect(
+      container.querySelector('[data-thread-id="background-thread"] .codex-session-status.notification'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[data-thread-id="active-thread"] .codex-session-status.notification'),
+    ).toBeNull();
   });
 
   it("reveals sessions in batches of 20 independently for each workspace", async () => {
