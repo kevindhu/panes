@@ -5482,6 +5482,7 @@ fn extract_imported_messages_from_turns(turns: &[serde_json::Value]) -> Vec<Impo
                 | "mcpToolCall"
                 | "dynamicToolCall"
                 | "collabAgentToolCall"
+                | "imageView"
                 | "imageGeneration" => {
                     assistant_blocks.push(json_action_block(&item, item_type.as_str()));
                     if item_type == "fileChange" {
@@ -5493,16 +5494,6 @@ fn extract_imported_messages_from_turns(turns: &[serde_json::Value]) -> Vec<Impo
                             }));
                         }
                     }
-                }
-                "imageView" => {
-                    let path = extract_any_string(&item, &["path"]).unwrap_or_default();
-                    assistant_blocks.push(serde_json::json!({
-                        "type": "notice",
-                        "kind": format!("codex_image_view_{}", imported_item_id(&item)),
-                        "level": "info",
-                        "title": "Image viewed",
-                        "message": if path.is_empty() { "Codex viewed an image".to_string() } else { format!("Codex viewed {path}") },
-                    }));
                 }
                 "contextCompaction" => {
                     let mut notice = serde_json::json!({
@@ -5696,7 +5687,11 @@ fn json_action_block(item: &serde_json::Value, item_type: &str) -> serde_json::V
         normalized_status.as_str(),
         "inprogress" | "in_progress" | "running"
     );
-    let output = imported_item_output(item);
+    let output = if matches!(item_type, "imageView" | "imageGeneration") {
+        None
+    } else {
+        imported_item_output(item)
+    };
     let error = if success || running {
         None
     } else {
@@ -5787,6 +5782,9 @@ fn imported_action_summary(item: &serde_json::Value, item_type: &str) -> String 
         "collabAgentToolCall" => extract_any_string(item, &["tool"])
             .map(|tool| format!("Collaborative agent: {tool}"))
             .unwrap_or_else(|| "Collaborative agent".to_string()),
+        "imageView" => extract_any_string(item, &["path"])
+            .map(|path| format!("View image: {path}"))
+            .unwrap_or_else(|| "View image".to_string()),
         "imageGeneration" => "Generate image".to_string(),
         _ => "Codex action".to_string(),
     }
@@ -9964,5 +9962,40 @@ mod tests {
         );
         assert_eq!(mapped.layers[0].version, "v2");
         assert!(mapped.approval_policy.is_some());
+    }
+
+    #[test]
+    fn imported_image_actions_keep_media_in_details_without_terminal_output() {
+        let generated = json_action_block(
+            &json!({
+                "id": "generated-1",
+                "type": "imageGeneration",
+                "status": "completed",
+                "result": "data:image/png;base64,iVBORw0KGgo=",
+                "savedPath": "/tmp/generated.png",
+                "revisedPrompt": "A blue poster"
+            }),
+            "imageGeneration",
+        );
+        assert_eq!(generated["details"]["type"], json!("imageGeneration"));
+        assert_eq!(
+            generated["details"]["savedPath"],
+            json!("/tmp/generated.png")
+        );
+        assert_eq!(generated["outputChunks"], json!([]));
+        assert_eq!(generated["result"]["output"], Value::Null);
+
+        let viewed = json_action_block(
+            &json!({
+                "id": "viewed-1",
+                "type": "imageView",
+                "status": "completed",
+                "path": "/tmp/reference.png"
+            }),
+            "imageView",
+        );
+        assert_eq!(viewed["details"]["path"], json!("/tmp/reference.png"));
+        assert_eq!(viewed["outputChunks"], json!([]));
+        assert_eq!(viewed["summary"], json!("View image: /tmp/reference.png"));
     }
 }

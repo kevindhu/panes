@@ -570,4 +570,23 @@ describe("Codex transcript projection", () => {
       .map((entry) => entry.itemType);
     expect(activities).toEqual(itemTypes);
   });
+
+  it("uses the revised image-generation prompt in the activity subtitle", () => {
+    const native = projectCodexTranscript({
+      turn: turn(8),
+      events: [],
+      chunks: [],
+      items: [item("generated-1", "imageGeneration", 2, {
+        status: "completed",
+        result: "data:image/png;base64,iVBORw0KGgo=",
+        revisedPrompt: "A crisp blue poster",
+      })],
+    });
+    const activity = native.entries.find((entry) => entry.kind === "activity");
+
+    expect(activity).toMatchObject({
+      title: "Generated image",
+      subtitle: "A crisp blue poster",
+    });
+  });
 });

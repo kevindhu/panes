@@ -481,6 +481,28 @@ impl TurnEventMapper {
                     details: item.clone(),
                 }]
             }
+            "dynamicToolCall" | "imageView" | "imageGeneration" => {
+                let engine_item_id = extract_any_string(item, &["id"]);
+                let action_id = self.resolve_or_register_action(engine_item_id.as_deref());
+                let summary = match item_type.as_str() {
+                    "dynamicToolCall" => extract_any_string(item, &["tool", "name"])
+                        .map(|tool| format!("Tool call: {tool}"))
+                        .unwrap_or_else(|| "Tool call".to_string()),
+                    "imageView" => extract_any_string(item, &["path"])
+                        .map(|path| format!("View image: {path}"))
+                        .unwrap_or_else(|| "View image".to_string()),
+                    "imageGeneration" => "Generate image".to_string(),
+                    _ => unreachable!(),
+                };
+
+                vec![EngineEvent::ActionStarted {
+                    action_id,
+                    engine_action_id: engine_item_id,
+                    action_type: ActionType::Other,
+                    summary,
+                    details: item.clone(),
+                }]
+            }
             "mcpToolCall" => {
                 let engine_item_id = extract_any_string(item, &["id"]);
                 let action_id = self.resolve_or_register_action(engine_item_id.as_deref());
@@ -557,6 +579,7 @@ impl TurnEventMapper {
             | "fileChange"
             | "webSearch"
             | "mcpToolCall"
+            | "dynamicToolCall"
             | "collabAgentToolCall" => {
                 let engine_item_id = extract_any_string(item, &["id"]);
                 let Some(action_id) = self.resolve_action_for_completion(engine_item_id.as_deref())
@@ -616,6 +639,39 @@ impl TurnEventMapper {
                         error,
                         diff,
                         duration_ms,
+                    },
+                    details: Some(item.clone()),
+                }]
+            }
+            "imageView" | "imageGeneration" => {
+                let engine_item_id = extract_any_string(item, &["id"]);
+                let Some(action_id) = self.resolve_action_for_completion(engine_item_id.as_deref())
+                else {
+                    return Vec::new();
+                };
+                let status = extract_any_string(item, &["status"])
+                    .unwrap_or_else(|| "completed".to_string());
+                let normalized_status = status.to_lowercase();
+                let success = normalized_status == "completed";
+                let error = if success {
+                    None
+                } else {
+                    extract_item_error(item)
+                        .or_else(|| extract_any_string(item, &["failure"]))
+                        .or_else(|| {
+                            Some(format!("Action failed with status `{normalized_status}`"))
+                        })
+                };
+
+                vec![EngineEvent::ActionCompleted {
+                    action_id,
+                    result: ActionResult {
+                        success,
+                        output: None,
+                        error,
+                        diff: None,
+                        duration_ms: extract_any_u64(item, &["durationMs", "duration_ms"])
+                            .unwrap_or(0),
                     },
                     details: Some(item.clone()),
                 }]
@@ -2538,6 +2594,61 @@ mod tests {
                 assert_eq!(engine_action_id.as_deref(), Some("collab_123"));
             }
             other => panic!("expected action started event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_image_items_as_media_actions_without_base64_output() {
+        let mut mapper = TurnEventMapper::default();
+        let started = mapper.map_notification(
+            "item/started",
+            &json!({
+                "item": {
+                    "id": "generated_123",
+                    "type": "imageGeneration",
+                    "status": "inProgress"
+                }
+            }),
+        );
+
+        assert!(matches!(
+            started.as_slice(),
+            [EngineEvent::ActionStarted {
+                action_type: ActionType::Other,
+                summary,
+                ..
+            }] if summary == "Generate image"
+        ));
+
+        let completed = mapper.map_notification(
+            "item/completed",
+            &json!({
+                "item": {
+                    "id": "generated_123",
+                    "type": "imageGeneration",
+                    "status": "completed",
+                    "result": "data:image/png;base64,iVBORw0KGgo=",
+                    "savedPath": "/tmp/generated.png",
+                    "revisedPrompt": "A blue poster"
+                }
+            }),
+        );
+
+        match completed.as_slice() {
+            [EngineEvent::ActionCompleted {
+                result,
+                details: Some(details),
+                ..
+            }] => {
+                assert!(result.success);
+                assert_eq!(result.output, None);
+                assert_eq!(details["savedPath"], json!("/tmp/generated.png"));
+                assert_eq!(
+                    details["result"],
+                    json!("data:image/png;base64,iVBORw0KGgo=")
+                );
+            }
+            other => panic!("expected image action completion, got {other:?}"),
         }
     }
 

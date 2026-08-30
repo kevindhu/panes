@@ -1,13 +1,24 @@
 import { convertFileSrc, isTauri } from "@tauri-apps/api/core";
 import { ipc } from "./codexIpc";
 import { recordPerfMetric } from "./perfTelemetry";
+import type { PreparedAttachmentImageAsset } from "../types";
+
+const ASSET_CACHE_LIMIT = 256;
+const FALLBACK_CACHE_LIMIT = 24;
+const IMAGE_BLOB_CACHE_LIMIT = 64;
+const EMBEDDED_IMAGE_CACHE_LIMIT = 64;
+const IMAGE_CACHE_TTL_MS = 5 * 60 * 1000;
+const MAX_CACHED_BLOB_SOURCE_CHARS = 8_192;
 
 const attachmentAssetUrlCache = new Map<string, Promise<string | null>>();
 const attachmentAssetUrlResolvedCache = new Map<string, string | null>();
+const attachmentAssetUrlResolvedAt = new Map<string, number>();
 const attachmentFallbackUrlCache = new Map<string, Promise<string | null>>();
 const attachmentFallbackUrlResolvedCache = new Map<string, string | null>();
+const attachmentFallbackUrlResolvedAt = new Map<string, number>();
 const attachmentObjectUrls = new Set<string>();
 const attachmentImageBlobCache = new Map<string, Promise<Blob>>();
+const embeddedImageAssetCache = new Map<string, Promise<PreparedAttachmentImageAsset | null>>();
 
 export interface AttachmentImageAssetOptions {
   maxWidth?: number;
@@ -68,7 +79,13 @@ export function loadAttachmentImageAssetUrl(
   }
 
   const cacheKey = getAttachmentImageCacheKey(normalizedFilePath, mimeType, options);
-  const cachedAsset = attachmentAssetUrlCache.get(cacheKey);
+  expireImageCacheEntry(
+    cacheKey,
+    attachmentAssetUrlCache,
+    attachmentAssetUrlResolvedCache,
+    attachmentAssetUrlResolvedAt,
+  );
+  const cachedAsset = touchMapEntry(attachmentAssetUrlCache, cacheKey);
   if (cachedAsset) {
     return cachedAsset;
   }
@@ -85,6 +102,13 @@ export function loadAttachmentImageAssetUrl(
       const separator = baseUrl.includes("?") ? "&" : "?";
       const assetUrl = `${baseUrl}${separator}v=${encodeURIComponent(asset.version)}`;
       attachmentAssetUrlResolvedCache.set(cacheKey, assetUrl);
+      attachmentAssetUrlResolvedAt.set(cacheKey, Date.now());
+      trimImageUrlCache(
+        attachmentAssetUrlCache,
+        attachmentAssetUrlResolvedCache,
+        attachmentAssetUrlResolvedAt,
+        ASSET_CACHE_LIMIT,
+      );
       recordPerfMetric("chat.image.asset_prepare.ms", performance.now() - startedAt, {
         kind: options.maxWidth || options.maxHeight ? "thumbnail" : "full",
       });
@@ -101,6 +125,7 @@ export function loadAttachmentImageAssetUrl(
     });
 
   attachmentAssetUrlCache.set(cacheKey, assetPromise);
+  trimMap(attachmentAssetUrlCache, ASSET_CACHE_LIMIT);
   return assetPromise;
 }
 
@@ -113,9 +138,14 @@ export function getCachedAttachmentImageAssetUrl(
   if (!normalizedFilePath) {
     return null;
   }
-  return attachmentAssetUrlResolvedCache.get(
-    getAttachmentImageCacheKey(normalizedFilePath, mimeType, options),
+  const cacheKey = getAttachmentImageCacheKey(normalizedFilePath, mimeType, options);
+  expireImageCacheEntry(
+    cacheKey,
+    attachmentAssetUrlCache,
+    attachmentAssetUrlResolvedCache,
+    attachmentAssetUrlResolvedAt,
   );
+  return touchMapEntry(attachmentAssetUrlResolvedCache, cacheKey);
 }
 
 export function loadAttachmentImageFallbackUrl(
@@ -128,7 +158,13 @@ export function loadAttachmentImageFallbackUrl(
   }
 
   const cacheKey = getAttachmentImageCacheKey(normalizedFilePath, mimeType);
-  const cachedFallback = attachmentFallbackUrlCache.get(cacheKey);
+  expireImageCacheEntry(
+    cacheKey,
+    attachmentFallbackUrlCache,
+    attachmentFallbackUrlResolvedCache,
+    attachmentFallbackUrlResolvedAt,
+  );
+  const cachedFallback = touchMapEntry(attachmentFallbackUrlCache, cacheKey);
   if (cachedFallback) {
     return cachedFallback;
   }
@@ -147,6 +183,14 @@ export function loadAttachmentImageFallbackUrl(
       }
       const fallbackUrl = createTrackedObjectUrl(new Blob([bytes], { type: resolvedMimeType }));
       attachmentFallbackUrlResolvedCache.set(cacheKey, fallbackUrl);
+      attachmentFallbackUrlResolvedAt.set(cacheKey, Date.now());
+      trimImageUrlCache(
+        attachmentFallbackUrlCache,
+        attachmentFallbackUrlResolvedCache,
+        attachmentFallbackUrlResolvedAt,
+        FALLBACK_CACHE_LIMIT,
+        true,
+      );
       return fallbackUrl;
     })
     .catch((error) => {
@@ -156,6 +200,7 @@ export function loadAttachmentImageFallbackUrl(
     });
 
   attachmentFallbackUrlCache.set(cacheKey, fallbackPromise);
+  trimMap(attachmentFallbackUrlCache, FALLBACK_CACHE_LIMIT);
   return fallbackPromise;
 }
 
@@ -167,9 +212,37 @@ export function getCachedAttachmentImageFallbackUrl(
   if (!normalizedFilePath) {
     return null;
   }
-  return attachmentFallbackUrlResolvedCache.get(
-    getAttachmentImageCacheKey(normalizedFilePath, mimeType),
+  const cacheKey = getAttachmentImageCacheKey(normalizedFilePath, mimeType);
+  expireImageCacheEntry(
+    cacheKey,
+    attachmentFallbackUrlCache,
+    attachmentFallbackUrlResolvedCache,
+    attachmentFallbackUrlResolvedAt,
   );
+  return touchMapEntry(attachmentFallbackUrlResolvedCache, cacheKey);
+}
+
+export function cacheEmbeddedImageDataUrl(
+  source: string,
+  mimeType?: string | null,
+): Promise<PreparedAttachmentImageAsset | null> {
+  const parsed = parseEmbeddedImageDataUrl(source, mimeType);
+  if (!parsed || !isTauriEnvironment()) {
+    return Promise.resolve(null);
+  }
+  const cacheKey = embeddedImageCacheKey(parsed.mimeType, parsed.dataBase64);
+  const cached = touchMapEntry(embeddedImageAssetCache, cacheKey);
+  if (cached) {
+    return cached;
+  }
+  const request = ipc.cacheEmbeddedChatImage(parsed.mimeType, parsed.dataBase64)
+    .catch((error) => {
+      embeddedImageAssetCache.delete(cacheKey);
+      throw error;
+    });
+  embeddedImageAssetCache.set(cacheKey, request);
+  trimMap(embeddedImageAssetCache, EMBEDDED_IMAGE_CACHE_LIMIT);
+  return request;
 }
 
 export async function loadImageBlobFromSources(
@@ -248,8 +321,10 @@ export async function copyAttachmentImage(
 export function resetAttachmentImageCachesForTests(): void {
   attachmentAssetUrlCache.clear();
   attachmentAssetUrlResolvedCache.clear();
+  attachmentAssetUrlResolvedAt.clear();
   attachmentFallbackUrlCache.clear();
   attachmentFallbackUrlResolvedCache.clear();
+  attachmentFallbackUrlResolvedAt.clear();
   if (typeof URL !== "undefined" && typeof URL.revokeObjectURL === "function") {
     for (const objectUrl of attachmentObjectUrls) {
       URL.revokeObjectURL(objectUrl);
@@ -257,6 +332,7 @@ export function resetAttachmentImageCachesForTests(): void {
   }
   attachmentObjectUrls.clear();
   attachmentImageBlobCache.clear();
+  embeddedImageAssetCache.clear();
 }
 
 function createTrackedObjectUrl(blob: Blob): string | null {
@@ -306,7 +382,8 @@ function getAttachmentImageCacheKey(
 }
 
 function loadImageBlobFromSource(source: string): Promise<Blob> {
-  const cachedBlob = attachmentImageBlobCache.get(source);
+  const shouldCache = source.length <= MAX_CACHED_BLOB_SOURCE_CHARS;
+  const cachedBlob = shouldCache ? touchMapEntry(attachmentImageBlobCache, source) : undefined;
   if (cachedBlob) {
     return cachedBlob;
   }
@@ -319,12 +396,121 @@ function loadImageBlobFromSource(source: string): Promise<Blob> {
       return response.blob();
     })
     .catch((error) => {
-      attachmentImageBlobCache.delete(source);
+      if (shouldCache) {
+        attachmentImageBlobCache.delete(source);
+      }
       throw error;
     });
 
-  attachmentImageBlobCache.set(source, blobPromise);
+  if (shouldCache) {
+    attachmentImageBlobCache.set(source, blobPromise);
+    trimMap(attachmentImageBlobCache, IMAGE_BLOB_CACHE_LIMIT);
+  }
   return blobPromise;
+}
+
+function parseEmbeddedImageDataUrl(
+  source: string,
+  fallbackMimeType?: string | null,
+): { mimeType: string; dataBase64: string } | null {
+  const match = source.trim().match(/^data:(image\/[a-z0-9.+-]+)(?:;[^,]*)?;base64,([a-z0-9+/=\s]+)$/i);
+  if (!match) {
+    return null;
+  }
+  const mimeType = resolveClipboardImageMimeType(match[1], fallbackMimeType);
+  const dataBase64 = match[2]?.replace(/\s+/g, "");
+  return mimeType && dataBase64 ? { mimeType, dataBase64 } : null;
+}
+
+function hashString(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+function embeddedImageCacheKey(mimeType: string, dataBase64: string): string {
+  const edgeLength = 96;
+  return [
+    mimeType,
+    dataBase64.length,
+    hashString(dataBase64),
+    dataBase64.slice(0, edgeLength),
+    dataBase64.slice(-edgeLength),
+  ].join("\u0000");
+}
+
+function touchMapEntry<K, V>(map: Map<K, V>, key: K): V | undefined {
+  const value = map.get(key);
+  if (value === undefined) {
+    return undefined;
+  }
+  map.delete(key);
+  map.set(key, value);
+  return value;
+}
+
+function trimMap<K, V>(map: Map<K, V>, maxEntries: number): void {
+  while (map.size > maxEntries) {
+    const oldestKey = map.keys().next().value as K | undefined;
+    if (oldestKey === undefined) {
+      break;
+    }
+    map.delete(oldestKey);
+  }
+}
+
+function expireImageCacheEntry(
+  cacheKey: string,
+  pending: Map<string, Promise<string | null>>,
+  resolved: Map<string, string | null>,
+  resolvedAt: Map<string, number>,
+): void {
+  const timestamp = resolvedAt.get(cacheKey);
+  if (timestamp === undefined || Date.now() - timestamp <= IMAGE_CACHE_TTL_MS) {
+    return;
+  }
+  const source = resolved.get(cacheKey);
+  pending.delete(cacheKey);
+  resolved.delete(cacheKey);
+  resolvedAt.delete(cacheKey);
+  if (source?.startsWith("blob:")) {
+    revokeTrackedObjectUrl(source);
+  }
+}
+
+function trimImageUrlCache(
+  pending: Map<string, Promise<string | null>>,
+  resolved: Map<string, string | null>,
+  resolvedAt: Map<string, number>,
+  maxEntries: number,
+  revokeObjectUrls = false,
+): void {
+  while (resolved.size > maxEntries) {
+    const oldestKey = resolved.keys().next().value as string | undefined;
+    if (oldestKey === undefined) {
+      break;
+    }
+    const source = resolved.get(oldestKey);
+    pending.delete(oldestKey);
+    resolved.delete(oldestKey);
+    resolvedAt.delete(oldestKey);
+    if (revokeObjectUrls && source?.startsWith("blob:")) {
+      revokeTrackedObjectUrl(source);
+    }
+  }
+}
+
+function revokeTrackedObjectUrl(source: string): void {
+  if (
+    attachmentObjectUrls.delete(source)
+    && typeof URL !== "undefined"
+    && typeof URL.revokeObjectURL === "function"
+  ) {
+    URL.revokeObjectURL(source);
+  }
 }
 
 function resolveClipboardImageMimeType(

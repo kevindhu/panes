@@ -187,6 +187,7 @@ pub fn run() {
             commands::power::get_helper_status,
             commands::power::register_keep_awake_helper,
             commands::chat::save_pasted_image_attachment,
+            commands::chat::cache_embedded_chat_image,
             commands::chat::prepare_attachment_image_asset,
             commands::chat::read_attachment_image_bytes,
             commands::chat::copy_attachment_image_to_clipboard,

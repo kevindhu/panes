@@ -86,6 +86,7 @@ export const ipc = {
   listCodexSkills: (cwd: string) => invoke<CodexSkill[]>("list_codex_skills", { cwd }),
   listCodexApps: () => invoke<CodexApp[]>("list_codex_apps"),
   savePastedImageAttachment: (fileName: string, mimeType: string, dataBase64: string) => invoke<Omit<ChatAttachment, "id">>("save_pasted_image_attachment", { fileName, mimeType, dataBase64 }),
+  cacheEmbeddedChatImage: (mimeType: string, dataBase64: string) => invoke<PreparedAttachmentImageAsset>("cache_embedded_chat_image", { mimeType, dataBase64 }),
   prepareAttachmentImageAsset: (filePath: string, mimeType?: string | null, maxWidth?: number | null, maxHeight?: number | null) => invoke<PreparedAttachmentImageAsset>("prepare_attachment_image_asset", { filePath, mimeType: mimeType ?? null, maxWidth: maxWidth ?? null, maxHeight: maxHeight ?? null }),
   readAttachmentImageBytes: (filePath: string, mimeType?: string | null) => invoke<ArrayBuffer | number[]>("read_attachment_image_bytes", { filePath, mimeType: mimeType ?? null }),
   copyAttachmentImageToClipboard: (filePath: string, mimeType?: string | null) => invoke<void>("copy_attachment_image_to_clipboard", { filePath, mimeType: mimeType ?? null }),
