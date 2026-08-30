@@ -46,15 +46,18 @@ async function initializeCodexWorkspace() {
     useWorkspaceStore.getState().loadWorkspaces(),
     useEngineStore.getState().load(),
   ]);
-  const workspaceId = useWorkspaceStore.getState().activeWorkspaceId;
-  if (!workspaceId) return;
-  await useThreadStore.getState().refreshThreads(workspaceId);
+  const workspaceState = useWorkspaceStore.getState();
+  const workspaceId = workspaceState.activeWorkspaceId;
+  const workspaceIds = workspaceState.workspaces.map((workspace) => workspace.id);
+  await useThreadStore.getState().refreshAllThreads(workspaceIds);
   const state = useThreadStore.getState();
   const selected = state.threads.find((thread) => thread.id === state.activeThreadId)
-    ?? state.threadsByWorkspace[workspaceId]?.[0]
+    ?? (workspaceId ? state.threadsByWorkspace[workspaceId]?.[0] : null)
     ?? null;
   await activateThreadContext(selected);
-  void useEngineStore.getState().ensureHealth("codex");
+  if (workspaceIds.length) {
+    void useEngineStore.getState().ensureHealth("codex");
+  }
 }
 
 function handleShortcut(action: string) {
@@ -91,7 +94,10 @@ export function App() {
     void listenThreadUpdated((event) => {
       if (event.thread?.engineId !== "codex") return;
       const applied = useThreadStore.getState().applyThreadUpdateLocal(event.thread);
-      if (!applied && event.workspaceId === useWorkspaceStore.getState().activeWorkspaceId) {
+      const workspaceExists = useWorkspaceStore
+        .getState()
+        .workspaces.some((workspace) => workspace.id === event.workspaceId);
+      if (!applied && workspaceExists) {
         void useThreadStore.getState().refreshThreads(event.workspaceId);
       }
     }).then((unlisten) => unlisteners.push(unlisten));

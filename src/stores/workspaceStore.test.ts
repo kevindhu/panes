@@ -133,6 +133,10 @@ describe("workspaceStore.openWorkspace", () => {
     expect(result).toEqual(openedWorkspace);
     expect(useWorkspaceStore.getState().activeWorkspaceId).toBe(openedWorkspace.id);
     expect(useWorkspaceStore.getState().workspaces).toEqual([openedWorkspace]);
+    expect(localStorage.setItem).toHaveBeenCalledWith(
+      "panes:lastActiveWorkspaceId",
+      openedWorkspace.id,
+    );
   });
 
   it("returns null when opening a workspace fails", async () => {

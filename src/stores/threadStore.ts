@@ -25,14 +25,16 @@ interface ThreadState {
   activeThreadId: string | null;
   startupRestorePending: boolean;
   loading: boolean;
+  archivedLoading: boolean;
   error?: string;
   createThread: (input: CreateThreadInput) => Promise<string | null>;
-  renameThread: (threadId: string, title: string) => Promise<void>;
+  renameThread: (threadId: string, title: string) => Promise<Thread | null>;
   refreshThreads: (workspaceId: string) => Promise<void>;
   refreshArchivedThreads: (workspaceId: string) => Promise<void>;
   refreshAllThreads: (workspaceIds: string[]) => Promise<void>;
-  removeThread: (threadId: string) => Promise<void>;
-  restoreThread: (threadId: string) => Promise<void>;
+  refreshAllArchivedThreads: (workspaceIds: string[]) => Promise<void>;
+  removeThread: (threadId: string) => Promise<boolean>;
+  restoreThread: (threadId: string) => Promise<Thread | null>;
   forkCodexThread: (threadId: string, profileOperationId?: string | null) => Promise<Thread | null>;
   forkCodexThreadAtTurn: (
     threadId: string,
@@ -131,6 +133,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
   activeThreadId: null,
   startupRestorePending: true,
   loading: false,
+  archivedLoading: false,
   createThread: async ({
     workspaceId,
     repoId,
@@ -202,8 +205,10 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
           loading: false,
         };
       });
+      return updated;
     } catch (error) {
       set({ loading: false, error: String(error) });
+      return null;
     }
   },
   refreshThreads: async (workspaceId) => {
@@ -283,6 +288,49 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       set({ loading: false, error: String(error) });
     }
   },
+  refreshAllArchivedThreads: async (workspaceIds) => {
+    if (!workspaceIds.length) {
+      set({
+        archivedThreadsByWorkspace: {},
+        archivedLoading: false,
+        error: undefined,
+      });
+      return;
+    }
+
+    set({ archivedLoading: true, error: undefined });
+    const results = await Promise.allSettled(
+      workspaceIds.map(async (workspaceId) => ({
+        workspaceId,
+        threads: await ipc.listArchivedThreads(workspaceId),
+      })),
+    );
+
+    set((state) => {
+      const archivedThreadsByWorkspace = workspaceIds.reduce<Record<string, Thread[]>>(
+        (acc, workspaceId) => {
+          acc[workspaceId] = state.archivedThreadsByWorkspace[workspaceId] ?? [];
+          return acc;
+        },
+        {},
+      );
+      let firstError: string | undefined;
+
+      for (const result of results) {
+        if (result.status === "fulfilled") {
+          archivedThreadsByWorkspace[result.value.workspaceId] = result.value.threads;
+        } else if (!firstError) {
+          firstError = String(result.reason);
+        }
+      }
+
+      return {
+        archivedThreadsByWorkspace,
+        archivedLoading: false,
+        error: firstError,
+      };
+    });
+  },
   removeThread: async (threadId) => {
     set({ loading: true, error: undefined });
     try {
@@ -322,8 +370,10 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
           loading: false,
         };
       });
+      return true;
     } catch (error) {
       set({ loading: false, error: String(error) });
+      return false;
     }
   },
   restoreThread: async (threadId) => {
@@ -355,8 +405,10 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
           loading: false,
         };
       });
+      return restored;
     } catch (error) {
       set({ loading: false, error: String(error) });
+      return null;
     }
   },
   forkCodexThread: async (threadId, profileOperationId) => {

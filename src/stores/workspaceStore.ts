@@ -169,6 +169,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         existingIndex === -1
           ? [workspace, ...current]
           : current.map((item) => (item.id === workspace.id ? workspace : item));
+      localStorage.setItem(LAST_WORKSPACE_KEY, workspace.id);
       set((state) => ({
         workspaces,
         archivedWorkspaces: state.archivedWorkspaces.filter((item) => item.id !== workspace.id),
