@@ -1,8 +1,14 @@
-import { resolveLocalImagePath } from "./localImageSources";
+import {
+  hasSupportedLocalImageExtension,
+  resolveLocalImagePath,
+  splitLocalImageSource,
+} from "./localImageSources";
+import { createChatImageDescriptor } from "./chatImageSources";
 
 export const MARKDOWN_LOCAL_IMAGE_PATH_ATTR = "data-panes-markdown-local-image-path";
 export const MARKDOWN_LOCAL_IMAGE_MIME_ATTR = "data-panes-markdown-local-image-mime";
 export const MARKDOWN_LOCAL_IMAGE_FALLBACK_ATTR = "data-panes-markdown-local-image-fallback";
+export const MARKDOWN_CHAT_IMAGE_SOURCE_ATTR = "data-panes-chat-image-source";
 
 const IMAGE_MIME_TYPES_BY_EXTENSION: Record<string, string> = {
   bmp: "image/bmp",
@@ -65,21 +71,57 @@ export function rewriteMarkdownImageSources(
 
   let changed = false;
 
-  for (const image of template.content.querySelectorAll("img[src]")) {
-    const source = image.getAttribute("src") ?? "";
-    const resolvedImage = resolveWorkspaceMarkdownImage(source, workspaceRootPath);
-
-    if (!resolvedImage) {
+  for (const anchor of template.content.querySelectorAll("a[href]")) {
+    const source = anchor.getAttribute("href")?.trim() ?? "";
+    if (!hasSupportedLocalImageExtension(splitLocalImageSource(source).path)) {
+      continue;
+    }
+    const descriptor = createChatImageDescriptor({
+      origin: "markdown",
+      source,
+      alt: anchor.textContent,
+      workspaceRootPath,
+    });
+    if (!descriptor) {
       continue;
     }
 
-    image.setAttribute("src", resolvedImage.source);
-    image.setAttribute(MARKDOWN_LOCAL_IMAGE_PATH_ATTR, resolvedImage.filePath);
+    const image = document.createElement("img");
+    image.setAttribute("src", source);
+    image.setAttribute("alt", anchor.textContent?.trim() || descriptor.fileName);
+    const title = anchor.getAttribute("title");
+    if (title) {
+      image.setAttribute("title", title);
+    }
+    anchor.replaceWith(image);
+    changed = true;
+  }
+
+  for (const image of template.content.querySelectorAll("img[src]")) {
+    const source = image.getAttribute("src") ?? "";
+    const resolvedImage = resolveWorkspaceMarkdownImage(source, workspaceRootPath);
+    const descriptor = createChatImageDescriptor({
+      origin: "markdown",
+      source,
+      filePath: resolvedImage?.filePath,
+      mimeType: resolvedImage?.mimeType,
+      alt: image.getAttribute("alt"),
+      workspaceRootPath,
+    });
+
+    if (!descriptor) {
+      continue;
+    }
+
+    image.setAttribute(MARKDOWN_CHAT_IMAGE_SOURCE_ATTR, source);
+    if (descriptor.filePath) {
+      image.setAttribute(MARKDOWN_LOCAL_IMAGE_PATH_ATTR, descriptor.filePath);
+    }
     image.setAttribute("role", "button");
     image.setAttribute("tabindex", "0");
     image.setAttribute("aria-label", "Open image");
-    if (resolvedImage.mimeType) {
-      image.setAttribute(MARKDOWN_LOCAL_IMAGE_MIME_ATTR, resolvedImage.mimeType);
+    if (descriptor.mimeType) {
+      image.setAttribute(MARKDOWN_LOCAL_IMAGE_MIME_ATTR, descriptor.mimeType);
     }
     changed = true;
   }

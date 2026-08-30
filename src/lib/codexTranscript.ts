@@ -413,7 +413,10 @@ function activityTitle(itemType: string, payload: JsonRecord): { title: string; 
     case "imageView":
       return { title: `Viewed ${readString(payload, "path") ?? "image"}`, subtitle: null };
     case "imageGeneration":
-      return { title: "Generated image", subtitle: readString(payload, "prompt") };
+      return {
+        title: "Generated image",
+        subtitle: readString(payload, "revisedPrompt", "revised_prompt", "prompt"),
+      };
     case "sleep":
       return { title: "Waited", subtitle: null };
     case "enteredReviewMode":

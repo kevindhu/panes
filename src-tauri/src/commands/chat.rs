@@ -50,6 +50,8 @@ const ENGINE_EVENT_LOG_ACTION_OUTPUT_MAX_CHARS: usize = 4_096;
 const TRUNCATED_SUFFIX: &str = "\n... [truncated]";
 const MAX_ATTACHMENTS_PER_TURN: usize = 10;
 const MAX_PASTED_IMAGE_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+const MAX_EMBEDDED_CHAT_IMAGE_CACHE_FILES: usize = 192;
+const MAX_EMBEDDED_CHAT_IMAGE_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const TEXT_ATTACHMENT_EXTENSIONS: &[&str] = &[
     "txt", "md", "json", "js", "ts", "tsx", "jsx", "py", "rs", "go", "css", "html", "yaml", "yml",
     "toml", "xml", "sql", "sh", "csv",
@@ -415,6 +417,87 @@ pub struct PreparedAttachmentImageAssetPayload {
 }
 
 #[tauri::command]
+pub async fn cache_embedded_chat_image(
+    mime_type: String,
+    data_base64: String,
+) -> Result<PreparedAttachmentImageAssetPayload, String> {
+    let normalized_mime = match mime_type.trim().to_lowercase().as_str() {
+        "image/jpg" => "image/jpeg".to_string(),
+        value => value.to_string(),
+    };
+    let extension = pasted_image_extension("embedded-image", &normalized_mime)
+        .ok_or_else(|| "Embedded chat image type is not supported.".to_string())?;
+    let encoded = data_base64
+        .split_once(',')
+        .map(|(_, data)| data)
+        .unwrap_or(data_base64.as_str())
+        .trim();
+    let bytes = BASE64
+        .decode(encoded)
+        .map_err(|_| "Embedded chat image data is not valid base64.".to_string())?;
+    if bytes.is_empty() {
+        return Err("Embedded chat image is empty.".to_string());
+    }
+    if bytes.len() > MAX_PASTED_IMAGE_ATTACHMENT_BYTES {
+        return Err("Embedded chat image exceeds the 10 MB preview limit.".to_string());
+    }
+    if !attachment_image_signature_matches(&bytes, &normalized_mime) {
+        return Err("Embedded chat image data does not match its image type.".to_string());
+    }
+
+    let mut hasher = DefaultHasher::new();
+    normalized_mime.hash(&mut hasher);
+    bytes.hash(&mut hasher);
+    let content_hash = hasher.finish();
+    let cache_dir = runtime_env::app_data_dir()
+        .join("cache")
+        .join("chat-images");
+    tokio_fs::create_dir_all(&cache_dir)
+        .await
+        .map_err(|error| format!("failed to create embedded image cache: {error}"))?;
+    let file_path = cache_dir.join(format!("{content_hash:016x}.{extension}"));
+
+    if !file_path.is_file() {
+        let temporary_path = cache_dir.join(format!(
+            ".{content_hash:016x}-{}.tmp.{extension}",
+            Uuid::new_v4().simple()
+        ));
+        tokio_fs::write(&temporary_path, &bytes)
+            .await
+            .map_err(|error| format!("failed to cache embedded chat image: {error}"))?;
+        match tokio_fs::rename(&temporary_path, &file_path).await {
+            Ok(()) => {}
+            Err(_) if file_path.is_file() => {
+                let _ = tokio_fs::remove_file(&temporary_path).await;
+            }
+            Err(error) => {
+                let _ = tokio_fs::remove_file(&temporary_path).await;
+                return Err(format!("failed to finalize embedded image cache: {error}"));
+            }
+        }
+    }
+
+    let metadata = tokio_fs::metadata(&file_path)
+        .await
+        .map_err(|error| format!("failed to read cached embedded image: {error}"))?;
+    let cache_dir_for_prune = cache_dir.clone();
+    let file_path_for_prune = file_path.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Err(error) =
+            prune_embedded_chat_image_cache(&cache_dir_for_prune, &file_path_for_prune)
+        {
+            log::warn!("failed to prune embedded chat image cache: {error}");
+        }
+    });
+
+    Ok(PreparedAttachmentImageAssetPayload {
+        file_path: file_path.to_string_lossy().into_owned(),
+        mime_type: normalized_mime,
+        version: attachment_asset_version(&metadata),
+    })
+}
+
+#[tauri::command]
 pub async fn save_pasted_image_attachment(
     file_name: String,
     mime_type: String,
@@ -691,7 +774,15 @@ async fn validate_attachment_image_signature(
         .map_err(|error| format!("failed to inspect attachment image: {error}"))?;
     header.truncate(read);
 
-    let signature_matches = match mime_type {
+    if attachment_image_signature_matches(&header, mime_type) {
+        Ok(())
+    } else {
+        Err("Attachment file contents do not match a supported image format.".to_string())
+    }
+}
+
+fn attachment_image_signature_matches(header: &[u8], mime_type: &str) -> bool {
+    match mime_type {
         "image/png" => header.starts_with(b"\x89PNG\r\n\x1a\n"),
         "image/jpeg" => header.starts_with(&[0xff, 0xd8, 0xff]),
         "image/gif" => header.starts_with(b"GIF87a") || header.starts_with(b"GIF89a"),
@@ -709,13 +800,46 @@ async fn validate_attachment_image_signature(
             .to_ascii_lowercase()
             .contains("<svg"),
         _ => false,
-    };
-
-    if signature_matches {
-        Ok(())
-    } else {
-        Err("Attachment file contents do not match a supported image format.".to_string())
     }
+}
+
+fn prune_embedded_chat_image_cache(cache_dir: &Path, keep_path: &Path) -> Result<(), String> {
+    let mut files = std::fs::read_dir(cache_dir)
+        .map_err(|error| format!("failed to read cache directory: {error}"))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let metadata = entry.metadata().ok()?;
+            metadata.is_file().then(|| {
+                let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+                (path, metadata.len(), modified)
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut total_bytes = files.iter().map(|(_, size, _)| *size).sum::<u64>();
+    if files.len() <= MAX_EMBEDDED_CHAT_IMAGE_CACHE_FILES
+        && total_bytes <= MAX_EMBEDDED_CHAT_IMAGE_CACHE_BYTES
+    {
+        return Ok(());
+    }
+
+    files.sort_by_key(|(_, _, modified)| *modified);
+    let mut remaining_files = files.len();
+    for (path, size, _) in files {
+        if remaining_files <= MAX_EMBEDDED_CHAT_IMAGE_CACHE_FILES
+            && total_bytes <= MAX_EMBEDDED_CHAT_IMAGE_CACHE_BYTES
+        {
+            break;
+        }
+        if path == keep_path {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            remaining_files = remaining_files.saturating_sub(1);
+            total_bytes = total_bytes.saturating_sub(size);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -6306,6 +6430,43 @@ mod tests {
         assert!(error.contains("do not match"));
 
         fs::remove_dir_all(&root).expect("remove image validation directory");
+    }
+
+    #[test]
+    fn embedded_image_signature_validation_covers_supported_formats() {
+        assert!(attachment_image_signature_matches(
+            b"\x89PNG\r\n\x1a\nrest",
+            "image/png"
+        ));
+        assert!(attachment_image_signature_matches(
+            &[0xff, 0xd8, 0xff, 0xe0],
+            "image/jpeg"
+        ));
+        assert!(attachment_image_signature_matches(b"GIF89a", "image/gif"));
+        assert!(attachment_image_signature_matches(
+            b"RIFF\x00\x00\x00\x00WEBP",
+            "image/webp"
+        ));
+        assert!(attachment_image_signature_matches(
+            b"BMpayload",
+            "image/bmp"
+        ));
+        assert!(attachment_image_signature_matches(
+            b"II*\0payload",
+            "image/tiff"
+        ));
+        assert!(attachment_image_signature_matches(
+            b"<?xml version='1.0'?><SVG viewBox='0 0 1 1'/>",
+            "image/svg+xml"
+        ));
+        assert!(!attachment_image_signature_matches(
+            b"not an image",
+            "image/png"
+        ));
+        assert!(!attachment_image_signature_matches(
+            b"\x89PNG\r\n\x1a\nrest",
+            "text/plain"
+        ));
     }
 
     #[test]

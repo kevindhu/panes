@@ -438,7 +438,9 @@ export function useTranscriptSelection({
       restorePendingRef.current = false;
       const root = rootRef.current;
       const bookmark = bookmarkRef.current;
-      if (!root || !bookmark || pointerActiveRef.current) return;
+      if (!root || !bookmark) return;
+      // Stable streaming text normally leaves the native range untouched.
+      // This remains the fallback for genuine Markdown structure changes.
       const current = captureTranscriptSelection(root);
       if (current?.selectedText === bookmark.selectedText) {
         bookmarkRef.current = current;

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act } from "react";
+import { act, useRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -60,10 +60,34 @@ vi.mock("../../stores/toastStore", () => ({
 
 import MarkdownContent from "./MarkdownContent";
 import { resetAttachmentImageCachesForTests } from "../../lib/attachmentImages";
+import { useTranscriptSelection } from "../../lib/transcriptSelection";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-describe("MarkdownContent local images", () => {
+function StreamingSelectionHarness({ content, streaming }: { content: string; streaming: boolean }) {
+  const rootRef = useRef<HTMLDivElement>(null);
+  useTranscriptSelection({ rootRef, resetKey: "thread:stable" });
+  return (
+    <div ref={rootRef}>
+      <MarkdownContent
+        content={content}
+        streaming={streaming}
+        selectionScopeId="message:stable"
+      />
+    </div>
+  );
+}
+
+function findTextNode(root: Node, text: string): Text {
+  const walker = document.createTreeWalker(root, window.NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) {
+    const node = walker.currentNode as Text;
+    if (node.data.includes(text)) return node;
+  }
+  throw new Error(`Could not find text node containing ${JSON.stringify(text)}`);
+}
+
+describe("MarkdownContent", () => {
   let container: HTMLDivElement;
   let root: Root;
 
@@ -181,6 +205,107 @@ describe("MarkdownContent local images", () => {
     expect(mockClipboardWriteText).toHaveBeenCalledWith("echo second\n");
     expect(copyButtons[1]?.getAttribute("aria-label")).toBe("Code copied");
     expect(copyButtons[0]?.getAttribute("aria-label")).toBe("Copy code");
+  });
+
+  it("keeps native selection nodes mounted while streamed text grows", async () => {
+    await act(async () => {
+      root.render(<StreamingSelectionHarness content="Keep this highlighted" streaming />);
+    });
+
+    const highlighted = findTextNode(container, "highlighted");
+    const range = document.createRange();
+    const highlightedOffset = highlighted.data.indexOf("highlighted");
+    range.setStart(highlighted, highlightedOffset);
+    range.setEnd(highlighted, highlightedOffset + "highlighted".length);
+    document.getSelection()?.removeAllRanges();
+    document.getSelection()?.addRange(range);
+    await act(async () => {
+      document.dispatchEvent(new Event("selectionchange"));
+      highlighted.parentElement?.dispatchEvent(new MouseEvent("pointerdown", {
+        bubbles: true,
+        button: 0,
+      }));
+    });
+
+    await act(async () => {
+      root.render(
+        <StreamingSelectionHarness
+          content="Keep this highlighted while output continues to grow."
+          streaming
+        />,
+      );
+      await Promise.resolve();
+    });
+
+    expect(findTextNode(container, "highlighted")).toBe(highlighted);
+    expect(document.getSelection()?.toString()).toBe("highlighted");
+
+    await act(async () => {
+      document.dispatchEvent(new MouseEvent("pointerup", { bubbles: true, button: 0 }));
+      root.render(
+        <StreamingSelectionHarness
+          content="Keep this highlighted while output continues to grow. More output."
+          streaming={false}
+        />,
+      );
+      await Promise.resolve();
+    });
+
+    expect(findTextNode(container, "highlighted")).toBe(highlighted);
+    expect(document.getSelection()?.toString()).toBe("highlighted");
+  });
+
+  it("keeps the selected text node when the current word is extended", async () => {
+    await act(async () => {
+      root.render(<StreamingSelectionHarness content="Keep this high" streaming />);
+    });
+
+    const growingWord = findTextNode(container, "high");
+    const range = document.createRange();
+    const growingWordOffset = growingWord.data.indexOf("high");
+    range.setStart(growingWord, growingWordOffset);
+    range.setEnd(growingWord, growingWordOffset + "high".length);
+    document.getSelection()?.removeAllRanges();
+    document.getSelection()?.addRange(range);
+    await act(async () => {
+      document.dispatchEvent(new Event("selectionchange"));
+      growingWord.parentElement?.dispatchEvent(new MouseEvent("pointerdown", {
+        bubbles: true,
+        button: 0,
+      }));
+      root.render(<StreamingSelectionHarness content="Keep this highlighted" streaming />);
+      await Promise.resolve();
+    });
+
+    expect(findTextNode(container, "high")).toBe(growingWord);
+    expect(container.textContent).toContain("Keep this highlighted");
+    expect(document.getSelection()?.toString()).toBe("high");
+  });
+
+  it("keeps deferred large-stream text append-only", async () => {
+    const prefix = "Earlier output. ".repeat(500);
+    await act(async () => {
+      root.render(<StreamingSelectionHarness content={`${prefix}Keep this high`} streaming />);
+    });
+
+    const growingWord = findTextNode(container, "high");
+    const start = growingWord.data.lastIndexOf("high");
+    const range = document.createRange();
+    range.setStart(growingWord, start);
+    range.setEnd(growingWord, start + "high".length);
+    document.getSelection()?.removeAllRanges();
+    document.getSelection()?.addRange(range);
+
+    await act(async () => {
+      root.render(
+        <StreamingSelectionHarness content={`${prefix}Keep this highlighted`} streaming />,
+      );
+      await Promise.resolve();
+    });
+
+    expect(findTextNode(container, "high")).toBe(growingWord);
+    expect(container.textContent).toContain("Keep this highlighted");
+    expect(document.getSelection()?.toString()).toBe("high");
   });
 
   it("opens a markdown web link on a plain click when unrelated text remains selected", async () => {
@@ -361,6 +486,41 @@ describe("MarkdownContent local images", () => {
     );
   });
 
+  it("promotes plain local image links, including encoded Windows file URLs", async () => {
+    const windowsPath = String.raw`C:\Users\lemondoo\Pictures\Kimtoxic\유나라 (01).png`;
+    const fileUrl = "file:///C:/%5CUsers%5Clemondoo%5CPictures%5CKimtoxic%5C%EC%9C%A0%EB%82%98%EB%9D%BC%20(01).png";
+
+    await act(async () => {
+      root.render(
+        <MarkdownContent
+          content={[
+            String.raw`[유나라 raw](<C:\Users\lemondoo\Pictures\Kimtoxic\유나라 (01).png>)`,
+            `[유나라 file URL](<${fileUrl}>)`,
+          ].join("\n\n")}
+          workspaceRootPath={"C:\\Users\\lemondoo\\PROJECTS\\manga_reader"}
+        />,
+      );
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const buttons = Array.from(
+      container.querySelectorAll<HTMLButtonElement>(".markdown-local-image-button"),
+    );
+    expect(buttons, container.innerHTML).toHaveLength(2);
+    expect(container.querySelectorAll("a")).toHaveLength(0);
+    expect(buttons.map((button) => (
+      button.getAttribute("data-panes-markdown-local-image-path")
+    ))).toEqual([windowsPath, windowsPath]);
+    expect(mockPrepareAttachmentImageAsset).toHaveBeenCalledWith(
+      windowsPath,
+      "image/png",
+      720,
+      440,
+    );
+  });
+
   it("loads UNC images without requiring a workspace root", async () => {
     const uncPath = String.raw`\\media-server\translations\translated page.webp`;
 
@@ -392,7 +552,7 @@ describe("MarkdownContent local images", () => {
     );
   });
 
-  it("does not route remote images through native attachment previews", async () => {
+  it("routes remote images through the shared viewer without native file APIs", async () => {
     await act(async () => {
       root.render(
         <MarkdownContent
@@ -408,15 +568,22 @@ describe("MarkdownContent local images", () => {
     const images = Array.from(container.querySelectorAll("img"));
     expect(images.map((image) => image.getAttribute("src"))).toEqual([
       "https://cdn.example.com/page.png",
-      "//cdn.example.com/page.webp",
+      "https://cdn.example.com/page.webp",
     ]);
-    expect(container.querySelector(".markdown-local-image-button")).toBeNull();
+    expect(container.querySelectorAll(".markdown-local-image-button")).toHaveLength(2);
     expect(mockPrepareAttachmentImageAsset).not.toHaveBeenCalled();
     expect(mockReadAttachmentImageBytes).not.toHaveBeenCalled();
     expect(mockConvertFileSrc).not.toHaveBeenCalled();
+
+    await act(async () => {
+      (container.querySelector(".markdown-local-image-button") as HTMLButtonElement).click();
+    });
+    expect(document.body.querySelector(".chat-image-viewer-image")?.getAttribute("src")).toBe(
+      "https://cdn.example.com/page.png",
+    );
   });
 
-  it("sizes the thumbnail frame to the image aspect ratio", async () => {
+  it("fits Markdown thumbnails inside 560 by 420 without upscaling small images", async () => {
     await act(async () => {
       root.render(
         <MarkdownContent
@@ -437,14 +604,30 @@ describe("MarkdownContent local images", () => {
 
     await act(async () => {
       if (image) {
+        setImageNaturalSize(image, 120, 80);
+        image.dispatchEvent(new Event("load", { bubbles: true }));
+      }
+    });
+    expect(button?.style.getPropertyValue("--markdown-local-image-frame-width")).toBe("120px");
+
+    await act(async () => {
+      if (image) {
+        setImageNaturalSize(image, 2_000, 1_000);
+        image.dispatchEvent(new Event("load", { bubbles: true }));
+      }
+    });
+    expect(button?.style.getPropertyValue("--markdown-local-image-frame-width")).toBe("560px");
+
+    await act(async () => {
+      if (image) {
         setImageNaturalSize(image, 360, 720);
         image.dispatchEvent(new Event("load", { bubbles: true }));
       }
     });
 
-    expect(button?.style.getPropertyValue("--markdown-local-image-frame-width")).toBe("110px");
-    expect(button?.style.getPropertyValue("--markdown-local-image-frame-height")).toBe("auto");
-    expect(button?.style.getPropertyValue("--markdown-local-image-aspect")).toBe("360 / 720");
+    expect(button?.style.getPropertyValue("--markdown-local-image-frame-width")).toBe("210px");
+    expect(button?.style.getPropertyValue("--markdown-local-image-frame-height")).toBe("");
+    expect(button?.style.getPropertyValue("--markdown-local-image-aspect")).toBe("");
   });
 
   it("opens local markdown images in the image viewer", async () => {
@@ -523,9 +706,9 @@ describe("MarkdownContent local images", () => {
     expect(remountedImage?.getAttribute("src")).toBe(
       "asset://C:/repo/screenshots/page.png.thumb.png?v=thumb",
     );
-    expect(remountedButton?.style.getPropertyValue("--markdown-local-image-frame-width")).toBe("110px");
-    expect(remountedButton?.style.getPropertyValue("--markdown-local-image-aspect")).toBe("360 / 720");
-    expect(mockPrepareAttachmentImageAsset).toHaveBeenCalledTimes(2);
+    expect(remountedButton?.style.getPropertyValue("--markdown-local-image-frame-width")).toBe("210px");
+    expect(remountedButton?.style.getPropertyValue("--markdown-local-image-aspect")).toBe("");
+    expect(mockPrepareAttachmentImageAsset).toHaveBeenCalledTimes(1);
   });
 
   it("reloads an absolute image preview after transient preview state is cleared", async () => {
@@ -562,7 +745,7 @@ describe("MarkdownContent local images", () => {
     expect(container.querySelector(".markdown-local-image-thumbnail")?.getAttribute("src")).toBe(
       "asset://C:/Users/dev/sibling/translated.png.thumb.png?v=thumb",
     );
-    expect(mockPrepareAttachmentImageAsset).toHaveBeenCalledTimes(4);
+    expect(mockPrepareAttachmentImageAsset).toHaveBeenCalledTimes(2);
   });
 
   it("keeps a local-image placeholder outside Tauri", async () => {

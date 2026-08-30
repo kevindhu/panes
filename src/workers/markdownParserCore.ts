@@ -117,7 +117,10 @@ function sanitizeUrl(url: string, attrName: string): string {
     return "#";
   }
 
-  if (attrName.toLowerCase() === "href" && isLocalFileLinkSyntax(trimmed)) {
+  if (
+    attrName.toLowerCase() === "href"
+    && (isLocalFileLinkSyntax(trimmed) || isLocalImageSource(trimmed))
+  ) {
     return trimmed;
   }
 

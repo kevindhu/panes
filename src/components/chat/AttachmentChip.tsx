@@ -1,21 +1,19 @@
 import {
-  useCallback,
-  useEffect,
-  useRef,
+  useMemo,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import { File, FileText, Image, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
-  getCachedAttachmentImageAssetUrl,
-  getCachedAttachmentImageFallbackUrl,
   isImageAttachmentMimeType,
-  loadAttachmentImageAssetUrl,
-  loadAttachmentImageFallbackUrl,
   resolveAttachmentImageMimeType,
 } from "../../lib/attachmentImages";
+import type { ChatImageDescriptor } from "../../lib/chatImageSources";
+import { useChatImageAsset } from "./ChatImage";
 import { ImageAttachmentViewer } from "./ImageAttachmentViewer";
+
+const ATTACHMENT_THUMBNAIL_OPTIONS = { maxWidth: 256, maxHeight: 256 };
 
 interface AttachmentChipData {
   fileName: string;
@@ -133,159 +131,18 @@ export function AttachmentChip({
 }: AttachmentChipProps) {
   const { t } = useTranslation("chat");
   const effectiveMimeType = getEffectiveMimeType(attachment);
-  const [assetSrc, setAssetSrc] = useState<string | null>(() => (
-    getCachedAttachmentImageAssetUrl(attachment.filePath, effectiveMimeType) ?? null
-  ));
-  const [fallbackSrc, setFallbackSrc] = useState<string | null>(() => (
-    getCachedAttachmentImageFallbackUrl(attachment.filePath, effectiveMimeType) ?? null
-  ));
-  const [sourceState, setSourceState] = useState<"loading" | "asset" | "fallback" | "failed">(
-    assetSrc ? "asset" : fallbackSrc ? "fallback" : "loading",
-  );
-  const [viewerOpen, setViewerOpen] = useState(false);
-  const assetRequestRef = useRef<Promise<string | null> | null>(null);
-  const fallbackRequestRef = useRef<Promise<string | null> | null>(null);
-  const requestTokenRef = useRef(0);
   const isImageAttachment = isImageAttachmentMimeType(effectiveMimeType);
-
-  const requestAsset = useCallback(async (): Promise<string | null> => {
-    if (!isImageAttachment || !attachment.filePath) {
-      return null;
-    }
-    const cachedAsset = getCachedAttachmentImageAssetUrl(
-      attachment.filePath,
-      effectiveMimeType,
-    );
-    if (cachedAsset !== undefined) {
-      if (cachedAsset) {
-        setAssetSrc(cachedAsset);
-        setSourceState("asset");
-      }
-      return cachedAsset;
-    }
-    if (!assetRequestRef.current) {
-      const requestToken = requestTokenRef.current;
-      assetRequestRef.current = loadAttachmentImageAssetUrl(
-        attachment.filePath,
-        effectiveMimeType,
-      )
-        .then((nextAssetSrc) => {
-          if (requestTokenRef.current === requestToken && nextAssetSrc) {
-            setAssetSrc(nextAssetSrc);
-            setSourceState("asset");
-          }
-          return nextAssetSrc;
-        })
-        .finally(() => {
-          if (requestTokenRef.current === requestToken) {
-            assetRequestRef.current = null;
-          }
-        });
-    }
-    return assetRequestRef.current;
-  }, [attachment.filePath, effectiveMimeType, isImageAttachment]);
-
-  const requestFallback = useCallback(async (): Promise<string | null> => {
-    if (!isImageAttachment || !attachment.filePath) {
-      return null;
-    }
-    const cachedFallback = getCachedAttachmentImageFallbackUrl(
-      attachment.filePath,
-      effectiveMimeType,
-    );
-    if (cachedFallback !== undefined) {
-      if (cachedFallback) {
-        setFallbackSrc(cachedFallback);
-        setSourceState("fallback");
-      }
-      return cachedFallback;
-    }
-    if (!fallbackRequestRef.current) {
-      const requestToken = requestTokenRef.current;
-      fallbackRequestRef.current = loadAttachmentImageFallbackUrl(
-        attachment.filePath,
-        effectiveMimeType,
-      )
-        .then((nextFallbackSrc) => {
-          if (requestTokenRef.current === requestToken && nextFallbackSrc) {
-            setFallbackSrc(nextFallbackSrc);
-            setSourceState("fallback");
-          }
-          return nextFallbackSrc;
-        })
-        .finally(() => {
-          if (requestTokenRef.current === requestToken) {
-            fallbackRequestRef.current = null;
-          }
-        });
-    }
-    return fallbackRequestRef.current;
-  }, [attachment.filePath, effectiveMimeType, isImageAttachment]);
-
-  const requestViewerSource = useCallback(async (): Promise<string | null> => {
-    try {
-      const nextAssetSrc = await requestAsset();
-      if (nextAssetSrc) {
-        return nextAssetSrc;
-      }
-    } catch {
-      // Fall through to the binary fallback.
-    }
-    return requestFallback();
-  }, [requestAsset, requestFallback]);
-
-  useEffect(() => {
-    let cancelled = false;
-    requestTokenRef.current += 1;
-    assetRequestRef.current = null;
-    fallbackRequestRef.current = null;
-    const cachedAsset = getCachedAttachmentImageAssetUrl(
-      attachment.filePath,
-      effectiveMimeType,
-    );
-    const cachedFallback = getCachedAttachmentImageFallbackUrl(
-      attachment.filePath,
-      effectiveMimeType,
-    );
-    setAssetSrc(cachedAsset ?? null);
-    setFallbackSrc(cachedFallback ?? null);
-    setSourceState(cachedAsset ? "asset" : cachedFallback ? "fallback" : "loading");
-
-    if (!isImageAttachment) {
-      return () => {
-        cancelled = true;
-      };
-    }
-
-    void requestAsset()
-      .then((nextAssetSrc) => {
-        if (!cancelled && !nextAssetSrc) {
-          return requestFallback();
-        }
-        return nextAssetSrc;
-      })
-      .catch(() => requestFallback())
-      .then((resolvedSrc) => {
-        if (!cancelled && !resolvedSrc) {
-          setSourceState("failed");
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setSourceState("failed");
-        }
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [attachment.filePath, effectiveMimeType, isImageAttachment, requestAsset, requestFallback]);
-
-  const thumbnailSrc = sourceState === "asset"
-    ? assetSrc
-    : sourceState === "fallback"
-      ? fallbackSrc
-      : null;
+  const image = useMemo<ChatImageDescriptor>(() => ({
+    id: `attachment:${attachment.filePath}:${attachment.fileName}`,
+    origin: "attachment",
+    fileName: attachment.fileName,
+    alt: attachment.fileName,
+    ...(isImageAttachment ? { filePath: attachment.filePath } : {}),
+    ...(effectiveMimeType ? { mimeType: effectiveMimeType } : {}),
+  }), [attachment.fileName, attachment.filePath, effectiveMimeType, isImageAttachment]);
+  const imageAsset = useChatImageAsset(image, ATTACHMENT_THUMBNAIL_OPTIONS, false);
+  const [viewerOpen, setViewerOpen] = useState(false);
+  const thumbnailSrc = isImageAttachment ? imageAsset.thumbnailSrc : null;
 
   const IconComponent = getAttachmentIcon(effectiveMimeType);
   const sizeBytes = attachment.sizeBytes ?? 0;
@@ -307,7 +164,7 @@ export function AttachmentChip({
     }
     setViewerOpen(true);
     if (!thumbnailSrc) {
-      void requestViewerSource().catch(() => {});
+      void imageAsset.requestViewerSource().catch(() => {});
     }
   }
 
@@ -319,30 +176,6 @@ export function AttachmentChip({
       event.preventDefault();
       openViewer();
     }
-  }
-
-  function handleThumbnailError() {
-    if (sourceState === "asset" && fallbackSrc) {
-      setSourceState("fallback");
-      return;
-    }
-
-    if (sourceState === "asset" || sourceState === "loading") {
-      void requestFallback()
-        .then((nextFallbackSrc) => {
-          if (nextFallbackSrc) {
-            setSourceState("fallback");
-            return;
-          }
-          setSourceState("failed");
-        })
-        .catch(() => {
-          setSourceState("failed");
-        });
-      return;
-    }
-
-    setSourceState("failed");
   }
 
   return (
@@ -364,7 +197,7 @@ export function AttachmentChip({
             draggable={false}
             loading="lazy"
             decoding="async"
-            onError={handleThumbnailError}
+            onError={imageAsset.handleThumbnailError}
           />
         ) : (
           <IconComponent size={compact ? 10 : 12} />
@@ -390,12 +223,12 @@ export function AttachmentChip({
       {interactive && (
         <ImageAttachmentViewer
           open={viewerOpen}
-          filePath={attachment.filePath}
+          filePath={imageAsset.resolvedFilePath}
           fileName={attachment.fileName}
           mimeType={effectiveMimeType}
-          originalSrc={sourceState === "asset" ? assetSrc : null}
+          originalSrc={imageAsset.originalSrc}
           previewSrc={thumbnailSrc}
-          requestPreview={requestViewerSource}
+          requestPreview={imageAsset.requestViewerSource}
           onClose={() => setViewerOpen(false)}
         />
       )}

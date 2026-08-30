@@ -14,6 +14,11 @@ const mockReadAttachmentImageBytes = vi.hoisted(() => vi.fn(async () => (
   new Uint8Array([97, 98, 99]).buffer
 )));
 const mockCopyAttachmentImageToClipboard = vi.hoisted(() => vi.fn(async () => undefined));
+const mockCacheEmbeddedChatImage = vi.hoisted(() => vi.fn(async () => ({
+  filePath: "C:/cache/embedded.png",
+  mimeType: "image/png",
+  version: "embedded",
+})));
 const mockCreateObjectURL = vi.hoisted(() => vi.fn<(blob: Blob) => string>(() => "blob:raw-fallback"));
 const mockRevokeObjectURL = vi.hoisted(() => vi.fn());
 
@@ -27,11 +32,13 @@ vi.mock("./codexIpc", () => ({
     prepareAttachmentImageAsset: mockPrepareAttachmentImageAsset,
     readAttachmentImageBytes: mockReadAttachmentImageBytes,
     copyAttachmentImageToClipboard: mockCopyAttachmentImageToClipboard,
+    cacheEmbeddedChatImage: mockCacheEmbeddedChatImage,
   },
 }));
 
 import {
   copyAttachmentImage,
+  cacheEmbeddedImageDataUrl,
   copyImageFromSources,
   getCachedAttachmentImageAssetUrl,
   loadAttachmentImageAssetUrl,
@@ -128,6 +135,22 @@ describe("attachmentImages", () => {
     expect(blob.size).toBe(3);
   });
 
+  it("persists embedded image data through the native cache once", async () => {
+    const source = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB";
+    const [first, second] = await Promise.all([
+      cacheEmbeddedImageDataUrl(source, "image/png"),
+      cacheEmbeddedImageDataUrl(source, "image/png"),
+    ]);
+
+    expect(first?.filePath).toBe("C:/cache/embedded.png");
+    expect(second).toEqual(first);
+    expect(mockCacheEmbeddedChatImage).toHaveBeenCalledTimes(1);
+    expect(mockCacheEmbeddedChatImage).toHaveBeenCalledWith(
+      "image/png",
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB",
+    );
+  });
+
   it("reuses a warmed image blob when copying to the clipboard", async () => {
     mockIsTauri.mockReturnValue(false);
     const mockWrite = vi.fn(async () => undefined);
@@ -158,6 +181,27 @@ describe("attachmentImages", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(mockWrite).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retain oversized inline image sources in the blob cache", async () => {
+    mockIsTauri.mockReturnValue(false);
+    const mockWrite = vi.fn(async () => undefined);
+    class MockClipboardItem {
+      constructor(public items: Record<string, Blob>) {}
+    }
+    vi.stubGlobal("ClipboardItem", MockClipboardItem);
+    vi.stubGlobal("navigator", { clipboard: { write: mockWrite } });
+    const fetchMock = vi.fn().mockImplementation(async () => (
+      new Response(new Blob(["image"], { type: "image/png" }), { status: 200 })
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+    const oversizedSource = `data:image/png;base64,${"A".repeat(9_000)}`;
+
+    await copyImageFromSources([oversizedSource], "image/png");
+    await copyImageFromSources([oversizedSource], "image/png");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(mockWrite).toHaveBeenCalledTimes(2);
   });
 
   it("copies image data after falling back to a secondary source", async () => {

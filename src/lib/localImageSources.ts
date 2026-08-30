@@ -45,6 +45,10 @@ function isWindowsUncPath(path: string): boolean {
   return /^\\\\[^\\/]+[\\/]+[^\\/]+(?:[\\/]|$)/.test(path);
 }
 
+function isPosixAbsolutePath(path: string): boolean {
+  return path.startsWith("/") && !path.startsWith("//");
+}
+
 function normalizeAbsoluteWindowsImagePath(sourcePath: string): string | null {
   const decodedPath = safeDecodePath(sourcePath);
 
@@ -59,6 +63,41 @@ function normalizeAbsoluteWindowsImagePath(sourcePath: string): string | null {
   }
 
   return null;
+}
+
+function normalizeWindowsFileUrlPath(path: string): string {
+  return path.replace(/[\\/]+/g, "\\");
+}
+
+export function resolveLocalImageFileUrl(source: string): string | null {
+  const trimmed = source.trim();
+  if (!trimmed.toLowerCase().startsWith("file://")) {
+    return null;
+  }
+
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol.toLowerCase() !== "file:") {
+      return null;
+    }
+    const decodedPath = decodeURIComponent(url.pathname);
+    let filePath: string;
+
+    if (url.hostname && url.hostname.toLowerCase() !== "localhost") {
+      const networkPath = normalizeWindowsFileUrlPath(decodedPath).replace(/^\\+/, "");
+      filePath = networkPath
+        ? `\\\\${decodeURIComponent(url.hostname)}\\${networkPath}`
+        : `\\\\${decodeURIComponent(url.hostname)}`;
+    } else if (/^\/[a-z]:[\\/]/i.test(decodedPath)) {
+      filePath = normalizeWindowsFileUrlPath(decodedPath.slice(1));
+    } else {
+      filePath = decodedPath;
+    }
+
+    return hasSupportedLocalImageExtension(filePath) ? filePath : null;
+  } catch {
+    return null;
+  }
 }
 
 export function hasSupportedLocalImageExtension(sourcePath: string): boolean {
@@ -116,9 +155,22 @@ export function isAbsoluteWindowsLocalImageSource(source: string): boolean {
   );
 }
 
+export function isAbsolutePosixLocalImageSource(source: string): boolean {
+  const trimmed = source.trim();
+
+  if (!trimmed) {
+    return false;
+  }
+
+  const { path } = splitLocalImageSource(trimmed);
+  return isPosixAbsolutePath(safeDecodePath(path)) && hasSupportedLocalImageExtension(path);
+}
+
 export function isLocalImageSource(source: string): boolean {
   return (
+    resolveLocalImageFileUrl(source) !== null ||
     isAbsoluteWindowsLocalImageSource(source) ||
+    isAbsolutePosixLocalImageSource(source) ||
     isWorkspaceRelativeLocalImageSource(source)
   );
 }
@@ -188,10 +240,20 @@ export function resolveLocalImagePath(
     return null;
   }
 
+  const fileUrlPath = resolveLocalImageFileUrl(trimmed);
+  if (fileUrlPath) {
+    return fileUrlPath;
+  }
+
   const { path } = splitLocalImageSource(trimmed);
   const absolutePath = normalizeAbsoluteWindowsImagePath(path);
   if (absolutePath && hasSupportedLocalImageExtension(path)) {
     return absolutePath;
+  }
+
+  const decodedPath = safeDecodePath(path);
+  if (isPosixAbsolutePath(decodedPath) && hasSupportedLocalImageExtension(decodedPath)) {
+    return decodedPath;
   }
 
   return resolveWorkspaceRelativeLocalImagePath(trimmed, workspaceRootPath);

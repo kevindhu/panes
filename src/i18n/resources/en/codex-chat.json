@@ -5,6 +5,8 @@
       "copy": "Copy image",
       "copySuccess": "Image copied to clipboard.",
       "copyFailed": "Failed to copy image.",
+      "zoomIn": "Zoom in",
+      "zoomOut": "Zoom out",
       "resetZoom": "Reset zoom",
       "close": "Close viewer",
       "loading": "Loading image...",

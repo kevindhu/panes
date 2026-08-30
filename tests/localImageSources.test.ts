@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   isAbsoluteWindowsLocalImageSource,
+  isAbsolutePosixLocalImageSource,
   isLocalImageSource,
   isWorkspaceRelativeLocalImageSource,
+  resolveLocalImageFileUrl,
   resolveLocalImagePath,
   resolveWorkspaceRelativeLocalImagePath,
 } from "../src/lib/localImageSources";
@@ -30,12 +32,33 @@ describe("local image sources", () => {
     expect(isAbsoluteWindowsLocalImageSource("C:/repo/notes.md")).toBe(false);
   });
 
+  it("recognizes absolute macOS and Linux image paths", () => {
+    expect(isAbsolutePosixLocalImageSource("/Users/dev/project/page.png")).toBe(true);
+    expect(isAbsolutePosixLocalImageSource("/home/dev/project/page%2007.webp?cache=1")).toBe(true);
+    expect(isAbsolutePosixLocalImageSource("//cdn.example.com/page.png")).toBe(false);
+    expect(isAbsolutePosixLocalImageSource("/home/dev/project/readme.md")).toBe(false);
+    expect(resolveLocalImagePath("/home/dev/project/page%2007.webp", null)).toBe(
+      "/home/dev/project/page 07.webp",
+    );
+  });
+
   it("does not mistake remote or protocol-relative images for local paths", () => {
     expect(isLocalImageSource("https://cdn.example.com/page.png")).toBe(false);
     expect(isLocalImageSource("http://cdn.example.com/page.png")).toBe(false);
     expect(isLocalImageSource("//cdn.example.com/page.png")).toBe(false);
     expect(isLocalImageSource("blob:https://example.com/id")).toBe(false);
     expect(isLocalImageSource("data:image/png;base64,YWJj")).toBe(false);
+  });
+
+  it("normalizes canonical and mixed-separator image file URLs", () => {
+    expect(resolveLocalImageFileUrl("file:///C:/Users/dev/Pictures/page%2001.png")).toBe(
+      "C:\\Users\\dev\\Pictures\\page 01.png",
+    );
+    expect(resolveLocalImageFileUrl(
+      "file:///C:/%5CUsers%5Clemondoo%5CPictures%5CKimtoxic%5C%EC%9C%A0%EB%82%98%EB%9D%BC%20(01).png",
+    )).toBe("C:\\Users\\lemondoo\\Pictures\\Kimtoxic\\유나라 (01).png");
+    expect(isLocalImageSource("file:///C:/Users/dev/Pictures/page.png")).toBe(true);
+    expect(resolveLocalImageFileUrl("file:///C:/Users/dev/Pictures/notes.txt")).toBeNull();
   });
 
   it("resolves relative image sources inside the workspace root", () => {
