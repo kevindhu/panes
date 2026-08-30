@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ChatTurnFinishedEvent } from "../lib/ipc";
-import type { ApprovalResponse, Message, StreamEvent, Thread } from "../types";
+import type { ChatTurnFinishedEvent } from "../lib/codexIpc";
+import type { ApprovalResponse, Message, SteerMessageReceipt, StreamEvent, Thread } from "../types";
 
 const mockIpc = vi.hoisted(() => ({
   sendMessage: vi.fn(),
@@ -25,7 +25,7 @@ const mockToast = vi.hoisted(() => ({
   error: vi.fn(),
 }));
 
-vi.mock("../lib/ipc", () => ({
+vi.mock("../lib/codexIpc", () => ({
   ipc: mockIpc,
   listenThreadEvents: mockListenThreadEvents,
 }));
@@ -118,7 +118,13 @@ describe("chatStore send", () => {
       truncated: false,
     });
     mockIpc.cancelTurn.mockResolvedValue(undefined);
-    mockIpc.steerMessage.mockResolvedValue(undefined);
+    mockIpc.steerMessage.mockImplementation(async (...args: unknown[]) => ({
+      steerId: typeof args[5] === "string" ? args[5] : "steer-1",
+      messageId: "persisted-steer-1",
+      nativeTurnId: "native-turn-1",
+      sourceSequence: 12,
+      acceptedSourceSequence: 13,
+    } satisfies SteerMessageReceipt));
     mockIpc.syncThreadFromEngine.mockResolvedValue({
       id: "thread-1",
       workspaceId: "workspace-1",
@@ -191,6 +197,49 @@ describe("chatStore send", () => {
 
     pendingRequest.resolve("assistant-message-id");
     await expect(sendPromise).resolves.toBe(true);
+    expect(useChatStore.getState().messages[1]?.id).toBe("assistant-message-id");
+  });
+
+  it("reconciles the persisted Codex turn without duplicating its optimistic user pair", async () => {
+    mockIpc.sendMessage.mockResolvedValueOnce("persisted-assistant");
+    await expect(useChatStore.getState().send("hello")).resolves.toBe(true);
+    const optimisticAssistant = useChatStore.getState().messages[1]!;
+    mockIpc.getThreadMessagesWindow.mockResolvedValueOnce({
+      messages: [
+        {
+          id: "persisted-user",
+          threadId: "thread-1",
+          role: "user",
+          content: "hello",
+          blocks: [{ type: "text", content: "hello" }],
+          status: "completed",
+          schemaVersion: 1,
+          createdAt: "2026-08-29 08:58:09",
+        },
+        {
+          id: "persisted-assistant",
+          threadId: "thread-1",
+          role: "assistant",
+          blocks: [],
+          status: "streaming",
+          schemaVersion: 1,
+          createdAt: "2026-08-29 08:58:09",
+          nativeTurnId: "native-turn-1",
+        },
+      ],
+      nextCursor: null,
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1", { forceReload: true });
+
+    expect(useChatStore.getState().messages.map((message) => message.id)).toEqual([
+      "persisted-user",
+      "persisted-assistant",
+    ]);
+    expect(useChatStore.getState().messages[1]).toMatchObject({
+      id: "persisted-assistant",
+      clientTurnId: optimisticAssistant.clientTurnId,
+    });
   });
 
   it("accepts a matching fast terminal event before the send IPC response settles", async () => {
@@ -211,6 +260,7 @@ describe("chatStore send", () => {
 
     pendingRequest.resolve("backend-assistant-id");
     await expect(sendPromise).resolves.toBe(true);
+    expect(useChatStore.getState().messages.at(-1)?.id).toBe("backend-assistant-id");
   });
 
   it("uses the accepted global completion as a backstop when the bound listener missed it", () => {
@@ -241,14 +291,7 @@ describe("chatStore send", () => {
     expect(useChatStore.getState().messages[0]).toMatchObject({
       id: "assistant-message-id",
       status: "completed",
-      blocks: expect.arrayContaining([
-        expect.objectContaining({
-          type: "notice",
-          kind: "turn_status",
-          status: "completed",
-          title: "Turn completed",
-        }),
-      ]),
+      blocks: [{ type: "text", content: "Finished work" }],
     });
   });
 
@@ -385,6 +428,17 @@ describe("chatStore send", () => {
     expect(
       useThreadStore.getState().threads.find((thread) => thread.id === "thread-1")?.status,
     ).toBe("completed");
+
+    const refresh = deferred<{ messages: Message[]; nextCursor: null }>();
+    mockIpc.getThreadMessagesWindow.mockReturnValueOnce(refresh.promise);
+    const switchBack = useChatStore.getState().setActiveThread("thread-1");
+    expect(useChatStore.getState()).toMatchObject({
+      threadId: "thread-1",
+      status: "completed",
+      streaming: false,
+    });
+    refresh.resolve({ messages: [], nextCursor: null });
+    await switchBack;
   });
 
   it("clears a stale running thread cache before switching away from a completed transcript", async () => {
@@ -561,6 +615,45 @@ describe("chatStore send", () => {
 
     pendingCancel.resolve();
     await expect(cancelPromise).resolves.toBeUndefined();
+  });
+
+  it("retains an empty assistant turn so an early stop can show confirmation", async () => {
+    useChatStore.setState({
+      threadId: "thread-1",
+      status: "streaming",
+      streaming: true,
+      messages: [
+        {
+          id: "user-1",
+          threadId: "thread-1",
+          role: "user",
+          content: "start",
+          blocks: [{ type: "text", content: "start" }],
+          status: "completed",
+          schemaVersion: 1,
+          createdAt: new Date().toISOString(),
+        },
+        {
+          id: "assistant-1",
+          threadId: "thread-1",
+          role: "assistant",
+          status: "streaming",
+          schemaVersion: 1,
+          createdAt: new Date().toISOString(),
+          blocks: [],
+        },
+      ],
+    });
+
+    await useChatStore.getState().cancel();
+
+    expect(useChatStore.getState().messages).toHaveLength(2);
+    expect(useChatStore.getState().messages[1]).toMatchObject({
+      id: "assistant-1",
+      role: "assistant",
+      status: "interrupted",
+      blocks: [],
+    });
   });
 
   it("reloads the current thread when forceReload is requested", async () => {
@@ -761,6 +854,10 @@ describe("chatStore send", () => {
     ).resolves.toBe(true);
 
     streamHandler!({
+      type: "TextDelta",
+      content: "Content before the notice.",
+    });
+    streamHandler!({
       type: "Notice",
       kind: "deprecation_notice",
       level: "warning",
@@ -775,6 +872,10 @@ describe("chatStore send", () => {
       .messages.find((message) => message.role === "assistant" && message.blocks?.length);
     expect(assistant?.blocks).toEqual([
       {
+        type: "text",
+        content: "Content before the notice.",
+      },
+      {
         type: "notice",
         kind: "deprecation_notice",
         level: "warning",
@@ -786,7 +887,7 @@ describe("chatStore send", () => {
     vi.useRealTimers();
   });
 
-  it("stores turn completion diagnostics as terminal notice blocks", async () => {
+  it("completes a turn without creating a terminal notice block", async () => {
     vi.useFakeTimers();
 
     let streamHandler: ((event: StreamEvent) => void) | null = null;
@@ -822,29 +923,14 @@ describe("chatStore send", () => {
 
     const assistant = useChatStore
       .getState()
-      .messages.find((message) => message.role === "assistant" && message.blocks?.length);
+      .messages.find((message) => message.role === "assistant");
     expect(assistant?.status).toBe("completed");
-    expect(assistant?.blocks).toEqual([
-      expect.objectContaining({
-        type: "notice",
-        kind: "turn_status",
-        level: "info",
-        title: "Turn completed",
-        message: "Codex reported a normal terminal completion.",
-        status: "completed",
-        source: "engine",
-        durationMs: 123456,
-        details: expect.arrayContaining([
-          "Completion source: explicit engine terminal event",
-          "Token usage: 12 input, 34 output",
-        ]),
-      }),
-    ]);
+    expect(assistant?.blocks).toEqual([]);
 
     vi.useRealTimers();
   });
 
-  it("terminalizes unresolved action blocks before turn completion stats are stored", async () => {
+  it("terminalizes unresolved action blocks without adding a terminal notice", async () => {
     vi.useFakeTimers();
 
     let streamHandler: ((event: StreamEvent) => void) | null = null;
@@ -859,9 +945,9 @@ describe("chatStore send", () => {
       type: "ActionStarted",
       action_id: "action-done",
       engine_action_id: "item-done",
-      action_type: "command",
-      summary: "pnpm test",
-      details: {},
+      action_type: "search",
+      summary: "Web search",
+      details: { query: "", action: null, results: null },
     });
     streamHandler!({
       type: "ActionStarted",
@@ -874,6 +960,11 @@ describe("chatStore send", () => {
     streamHandler!({
       type: "ActionCompleted",
       action_id: "action-done",
+      details: {
+        query: "Shiro no Yakata game",
+        action: { type: "search", query: "Shiro no Yakata game" },
+        results: [{ title: "Developer blog", url: "https://example.com" }],
+      },
       result: {
         success: true,
         durationMs: 25,
@@ -897,6 +988,11 @@ describe("chatStore send", () => {
     expect(actionBlocks[0]).toMatchObject({
       actionId: "action-done",
       status: "done",
+      details: {
+        query: "Shiro no Yakata game",
+        action: { type: "search", query: "Shiro no Yakata game" },
+        results: [{ title: "Developer blog", url: "https://example.com" }],
+      },
     });
     expect(actionBlocks[1]).toMatchObject({
       actionId: "action-lost",
@@ -907,25 +1003,13 @@ describe("chatStore send", () => {
         durationMs: 0,
       },
     });
-    expect(assistant?.blocks).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "notice",
-          kind: "turn_status",
-          title: "Turn interrupted",
-          status: "interrupted",
-          source: "reconciled_stream_lost",
-          details: expect.arrayContaining([
-            "Actions: 2 total, 1 done, 1 error, 0 running, 0 pending",
-          ]),
-        }),
-      ]),
-    );
+    expect(assistant?.status).toBe("interrupted");
+    expect(assistant?.blocks?.some((block) => block.type === "notice")).toBe(false);
 
     vi.useRealTimers();
   });
 
-  it("uses recovered turn snapshots before terminal completion stats are stored", async () => {
+  it("uses recovered turn snapshots without adding a terminal notice", async () => {
     vi.useFakeTimers();
 
     let streamHandler: ((event: StreamEvent) => void) | null = null;
@@ -988,22 +1072,8 @@ describe("chatStore send", () => {
         durationMs: 25,
       },
     });
-    expect(assistant?.blocks).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "notice",
-          kind: "turn_status",
-          level: "info",
-          title: "Turn completed",
-          status: "completed",
-          source: "recovered_snapshot",
-          details: expect.arrayContaining([
-            "Completion source: recovered from Codex thread history",
-            "Actions: 1 total, 1 done, 0 error, 0 running, 0 pending",
-          ]),
-        }),
-      ]),
-    );
+    expect(assistant?.blocks).toHaveLength(1);
+    expect(assistant?.blocks?.some((block) => block.type === "notice")).toBe(false);
 
     vi.useRealTimers();
   });
@@ -1035,8 +1105,6 @@ describe("chatStore send", () => {
           level: "warning",
           title: "Turn interrupted",
           message: "The turn ended before a normal completion.",
-          status: "interrupted",
-          source: "reconciled_stream_lost",
           details: [
             "Completion source: reconciled from thread history after live stream loss",
             "Actions: 1 total, 0 done, 0 error, 1 running, 0 pending",
@@ -1059,18 +1127,11 @@ describe("chatStore send", () => {
       status: "error",
       result: {
         success: false,
-        error: "Panes lost the live Codex stream before this action reported completion.",
+        error: "The turn was interrupted before this action reported completion.",
         durationMs: 0,
       },
     });
-    expect(assistant.blocks?.[1]).toMatchObject({
-      type: "notice",
-      kind: "turn_status",
-      details: [
-        "Completion source: reconciled from thread history after live stream loss",
-        "Actions: 1 total, 0 done, 1 error, 0 running, 0 pending",
-      ],
-    });
+    expect(assistant.blocks).toHaveLength(1);
   });
 
   it("normalizes stale pending approval blocks when terminal messages are loaded", async () => {
@@ -1097,8 +1158,6 @@ describe("chatStore send", () => {
           title: "Approval still pending",
           message:
             "A terminal result was recorded, but Panes still has unresolved approvals. The turn may have ended early or the approval protocol may be out of sync.",
-          status: "awaiting_approval",
-          source: "engine",
           details: [
             "Completion source: explicit engine terminal event",
             "Approvals: 1 pending, 0 answered",
@@ -1122,19 +1181,7 @@ describe("chatStore send", () => {
       status: "answered",
       decision: "cancel",
     });
-    expect(assistant.blocks?.[1]).toMatchObject({
-      type: "notice",
-      kind: "turn_status",
-      level: "info",
-      title: "Turn completed",
-      message: "Codex reported a normal terminal completion.",
-      status: "completed",
-      source: "engine",
-      details: [
-        "Completion source: explicit engine terminal event",
-        "Approvals: 0 pending, 1 answered",
-      ],
-    });
+    expect(assistant.blocks).toHaveLength(1);
   });
 
   it("derives context usage from current context tokens instead of cumulative totals", async () => {
@@ -1155,6 +1202,11 @@ describe("chatStore send", () => {
         current_tokens: 30000,
         max_context_tokens: 200000,
         context_window_percent: 45,
+        input_tokens: 24000,
+        cached_input_tokens: 10000,
+        cache_write_input_tokens: 1000,
+        output_tokens: 6000,
+        reasoning_output_tokens: 2000,
         five_hour_percent: 17,
         weekly_percent: 42,
       },
@@ -1166,6 +1218,13 @@ describe("chatStore send", () => {
       currentTokens: 30000,
       maxContextTokens: 200000,
       contextPercent: 90,
+      breakdown: {
+        inputTokens: 24000,
+        cachedInputTokens: 10000,
+        cacheWriteInputTokens: 1000,
+        outputTokens: 6000,
+        reasoningOutputTokens: 2000,
+      },
       windowFiveHourPercent: 83,
       windowWeeklyPercent: 58,
       windowFiveHourResetsAt: null,
@@ -1189,6 +1248,11 @@ describe("chatStore send", () => {
           currentTokens: 30000,
           maxContextTokens: 200000,
           contextWindowPercent: 90,
+          inputTokens: 24000,
+          cachedInputTokens: 10000,
+          cacheWriteInputTokens: 1000,
+          outputTokens: 6000,
+          reasoningOutputTokens: 2000,
         },
       },
       title: "Thread 1",
@@ -1216,6 +1280,13 @@ describe("chatStore send", () => {
       currentTokens: 30000,
       maxContextTokens: 200000,
       contextPercent: 90,
+      breakdown: {
+        inputTokens: 24000,
+        cachedInputTokens: 10000,
+        cacheWriteInputTokens: 1000,
+        outputTokens: 6000,
+        reasoningOutputTokens: 2000,
+      },
       windowFiveHourPercent: null,
       windowWeeklyPercent: null,
       windowFiveHourResetsAt: null,
@@ -1270,6 +1341,11 @@ describe("chatStore send", () => {
         current_tokens: 30000,
         max_context_tokens: 200000,
         context_window_percent: 90,
+        input_tokens: 24000,
+        cached_input_tokens: 10000,
+        cache_write_input_tokens: 1000,
+        output_tokens: 6000,
+        reasoning_output_tokens: 2000,
       },
     });
 
@@ -1280,6 +1356,11 @@ describe("chatStore send", () => {
         currentTokens: 30000,
         maxContextTokens: 200000,
         contextWindowPercent: 90,
+        inputTokens: 24000,
+        cachedInputTokens: 10000,
+        cacheWriteInputTokens: 1000,
+        outputTokens: 6000,
+        reasoningOutputTokens: 2000,
       },
     });
 
@@ -1305,6 +1386,11 @@ describe("chatStore send", () => {
         current_tokens: 30000,
         max_context_tokens: 200000,
         context_window_percent: 45,
+        input_tokens: 24000,
+        cached_input_tokens: 10000,
+        cache_write_input_tokens: 1000,
+        output_tokens: 6000,
+        reasoning_output_tokens: 2000,
         five_hour_percent: 17,
         weekly_percent: 42,
       },
@@ -1326,6 +1412,13 @@ describe("chatStore send", () => {
       currentTokens: 30000,
       maxContextTokens: 200000,
       contextPercent: 90,
+      breakdown: {
+        inputTokens: 24000,
+        cachedInputTokens: 10000,
+        cacheWriteInputTokens: 1000,
+        outputTokens: 6000,
+        reasoningOutputTokens: 2000,
+      },
       windowFiveHourPercent: 75,
       windowWeeklyPercent: 50,
       windowFiveHourResetsAt: null,
@@ -1368,6 +1461,11 @@ describe("chatStore send", () => {
           currentTokens: 40000,
           maxContextTokens: 200000,
           contextWindowPercent: 84,
+          inputTokens: 32000,
+          cachedInputTokens: 14000,
+          cacheWriteInputTokens: 2000,
+          outputTokens: 8000,
+          reasoningOutputTokens: 3000,
         },
       },
       title: "Thread 2",
@@ -1418,6 +1516,13 @@ describe("chatStore send", () => {
       currentTokens: 40000,
       maxContextTokens: 200000,
       contextPercent: 85,
+      breakdown: {
+        inputTokens: 32000,
+        cachedInputTokens: 14000,
+        cacheWriteInputTokens: 2000,
+        outputTokens: 8000,
+        reasoningOutputTokens: 3000,
+      },
       windowFiveHourPercent: 83,
       windowWeeklyPercent: 58,
       windowFiveHourResetsAt: "2025-01-01T00:00:00.000Z",
@@ -1891,20 +1996,6 @@ describe("chatStore send", () => {
               details: {},
               status: "pending",
             },
-            {
-              type: "notice",
-              kind: "turn_status",
-              level: "warning",
-              title: "Approval still pending",
-              message:
-                "A terminal result was recorded, but Panes still has unresolved approvals. The turn may have ended early or the approval protocol may be out of sync.",
-              status: "awaiting_approval",
-              source: "engine",
-              details: [
-                "Completion source: explicit engine terminal event",
-                "Approvals: 1 pending, 0 answered",
-              ],
-            },
           ],
           createdAt: new Date().toISOString(),
           hydration: "full",
@@ -2046,6 +2137,7 @@ describe("chatStore send", () => {
       null,
       [{ type: "mention", name: "Docs", path: "app://docs" }],
       false,
+      expect.any(String),
     );
     expect(useChatStore.getState().messages).toHaveLength(1);
     expect(useChatStore.getState().messages[0]).toMatchObject({
@@ -2055,6 +2147,9 @@ describe("chatStore send", () => {
           type: "steer",
           content: "follow up",
           mentions: [{ type: "mention", name: "Docs", path: "app://docs" }],
+          persistedMessageId: "persisted-steer-1",
+          sourceSequence: 12,
+          status: "accepted",
         },
       ],
     });
@@ -2125,7 +2220,7 @@ describe("chatStore send", () => {
       error: undefined,
       unlisten: undefined,
     });
-    const pendingRequest = deferred<void>();
+    const pendingRequest = deferred<SteerMessageReceipt>();
     const onAccepted = vi.fn();
     mockIpc.steerMessage.mockReturnValueOnce(pendingRequest.promise);
 
@@ -2136,7 +2231,13 @@ describe("chatStore send", () => {
     expect(onAccepted).toHaveBeenCalledTimes(1);
     expect(useChatStore.getState().messages[0].blocks).toHaveLength(1);
 
-    pendingRequest.resolve();
+    pendingRequest.resolve({
+      steerId: "steer-accepted",
+      messageId: "persisted-steer-accepted",
+      nativeTurnId: "native-turn-1",
+      sourceSequence: 20,
+      acceptedSourceSequence: 21,
+    });
     await expect(steerPromise).resolves.toBe(true);
   });
 
@@ -2189,13 +2290,16 @@ describe("chatStore send", () => {
         {
           type: "steer",
           steerId: "steer-user-1",
+          persistedMessageId: "steer-user-1",
           content: "focus on the failing test",
+          status: "accepted",
+          observedAtMs: expect.any(Number),
         },
       ],
     });
   });
 
-  it("sorts bound message windows chronologically before rendering", async () => {
+  it("preserves the authoritative message-window sequence instead of re-sorting timestamps", async () => {
     mockIpc.getThreadMessagesWindow.mockResolvedValueOnce({
       messages: [
         {
@@ -2247,9 +2351,9 @@ describe("chatStore send", () => {
     await useChatStore.getState().setActiveThread("thread-1");
 
     expect(useChatStore.getState().messages.map((message) => message.id)).toEqual([
+      "assistant-late",
       "user-early",
       "assistant-mid",
-      "assistant-late",
     ]);
   });
 
@@ -2321,6 +2425,64 @@ describe("chatStore send", () => {
       "user-regular",
       "assistant-latest",
     ]);
+  });
+
+  it("reconnects a paginated persisted steer to its preceding assistant", async () => {
+    mockIpc.getThreadMessagesWindow
+      .mockResolvedValueOnce({
+        messages: [{
+          id: "steer-page-boundary",
+          threadId: "thread-1",
+          role: "user",
+          content: "Continue with the failing test.",
+          blocks: [{ type: "text", content: "Continue with the failing test.", isSteer: true }],
+          turnEngineId: "codex",
+          turnModelId: "gpt-5.3-codex",
+          turnReasoningEffort: "medium",
+          schemaVersion: 1,
+          status: "completed",
+          tokenUsage: null,
+          createdAt: "2026-05-19 12:00:01.250",
+        }],
+        nextCursor: { createdAt: "2026-05-19 12:00:01.250", id: "cursor-steer", rowId: 2 },
+      })
+      .mockResolvedValueOnce({
+        messages: [{
+          id: "assistant-before-steer",
+          threadId: "thread-1",
+          role: "assistant",
+          content: null,
+          blocks: [{ type: "text", content: "Working." }],
+          turnEngineId: "codex",
+          turnModelId: "gpt-5.3-codex",
+          turnReasoningEffort: "medium",
+          schemaVersion: 1,
+          status: "completed",
+          tokenUsage: null,
+          createdAt: "2026-05-19 12:00:00.000",
+        }],
+        nextCursor: null,
+      });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+    expect(useChatStore.getState().messages.map((message) => message.id)).toEqual(["steer-page-boundary"]);
+    await useChatStore.getState().loadOlderMessages();
+
+    expect(useChatStore.getState().messages).toHaveLength(1);
+    expect(useChatStore.getState().messages[0]).toMatchObject({
+      id: "assistant-before-steer",
+      blocks: [
+        { type: "text", content: "Working." },
+        {
+          type: "steer",
+          steerId: "steer-page-boundary",
+          persistedMessageId: "steer-page-boundary",
+          content: "Continue with the failing test.",
+          observedAtMs: Date.parse("2026-05-19T12:00:01.250Z"),
+          status: "accepted",
+        },
+      ],
+    });
   });
 
   it.each([
@@ -2476,7 +2638,6 @@ describe("chatStore send", () => {
               level: "info",
               title: "Turn completed",
               message: "The turn reached a terminal completion.",
-              status: "completed",
             },
           ],
           status: "completed",
@@ -2504,6 +2665,7 @@ describe("chatStore send", () => {
     expect(useChatStore.getState().messages.at(-1)).toMatchObject({
       id: "assistant-completed-turn",
       status: "completed",
+      blocks: [{ type: "text", content: "Final persisted response" }],
     });
     expect(
       useThreadStore.getState().threads.find((item) => item.id === "thread-1")?.status,
@@ -2567,9 +2729,7 @@ describe("chatStore send", () => {
     expect(useChatStore.getState().messages.at(-1)).toMatchObject({
       id: "assistant-message-id",
       status: "completed",
-      blocks: expect.arrayContaining([
-        expect.objectContaining({ kind: "turn_status", status: "completed" }),
-      ]),
+      blocks: [{ type: "text", content: "Finishing now" }],
     });
     useChatStore.getState().unlisten?.();
     expect(freshUnlisten).toHaveBeenCalledTimes(1);
@@ -2597,7 +2757,7 @@ describe("chatStore send", () => {
     });
     mockListenThreadEvents.mockImplementationOnce(async (threadId) => {
       expect(threadId).toBe("thread-2");
-      expect(useChatStore.getState().threadId).toBe("thread-1");
+      expect(useChatStore.getState().threadId).toBe("thread-2");
       expect(
         acceptTurnFinishedRuntimeEvent(
           makeTurnFinishedEvent({
@@ -2621,9 +2781,7 @@ describe("chatStore send", () => {
     expect(useChatStore.getState().messages.at(-1)).toMatchObject({
       id: "assistant-b",
       status: "completed",
-      blocks: expect.arrayContaining([
-        expect.objectContaining({ kind: "turn_status", status: "completed" }),
-      ]),
+      blocks: [{ type: "text", content: "Finishing in the background" }],
     });
     expect(
       useThreadStore.getState().threads.find((thread) => thread.id === "thread-2")?.status,
@@ -2713,7 +2871,7 @@ describe("chatStore send", () => {
       nextCursor: null,
     });
     mockListenThreadEvents.mockImplementationOnce(async (_threadId, onEvent) => {
-      expect(useChatStore.getState().threadId).toBe("thread-1");
+      expect(useChatStore.getState().threadId).toBe("thread-2");
       onEvent({
         type: "TurnCompleted",
         status: "completed",
@@ -2732,9 +2890,7 @@ describe("chatStore send", () => {
     expect(useChatStore.getState().messages.at(-1)).toMatchObject({
       id: "assistant-b",
       status: "completed",
-      blocks: expect.arrayContaining([
-        expect.objectContaining({ kind: "turn_status", status: "completed" }),
-      ]),
+      blocks: [{ type: "text", content: "Almost done" }],
     });
   });
 
@@ -3030,7 +3186,7 @@ describe("chatStore send", () => {
     const state = useChatStore.getState();
     expect(state.messages.map((message) => message.id)).toEqual([
       "persisted-user",
-      "optimistic-assistant",
+      "persisted-assistant",
     ]);
     expect(state.messages[1]?.blocks).toEqual([
       { type: "text", content: "streamed content" },
@@ -3114,19 +3270,7 @@ describe("chatStore send", () => {
         }),
       ]),
     );
-    expect(assistant?.blocks).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "notice",
-          kind: "turn_status",
-          level: "info",
-          title: "Turn completed",
-          status: "completed",
-          source: "engine",
-          details: expect.arrayContaining(["Approvals: 0 pending, 1 answered"]),
-        }),
-      ]),
-    );
+    expect(assistant?.blocks).toHaveLength(1);
 
     vi.useRealTimers();
   });
@@ -3215,7 +3359,7 @@ describe("chatStore send", () => {
     );
   });
 
-  it("syncs dirty Codex thread metadata before binding the message window", async () => {
+  it("starts dirty Codex synchronization while binding the local message window", async () => {
     const thread = {
       id: "thread-1",
       workspaceId: "workspace-1",
@@ -3249,6 +3393,196 @@ describe("chatStore send", () => {
 
     expect(mockIpc.syncThreadFromEngine).toHaveBeenCalledWith("thread-1");
     expect(mockIpc.getThreadMessagesWindow).toHaveBeenCalledWith("thread-1", null, 80);
+  });
+
+  it("shows durable local history without waiting for Codex reconciliation", async () => {
+    const thread = {
+      ...makeThread("thread-1", "completed"),
+      engineMetadata: { codexSyncRequired: true },
+    };
+    seedThreads(thread);
+    const sync = deferred<Thread>();
+    mockIpc.syncThreadFromEngine.mockReturnValueOnce(sync.promise);
+    mockIpc.getThreadMessagesWindow.mockResolvedValue({
+      messages: [{
+        id: "local-message",
+        threadId: "thread-1",
+        role: "assistant",
+        blocks: [{ type: "text", content: "Available locally" }],
+        status: "completed",
+        schemaVersion: 1,
+        createdAt: "2026-07-10T09:00:00.000Z",
+      }],
+      nextCursor: null,
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    expect(useChatStore.getState().messages.at(-1)).toMatchObject({
+      id: "local-message",
+      blocks: [{ type: "text", content: "Available locally" }],
+    });
+    sync.resolve({
+      ...thread,
+      engineMetadata: { codexSyncRequired: false },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  it("restores a revisited thread synchronously while its local refresh is pending", async () => {
+    const threadOne = makeThread("thread-1", "completed");
+    const threadTwo = makeThread("thread-2", "completed");
+    seedThreads(threadOne, threadTwo);
+    mockIpc.getThreadMessagesWindow
+      .mockResolvedValueOnce({
+        messages: [{
+          id: "thread-one-message",
+          threadId: "thread-1",
+          role: "assistant",
+          blocks: [{ type: "text", content: "Thread one" }],
+          status: "completed",
+          schemaVersion: 1,
+          createdAt: "2026-07-10T09:00:00.000Z",
+        }],
+        nextCursor: null,
+      })
+      .mockResolvedValueOnce({
+        messages: [{
+          id: "thread-two-message",
+          threadId: "thread-2",
+          role: "assistant",
+          blocks: [{ type: "text", content: "Thread two" }],
+          status: "completed",
+          schemaVersion: 1,
+          createdAt: "2026-07-10T09:01:00.000Z",
+        }],
+        nextCursor: null,
+      });
+    await useChatStore.getState().setActiveThread("thread-1");
+    await useChatStore.getState().setActiveThread("thread-2");
+
+    const refresh = deferred<{
+      messages: Message[];
+      nextCursor: null;
+    }>();
+    mockIpc.getThreadMessagesWindow.mockReturnValueOnce(refresh.promise);
+    const binding = useChatStore.getState().setActiveThread("thread-1");
+
+    expect(useChatStore.getState().threadId).toBe("thread-1");
+    expect(useChatStore.getState().messages.at(-1)?.id).toBe("thread-one-message");
+    expect(mockRecordPerfMetric).toHaveBeenCalledWith(
+      "chat.thread.history_visible.ms",
+      expect.any(Number),
+      { threadId: "thread-1", source: "memory" },
+    );
+
+    refresh.resolve({
+      messages: [{
+        id: "thread-one-message",
+        threadId: "thread-1",
+        role: "assistant",
+        blocks: [{ type: "text", content: "Thread one refreshed" }],
+        status: "completed",
+        schemaVersion: 1,
+        createdAt: "2026-07-10T09:00:00.000Z",
+      }],
+      nextCursor: null,
+    });
+    await binding;
+    expect(useChatStore.getState().messages.at(-1)?.blocks).toEqual([
+      { type: "text", content: "Thread one refreshed" },
+    ]);
+  });
+
+  it("retains already-loaded older history when refreshing a revisited thread", async () => {
+    const threadOne = makeThread("thread-1", "completed");
+    const threadTwo = makeThread("thread-2", "completed");
+    seedThreads(threadOne, threadTwo);
+    const latestMessage: Message = {
+      id: "latest-message",
+      threadId: "thread-1",
+      role: "assistant",
+      blocks: [{ type: "text", content: "Latest" }],
+      status: "completed",
+      schemaVersion: 1,
+      createdAt: "2026-07-10T09:10:00.000Z",
+    };
+    const olderMessage: Message = {
+      id: "older-message",
+      threadId: "thread-1",
+      role: "assistant",
+      blocks: [{ type: "text", content: "Older" }],
+      status: "completed",
+      schemaVersion: 1,
+      createdAt: "2026-07-10T09:00:00.000Z",
+    };
+    mockIpc.getThreadMessagesWindow
+      .mockResolvedValueOnce({
+        messages: [latestMessage],
+        nextCursor: {
+          createdAt: latestMessage.createdAt,
+          id: latestMessage.id,
+          rowId: 2,
+        },
+      })
+      .mockResolvedValueOnce({ messages: [olderMessage], nextCursor: null })
+      .mockResolvedValueOnce({ messages: [], nextCursor: null })
+      .mockResolvedValueOnce({ messages: [latestMessage], nextCursor: {
+        createdAt: latestMessage.createdAt,
+        id: latestMessage.id,
+        rowId: 2,
+      } });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+    await useChatStore.getState().loadOlderMessages();
+    await useChatStore.getState().setActiveThread("thread-2");
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    expect(useChatStore.getState().messages.map((message) => message.id)).toEqual([
+      "older-message",
+      "latest-message",
+    ]);
+    expect(useChatStore.getState()).toMatchObject({
+      olderCursor: null,
+      hasOlderMessages: false,
+    });
+  });
+
+  it("does not prepend stale cached history when a refreshed window has no shared identity", async () => {
+    const threadOne = makeThread("thread-1", "completed");
+    const threadTwo = makeThread("thread-2", "completed");
+    seedThreads(threadOne, threadTwo);
+    const message = (id: string, content: string, createdAt: string): Message => ({
+      id,
+      threadId: "thread-1",
+      role: "assistant",
+      blocks: [{ type: "text", content }],
+      status: "completed",
+      schemaVersion: 1,
+      createdAt,
+    });
+    mockIpc.getThreadMessagesWindow
+      .mockResolvedValueOnce({
+        messages: [
+          message("stale-older", "Stale older", "2026-07-10T09:00:00.000Z"),
+          message("stale-latest", "Stale latest", "2026-07-10T09:10:00.000Z"),
+        ],
+        nextCursor: null,
+      })
+      .mockResolvedValueOnce({ messages: [], nextCursor: null })
+      .mockResolvedValueOnce({
+        messages: [message("fresh-only", "Fresh", "2026-07-10T09:20:00.000Z")],
+        nextCursor: null,
+      });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+    await useChatStore.getState().setActiveThread("thread-2");
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    expect(useChatStore.getState().messages.map((item) => item.id)).toEqual([
+      "fresh-only",
+    ]);
   });
 
   it("normalizes deny approvals to decline in optimistic state", async () => {

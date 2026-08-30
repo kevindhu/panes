@@ -1,14 +1,15 @@
 import { convertFileSrc, isTauri } from "@tauri-apps/api/core";
-import { ipc } from "./ipc";
-import type { AttachmentPreview } from "../types";
+import { ipc } from "./codexIpc";
+import { recordPerfMetric } from "./perfTelemetry";
 
-const attachmentPreviewUrlCache = new Map<string, Promise<string | null>>();
-const attachmentPreviewObjectUrlCache = new Map<string, Promise<string | null>>();
-const attachmentPreviewObjectUrlResolvedCache = new Map<string, string | null>();
-const attachmentPreviewObjectUrls = new Set<string>();
+const attachmentAssetUrlCache = new Map<string, Promise<string | null>>();
+const attachmentAssetUrlResolvedCache = new Map<string, string | null>();
+const attachmentFallbackUrlCache = new Map<string, Promise<string | null>>();
+const attachmentFallbackUrlResolvedCache = new Map<string, string | null>();
+const attachmentObjectUrls = new Set<string>();
 const attachmentImageBlobCache = new Map<string, Promise<Blob>>();
 
-interface AttachmentPreviewObjectUrlOptions {
+export interface AttachmentImageAssetOptions {
   maxWidth?: number;
   maxHeight?: number;
 }
@@ -56,154 +57,119 @@ export function resolveAttachmentImageMimeType(
   return mimeType?.trim() || guessedMimeType;
 }
 
-export function attachmentPreviewToDataUrl(preview?: AttachmentPreview | null): string | null {
-  if (!preview?.mimeType || !preview.dataBase64) {
-    return null;
-  }
-  return `data:${preview.mimeType};base64,${preview.dataBase64}`;
-}
-
-function attachmentPreviewToBlob(preview?: AttachmentPreview | null): Blob | null {
-  if (!preview?.mimeType || !preview.dataBase64 || typeof Blob === "undefined") {
-    return null;
-  }
-
-  const decodeBase64 = globalThis.atob;
-  if (typeof decodeBase64 !== "function") {
-    return null;
-  }
-
-  const binary = decodeBase64(preview.dataBase64);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
-  return new Blob([bytes], { type: preview.mimeType });
-}
-
-function createTrackedObjectUrl(blob: Blob): string | null {
-  if (typeof URL === "undefined" || typeof URL.createObjectURL !== "function") {
-    return null;
-  }
-
-  const objectUrl = URL.createObjectURL(blob);
-  attachmentPreviewObjectUrls.add(objectUrl);
-  return objectUrl;
-}
-
-export function loadAttachmentPreviewDataUrl(
+export function loadAttachmentImageAssetUrl(
   filePath: string,
   mimeType?: string | null,
+  options: AttachmentImageAssetOptions = {},
 ): Promise<string | null> {
   const normalizedFilePath = filePath.trim();
-  if (!normalizedFilePath) {
+  if (!normalizedFilePath || !isTauriEnvironment()) {
     return Promise.resolve(null);
   }
 
-  const cacheKey = getAttachmentPreviewCacheKey(normalizedFilePath, mimeType);
-  const cachedPreview = attachmentPreviewUrlCache.get(cacheKey);
-  if (cachedPreview) {
-    return cachedPreview;
+  const cacheKey = getAttachmentImageCacheKey(normalizedFilePath, mimeType, options);
+  const cachedAsset = attachmentAssetUrlCache.get(cacheKey);
+  if (cachedAsset) {
+    return cachedAsset;
   }
 
-  const previewPromise = ipc.readAttachmentPreview(normalizedFilePath, mimeType ?? null)
-    .then((preview) => attachmentPreviewToDataUrl(preview))
+  const startedAt = performance.now();
+  const assetPromise = ipc.prepareAttachmentImageAsset(
+    normalizedFilePath,
+    mimeType ?? null,
+    options.maxWidth ?? null,
+    options.maxHeight ?? null,
+  )
+    .then((asset) => {
+      const baseUrl = convertFileSrc(asset.filePath);
+      const separator = baseUrl.includes("?") ? "&" : "?";
+      const assetUrl = `${baseUrl}${separator}v=${encodeURIComponent(asset.version)}`;
+      attachmentAssetUrlResolvedCache.set(cacheKey, assetUrl);
+      recordPerfMetric("chat.image.asset_prepare.ms", performance.now() - startedAt, {
+        kind: options.maxWidth || options.maxHeight ? "thumbnail" : "full",
+      });
+      return assetUrl;
+    })
     .catch((error) => {
-      attachmentPreviewUrlCache.delete(cacheKey);
+      attachmentAssetUrlCache.delete(cacheKey);
+      attachmentAssetUrlResolvedCache.delete(cacheKey);
+      recordPerfMetric("chat.image.asset_prepare.ms", performance.now() - startedAt, {
+        kind: options.maxWidth || options.maxHeight ? "thumbnail" : "full",
+        failed: true,
+      });
       throw error;
     });
 
-  attachmentPreviewUrlCache.set(cacheKey, previewPromise);
-  return previewPromise;
+  attachmentAssetUrlCache.set(cacheKey, assetPromise);
+  return assetPromise;
 }
 
-export function loadAttachmentPreviewObjectUrl(
+export function getCachedAttachmentImageAssetUrl(
   filePath: string,
   mimeType?: string | null,
-  options: AttachmentPreviewObjectUrlOptions = {},
-): Promise<string | null> {
-  const normalizedFilePath = filePath.trim();
-  if (!normalizedFilePath) {
-    return Promise.resolve(null);
-  }
-
-  const cacheKey = getAttachmentPreviewObjectUrlCacheKey(normalizedFilePath, mimeType, options);
-  const cachedPreview = attachmentPreviewObjectUrlCache.get(cacheKey);
-  if (cachedPreview) {
-    return cachedPreview;
-  }
-
-  const previewPromise = ipc.readAttachmentPreview(normalizedFilePath, mimeType ?? null)
-    .then(async (preview) => {
-      const originalBlob = attachmentPreviewToBlob(preview);
-      if (!originalBlob) {
-        return attachmentPreviewToDataUrl(preview);
-      }
-
-      const displayBlob = await maybeResizeImageBlob(originalBlob, preview?.mimeType, options);
-      return createTrackedObjectUrl(displayBlob) ?? attachmentPreviewToDataUrl(preview);
-    })
-    .then((previewSource) => {
-      attachmentPreviewObjectUrlResolvedCache.set(cacheKey, previewSource);
-      return previewSource;
-    })
-    .catch((error) => {
-      attachmentPreviewObjectUrlCache.delete(cacheKey);
-      attachmentPreviewObjectUrlResolvedCache.delete(cacheKey);
-      throw error;
-    });
-
-  attachmentPreviewObjectUrlCache.set(cacheKey, previewPromise);
-  return previewPromise;
-}
-
-export function getCachedAttachmentPreviewObjectUrl(
-  filePath: string,
-  mimeType?: string | null,
-  options: AttachmentPreviewObjectUrlOptions = {},
+  options: AttachmentImageAssetOptions = {},
 ): string | null | undefined {
   const normalizedFilePath = filePath.trim();
   if (!normalizedFilePath) {
     return null;
   }
-
-  const cacheKey = getAttachmentPreviewObjectUrlCacheKey(normalizedFilePath, mimeType, options);
-  return attachmentPreviewObjectUrlResolvedCache.get(cacheKey);
+  return attachmentAssetUrlResolvedCache.get(
+    getAttachmentImageCacheKey(normalizedFilePath, mimeType, options),
+  );
 }
 
-export function getAttachmentOriginalImageSrc(filePath: string): string | null {
-  const normalizedPath = filePath.trim();
-  if (!normalizedPath || !isTauri()) {
+export function loadAttachmentImageFallbackUrl(
+  filePath: string,
+  mimeType?: string | null,
+): Promise<string | null> {
+  const normalizedFilePath = filePath.trim();
+  if (!normalizedFilePath || !isTauriEnvironment()) {
+    return Promise.resolve(null);
+  }
+
+  const cacheKey = getAttachmentImageCacheKey(normalizedFilePath, mimeType);
+  const cachedFallback = attachmentFallbackUrlCache.get(cacheKey);
+  if (cachedFallback) {
+    return cachedFallback;
+  }
+
+  const fallbackPromise = ipc.readAttachmentImageBytes(normalizedFilePath, mimeType ?? null)
+    .then((rawBytes) => {
+      const bytes = rawBytes instanceof ArrayBuffer
+        ? new Uint8Array(rawBytes)
+        : Uint8Array.from(rawBytes);
+      if (bytes.byteLength === 0) {
+        return null;
+      }
+      const resolvedMimeType = resolveAttachmentImageMimeType(normalizedFilePath, mimeType);
+      if (!resolvedMimeType) {
+        return null;
+      }
+      const fallbackUrl = createTrackedObjectUrl(new Blob([bytes], { type: resolvedMimeType }));
+      attachmentFallbackUrlResolvedCache.set(cacheKey, fallbackUrl);
+      return fallbackUrl;
+    })
+    .catch((error) => {
+      attachmentFallbackUrlCache.delete(cacheKey);
+      attachmentFallbackUrlResolvedCache.delete(cacheKey);
+      throw error;
+    });
+
+  attachmentFallbackUrlCache.set(cacheKey, fallbackPromise);
+  return fallbackPromise;
+}
+
+export function getCachedAttachmentImageFallbackUrl(
+  filePath: string,
+  mimeType?: string | null,
+): string | null | undefined {
+  const normalizedFilePath = filePath.trim();
+  if (!normalizedFilePath) {
     return null;
   }
-  return convertFileSrc(normalizedPath);
-}
-
-export function getAttachmentImageSources(
-  originalSrc: string | null,
-  previewSrc: string | null,
-): { primarySrc: string | null; fallbackSrc: string | null } {
-  const normalizedOriginal = normalizeSource(originalSrc);
-  const normalizedPreview = normalizeSource(previewSrc);
-
-  if (!normalizedOriginal) {
-    return {
-      primarySrc: normalizedPreview,
-      fallbackSrc: null,
-    };
-  }
-
-  if (!normalizedPreview || normalizedPreview === normalizedOriginal) {
-    return {
-      primarySrc: normalizedOriginal,
-      fallbackSrc: null,
-    };
-  }
-
-  return {
-    primarySrc: normalizedOriginal,
-    fallbackSrc: normalizedPreview,
-  };
+  return attachmentFallbackUrlResolvedCache.get(
+    getAttachmentImageCacheKey(normalizedFilePath, mimeType),
+  );
 }
 
 export async function loadImageBlobFromSources(
@@ -263,7 +229,7 @@ export async function copyAttachmentImage(
   const normalizedFilePath = filePath.trim();
   let nativeCopyError: unknown;
 
-  if (normalizedFilePath && isTauri()) {
+  if (normalizedFilePath && isTauriEnvironment()) {
     try {
       await ipc.copyAttachmentImageToClipboard(normalizedFilePath, mimeType ?? null);
       return;
@@ -280,16 +246,34 @@ export async function copyAttachmentImage(
 }
 
 export function resetAttachmentImageCachesForTests(): void {
-  attachmentPreviewUrlCache.clear();
-  attachmentPreviewObjectUrlCache.clear();
-  attachmentPreviewObjectUrlResolvedCache.clear();
+  attachmentAssetUrlCache.clear();
+  attachmentAssetUrlResolvedCache.clear();
+  attachmentFallbackUrlCache.clear();
+  attachmentFallbackUrlResolvedCache.clear();
   if (typeof URL !== "undefined" && typeof URL.revokeObjectURL === "function") {
-    for (const objectUrl of attachmentPreviewObjectUrls) {
+    for (const objectUrl of attachmentObjectUrls) {
       URL.revokeObjectURL(objectUrl);
     }
   }
-  attachmentPreviewObjectUrls.clear();
+  attachmentObjectUrls.clear();
   attachmentImageBlobCache.clear();
+}
+
+function createTrackedObjectUrl(blob: Blob): string | null {
+  if (typeof URL === "undefined" || typeof URL.createObjectURL !== "function") {
+    return null;
+  }
+  const objectUrl = URL.createObjectURL(blob);
+  attachmentObjectUrls.add(objectUrl);
+  return objectUrl;
+}
+
+function isTauriEnvironment(): boolean {
+  try {
+    return isTauri();
+  } catch {
+    return false;
+  }
 }
 
 function normalizeSource(value?: string | null): string | null {
@@ -307,89 +291,18 @@ function uniqueSources(sources: Array<string | null | undefined>): string[] {
   );
 }
 
-function getAttachmentPreviewCacheKey(filePath: string, mimeType?: string | null): string {
-  const normalizedMimeType = mimeType?.trim().toLowerCase() ?? "";
-  return `${filePath}\u0000${normalizedMimeType}`;
-}
-
-function getAttachmentPreviewObjectUrlCacheKey(
+function getAttachmentImageCacheKey(
   filePath: string,
   mimeType?: string | null,
-  options: AttachmentPreviewObjectUrlOptions = {},
+  options: AttachmentImageAssetOptions = {},
 ): string {
-  const baseKey = getAttachmentPreviewCacheKey(filePath, mimeType);
-  return `${baseKey}\u0000${options.maxWidth ?? ""}\u0000${options.maxHeight ?? ""}`;
-}
-
-async function maybeResizeImageBlob(
-  blob: Blob,
-  mimeType: string | undefined,
-  options: AttachmentPreviewObjectUrlOptions,
-): Promise<Blob> {
-  const maxWidth = options.maxWidth ?? 0;
-  const maxHeight = options.maxHeight ?? 0;
-
-  if (
-    (maxWidth <= 0 && maxHeight <= 0) ||
-    typeof createImageBitmap !== "function" ||
-    typeof document === "undefined" ||
-    !isCanvasResizableMimeType(mimeType)
-  ) {
-    return blob;
-  }
-
-  let bitmap: ImageBitmap | null = null;
-  try {
-    bitmap = await createImageBitmap(blob);
-    const width = bitmap.width;
-    const height = bitmap.height;
-    if (width <= 0 || height <= 0) {
-      return blob;
-    }
-
-    const scale = Math.min(
-      1,
-      maxWidth > 0 ? maxWidth / width : 1,
-      maxHeight > 0 ? maxHeight / height : 1,
-    );
-    if (scale >= 1) {
-      return blob;
-    }
-
-    const canvas = document.createElement("canvas");
-    canvas.width = Math.max(1, Math.round(width * scale));
-    canvas.height = Math.max(1, Math.round(height * scale));
-    const context = canvas.getContext("2d");
-    if (!context) {
-      return blob;
-    }
-
-    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-    const outputMimeType = mimeType?.toLowerCase() === "image/jpeg"
-      ? "image/jpeg"
-      : "image/png";
-    const resizedBlob = await canvasToBlob(canvas, outputMimeType);
-    return resizedBlob ?? blob;
-  } catch {
-    return blob;
-  } finally {
-    bitmap?.close();
-  }
-}
-
-function canvasToBlob(canvas: HTMLCanvasElement, mimeType: string): Promise<Blob | null> {
-  return new Promise((resolve) => {
-    canvas.toBlob(resolve, mimeType, mimeType === "image/jpeg" ? 0.86 : undefined);
-  });
-}
-
-function isCanvasResizableMimeType(mimeType?: string | null): boolean {
-  const normalizedMimeType = mimeType?.trim().toLowerCase();
-  return (
-    normalizedMimeType === "image/png" ||
-    normalizedMimeType === "image/jpeg" ||
-    normalizedMimeType === "image/webp"
-  );
+  const normalizedMimeType = mimeType?.trim().toLowerCase() ?? "";
+  return [
+    filePath,
+    normalizedMimeType,
+    options.maxWidth ?? "",
+    options.maxHeight ?? "",
+  ].join("\u0000");
 }
 
 function loadImageBlobFromSource(source: string): Promise<Blob> {

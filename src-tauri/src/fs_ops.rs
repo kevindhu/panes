@@ -301,7 +301,9 @@ pub fn write_file(repo_path: &str, file_path: &str, content: &str) -> anyhow::Re
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use super::{create_dir, create_file, delete_path, rename_path};
+    use super::{create_dir, create_file, rename_path};
+    #[cfg(unix)]
+    use super::delete_path;
     use uuid::Uuid;
 
     #[cfg(unix)]

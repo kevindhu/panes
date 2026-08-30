@@ -1,10 +1,6 @@
 import type { Message, ThreadStatus } from "../../types";
 
-export function getPlanImplementationCodingMessage(engineId?: string | null): string {
-  return engineId === "claude"
-    ? "Exit plan mode and implement the plan."
-    : "Implement the plan.";
-}
+export const PLAN_IMPLEMENTATION_CODING_MESSAGE = "Implement the plan.";
 
 export type PlanImplementationDecision = "implement" | "stay";
 
@@ -17,86 +13,48 @@ export function resolvePlanImplementationDecision(
   const implement = implementChoice.trim();
   const stay = stayChoice.trim();
 
-  if (!selected || !implement || !stay || implement === stay) {
-    return null;
-  }
-  if (selected === implement) {
-    return "implement";
-  }
-  if (selected === stay) {
-    return "stay";
-  }
+  if (!selected || !implement || !stay || implement === stay) return null;
+  if (selected === implement) return "implement";
+  if (selected === stay) return "stay";
   return null;
 }
 
 const STRUCTURED_PLAN_LINE_PATTERN =
   /(^|\n)- \[(?:pending|in_progress|inProgress|completed)\] /;
 const GENERIC_PLAN_LIST_PATTERN = /(^|\n)(?:[-*]|\d+\.)\s+\S+/g;
+const PROPOSED_PLAN_PATTERN = /<proposed_plan>[\s\S]*<\/proposed_plan>/i;
+
+export function textHasStructuredPlan(content: string | null | undefined): boolean {
+  if (!content?.trim()) return false;
+  if (PROPOSED_PLAN_PATTERN.test(content) || STRUCTURED_PLAN_LINE_PATTERN.test(content)) {
+    return true;
+  }
+  return (content.match(GENERIC_PLAN_LIST_PATTERN) ?? []).length >= 2;
+}
 
 export function messageHasStructuredPlan(message: Message | null | undefined): boolean {
-  if (!message || message.role !== "assistant") {
-    return false;
-  }
+  if (!message || message.role !== "assistant") return false;
 
   const content = (message.blocks ?? []).reduce((combined, block) => {
-    if (block.type !== "text" && block.type !== "thinking") {
-      return combined;
-    }
-
+    if (block.type !== "text" && block.type !== "thinking") return combined;
     return combined ? `${combined}\n${block.content}` : block.content;
   }, "");
 
-  if (!content) {
-    return false;
-  }
-
-  if (STRUCTURED_PLAN_LINE_PATTERN.test(content)) {
-    return true;
-  }
-
-  const genericListMatches = content.match(GENERIC_PLAN_LIST_PATTERN) ?? [];
-  return genericListMatches.length >= 2;
-}
-
-export function shouldClearPendingPlanImplementationPrompt(status: ThreadStatus): boolean {
-  return status === "error" || status === "idle";
-}
-
-export function latestAssistantMessage(messages: Message[]): Message | undefined {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (message.role === "assistant") {
-      return message;
-    }
-  }
-
-  return undefined;
+  return textHasStructuredPlan(content);
 }
 
 function trailingAssistantMessages(messages: Message[]): Message[] {
   const trailing: Message[] = [];
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
-    if (message.role === "assistant") {
-      trailing.unshift(message);
-      continue;
-    }
-    break;
+    if (message.role !== "assistant") break;
+    trailing.unshift(message);
   }
-
   return trailing;
 }
 
-function messageHasExitPlanModeAttempt(message: Message | null | undefined): boolean {
-  if (!message || message.role !== "assistant") {
-    return false;
-  }
-  return (message.blocks ?? []).some(
-    (block) =>
-      block.type === "action" &&
-      typeof block.summary === "string" &&
-      block.summary.includes("ExitPlanMode"),
-  );
+export function shouldClearPendingPlanImplementationPrompt(status: ThreadStatus): boolean {
+  return status === "error" || status === "idle";
 }
 
 export function shouldPromptToImplementPlan({
@@ -104,38 +62,20 @@ export function shouldPromptToImplementPlan({
   status,
   activeThreadId,
   armedThreadId,
-  engineId,
   messages,
+  nativePlanText,
 }: {
   streaming: boolean;
   status: ThreadStatus;
   activeThreadId: string | null;
   armedThreadId: string | null;
-  engineId?: string | null;
   messages: Message[];
+  nativePlanText?: string | null;
 }): boolean {
-  if (streaming) {
-    return false;
-  }
-
-  if (status !== "completed") {
-    return false;
-  }
-
-  if (!activeThreadId || armedThreadId !== activeThreadId) {
-    return false;
-  }
+  if (streaming || status !== "completed") return false;
+  if (!activeThreadId || armedThreadId !== activeThreadId) return false;
+  if (nativePlanText?.trim()) return true;
 
   const assistantMessages = trailingAssistantMessages(messages);
-  if (assistantMessages.length === 0) {
-    return false;
-  }
-
-  // Show the prompt if the assistant produced a structured plan, or if it
-  // attempted to call ExitPlanMode in Claude plan mode (which may fail at
-  // the SDK level but still signals the agent considers planning complete).
-  return (
-    assistantMessages.some(messageHasStructuredPlan) ||
-    (engineId === "claude" && assistantMessages.some(messageHasExitPlanModeAttempt))
-  );
+  return assistantMessages.some(messageHasStructuredPlan);
 }

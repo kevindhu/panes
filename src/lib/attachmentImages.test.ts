@@ -1,36 +1,41 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-type PreviewPayload = {
-  mimeType: string;
-  dataBase64: string;
-};
-
 const mockConvertFileSrc = vi.hoisted(() => vi.fn((filePath: string) => `asset://${filePath}`));
 const mockIsTauri = vi.hoisted(() => vi.fn(() => true));
-const mockReadAttachmentPreview = vi.hoisted(() =>
-  vi.fn<(filePath: string, mimeType?: string | null) => Promise<PreviewPayload | null>>(async () => null)
-);
+const mockPrepareAttachmentImageAsset = vi.hoisted(() => vi.fn(async (
+  filePath: string,
+  mimeType?: string | null,
+) => ({
+  filePath,
+  mimeType: mimeType ?? "image/png",
+  version: "abc123",
+})));
+const mockReadAttachmentImageBytes = vi.hoisted(() => vi.fn(async () => (
+  new Uint8Array([97, 98, 99]).buffer
+)));
 const mockCopyAttachmentImageToClipboard = vi.hoisted(() => vi.fn(async () => undefined));
+const mockCreateObjectURL = vi.hoisted(() => vi.fn<(blob: Blob) => string>(() => "blob:raw-fallback"));
+const mockRevokeObjectURL = vi.hoisted(() => vi.fn());
 
 vi.mock("@tauri-apps/api/core", () => ({
   convertFileSrc: mockConvertFileSrc,
   isTauri: mockIsTauri,
 }));
 
-vi.mock("./ipc", () => ({
+vi.mock("./codexIpc", () => ({
   ipc: {
-    readAttachmentPreview: mockReadAttachmentPreview,
+    prepareAttachmentImageAsset: mockPrepareAttachmentImageAsset,
+    readAttachmentImageBytes: mockReadAttachmentImageBytes,
     copyAttachmentImageToClipboard: mockCopyAttachmentImageToClipboard,
   },
 }));
 
 import {
-  attachmentPreviewToDataUrl,
   copyAttachmentImage,
   copyImageFromSources,
-  getAttachmentImageSources,
-  getAttachmentOriginalImageSrc,
-  loadAttachmentPreviewDataUrl,
+  getCachedAttachmentImageAssetUrl,
+  loadAttachmentImageAssetUrl,
+  loadAttachmentImageFallbackUrl,
   prewarmImageBlobFromSources,
   resetAttachmentImageCachesForTests,
 } from "./attachmentImages";
@@ -38,9 +43,26 @@ import {
 describe("attachmentImages", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    Object.defineProperty(URL, "createObjectURL", {
+      value: mockCreateObjectURL,
+      configurable: true,
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      value: mockRevokeObjectURL,
+      configurable: true,
+    });
     resetAttachmentImageCachesForTests();
     mockIsTauri.mockReturnValue(true);
     mockConvertFileSrc.mockImplementation((filePath: string) => `asset://${filePath}`);
+    mockPrepareAttachmentImageAsset.mockImplementation(async (
+      filePath: string,
+      mimeType?: string | null,
+    ) => ({
+      filePath,
+      mimeType: mimeType ?? "image/png",
+      version: "abc123",
+    }));
+    mockReadAttachmentImageBytes.mockResolvedValue(new Uint8Array([97, 98, 99]).buffer);
     mockCopyAttachmentImageToClipboard.mockResolvedValue(undefined);
   });
 
@@ -49,50 +71,61 @@ describe("attachmentImages", () => {
     vi.unstubAllGlobals();
   });
 
-  it("prefers a Tauri file source when available", () => {
-    expect(getAttachmentOriginalImageSrc("C:/images/cat.png")).toBe("asset://C:/images/cat.png");
+  it("authorizes and caches a versioned Tauri asset URL", async () => {
+    const [firstSource, secondSource] = await Promise.all([
+      loadAttachmentImageAssetUrl("C:/images/cat.png", "image/png"),
+      loadAttachmentImageAssetUrl("C:/images/cat.png", "image/png"),
+    ]);
+
+    expect(firstSource).toBe("asset://C:/images/cat.png?v=abc123");
+    expect(secondSource).toBe(firstSource);
+    expect(getCachedAttachmentImageAssetUrl("C:/images/cat.png", "image/png")).toBe(firstSource);
+    expect(mockPrepareAttachmentImageAsset).toHaveBeenCalledTimes(1);
+    expect(mockPrepareAttachmentImageAsset).toHaveBeenCalledWith(
+      "C:/images/cat.png",
+      "image/png",
+      null,
+      null,
+    );
     expect(mockConvertFileSrc).toHaveBeenCalledWith("C:/images/cat.png");
   });
 
-  it("returns null for original image sources outside Tauri", () => {
+  it("requests a bounded native thumbnail independently from the full asset", async () => {
+    await loadAttachmentImageAssetUrl("C:/images/cat.png", "image/png", {
+      maxWidth: 720,
+      maxHeight: 440,
+    });
+
+    expect(mockPrepareAttachmentImageAsset).toHaveBeenCalledWith(
+      "C:/images/cat.png",
+      "image/png",
+      720,
+      440,
+    );
+  });
+
+  it("returns null without invoking native APIs outside Tauri", async () => {
     mockIsTauri.mockReturnValue(false);
 
-    expect(getAttachmentOriginalImageSrc("C:/images/cat.png")).toBeNull();
+    await expect(loadAttachmentImageAssetUrl("C:/images/cat.png", "image/png")).resolves.toBeNull();
+    expect(mockPrepareAttachmentImageAsset).not.toHaveBeenCalled();
     expect(mockConvertFileSrc).not.toHaveBeenCalled();
   });
 
-  it("builds a data URL from an attachment preview payload", () => {
-    expect(
-      attachmentPreviewToDataUrl({
-        mimeType: "image/png",
-        dataBase64: "YWJj",
-      }),
-    ).toBe("data:image/png;base64,YWJj");
-  });
-
-  it("uses the preview as a fallback when the original file source exists", () => {
-    expect(
-      getAttachmentImageSources("asset://cat.png", "data:image/png;base64,YWJj"),
-    ).toEqual({
-      primarySrc: "asset://cat.png",
-      fallbackSrc: "data:image/png;base64,YWJj",
-    });
-  });
-
-  it("deduplicates attachment preview reads", async () => {
-    mockReadAttachmentPreview.mockResolvedValue({
-      mimeType: "image/png",
-      dataBase64: "YWJj",
-    });
-
-    const [firstPreview, secondPreview] = await Promise.all([
-      loadAttachmentPreviewDataUrl("C:/images/cat.png", "image/png"),
-      loadAttachmentPreviewDataUrl("C:/images/cat.png", "image/png"),
+  it("builds and deduplicates an object URL from the raw binary fallback", async () => {
+    const [firstFallback, secondFallback] = await Promise.all([
+      loadAttachmentImageFallbackUrl("C:/images/cat.png", "image/png"),
+      loadAttachmentImageFallbackUrl("C:/images/cat.png", "image/png"),
     ]);
 
-    expect(firstPreview).toBe("data:image/png;base64,YWJj");
-    expect(secondPreview).toBe("data:image/png;base64,YWJj");
-    expect(mockReadAttachmentPreview).toHaveBeenCalledTimes(1);
+    expect(firstFallback).toBe("blob:raw-fallback");
+    expect(secondFallback).toBe(firstFallback);
+    expect(mockReadAttachmentImageBytes).toHaveBeenCalledTimes(1);
+    expect(mockReadAttachmentImageBytes).toHaveBeenCalledWith("C:/images/cat.png", "image/png");
+    expect(mockCreateObjectURL).toHaveBeenCalledTimes(1);
+    const blob = mockCreateObjectURL.mock.calls[0]?.[0] as Blob;
+    expect(blob.type).toBe("image/png");
+    expect(blob.size).toBe(3);
   });
 
   it("reuses a warmed image blob when copying to the clipboard", async () => {
@@ -155,17 +188,12 @@ describe("attachmentImages", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await copyImageFromSources(
-      ["asset://broken", "data:image/png;base64,YWJj"],
+      ["asset://broken", "blob:fallback"],
       "image/png",
     );
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(mockWrite).toHaveBeenCalledTimes(1);
-
-    const clipboardItems = (
-      mockWrite.mock.calls[0] as unknown as [Array<{ items: Record<string, Blob> }>]
-    )[0];
-    expect(Object.keys(clipboardItems[0].items)).toEqual(["image/png"]);
   });
 
   it("uses the native desktop clipboard path when available", async () => {
@@ -180,7 +208,6 @@ describe("attachmentImages", () => {
 
   it("falls back to the browser clipboard path when native copy fails", async () => {
     mockCopyAttachmentImageToClipboard.mockRejectedValueOnce(new Error("native failed"));
-
     const mockWrite = vi.fn(async () => undefined);
 
     class MockClipboardItem {
@@ -197,7 +224,6 @@ describe("attachmentImages", () => {
         write: mockWrite,
       },
     });
-
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(new Blob(["image"], { type: "image/png" }), { status: 200 }),
     );

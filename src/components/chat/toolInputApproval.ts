@@ -1,7 +1,9 @@
 import type {
+  ApprovalBlock,
   ApprovalResponse,
   DynamicToolCallResponse,
   McpServerElicitationResponse,
+  Message,
   NetworkPolicyAmendment,
   PermissionsApprovalResponse,
 } from "../../types";
@@ -19,6 +21,7 @@ export interface ToolInputQuestion {
   options: ToolInputOption[];
   multiple?: boolean;
   custom?: boolean;
+  secret?: boolean;
 }
 
 export type ToolInputSelections = Record<string, string[]>;
@@ -61,24 +64,6 @@ export function isMcpElicitationApproval(details?: Record<string, unknown>): boo
 
 export function requiresCustomApprovalPayload(details?: Record<string, unknown>): boolean {
   return isDynamicToolCallApproval(details) || isMcpElicitationApproval(details);
-}
-
-export function isSupportedClaudeToolInputApproval(
-  details?: Record<string, unknown>
-): boolean {
-  if (!isRequestUserInputApproval(details)) {
-    return false;
-  }
-
-  const normalizedDetails = details ?? {};
-  if (parseToolInputQuestions(normalizedDetails).length === 0) {
-    return false;
-  }
-
-  return (
-    parseProposedExecpolicyAmendment(normalizedDetails).length === 0 &&
-    parseProposedNetworkPolicyAmendments(normalizedDetails).length === 0
-  );
 }
 
 export function defaultAdvancedApprovalPayload(
@@ -451,6 +436,8 @@ export function parseToolInputQuestions(details: Record<string, unknown>): ToolI
           .map(parseOption)
           .filter((option): option is ToolInputOption => Boolean(option))
       : [];
+    const customValue = questionObj.isOther ?? questionObj.is_other ?? questionObj.custom;
+    const secretValue = questionObj.isSecret ?? questionObj.is_secret ?? questionObj.secret;
 
     questions.push({
       id: questionId,
@@ -458,12 +445,38 @@ export function parseToolInputQuestions(details: Record<string, unknown>): ToolI
       question: questionText,
       options,
       multiple: questionObj.multiple === true,
-      custom:
-        typeof questionObj.custom === "boolean" ? questionObj.custom : undefined,
+      custom: typeof customValue === "boolean" ? customValue : undefined,
+      secret: typeof secretValue === "boolean" ? secretValue : undefined,
     });
   }
 
   return questions;
+}
+
+export function toolInputQuestionAllowsCustomAnswer(question: ToolInputQuestion): boolean {
+  // Codex uses `options: null` for a free-form question. `isOther` only
+  // controls whether an additional free-form answer is allowed alongside a
+  // fixed option list.
+  return question.options.length === 0 || question.custom === true;
+}
+
+export function findLatestPendingToolInputApproval(messages: Message[]): ApprovalBlock | null {
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const blocks = messages[messageIndex]?.blocks ?? [];
+    for (let blockIndex = blocks.length - 1; blockIndex >= 0; blockIndex -= 1) {
+      const block = blocks[blockIndex];
+      if (
+        block.type === "approval" &&
+        block.status === "pending" &&
+        isRequestUserInputApproval(block.details) &&
+        parseToolInputQuestions(block.details).length > 0
+      ) {
+        return block;
+      }
+    }
+  }
+
+  return null;
 }
 
 function defaultAnswersForQuestion(question: ToolInputQuestion): string[] {
@@ -511,7 +524,7 @@ export function buildToolInputResponseFromSelections(
   const answers: Record<string, { answers: string[] }> = {};
 
   for (const question of questions) {
-    const allowCustom = question.custom !== false;
+    const allowCustom = toolInputQuestionAllowsCustomAnswer(question);
     const customAnswer = allowCustom ? customByQuestion?.[question.id]?.trim() : "";
     const selectedAnswers = selectedAnswersForQuestion(selectedByQuestion, question);
     const fallbackAnswers = defaultAnswersForQuestion(question);

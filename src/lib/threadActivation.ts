@@ -82,6 +82,9 @@ export async function activateThreadContext(
     workspaceActivation = workspaceStore.setActiveWorkspace(thread.workspaceId);
   }
   threadStore.setActiveThread(thread.id);
+  const chatActivation = options?.forceChatReload
+    ? chatStore.setActiveThread(thread.id, { forceReload: true })
+    : chatStore.setActiveThread(thread.id);
   if (workspaceActivation) {
     await workspaceActivation;
   }
@@ -96,12 +99,7 @@ export async function activateThreadContext(
     workspaceStore.setActiveRepo(null, { remember: false });
   }
 
-  if (options?.forceChatReload) {
-    await chatStore.setActiveThread(thread.id, { forceReload: true });
-    return;
-  }
-
-  await chatStore.setActiveThread(thread.id);
+  await chatActivation;
 }
 
 export async function restoreStartupThreadContext(

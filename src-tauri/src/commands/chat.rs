@@ -1,8 +1,9 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
-    path::Path,
-    time::{Duration, Instant},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use anyhow::Context;
@@ -11,8 +12,9 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, value::RawValue, Value};
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 use tokio::fs as tokio_fs;
+use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -22,8 +24,8 @@ use crate::{
     engines::{
         approval_response_route_for_engine, normalize_approval_response_for_engine,
         trim_action_output_delta_content, validate_engine_sandbox_mode, ApprovalRequestRoute,
-        EngineEvent, OutputStream, SandboxPolicy, ThreadScope, TurnAttachment,
-        TurnCompletionSource, TurnCompletionStatus, TurnInput, TurnInputItem,
+        EngineEvent, OutputStream, SandboxPolicy, SteerMarker, SteerReceipt, ThreadScope,
+        TurnAttachment, TurnCompletionSource, TurnCompletionStatus, TurnInput, TurnInputItem,
         STREAMED_DIFF_MAX_CHARS,
     },
     models::{
@@ -34,6 +36,8 @@ use crate::{
     runtime_env,
     state::AppState,
 };
+
+use super::codex_transcript::CodexTranscriptRecorder;
 
 const MAX_THREAD_TITLE_CHARS: usize = 72;
 const STREAM_EVENT_COALESCE_MAX_CHARS: usize = 8_192;
@@ -70,6 +74,11 @@ fn usage_snapshot_has_context_metrics(usage: &crate::engines::UsageLimitsSnapsho
     usage.current_tokens.is_some()
         || usage.max_context_tokens.is_some()
         || usage.context_window_percent.is_some()
+        || usage.input_tokens.is_some()
+        || usage.cached_input_tokens.is_some()
+        || usage.cache_write_input_tokens.is_some()
+        || usage.output_tokens.is_some()
+        || usage.reasoning_output_tokens.is_some()
 }
 
 fn merge_context_usage_cache_into_metadata(
@@ -88,6 +97,11 @@ fn merge_context_usage_cache_into_metadata(
                 "currentTokens": usage.current_tokens,
                 "maxContextTokens": usage.max_context_tokens,
                 "contextWindowPercent": usage.context_window_percent,
+                "inputTokens": usage.input_tokens,
+                "cachedInputTokens": usage.cached_input_tokens,
+                "cacheWriteInputTokens": usage.cache_write_input_tokens,
+                "outputTokens": usage.output_tokens,
+                "reasoningOutputTokens": usage.reasoning_output_tokens,
             }),
         );
     }
@@ -157,12 +171,6 @@ enum ContentBlock {
         message: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         details: Option<Vec<String>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        status: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        source: Option<String>,
-        #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
-        duration_ms: Option<u64>,
     },
 
     #[serde(rename = "error")]
@@ -211,242 +219,6 @@ struct EventProgress {
     turn_model_id: Option<String>,
     blocks_changed: bool,
     force_persist: bool,
-}
-
-#[derive(Default)]
-struct TurnBlockStats {
-    actions_total: usize,
-    actions_done: usize,
-    actions_error: usize,
-    actions_running: usize,
-    actions_pending: usize,
-    approvals_pending: usize,
-    approvals_answered: usize,
-    diff_blocks: usize,
-    error_blocks: usize,
-}
-
-fn collect_turn_block_stats(blocks: &[ContentBlock]) -> TurnBlockStats {
-    let mut stats = TurnBlockStats::default();
-
-    for block in blocks {
-        match block {
-            ContentBlock::Action { status, .. } => {
-                stats.actions_total += 1;
-                match status.as_str() {
-                    "done" => stats.actions_done += 1,
-                    "error" => stats.actions_error += 1,
-                    "pending" => stats.actions_pending += 1,
-                    _ => stats.actions_running += 1,
-                }
-            }
-            ContentBlock::Approval { status, .. } => {
-                if status == "pending" {
-                    stats.approvals_pending += 1;
-                } else {
-                    stats.approvals_answered += 1;
-                }
-            }
-            ContentBlock::Diff { .. } => {
-                stats.diff_blocks += 1;
-            }
-            ContentBlock::Error { .. } => {
-                stats.error_blocks += 1;
-            }
-            _ => {}
-        }
-    }
-
-    stats
-}
-
-fn describe_turn_completion_source(source: Option<&TurnCompletionSource>) -> Option<&'static str> {
-    match source {
-        Some(TurnCompletionSource::Engine) => Some("explicit engine terminal event"),
-        Some(TurnCompletionSource::RecoveredSnapshot) => {
-            Some("recovered from Codex thread history")
-        }
-        Some(TurnCompletionSource::ReconciledStreamLost) => {
-            Some("reconciled from thread history after live stream loss")
-        }
-        Some(TurnCompletionSource::ReconciledTimeout) => {
-            Some("reconciled from thread history after completion timeout")
-        }
-        Some(TurnCompletionSource::TimeoutFallback) => Some("Panes timeout fallback"),
-        None => None,
-    }
-}
-
-fn turn_status_notice_level(status: &TurnCompletionStatus) -> &'static str {
-    match status {
-        TurnCompletionStatus::Completed => "info",
-        TurnCompletionStatus::Interrupted => "warning",
-        TurnCompletionStatus::Failed => "error",
-    }
-}
-
-fn turn_status_notice_has_pending_approval_conflict(stats: &TurnBlockStats) -> bool {
-    stats.approvals_pending > 0
-}
-
-fn turn_status_notice_level_with_stats(
-    status: &TurnCompletionStatus,
-    stats: &TurnBlockStats,
-) -> &'static str {
-    if turn_status_notice_has_pending_approval_conflict(stats) {
-        "warning"
-    } else {
-        turn_status_notice_level(status)
-    }
-}
-
-fn turn_status_notice_title(status: &TurnCompletionStatus, stats: &TurnBlockStats) -> &'static str {
-    if turn_status_notice_has_pending_approval_conflict(stats) {
-        return "Approval still pending";
-    }
-
-    match status {
-        TurnCompletionStatus::Completed => "Turn completed",
-        TurnCompletionStatus::Interrupted => "Turn interrupted",
-        TurnCompletionStatus::Failed => "Turn failed",
-    }
-}
-
-fn turn_status_notice_message(
-    status: &TurnCompletionStatus,
-    source: Option<&TurnCompletionSource>,
-    stats: &TurnBlockStats,
-) -> String {
-    if turn_status_notice_has_pending_approval_conflict(stats) {
-        return "A terminal result was recorded, but Panes still has unresolved approvals. The turn may have ended early or the approval protocol may be out of sync.".to_string();
-    }
-
-    match (status, source) {
-        (TurnCompletionStatus::Completed, Some(TurnCompletionSource::Engine)) => {
-            "Codex reported a normal terminal completion.".to_string()
-        }
-        (TurnCompletionStatus::Completed, Some(TurnCompletionSource::RecoveredSnapshot)) => {
-            "Panes recovered the completed turn from Codex thread history.".to_string()
-        }
-        (TurnCompletionStatus::Completed, Some(TurnCompletionSource::ReconciledTimeout)) => {
-            "Panes recovered the completed turn from thread history after the live completion timed out."
-                .to_string()
-        }
-        (TurnCompletionStatus::Interrupted, _) => {
-            "The turn ended before a normal completion.".to_string()
-        }
-        (TurnCompletionStatus::Failed, Some(TurnCompletionSource::ReconciledStreamLost)) => {
-            "Panes recovered the turn after losing the live Codex stream. The transcript may be incomplete."
-                .to_string()
-        }
-        (TurnCompletionStatus::Failed, Some(TurnCompletionSource::TimeoutFallback)) => {
-            "Panes timed out waiting for Codex to finish and marked the turn as failed."
-                .to_string()
-        }
-        (TurnCompletionStatus::Failed, _) => "Codex reported a terminal failure.".to_string(),
-        (TurnCompletionStatus::Completed, _) => "The turn reached a terminal completion."
-            .to_string(),
-    }
-}
-
-fn build_turn_status_notice_block(
-    blocks: &[ContentBlock],
-    status: &TurnCompletionStatus,
-    token_usage: Option<&crate::engines::TokenUsage>,
-    source: Option<&TurnCompletionSource>,
-    duration_ms: Option<u64>,
-) -> ContentBlock {
-    let stats = collect_turn_block_stats(blocks);
-    let mut details = Vec::new();
-
-    if let Some(source_label) = describe_turn_completion_source(source) {
-        details.push(format!("Completion source: {source_label}"));
-    }
-
-    if let Some(usage) = token_usage {
-        details.push(format!(
-            "Token usage: {} input, {} output",
-            usage.input, usage.output
-        ));
-    }
-
-    if stats.actions_total > 0 {
-        details.push(format!(
-            "Actions: {} total, {} done, {} error, {} running, {} pending",
-            stats.actions_total,
-            stats.actions_done,
-            stats.actions_error,
-            stats.actions_running,
-            stats.actions_pending
-        ));
-    }
-
-    if stats.approvals_pending > 0 || stats.approvals_answered > 0 {
-        details.push(format!(
-            "Approvals: {} pending, {} answered",
-            stats.approvals_pending, stats.approvals_answered
-        ));
-        if turn_status_notice_has_pending_approval_conflict(&stats) {
-            details.push(format!(
-                "Protocol warning: terminal result arrived while {} approval(s) were still pending.",
-                stats.approvals_pending
-            ));
-        }
-    }
-
-    if stats.diff_blocks > 0 {
-        details.push(format!("Diff blocks: {}", stats.diff_blocks));
-    }
-
-    if stats.error_blocks > 0 {
-        details.push(format!("Error blocks: {}", stats.error_blocks));
-    }
-
-    ContentBlock::Notice {
-        kind: "turn_status".to_string(),
-        level: turn_status_notice_level_with_stats(status, &stats).to_string(),
-        title: turn_status_notice_title(status, &stats).to_string(),
-        message: turn_status_notice_message(status, source, &stats),
-        details: (!details.is_empty()).then_some(details),
-        status: Some(
-            if turn_status_notice_has_pending_approval_conflict(&stats) {
-                "awaiting_approval"
-            } else {
-                match status {
-                    TurnCompletionStatus::Completed => "completed",
-                    TurnCompletionStatus::Interrupted => "interrupted",
-                    TurnCompletionStatus::Failed => "failed",
-                }
-            }
-            .to_string(),
-        ),
-        source: source.map(|value| {
-            match value {
-                TurnCompletionSource::Engine => "engine",
-                TurnCompletionSource::RecoveredSnapshot => "recovered_snapshot",
-                TurnCompletionSource::ReconciledStreamLost => "reconciled_stream_lost",
-                TurnCompletionSource::ReconciledTimeout => "reconciled_timeout",
-                TurnCompletionSource::TimeoutFallback => "timeout_fallback",
-            }
-            .to_string()
-        }),
-        duration_ms,
-    }
-}
-
-fn finalize_turn_blocks_with_notice(
-    blocks: &mut Vec<ContentBlock>,
-    action_index: &mut HashMap<String, usize>,
-    approval_index: &mut HashMap<String, usize>,
-    status: &TurnCompletionStatus,
-    token_usage: Option<&crate::engines::TokenUsage>,
-    source: Option<&TurnCompletionSource>,
-    duration_ms: Option<u64>,
-) -> bool {
-    let mut changed = terminalize_unresolved_turn_blocks(blocks, status, source);
-    let notice = build_turn_status_notice_block(blocks, status, token_usage, source, duration_ms);
-    changed |= upsert_notice_block(blocks, action_index, approval_index, "turn_status", notice);
-    changed
 }
 
 fn unresolved_action_terminal_error(
@@ -597,40 +369,6 @@ fn terminalize_unresolved_turn_blocks_json(
     changed
 }
 
-fn upsert_turn_status_notice_json(
-    blocks: &mut Value,
-    status: &TurnCompletionStatus,
-    source: Option<&TurnCompletionSource>,
-    duration_ms: Option<u64>,
-) -> bool {
-    let decoded_blocks = serde_json::from_value::<Vec<ContentBlock>>(blocks.clone())
-        .unwrap_or_else(|error| {
-            log::warn!("failed to decode blocks while adding terminal status notice: {error}");
-            Vec::new()
-        });
-    let notice = build_turn_status_notice_block(&decoded_blocks, status, None, source, duration_ms);
-    let Ok(notice_value) = serde_json::to_value(notice) else {
-        return false;
-    };
-    let Some(items) = blocks.as_array_mut() else {
-        return false;
-    };
-
-    if let Some(existing) = items.iter_mut().find(|item| {
-        item.get("type").and_then(Value::as_str) == Some("notice")
-            && item.get("kind").and_then(Value::as_str) == Some("turn_status")
-    }) {
-        if *existing == notice_value {
-            return false;
-        }
-        *existing = notice_value;
-        return true;
-    }
-
-    items.push(notice_value);
-    true
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ThreadUpdatedEvent {
@@ -670,9 +408,10 @@ pub struct ChatAttachmentPayload {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AttachmentPreviewPayload {
+pub struct PreparedAttachmentImageAssetPayload {
+    pub file_path: String,
     pub mime_type: String,
-    pub data_base64: String,
+    pub version: String,
 }
 
 #[tauri::command]
@@ -724,39 +463,94 @@ pub async fn save_pasted_image_attachment(
 }
 
 #[tauri::command]
-pub async fn read_attachment_preview(
+pub async fn prepare_attachment_image_asset(
+    app: tauri::AppHandle,
     file_path: String,
     mime_type: Option<String>,
-) -> Result<Option<AttachmentPreviewPayload>, String> {
-    let file_path = file_path.trim().to_string();
-    if file_path.is_empty() {
-        return Ok(None);
-    }
-
-    let Some(preview_mime_type) =
-        normalize_image_preview_mime_type(&file_path, mime_type.as_deref())
-    else {
-        return Ok(None);
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+) -> Result<PreparedAttachmentImageAssetPayload, String> {
+    let (source_path, source_mime_type, metadata) =
+        validate_attachment_image_file(&file_path, mime_type.as_deref()).await?;
+    let source_version = attachment_asset_version(&metadata);
+    let thumbnail_bounds = match (max_width, max_height) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => {
+            Some((width.min(2_048), height.min(2_048)))
+        }
+        _ => None,
     };
 
-    let metadata = tokio_fs::metadata(&file_path)
-        .await
-        .map_err(|error| format!("failed to read attachment metadata: {error}"))?;
-    if !metadata.is_file() {
-        return Ok(None);
-    }
-    if metadata.len() > MAX_PASTED_IMAGE_ATTACHMENT_BYTES as u64 {
-        return Ok(None);
-    }
+    let (asset_path, asset_mime_type, version) = if let Some((max_width, max_height)) =
+        thumbnail_bounds
+    {
+        let cache_dir = runtime_env::app_data_dir()
+            .join("cache")
+            .join("image-thumbnails");
+        tokio_fs::create_dir_all(&cache_dir)
+            .await
+            .map_err(|error| format!("failed to create image thumbnail cache: {error}"))?;
 
+        let source_path_for_thumbnail = source_path.clone();
+        let source_mime_for_thumbnail = source_mime_type.clone();
+        let source_version_for_thumbnail = source_version.clone();
+        let thumbnail = tokio::task::spawn_blocking(move || {
+            prepare_cached_attachment_thumbnail(
+                &source_path_for_thumbnail,
+                &source_mime_for_thumbnail,
+                &source_version_for_thumbnail,
+                &cache_dir,
+                max_width,
+                max_height,
+            )
+        })
+        .await
+        .map_err(|error| format!("failed to join image thumbnail task: {error}"))?;
+
+        match thumbnail {
+            Ok(Some(thumbnail_path)) => {
+                let thumbnail_metadata = std::fs::metadata(&thumbnail_path)
+                    .map_err(|error| format!("failed to read cached image thumbnail: {error}"))?;
+                (
+                    thumbnail_path,
+                    "image/png".to_string(),
+                    attachment_asset_version(&thumbnail_metadata),
+                )
+            }
+            Ok(None) => (source_path, source_mime_type, source_version),
+            Err(error) => {
+                log::warn!(
+                    "failed to prepare thumbnail for `{}`; using original image: {error}",
+                    source_path.display()
+                );
+                (source_path, source_mime_type, source_version)
+            }
+        }
+    } else {
+        (source_path, source_mime_type, source_version)
+    };
+
+    app.asset_protocol_scope()
+        .allow_file(&asset_path)
+        .map_err(|error| format!("failed to authorize attachment image asset: {error}"))?;
+
+    Ok(PreparedAttachmentImageAssetPayload {
+        file_path: asset_path.to_string_lossy().into_owned(),
+        mime_type: asset_mime_type,
+        version,
+    })
+}
+
+#[tauri::command]
+pub async fn read_attachment_image_bytes(
+    file_path: String,
+    mime_type: Option<String>,
+) -> Result<tauri::ipc::Response, String> {
+    let (file_path, _, _) =
+        validate_attachment_image_file(&file_path, mime_type.as_deref()).await?;
     let bytes = tokio_fs::read(&file_path)
         .await
-        .map_err(|error| format!("failed to read attachment preview: {error}"))?;
-
-    Ok(Some(AttachmentPreviewPayload {
-        mime_type: preview_mime_type,
-        data_base64: BASE64.encode(bytes),
-    }))
+        .map_err(|error| format!("failed to read attachment image: {error}"))?;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 #[tauri::command]
@@ -817,6 +611,193 @@ fn normalize_image_preview_mime_type(file_path: &str, mime_type: Option<&str>) -
         .and_then(|value| value.to_str())?
         .to_lowercase();
     image_mime_type_for_extension(&extension).map(ToOwned::to_owned)
+}
+
+async fn validate_attachment_image_file(
+    file_path: &str,
+    mime_type: Option<&str>,
+) -> Result<(PathBuf, String, std::fs::Metadata), String> {
+    let normalized_file_path = file_path.trim();
+    if normalized_file_path.is_empty() {
+        return Err("Attachment path is empty.".to_string());
+    }
+
+    let canonical_path = tokio_fs::canonicalize(normalized_file_path)
+        .await
+        .map(normalize_canonical_asset_path)
+        .map_err(|error| format!("failed to resolve attachment image path: {error}"))?;
+    let resolved_mime_type = attachment_image_mime_type(&canonical_path, mime_type)
+        .ok_or_else(|| "Attachment is not a supported image.".to_string())?;
+    let metadata = tokio_fs::metadata(&canonical_path)
+        .await
+        .map_err(|error| format!("failed to read attachment image metadata: {error}"))?;
+    if !metadata.is_file() {
+        return Err("Attachment image path does not point to a file.".to_string());
+    }
+    if metadata.len() == 0 {
+        return Err("Attachment image is empty.".to_string());
+    }
+    if metadata.len() > MAX_PASTED_IMAGE_ATTACHMENT_BYTES as u64 {
+        return Err("Attachment image exceeds the 10 MB preview limit.".to_string());
+    }
+    validate_attachment_image_signature(&canonical_path, &resolved_mime_type).await?;
+
+    Ok((canonical_path, resolved_mime_type, metadata))
+}
+
+fn attachment_image_mime_type(
+    file_path: &Path,
+    fallback_mime_type: Option<&str>,
+) -> Option<String> {
+    let extension = file_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase);
+    let extension_mime_type = extension.as_deref().and_then(image_mime_type_for_extension);
+    extension_mime_type.map(ToOwned::to_owned).or_else(|| {
+        let normalized = fallback_mime_type?.trim().to_lowercase();
+        matches!(
+            normalized.as_str(),
+            "image/png"
+                | "image/jpeg"
+                | "image/jpg"
+                | "image/gif"
+                | "image/webp"
+                | "image/bmp"
+                | "image/tiff"
+                | "image/svg+xml"
+        )
+        .then(|| {
+            if normalized == "image/jpg" {
+                "image/jpeg".to_string()
+            } else {
+                normalized
+            }
+        })
+    })
+}
+
+async fn validate_attachment_image_signature(
+    file_path: &Path,
+    mime_type: &str,
+) -> Result<(), String> {
+    let mut file = tokio_fs::File::open(file_path)
+        .await
+        .map_err(|error| format!("failed to inspect attachment image: {error}"))?;
+    let mut header = vec![0_u8; 8_192];
+    let read = file
+        .read(&mut header)
+        .await
+        .map_err(|error| format!("failed to inspect attachment image: {error}"))?;
+    header.truncate(read);
+
+    let signature_matches = match mime_type {
+        "image/png" => header.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => header.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/gif" => header.starts_with(b"GIF87a") || header.starts_with(b"GIF89a"),
+        "image/webp" => {
+            header.len() >= 12 && header.starts_with(b"RIFF") && &header[8..12] == b"WEBP"
+        }
+        "image/bmp" => header.starts_with(b"BM"),
+        "image/tiff" => {
+            header.starts_with(b"II*\0")
+                || header.starts_with(b"MM\0*")
+                || header.starts_with(b"II+\0")
+                || header.starts_with(b"MM\0+")
+        }
+        "image/svg+xml" => String::from_utf8_lossy(&header)
+            .to_ascii_lowercase()
+            .contains("<svg"),
+        _ => false,
+    };
+
+    if signature_matches {
+        Ok(())
+    } else {
+        Err("Attachment file contents do not match a supported image format.".to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_canonical_asset_path(path: PathBuf) -> PathBuf {
+    let value = path.to_string_lossy();
+    if let Some(unc_path) = value.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{unc_path}"));
+    }
+    if let Some(drive_path) = value.strip_prefix(r"\\?\") {
+        return PathBuf::from(drive_path);
+    }
+    path
+}
+
+#[cfg(not(target_os = "windows"))]
+fn normalize_canonical_asset_path(path: PathBuf) -> PathBuf {
+    path
+}
+
+fn attachment_asset_version(metadata: &std::fs::Metadata) -> String {
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{:x}-{modified_nanos:x}", metadata.len())
+}
+
+fn prepare_cached_attachment_thumbnail(
+    source_path: &Path,
+    source_mime_type: &str,
+    source_version: &str,
+    cache_dir: &Path,
+    max_width: u32,
+    max_height: u32,
+) -> Result<Option<PathBuf>, String> {
+    if source_mime_type == "image/svg+xml" {
+        return Ok(None);
+    }
+
+    let mut hasher = DefaultHasher::new();
+    source_path.hash(&mut hasher);
+    source_version.hash(&mut hasher);
+    max_width.hash(&mut hasher);
+    max_height.hash(&mut hasher);
+    let cache_path = cache_dir.join(format!("{:016x}.png", hasher.finish()));
+    if cache_path.is_file() {
+        return Ok(Some(cache_path));
+    }
+
+    let image = image::ImageReader::open(source_path)
+        .map_err(|error| format!("failed to open image: {error}"))?
+        .with_guessed_format()
+        .map_err(|error| format!("failed to detect image format: {error}"))?
+        .decode()
+        .map_err(|error| format!("failed to decode image: {error}"))?;
+    if image.width() <= max_width && image.height() <= max_height {
+        return Ok(None);
+    }
+
+    let thumbnail = image.thumbnail(max_width, max_height);
+    let temporary_path = cache_dir.join(format!(
+        ".{:016x}-{}.tmp.png",
+        hasher.finish(),
+        Uuid::new_v4().simple()
+    ));
+    thumbnail
+        .save_with_format(&temporary_path, image::ImageFormat::Png)
+        .map_err(|error| format!("failed to encode image thumbnail: {error}"))?;
+
+    match std::fs::rename(&temporary_path, &cache_path) {
+        Ok(()) => Ok(Some(cache_path)),
+        Err(_) if cache_path.is_file() => {
+            let _ = std::fs::remove_file(&temporary_path);
+            Ok(Some(cache_path))
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary_path);
+            Err(format!("failed to cache image thumbnail: {error}"))
+        }
+    }
 }
 
 fn image_mime_type_for_extension(extension: &str) -> Option<&'static str> {
@@ -938,6 +919,21 @@ pub async fn send_message(
     })
     .await?
     .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+    // Branch threads defer their (slow) engine-level Codex fork until first use. Ensure the
+    // engine thread is materialized before the turn starts; the background prefetch has
+    // usually already done this, so this is normally instant.
+    if crate::commands::threads::is_engine_fork_pending(thread.engine_metadata.as_ref()) {
+        thread = crate::commands::threads::resolve_pending_engine_fork(state.inner(), &thread.id)
+            .await?;
+    }
+    if crate::commands::threads::is_engine_rollback_pending(thread.engine_metadata.as_ref()) {
+        thread = crate::commands::threads::resolve_pending_engine_rollback(
+            state.inner(),
+            &thread.id,
+            Some(&app),
+        )
+        .await?;
+    }
     let requested_model_id = model_id
         .as_deref()
         .map(str::trim)
@@ -1023,20 +1019,10 @@ pub async fn send_message(
         configured_reasoning_effort.clone()
     };
     let sandbox_mode_override = thread_sandbox_mode(thread.engine_metadata.as_ref())?;
-    let supports_panes_sandbox = thread.engine_id != "opencode";
-    let sandbox_mode = if supports_panes_sandbox {
+    let sandbox_mode =
         Some(sandbox_mode_override.clone().unwrap_or_else(|| {
             default_sandbox_mode_for_engine(thread.engine_id.as_str()).to_string()
-        }))
-    } else {
-        if sandbox_mode_override.is_some() {
-            log::warn!(
-                "ignoring sandbox mode override on OpenCode thread {}",
-                thread.id
-            );
-        }
-        None
-    };
+        }));
     let workspace_writable_roots = if selected_repo.is_some() {
         None
     } else {
@@ -1187,7 +1173,6 @@ pub async fn send_message(
         service_tier: thread_service_tier(thread.engine_metadata.as_ref()),
         personality,
         output_schema: thread_output_schema(thread.engine_metadata.as_ref()),
-        opencode_agent: thread_opencode_agent(thread.engine_metadata.as_ref()),
     };
 
     let engine_thread_id = state
@@ -1316,7 +1301,7 @@ pub async fn start_codex_review(
     }
 
     let db = state.db.clone();
-    let source_thread = run_db(db.clone(), {
+    let mut source_thread = run_db(db.clone(), {
         let thread_id = thread_id.clone();
         move |db| db::threads::get_thread(db, &thread_id)
     })
@@ -1325,6 +1310,21 @@ pub async fn start_codex_review(
 
     if source_thread.engine_id != "codex" {
         return Err("Native review is only available for Codex threads.".to_string());
+    }
+
+    if crate::commands::threads::is_engine_fork_pending(source_thread.engine_metadata.as_ref()) {
+        source_thread =
+            crate::commands::threads::resolve_pending_engine_fork(state.inner(), &source_thread.id)
+                .await?;
+    }
+    if crate::commands::threads::is_engine_rollback_pending(source_thread.engine_metadata.as_ref())
+    {
+        source_thread = crate::commands::threads::resolve_pending_engine_rollback(
+            state.inner(),
+            &source_thread.id,
+            Some(&app),
+        )
+        .await?;
     }
 
     let source_engine_thread_id = source_thread
@@ -1460,7 +1460,8 @@ pub async fn steer_message(
     attachments: Option<Vec<ChatAttachmentPayload>>,
     input_items: Option<Vec<ChatInputItemPayload>>,
     plan_mode: Option<bool>,
-) -> Result<(), String> {
+    steer_id: Option<String>,
+) -> Result<SteerReceipt, String> {
     if state.turns.get(&thread_id).await.is_none() {
         return Err(
             "No active turn is running for this thread yet. Wait for Codex to start the turn before steering."
@@ -1487,6 +1488,13 @@ pub async fn steer_message(
     let attachments = normalize_attachments(attachments)?;
     let input_items = normalize_input_items(message.as_str(), input_items)?;
     let plan_mode = plan_mode.unwrap_or(false);
+    let steer_id = steer_id
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    if steer_id.len() > 128 {
+        return Err("Steer id cannot exceed 128 characters.".to_string());
+    }
     let turn_input = TurnInput {
         message: message.clone(),
         attachments: attachments.clone(),
@@ -1519,28 +1527,41 @@ pub async fn steer_message(
     })
     .await?;
 
-    if let Err(error) = state
+    let steer_marker = SteerMarker {
+        steer_id,
+        message_id: user_message.id.clone(),
+        display: json!({
+            "content": message,
+            "planMode": plan_mode,
+            "blocks": user_blocks,
+        }),
+    };
+
+    let receipt = match state
         .engines
-        .steer_message(&thread, &engine_thread_id, turn_input)
+        .steer_message(&thread, &engine_thread_id, turn_input, steer_marker)
         .await
     {
-        let rollback_result = run_db(db, {
-            let message_id = user_message.id.clone();
-            move |db| db::messages::delete_message(db, &message_id)
-        })
-        .await;
-        if let Err(rollback_error) = rollback_result {
-            log::warn!(
-                "failed to roll back persisted steer message {} after steer error: {}",
-                user_message.id,
-                rollback_error
-            );
+        Ok(receipt) => receipt,
+        Err(error) => {
+            let rollback_result = run_db(db, {
+                let message_id = user_message.id.clone();
+                move |db| db::messages::delete_message(db, &message_id)
+            })
+            .await;
+            if let Err(rollback_error) = rollback_result {
+                log::warn!(
+                    "failed to roll back persisted steer message {} after steer error: {}",
+                    user_message.id,
+                    rollback_error
+                );
+            }
+
+            return Err(err_to_string(error));
         }
+    };
 
-        return Err(err_to_string(error));
-    }
-
-    Ok(())
+    Ok(receipt)
 }
 
 fn build_user_blocks(
@@ -1915,7 +1936,6 @@ fn persist_cancelled_turn_snapshot(
                 &TurnCompletionStatus::Interrupted,
                 None,
             );
-            upsert_turn_status_notice_json(blocks, &TurnCompletionStatus::Interrupted, None, None);
         }
 
         if let Some(blocks_json) = updated_blocks.map(|blocks| blocks.to_string()) {
@@ -2274,6 +2294,15 @@ async fn run_turn(
     let max_output_chars = state.config.debug.max_action_output_chars;
     let turn_started_at = Instant::now();
     let (event_tx, mut event_rx) = mpsc::channel::<EngineEvent>(ENGINE_EVENT_QUEUE_CAPACITY);
+    let mut transcript_recorder = (thread.engine_id == "codex").then(|| {
+        CodexTranscriptRecorder::start(
+            state.db.clone(),
+            thread.id.clone(),
+            assistant_message_id.clone(),
+            &app,
+        )
+    });
+    let mut transcript_recording_error: Option<String> = None;
 
     if thread.engine_id == "codex" && turn_input.plan_mode {
         let message = format!(
@@ -2285,7 +2314,7 @@ async fn run_turn(
             initial_turn_model_id
         );
         log::info!("{message}");
-        crate::diagnostic_logs::append_codex_event_routing_log(&message);
+        let _ = crate::diagnostic_logs::append_codex_event_routing_log(&message);
     }
 
     let engines = state.engines.clone();
@@ -2326,6 +2355,7 @@ async fn run_turn(
 
     let initial_turn_started_event = EngineEvent::TurnStarted {
         client_turn_id: client_turn_id.clone(),
+        native_turn_id: None,
     };
     let initial_progress = process_stream_event(
         &app,
@@ -2437,6 +2467,24 @@ async fn run_turn(
         let Some(incoming_event) = incoming_event else {
             break;
         };
+
+        if let EngineEvent::CodexNativeEvent { event } = incoming_event {
+            if transcript_recording_error.is_none() {
+                let record_result = match transcript_recorder.as_ref() {
+                    Some(recorder) => recorder.record(event).await,
+                    None => Err(anyhow::anyhow!(
+                        "received a Codex native event without a transcript recorder"
+                    )),
+                };
+                if let Err(error) = record_result {
+                    let message = format!("Codex transcript recording failed: {error}");
+                    log::error!("{message}");
+                    transcript_recording_error = Some(message);
+                    cancellation.cancel();
+                }
+            }
+            continue;
+        }
 
         let mut current_event = incoming_event;
 
@@ -2648,6 +2696,14 @@ async fn run_turn(
         .await;
     }
 
+    if let Some(recorder) = transcript_recorder.take() {
+        if let Err(error) = recorder.finish().await {
+            let message = format!("Codex transcript flush failed: {error}");
+            log::error!("{message}");
+            transcript_recording_error.get_or_insert(message);
+        }
+    }
+
     match engine_task.await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
@@ -2664,15 +2720,8 @@ async fn run_turn(
                 thread_status = ThreadStatusDto::Error;
                 thread_status_dirty = true;
             }
-            if finalize_turn_blocks_with_notice(
-                &mut blocks,
-                &mut action_index,
-                &mut approval_index,
-                &TurnCompletionStatus::Failed,
-                None,
-                None,
-                Some(elapsed_duration_ms(turn_started_at)),
-            ) {
+            if terminalize_unresolved_turn_blocks(&mut blocks, &TurnCompletionStatus::Failed, None)
+            {
                 blocks_dirty = true;
             }
             resolve_pending_approvals_for_terminal_message(&state, &assistant_message_id).await;
@@ -2697,19 +2746,34 @@ async fn run_turn(
                 thread_status = ThreadStatusDto::Error;
                 thread_status_dirty = true;
             }
-            if finalize_turn_blocks_with_notice(
-                &mut blocks,
-                &mut action_index,
-                &mut approval_index,
-                &TurnCompletionStatus::Failed,
-                None,
-                None,
-                Some(elapsed_duration_ms(turn_started_at)),
-            ) {
+            if terminalize_unresolved_turn_blocks(&mut blocks, &TurnCompletionStatus::Failed, None)
+            {
                 blocks_dirty = true;
             }
             resolve_pending_approvals_for_terminal_message(&state, &assistant_message_id).await;
         }
+    }
+
+    if let Some(error_message) = transcript_recording_error {
+        blocks.push(ContentBlock::Error {
+            message: error_message.clone(),
+        });
+        blocks_dirty = true;
+        if message_status != MessageStatusDto::Error {
+            message_status = MessageStatusDto::Error;
+            message_state_dirty = true;
+        }
+        if thread_status != ThreadStatusDto::Error {
+            thread_status = ThreadStatusDto::Error;
+            thread_status_dirty = true;
+        }
+        let _ = app.emit(
+            &stream_event_topic,
+            EngineEvent::Error {
+                message: error_message,
+                recoverable: false,
+            },
+        );
     }
 
     if cancellation.is_cancelled() && matches!(message_status, MessageStatusDto::Streaming) {
@@ -2717,15 +2781,8 @@ async fn run_turn(
         message_state_dirty = true;
         thread_status = ThreadStatusDto::Idle;
         thread_status_dirty = true;
-        if finalize_turn_blocks_with_notice(
-            &mut blocks,
-            &mut action_index,
-            &mut approval_index,
-            &TurnCompletionStatus::Interrupted,
-            None,
-            None,
-            Some(elapsed_duration_ms(turn_started_at)),
-        ) {
+        if terminalize_unresolved_turn_blocks(&mut blocks, &TurnCompletionStatus::Interrupted, None)
+        {
             blocks_dirty = true;
         }
         resolve_pending_approvals_for_terminal_message(&state, &assistant_message_id).await;
@@ -2830,6 +2887,13 @@ async fn run_codex_review_turn(
     let turn_started_at = Instant::now();
     let (event_tx, mut event_rx) = mpsc::channel::<EngineEvent>(ENGINE_EVENT_QUEUE_CAPACITY);
     let (started_tx, started_rx) = oneshot::channel();
+    let mut transcript_recorder = Some(CodexTranscriptRecorder::start(
+        state.db.clone(),
+        review_thread.id.clone(),
+        assistant_message_id.clone(),
+        &app,
+    ));
+    let mut transcript_recording_error: Option<String> = None;
 
     let engines = state.engines.clone();
     let source_engine_thread_id_for_engine = source_engine_thread_id.clone();
@@ -2934,6 +2998,7 @@ async fn run_codex_review_turn(
 
     let initial_turn_started_event = EngineEvent::TurnStarted {
         client_turn_id: None,
+        native_turn_id: None,
     };
     let initial_progress = process_stream_event(
         &app,
@@ -3050,6 +3115,24 @@ async fn run_codex_review_turn(
             break;
         };
 
+        if let EngineEvent::CodexNativeEvent { event } = incoming_event {
+            if transcript_recording_error.is_none() {
+                let record_result = match transcript_recorder.as_ref() {
+                    Some(recorder) => recorder.record(event).await,
+                    None => Err(anyhow::anyhow!(
+                        "received a Codex review event without a transcript recorder"
+                    )),
+                };
+                if let Err(error) = record_result {
+                    let message = format!("Codex review transcript recording failed: {error}");
+                    log::error!("{message}");
+                    transcript_recording_error = Some(message);
+                    cancellation.cancel();
+                }
+            }
+            continue;
+        }
+
         let mut current_event = incoming_event;
 
         loop {
@@ -3260,6 +3343,14 @@ async fn run_codex_review_turn(
         .await;
     }
 
+    if let Some(recorder) = transcript_recorder.take() {
+        if let Err(error) = recorder.finish().await {
+            let message = format!("Codex review transcript flush failed: {error}");
+            log::error!("{message}");
+            transcript_recording_error.get_or_insert(message);
+        }
+    }
+
     match engine_task.await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
@@ -3276,15 +3367,8 @@ async fn run_codex_review_turn(
                 thread_status = ThreadStatusDto::Error;
                 thread_status_dirty = true;
             }
-            if finalize_turn_blocks_with_notice(
-                &mut blocks,
-                &mut action_index,
-                &mut approval_index,
-                &TurnCompletionStatus::Failed,
-                None,
-                None,
-                Some(elapsed_duration_ms(turn_started_at)),
-            ) {
+            if terminalize_unresolved_turn_blocks(&mut blocks, &TurnCompletionStatus::Failed, None)
+            {
                 blocks_dirty = true;
             }
             resolve_pending_approvals_for_terminal_message(&state, &assistant_message_id).await;
@@ -3309,19 +3393,34 @@ async fn run_codex_review_turn(
                 thread_status = ThreadStatusDto::Error;
                 thread_status_dirty = true;
             }
-            if finalize_turn_blocks_with_notice(
-                &mut blocks,
-                &mut action_index,
-                &mut approval_index,
-                &TurnCompletionStatus::Failed,
-                None,
-                None,
-                Some(elapsed_duration_ms(turn_started_at)),
-            ) {
+            if terminalize_unresolved_turn_blocks(&mut blocks, &TurnCompletionStatus::Failed, None)
+            {
                 blocks_dirty = true;
             }
             resolve_pending_approvals_for_terminal_message(&state, &assistant_message_id).await;
         }
+    }
+
+    if let Some(error_message) = transcript_recording_error {
+        blocks.push(ContentBlock::Error {
+            message: error_message.clone(),
+        });
+        blocks_dirty = true;
+        if message_status != MessageStatusDto::Error {
+            message_status = MessageStatusDto::Error;
+            message_state_dirty = true;
+        }
+        if thread_status != ThreadStatusDto::Error {
+            thread_status = ThreadStatusDto::Error;
+            thread_status_dirty = true;
+        }
+        let _ = app.emit(
+            &stream_event_topic,
+            EngineEvent::Error {
+                message: error_message,
+                recoverable: false,
+            },
+        );
     }
 
     if cancellation.is_cancelled() && matches!(message_status, MessageStatusDto::Streaming) {
@@ -3329,15 +3428,8 @@ async fn run_codex_review_turn(
         message_state_dirty = true;
         thread_status = ThreadStatusDto::Idle;
         thread_status_dirty = true;
-        if finalize_turn_blocks_with_notice(
-            &mut blocks,
-            &mut action_index,
-            &mut approval_index,
-            &TurnCompletionStatus::Interrupted,
-            None,
-            None,
-            Some(elapsed_duration_ms(turn_started_at)),
-        ) {
+        if terminalize_unresolved_turn_blocks(&mut blocks, &TurnCompletionStatus::Interrupted, None)
+        {
             blocks_dirty = true;
         }
         resolve_pending_approvals_for_terminal_message(&state, &assistant_message_id).await;
@@ -3642,6 +3734,26 @@ async fn process_stream_event(
     }
 
     match &normalized_event {
+        EngineEvent::TurnStarted {
+            native_turn_id: Some(native_turn_id),
+            ..
+        } => {
+            if let Err(error) = run_db(state.db.clone(), {
+                let assistant_message_id = assistant_message_id.to_string();
+                let native_turn_id = native_turn_id.clone();
+                move |db| {
+                    db::messages::update_assistant_native_turn_id(
+                        db,
+                        &assistant_message_id,
+                        &native_turn_id,
+                    )
+                }
+            })
+            .await
+            {
+                log::warn!("failed to persist Codex native turn id: {error}");
+            }
+        }
         EngineEvent::ActionStarted {
             action_id,
             engine_action_id,
@@ -3675,11 +3787,18 @@ async fn process_stream_event(
                 log::warn!("failed to persist action start: {error}");
             }
         }
-        EngineEvent::ActionCompleted { action_id, result } => {
+        EngineEvent::ActionCompleted {
+            action_id,
+            result,
+            details,
+        } => {
             if let Err(error) = run_db(state.db.clone(), {
                 let action_id = action_id.clone();
                 let result = result.clone();
-                move |db| db::actions::update_action_completed(db, &action_id, &result)
+                let details = details.clone();
+                move |db| {
+                    db::actions::update_action_completed(db, &action_id, &result, details.as_ref())
+                }
             })
             .await
             {
@@ -4072,10 +4191,7 @@ fn chat_notification_preview(blocks: &[ContentBlock]) -> Option<String> {
                 title,
                 ..
             } => {
-                if kind == "turn_status"
-                    || kind == "context_compacted"
-                    || kind.starts_with("codex_context_compaction_")
-                {
+                if kind == "context_compacted" || kind.starts_with("codex_context_compaction_") {
                     continue;
                 }
                 if let Some(preview) = normalize_chat_notification_preview(message) {
@@ -4186,7 +4302,7 @@ fn apply_event_to_blocks(
     approval_index: &mut HashMap<String, usize>,
     event: &EngineEvent,
     max_output_chars: usize,
-    turn_duration_ms: Option<u64>,
+    _turn_duration_ms: Option<u64>,
 ) -> EventProgress {
     let mut progress = EventProgress::default();
 
@@ -4198,6 +4314,7 @@ fn apply_event_to_blocks(
             let mut next_blocks = Vec::with_capacity(recovered.len());
             for block in recovered {
                 match serde_json::from_value::<ContentBlock>(block.clone()) {
+                    Ok(ContentBlock::Notice { kind, .. }) if kind == "turn_status" => {}
                     Ok(block) => next_blocks.push(block),
                     Err(error) => {
                         log::warn!("failed to decode recovered turn block: {error}");
@@ -4219,29 +4336,16 @@ fn apply_event_to_blocks(
         } => {
             progress.force_persist = true;
             let source = diagnostics.as_ref().map(|value| &value.source);
-            progress.blocks_changed |= finalize_turn_blocks_with_notice(
-                blocks,
-                action_index,
-                approval_index,
-                status,
-                token_usage.as_ref(),
-                source,
-                turn_duration_ms,
-            );
-            let has_pending_approvals = collect_turn_block_stats(blocks).approvals_pending > 0;
+            progress.blocks_changed |= terminalize_unresolved_turn_blocks(blocks, status, source);
             progress.message_status = Some(match status {
                 TurnCompletionStatus::Completed => MessageStatusDto::Completed,
                 TurnCompletionStatus::Interrupted => MessageStatusDto::Interrupted,
                 TurnCompletionStatus::Failed => MessageStatusDto::Error,
             });
-            progress.thread_status = Some(if has_pending_approvals {
-                ThreadStatusDto::AwaitingApproval
-            } else {
-                match status {
-                    TurnCompletionStatus::Completed => ThreadStatusDto::Completed,
-                    TurnCompletionStatus::Interrupted => ThreadStatusDto::Idle,
-                    TurnCompletionStatus::Failed => ThreadStatusDto::Error,
-                }
+            progress.thread_status = Some(match status {
+                TurnCompletionStatus::Completed => ThreadStatusDto::Completed,
+                TurnCompletionStatus::Interrupted => ThreadStatusDto::Idle,
+                TurnCompletionStatus::Failed => ThreadStatusDto::Error,
             });
             progress.token_usage = token_usage
                 .as_ref()
@@ -4324,14 +4428,22 @@ fn apply_event_to_blocks(
                 }
             }
         }
-        EngineEvent::ActionCompleted { action_id, result } => {
+        EngineEvent::ActionCompleted {
+            action_id,
+            result,
+            details: completed_details,
+        } => {
             if let Some(index) = action_index.get(action_id).copied() {
                 if let Some(ContentBlock::Action {
+                    details,
                     status,
                     result: block_result,
                     ..
                 }) = blocks.get_mut(index)
                 {
+                    if let Some(completed_details) = completed_details {
+                        merge_action_details(details, completed_details);
+                    }
                     *status = if result.success { "done" } else { "error" }.to_string();
                     *block_result = Some(ActionBlockResult {
                         success: result.success,
@@ -4386,6 +4498,7 @@ fn apply_event_to_blocks(
                     next_blocks.push(block);
                 }
                 *blocks = next_blocks;
+                rebuild_block_indexes(blocks, action_index, approval_index);
             } else {
                 blocks.push(ContentBlock::Diff {
                     diff: diff.to_string(),
@@ -4405,9 +4518,6 @@ fn apply_event_to_blocks(
                 title: "Model rerouted".to_string(),
                 message: format_model_reroute_notice(from_model, to_model, reason),
                 details: None,
-                status: None,
-                source: None,
-                duration_ms: None,
             };
             progress.blocks_changed = upsert_notice_block(
                 blocks,
@@ -4426,15 +4536,15 @@ fn apply_event_to_blocks(
             message,
             details,
         } => {
+            if kind == "turn_status" {
+                return progress;
+            }
             let block = ContentBlock::Notice {
                 kind: kind.to_string(),
                 level: level.to_string(),
                 title: title.to_string(),
                 message: message.to_string(),
                 details: details.as_ref().filter(|items| !items.is_empty()).cloned(),
-                status: None,
-                source: None,
-                duration_ms: None,
             };
             progress.blocks_changed =
                 upsert_notice_block(blocks, action_index, approval_index, kind, block);
@@ -4474,6 +4584,7 @@ fn apply_event_to_blocks(
             }
         }
         EngineEvent::UsageLimitsUpdated { .. } => {}
+        EngineEvent::CodexNativeEvent { .. } => {}
     }
 
     progress
@@ -4555,6 +4666,20 @@ fn update_action_progress(details: &mut Box<RawValue>, message: &str) -> bool {
     false
 }
 
+fn merge_action_details(details: &mut Box<RawValue>, completed_details: &Value) {
+    let mut value: Value = serde_json::from_str(details.get())
+        .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+    match (&mut value, completed_details) {
+        (Value::Object(existing), Value::Object(completed)) => {
+            for (key, completed_value) in completed {
+                existing.insert(key.clone(), completed_value.clone());
+            }
+        }
+        (_, completed) => value = completed.clone(),
+    }
+    *details = value_to_raw(&value);
+}
+
 fn upsert_action_block(
     blocks: &mut Vec<ContentBlock>,
     action_index: &mut HashMap<String, usize>,
@@ -4615,11 +4740,9 @@ fn upsert_notice_block(
         }
     }
 
-    if kind == "turn_status" {
-        blocks.push(block);
-    } else {
-        blocks.insert(0, block);
-    }
+    // A notice is part of the event stream, not message metadata. Keep its
+    // first-observed position; later updates of the same kind stay in place.
+    blocks.push(block);
     rebuild_block_indexes(blocks, action_index, approval_index);
     true
 }
@@ -4813,49 +4936,28 @@ fn aggregate_workspace_trust_level(repos: &[RepoDto]) -> TrustLevelDto {
 }
 
 fn approval_policy_for_engine_and_trust_level(
-    engine_id: &str,
+    _engine_id: &str,
     _trust_level: &TrustLevelDto,
 ) -> &'static str {
-    match engine_id {
-        "claude" => "trusted",
-        "opencode" => "allow",
-        _ => "never",
-    }
+    "never"
 }
 
 fn allow_network_for_trust_level(_trust_level: &TrustLevelDto) -> bool {
     true
 }
 
-fn default_sandbox_mode_for_engine(engine_id: &str) -> &'static str {
-    match engine_id {
-        "codex" => "danger-full-access",
-        _ => "workspace-write",
-    }
+fn default_sandbox_mode_for_engine(_engine_id: &str) -> &'static str {
+    "danger-full-access"
 }
 
 fn thread_approval_policy_override_value(
-    engine_id: &str,
+    _engine_id: &str,
     metadata: Option<&Value>,
 ) -> Result<Option<Value>, String> {
-    match engine_id {
-        "claude" => Ok(metadata
-            .and_then(|value| value.get("claudePermissionMode"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| matches!(*value, "trusted" | "standard" | "restricted"))
-            .map(|value| Value::String(value.to_string()))),
-        "opencode" => Ok(metadata
-            .and_then(|value| value.get("opencodePermissionMode"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| matches!(*value, "ask" | "allow" | "deny"))
-            .map(|value| Value::String(value.to_string()))),
-        _ => metadata
-            .and_then(|value| value.get("sandboxApprovalPolicy"))
-            .map(normalize_codex_approval_policy_value)
-            .transpose(),
-    }
+    metadata
+        .and_then(|value| value.get("sandboxApprovalPolicy"))
+        .map(normalize_codex_approval_policy_value)
+        .transpose()
 }
 
 fn thread_allow_network_override(metadata: Option<&Value>) -> Option<bool> {
@@ -5062,15 +5164,6 @@ fn thread_approvals_reviewer(metadata: Option<&Value>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn thread_opencode_agent(metadata: Option<&Value>) -> Option<String> {
-    metadata
-        .and_then(|value| value.get("opencodeAgent"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
 fn normalize_reasoning_effort_value(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -5195,12 +5288,10 @@ mod tests {
         config::app_config::AppConfig,
         db,
         engines::EngineManager,
-        git::{repo::FileTreeCache, watcher::GitWatcherManager},
+        file_tree::FileTreeCache,
         models::{EngineCapabilitiesDto, ReasoningEffortOptionDto},
         power::KeepAwakeManager,
         state::{AppState, TurnManager},
-        terminal::TerminalManager,
-        terminal_notifications::TerminalNotificationManager,
     };
     use rusqlite::params;
     use uuid::Uuid;
@@ -5213,14 +5304,12 @@ mod tests {
         AppState {
             db,
             config: Arc::new(AppConfig::default()),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             engines: Arc::new(EngineManager::new()),
-            git_watchers: Arc::new(GitWatcherManager::default()),
-            terminals: Arc::new(TerminalManager::default()),
-            notifications: Arc::new(TerminalNotificationManager::default()),
             keep_awake: Arc::new(KeepAwakeManager::new()),
             turns: Arc::new(TurnManager::default()),
             file_tree_cache: Arc::new(FileTreeCache::new()),
+            pending_forks: Arc::new(crate::state::PendingThreadMutationManager::default()),
+            pending_rollbacks: Arc::new(crate::state::PendingThreadMutationManager::default()),
         }
     }
 
@@ -5247,11 +5336,11 @@ mod tests {
 
     fn attachment_validation_catalog(attachment_modalities: Vec<&str>) -> Vec<EngineInfoDto> {
         vec![EngineInfoDto {
-            id: "opencode".to_string(),
-            name: "OpenCode".to_string(),
+            id: "codex".to_string(),
+            name: "Codex".to_string(),
             models: vec![EngineModelDto {
-                id: "opencode/test".to_string(),
-                display_name: "OpenCode Test".to_string(),
+                id: "gpt-test".to_string(),
+                display_name: "Codex Test".to_string(),
                 description: String::new(),
                 hidden: false,
                 is_default: true,
@@ -5295,8 +5384,8 @@ mod tests {
 
         assert!(validate_attachments_for_engine_model(
             &attachments,
-            "opencode",
-            "opencode/test",
+            "codex",
+            "gpt-test",
             Some(&catalog),
         )
         .is_ok());
@@ -5309,8 +5398,8 @@ mod tests {
 
         let error = validate_attachments_for_engine_model(
             &attachments,
-            "opencode",
-            "opencode/test",
+            "codex",
+            "gpt-test",
             Some(&catalog),
         )
         .expect_err("model without attachment modalities should reject files");
@@ -5325,8 +5414,8 @@ mod tests {
 
         let error = validate_attachments_for_engine_model(
             &attachments,
-            "opencode",
-            "opencode/test",
+            "codex",
+            "gpt-test",
             Some(&catalog),
         )
         .expect_err("image should be blocked for text-only models");
@@ -5378,15 +5467,6 @@ mod tests {
         )
         .expect("failed to persist approval block");
         assistant_message.id
-    }
-
-    fn insert_pending_approval(state: &AppState, thread: &ThreadDto, approval_id: &str) -> String {
-        insert_pending_approval_with_details(
-            state,
-            thread,
-            approval_id,
-            serde_json::json!({ "command": "touch file.txt" }),
-        )
     }
 
     #[test]
@@ -5545,21 +5625,10 @@ mod tests {
             blocks[1].get("decision").and_then(Value::as_str),
             Some("cancel")
         );
-        let terminal_notice = blocks
+        assert_eq!(blocks.len(), 2);
+        assert!(!blocks
             .iter()
-            .find(|block| {
-                block.get("type").and_then(Value::as_str) == Some("notice")
-                    && block.get("kind").and_then(Value::as_str) == Some("turn_status")
-            })
-            .expect("cancelled snapshots must include a terminal status notice");
-        assert_eq!(
-            terminal_notice.get("title").and_then(Value::as_str),
-            Some("Turn interrupted")
-        );
-        assert_eq!(
-            terminal_notice.get("status").and_then(Value::as_str),
-            Some("interrupted")
-        );
+            .any(|block| { block.get("type").and_then(Value::as_str) == Some("notice") }));
     }
 
     #[test]
@@ -5831,18 +5900,6 @@ mod tests {
     #[test]
     fn permission_defaults_use_max_privilege_modes() {
         assert_eq!(
-            approval_policy_for_engine_and_trust_level("claude", &TrustLevelDto::Trusted),
-            "trusted"
-        );
-        assert_eq!(
-            approval_policy_for_engine_and_trust_level("claude", &TrustLevelDto::Standard),
-            "trusted"
-        );
-        assert_eq!(
-            approval_policy_for_engine_and_trust_level("claude", &TrustLevelDto::Restricted),
-            "trusted"
-        );
-        assert_eq!(
             approval_policy_for_engine_and_trust_level("codex", &TrustLevelDto::Trusted),
             "never"
         );
@@ -5853,56 +5910,6 @@ mod tests {
         assert_eq!(
             approval_policy_for_engine_and_trust_level("codex", &TrustLevelDto::Restricted),
             "never"
-        );
-    }
-
-    #[test]
-    fn opencode_defaults_allow_tools_without_permission_prompts() {
-        assert_eq!(
-            approval_policy_for_engine_and_trust_level("opencode", &TrustLevelDto::Trusted),
-            "allow"
-        );
-        assert_eq!(
-            approval_policy_for_engine_and_trust_level("opencode", &TrustLevelDto::Standard),
-            "allow"
-        );
-        assert_eq!(
-            approval_policy_for_engine_and_trust_level("opencode", &TrustLevelDto::Restricted),
-            "allow"
-        );
-    }
-
-    #[test]
-    fn claude_permission_mode_override_uses_claude_key() {
-        let metadata = serde_json::json!({
-            "claudePermissionMode": "restricted",
-            "sandboxApprovalPolicy": "never",
-        });
-
-        assert_eq!(
-            thread_approval_policy_override_value("claude", Some(&metadata)).unwrap(),
-            Some(Value::String("restricted".to_string()))
-        );
-        assert_eq!(
-            thread_approval_policy_override_value("codex", Some(&metadata)).unwrap(),
-            Some(Value::String("never".to_string()))
-        );
-    }
-
-    #[test]
-    fn opencode_permission_mode_override_uses_opencode_key() {
-        let metadata = serde_json::json!({
-            "opencodePermissionMode": "allow",
-            "sandboxApprovalPolicy": "never",
-        });
-
-        assert_eq!(
-            thread_approval_policy_override_value("opencode", Some(&metadata)).unwrap(),
-            Some(Value::String("allow".to_string()))
-        );
-        assert_eq!(
-            thread_approval_policy_override_value("codex", Some(&metadata)).unwrap(),
-            Some(Value::String("never".to_string()))
         );
     }
 
@@ -5978,7 +5985,7 @@ mod tests {
     }
 
     #[test]
-    fn model_reroute_notice_reindexes_action_blocks() {
+    fn model_reroute_notice_preserves_arrival_order_and_action_updates() {
         let mut blocks = Vec::new();
         let mut action_index = HashMap::new();
         let mut approval_index = HashMap::new();
@@ -6028,7 +6035,7 @@ mod tests {
         assert!(progress.blocks_changed);
 
         assert!(matches!(
-            &blocks[0],
+            &blocks[1],
             ContentBlock::Notice {
                 kind,
                 level,
@@ -6036,7 +6043,7 @@ mod tests {
                 ..
             } if kind == "model_rerouted" && level == "info" && title == "Model rerouted"
         ));
-        match &blocks[1] {
+        match &blocks[0] {
             ContentBlock::Action { details, .. } => {
                 let details_value: Value = serde_json::from_str(details.get())
                     .expect("action details should parse as JSON");
@@ -6058,6 +6065,86 @@ mod tests {
     }
 
     #[test]
+    fn action_completion_replaces_empty_web_search_start_details() {
+        let mut blocks = Vec::new();
+        let mut action_index = HashMap::new();
+        let mut approval_index = HashMap::new();
+
+        let started = apply_event_to_blocks(
+            &mut blocks,
+            &mut action_index,
+            &mut approval_index,
+            &EngineEvent::ActionStarted {
+                action_id: "search-action".to_string(),
+                engine_action_id: Some("search-item".to_string()),
+                action_type: crate::engines::events::ActionType::Search,
+                summary: "Web search".to_string(),
+                details: serde_json::json!({
+                    "query": "",
+                    "action": null,
+                    "results": null
+                }),
+            },
+            1000,
+            None,
+        );
+        assert!(started.blocks_changed);
+
+        let completed = apply_event_to_blocks(
+            &mut blocks,
+            &mut action_index,
+            &mut approval_index,
+            &EngineEvent::ActionCompleted {
+                action_id: "search-action".to_string(),
+                result: crate::engines::ActionResult {
+                    success: true,
+                    output: None,
+                    error: None,
+                    diff: None,
+                    duration_ms: 25,
+                },
+                details: Some(serde_json::json!({
+                    "query": "Shiro no Yakata game",
+                    "action": { "type": "search", "query": "Shiro no Yakata game" },
+                    "results": [{
+                        "title": "Developer blog",
+                        "url": "https://zell23.livedoor.blog/"
+                    }]
+                })),
+            },
+            1000,
+            None,
+        );
+        assert!(completed.blocks_changed);
+
+        match &blocks[0] {
+            ContentBlock::Action {
+                details,
+                status,
+                result,
+                ..
+            } => {
+                let details: Value = serde_json::from_str(details.get())
+                    .expect("completed search details should remain valid JSON");
+                assert_eq!(status, "done");
+                assert_eq!(
+                    details.get("query").and_then(Value::as_str),
+                    Some("Shiro no Yakata game")
+                );
+                assert_eq!(
+                    details
+                        .get("results")
+                        .and_then(Value::as_array)
+                        .map(Vec::len),
+                    Some(1)
+                );
+                assert_eq!(result.as_ref().map(|result| result.duration_ms), Some(25));
+            }
+            other => panic!("expected completed search action block, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn diff_update_collapses_existing_same_scope_diff_blocks() {
         let mut blocks = vec![
             ContentBlock::Diff {
@@ -6073,9 +6160,20 @@ mod tests {
                 diff: "old diff 2".to_string(),
                 scope: "turn".to_string(),
             },
+            ContentBlock::Action {
+                action_id: "action-after-diff".to_string(),
+                engine_action_id: None,
+                action_type: "other".to_string(),
+                summary: "Continue".to_string(),
+                details: empty_raw_value(),
+                output_chunks: Vec::new(),
+                status: "running".to_string(),
+                result: None,
+            },
         ];
         let mut action_index = HashMap::new();
         let mut approval_index = HashMap::new();
+        rebuild_block_indexes(&blocks, &mut action_index, &mut approval_index);
 
         let progress = apply_event_to_blocks(
             &mut blocks,
@@ -6090,7 +6188,7 @@ mod tests {
         );
 
         assert!(progress.blocks_changed);
-        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks.len(), 3);
         assert!(matches!(
             &blocks[0],
             ContentBlock::Text { content, .. } if content == "kept"
@@ -6099,6 +6197,30 @@ mod tests {
             &blocks[1],
             ContentBlock::Diff { diff, scope } if diff == "new diff" && scope == "turn"
         ));
+
+        let follow_up = apply_event_to_blocks(
+            &mut blocks,
+            &mut action_index,
+            &mut approval_index,
+            &EngineEvent::ActionProgressUpdated {
+                action_id: "action-after-diff".to_string(),
+                message: "Still in sequence".to_string(),
+            },
+            1000,
+            None,
+        );
+        assert!(follow_up.blocks_changed);
+        match &blocks[2] {
+            ContentBlock::Action { details, .. } => {
+                let details: Value = serde_json::from_str(details.get())
+                    .expect("action details should remain valid JSON");
+                assert_eq!(
+                    details.get("progressMessage").and_then(Value::as_str),
+                    Some("Still in sequence")
+                );
+            }
+            other => panic!("expected action after collapsed diff, got {other:?}"),
+        }
     }
 
     #[test]
@@ -6107,6 +6229,83 @@ mod tests {
             pasted_image_extension("pasted-image-1.png", "image/heic"),
             None
         );
+    }
+
+    #[test]
+    fn cached_attachment_thumbnail_is_bounded_and_reused() {
+        let root = std::env::temp_dir().join(format!("panes-image-thumbnail-{}", Uuid::new_v4()));
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&cache_dir).expect("create thumbnail cache");
+        let source_path = root.join("source.png");
+        image::RgbaImage::from_pixel(120, 80, image::Rgba([12, 34, 56, 255]))
+            .save(&source_path)
+            .expect("save source image");
+        let metadata = fs::metadata(&source_path).expect("source metadata");
+        let version = attachment_asset_version(&metadata);
+
+        let first = prepare_cached_attachment_thumbnail(
+            &source_path,
+            "image/png",
+            &version,
+            &cache_dir,
+            30,
+            30,
+        )
+        .expect("prepare first thumbnail")
+        .expect("large source should produce a thumbnail");
+        let decoded = image::open(&first).expect("decode cached thumbnail");
+        assert!(decoded.width() <= 30);
+        assert!(decoded.height() <= 30);
+
+        let second = prepare_cached_attachment_thumbnail(
+            &source_path,
+            "image/png",
+            &version,
+            &cache_dir,
+            30,
+            30,
+        )
+        .expect("reuse cached thumbnail")
+        .expect("cached thumbnail should exist");
+        assert_eq!(first, second);
+
+        fs::remove_dir_all(&root).expect("remove thumbnail test directory");
+    }
+
+    #[test]
+    fn svg_thumbnail_preparation_uses_the_original_asset() {
+        let source_path = Path::new("example.svg");
+        let cache_dir = Path::new("unused-cache");
+        assert_eq!(
+            prepare_cached_attachment_thumbnail(
+                source_path,
+                "image/svg+xml",
+                "version",
+                cache_dir,
+                720,
+                440,
+            )
+            .expect("SVG thumbnail preparation should not fail"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_asset_validation_rejects_non_image_contents() {
+        let root = std::env::temp_dir().join(format!("panes-image-validation-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create image validation directory");
+        let fake_image = root.join("not-an-image.png");
+        fs::write(&fake_image, b"not actually a PNG").expect("write fake image");
+
+        let error = validate_attachment_image_file(
+            fake_image.to_string_lossy().as_ref(),
+            Some("image/png"),
+        )
+        .await
+        .expect_err("fake image should be rejected");
+        assert!(error.contains("do not match"));
+
+        fs::remove_dir_all(&root).expect("remove image validation directory");
     }
 
     #[test]
@@ -6191,7 +6390,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_completed_persists_terminal_turn_status_notice() {
+    fn turn_completed_updates_state_without_adding_a_notice() {
         let mut blocks = vec![ContentBlock::Action {
             action_id: "action-1".to_string(),
             engine_action_id: Some("item-1".to_string()),
@@ -6228,34 +6427,16 @@ mod tests {
             Some(123_456),
         );
 
-        assert!(progress.blocks_changed);
-        assert_eq!(blocks.len(), 2);
-        assert!(matches!(
-            &blocks[1],
-            ContentBlock::Notice {
-                kind,
-                level,
-                title,
-                message,
-                details: Some(details),
-                status: Some(status),
-                source: Some(source),
-                duration_ms: Some(duration_ms),
-            }
-            if kind == "turn_status"
-                && level == "info"
-                && title == "Turn completed"
-                && message == "Codex reported a normal terminal completion."
-                && status == "completed"
-                && source == "engine"
-                && *duration_ms == 123_456
-                && details.iter().any(|detail| detail == "Completion source: explicit engine terminal event")
-                && details.iter().any(|detail| detail == "Token usage: 12 input, 34 output")
-        ));
+        assert!(!progress.blocks_changed);
+        assert!(progress.force_persist);
+        assert_eq!(progress.message_status, Some(MessageStatusDto::Completed));
+        assert_eq!(progress.thread_status, Some(ThreadStatusDto::Completed));
+        assert_eq!(progress.token_usage, Some((12, 34)));
+        assert_eq!(blocks.len(), 1);
     }
 
     #[test]
-    fn turn_completed_terminalizes_unresolved_action_blocks_before_stats() {
+    fn turn_completed_terminalizes_unresolved_action_blocks() {
         let mut blocks = vec![ContentBlock::Action {
             action_id: "action-1".to_string(),
             engine_action_id: Some("item-1".to_string()),
@@ -6286,7 +6467,7 @@ mod tests {
         );
 
         assert!(progress.blocks_changed);
-        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks.len(), 1);
         match &blocks[0] {
             ContentBlock::Action { status, result, .. } => {
                 assert_eq!(status, "error");
@@ -6302,24 +6483,10 @@ mod tests {
             }
             other => panic!("expected action block, got {other:?}"),
         }
-        assert!(matches!(
-            &blocks[1],
-            ContentBlock::Notice {
-                kind,
-                details: Some(details),
-                status: Some(status),
-                source: Some(source),
-                ..
-            }
-            if kind == "turn_status"
-                && status == "interrupted"
-                && source == "reconciled_stream_lost"
-                && details.iter().any(|detail| detail == "Actions: 1 total, 0 done, 1 error, 0 running, 0 pending")
-        ));
     }
 
     #[test]
-    fn turn_completed_with_pending_approval_resolves_approval_before_stats() {
+    fn turn_completed_resolves_pending_approval_without_adding_a_notice() {
         let mut blocks = vec![ContentBlock::Approval {
             approval_id: "approval-1".to_string(),
             action_type: "command".to_string(),
@@ -6364,28 +6531,7 @@ mod tests {
                 ..
             } if status == "answered" && decision == "cancel"
         ));
-        assert!(matches!(
-            &blocks[1],
-            ContentBlock::Notice {
-                kind,
-                level,
-                title,
-                message,
-                details: Some(details),
-                status: Some(status),
-                source: Some(source),
-                duration_ms: Some(duration_ms),
-            }
-            if kind == "turn_status"
-                && level == "info"
-                && title == "Turn completed"
-                && message == "Codex reported a normal terminal completion."
-                && status == "completed"
-                && source == "engine"
-                && *duration_ms == 42_000
-                && details.iter().any(|detail| detail == "Approvals: 0 pending, 1 answered")
-                && !details.iter().any(|detail| detail.contains("Protocol warning"))
-        ));
+        assert_eq!(blocks.len(), 1);
     }
 
     #[test]
@@ -6428,68 +6574,6 @@ mod tests {
             approval_response_decision_for_persistence(&response),
             "decline"
         );
-    }
-
-    #[tokio::test]
-    async fn invalid_claude_approval_response_keeps_approval_pending() {
-        let state = test_app_state();
-        let thread = test_thread(&state, "claude", "claude-sonnet-4-6");
-        let approval_id = "approval-invalid";
-        let message_id = insert_pending_approval(&state, &thread, approval_id);
-
-        let error = respond_to_approval_inner(
-            &state,
-            thread.id.clone(),
-            approval_id.to_string(),
-            serde_json::json!({}),
-        )
-        .await
-        .expect_err("expected invalid approval payload to fail");
-
-        assert!(error.contains("explicit `decision`"));
-
-        let conn = state.db.connect().expect("failed to open db connection");
-        let approval_row = conn
-            .query_row(
-                "SELECT status, decision FROM approvals WHERE id = ?1",
-                params![approval_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-            )
-            .expect("failed to load approval row");
-        assert_eq!(approval_row.0, "pending");
-        assert_eq!(approval_row.1, None);
-
-        let thread_status = conn
-            .query_row(
-                "SELECT status FROM threads WHERE id = ?1",
-                params![thread.id],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("failed to load thread status");
-        assert_eq!(thread_status, "awaiting_approval");
-
-        let raw_blocks = conn
-            .query_row(
-                "SELECT blocks_json FROM messages WHERE id = ?1",
-                params![message_id],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("failed to load message blocks");
-        let blocks: Value =
-            serde_json::from_str(&raw_blocks).expect("message blocks should deserialize");
-        assert_eq!(
-            blocks
-                .as_array()
-                .and_then(|items| items.first())
-                .and_then(|item| item.get("status"))
-                .and_then(Value::as_str),
-            Some("pending")
-        );
-        assert!(blocks
-            .as_array()
-            .and_then(|items| items.first())
-            .and_then(|item| item.get("decision"))
-            .is_none());
     }
 
     #[tokio::test]

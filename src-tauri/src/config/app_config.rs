@@ -12,34 +12,8 @@ use crate::runtime_env;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
-    pub general: GeneralConfig,
-    pub ui: UiConfig,
     pub debug: DebugConfig,
     pub power: PowerConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct GeneralConfig {
-    pub theme: String,
-    pub default_engine: String,
-    pub default_model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub terminal_accelerated_rendering: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chat_notifications: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub terminal_notifications: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub notification_sound: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct UiConfig {
-    pub sidebar_width: u32,
-    pub git_panel_width: u32,
-    pub font_size: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,43 +35,6 @@ pub struct PowerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_duration_secs: Option<u64>,
     pub prevent_closed_display_sleep: bool,
-}
-
-impl Default for GeneralConfig {
-    fn default() -> Self {
-        Self {
-            theme: "dark".to_string(),
-            default_engine: "codex".to_string(),
-            default_model: "gpt-5.4".to_string(),
-            terminal_accelerated_rendering: None,
-            chat_notifications: None,
-            terminal_notifications: None,
-            notification_sound: None,
-        }
-    }
-}
-
-impl AppConfig {
-    /// Resolve the configured notification sound name.
-    /// Returns `None` if explicitly set to `"none"`, the stored value if set,
-    /// or the platform default (`"Glass"` on macOS) otherwise.
-    pub fn notification_sound(&self) -> Option<&str> {
-        match self.general.notification_sound.as_deref() {
-            Some("none") => None,
-            Some(name) => Some(name),
-            None => default_notification_sound(),
-        }
-    }
-}
-
-impl Default for UiConfig {
-    fn default() -> Self {
-        Self {
-            sidebar_width: 260,
-            git_panel_width: 380,
-            font_size: 13,
-        }
-    }
 }
 
 impl Default for DebugConfig {
@@ -126,8 +63,6 @@ impl Default for PowerConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            general: GeneralConfig::default(),
-            ui: UiConfig::default(),
             debug: DebugConfig::default(),
             power: PowerConfig::default(),
         }
@@ -135,18 +70,6 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    pub fn terminal_accelerated_rendering_enabled(&self) -> bool {
-        self.general.terminal_accelerated_rendering.unwrap_or(true)
-    }
-
-    pub fn chat_notifications_enabled(&self) -> bool {
-        self.general.chat_notifications.unwrap_or(false)
-    }
-
-    pub fn terminal_notifications_enabled(&self) -> bool {
-        self.general.terminal_notifications.unwrap_or(false)
-    }
-
     pub fn load_or_create() -> anyhow::Result<Self> {
         let _guard = lock_config()?;
         Self::load_or_create_unlocked()
@@ -197,18 +120,6 @@ impl AppConfig {
 
     pub fn path() -> PathBuf {
         runtime_env::app_data_dir().join("config.toml")
-    }
-}
-
-fn default_notification_sound() -> Option<&'static str> {
-    #[cfg(target_os = "macos")]
-    {
-        return Some("Glass");
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
     }
 }
 
@@ -299,18 +210,8 @@ mod tests {
     }
 
     #[test]
-    fn missing_optional_general_fields_use_defaults() {
+    fn missing_power_fields_use_defaults() {
         let raw = r#"
-[general]
-theme = "dark"
-default_engine = "codex"
-default_model = "gpt-5.4"
-
-[ui]
-sidebar_width = 260
-git_panel_width = 380
-font_size = 13
-
 [debug]
 persist_engine_event_logs = false
 max_action_output_chars = 20000
@@ -319,8 +220,6 @@ max_action_output_chars = 20000
         let config = toml::from_str::<AppConfig>(raw).expect("config should deserialize");
 
         assert!(!config.power.keep_awake_enabled);
-        assert_eq!(config.general.terminal_accelerated_rendering, None);
-        assert_eq!(config.general.terminal_notifications, None);
         assert!(!config.power.prevent_display_sleep);
         assert!(!config.power.prevent_screen_saver);
         assert!(!config.power.ac_only_mode);
@@ -330,96 +229,30 @@ max_action_output_chars = 20000
     }
 
     #[test]
-    fn default_config_omits_optional_general_fields_from_toml() {
+    fn default_config_contains_only_active_sections() {
         let raw = toml::to_string_pretty(&AppConfig::default()).expect("config should serialize");
 
         assert!(raw.contains("[power]"));
+        assert!(raw.contains("[debug]"));
         assert!(raw.contains("keep_awake_enabled = false"));
-        assert!(!raw.contains("terminal_accelerated_rendering"));
-        assert!(!raw.contains("terminal_notifications"));
+        assert!(!raw.contains("[general]"));
+        assert!(!raw.contains("[ui]"));
     }
 
     #[test]
     fn save_overwrites_existing_config() {
         with_temp_app_data_env(|| {
             let mut config = AppConfig::default();
-            config.general.default_model = "gpt-5.3".to_string();
+            config.power.keep_awake_enabled = false;
             config.save().expect("initial config save should succeed");
 
             let mut updated = AppConfig::load_or_create().expect("config should reload");
-            updated.general.default_model = "gpt-5.4".to_string();
             updated.power.keep_awake_enabled = true;
             updated.save().expect("updated config save should succeed");
 
             let saved = AppConfig::load_or_create().expect("config should reload after overwrite");
-            assert_eq!(saved.general.default_model, "gpt-5.4");
             assert!(saved.power.keep_awake_enabled);
         });
-    }
-
-    #[test]
-    fn legacy_native_window_decorations_field_is_ignored() {
-        let raw = r#"
-[general]
-theme = "dark"
-default_engine = "codex"
-default_model = "gpt-5.4"
-native_window_decorations = false
-
-[ui]
-sidebar_width = 260
-git_panel_width = 380
-font_size = 13
-
-[debug]
-persist_engine_event_logs = false
-max_action_output_chars = 20000
-"#;
-
-        let config = toml::from_str::<AppConfig>(raw).expect("legacy config should deserialize");
-
-        assert_eq!(config.general.terminal_accelerated_rendering, None);
-        assert_eq!(config.general.terminal_notifications, None);
-    }
-
-    #[test]
-    fn legacy_locale_field_is_ignored() {
-        let raw = r#"
-[general]
-theme = "dark"
-default_engine = "codex"
-default_model = "gpt-5.4"
-locale = "en"
-
-[ui]
-sidebar_width = 260
-git_panel_width = 380
-font_size = 13
-
-[debug]
-persist_engine_event_logs = false
-max_action_output_chars = 20000
-"#;
-
-        let config = toml::from_str::<AppConfig>(raw).expect("legacy config should deserialize");
-        let serialized = toml::to_string_pretty(&config).expect("config should serialize");
-
-        assert_eq!(config.general.default_model, "gpt-5.4");
-        assert!(!serialized.contains("locale"));
-    }
-
-    #[test]
-    fn terminal_accelerated_rendering_defaults_to_enabled() {
-        let config = AppConfig::default();
-
-        assert!(config.terminal_accelerated_rendering_enabled());
-    }
-
-    #[test]
-    fn terminal_notifications_default_to_disabled() {
-        let config = AppConfig::default();
-
-        assert!(!config.terminal_notifications_enabled());
     }
 
     #[test]
@@ -446,20 +279,6 @@ max_action_output_chars = 20000
     #[test]
     fn old_config_without_new_power_fields_loads() {
         let raw = r#"
-[general]
-theme = "dark"
-default_engine = "codex"
-default_model = "gpt-5.4"
-
-[ui]
-sidebar_width = 260
-git_panel_width = 380
-font_size = 13
-
-[debug]
-persist_engine_event_logs = false
-max_action_output_chars = 20000
-
 [power]
 keep_awake_enabled = true
 "#;

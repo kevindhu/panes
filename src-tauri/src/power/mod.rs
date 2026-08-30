@@ -1359,7 +1359,7 @@ fn exit_status_message(status: ExitStatus) -> String {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn exit_status_from_code(code: i32) -> ExitStatus {
     #[cfg(unix)]
     {

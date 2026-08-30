@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockOpenExternal = vi.hoisted(() => vi.fn());
+const mockOpenPathWithDefaultApp = vi.hoisted(() => vi.fn());
+const mockDispatchEvent = vi.hoisted(() => vi.fn());
 const mockOpenFileAtLocation = vi.hoisted(() => vi.fn());
 const mockSetLayoutMode = vi.hoisted(() => vi.fn());
 const mockEnsureWorkspace = vi.hoisted(() => vi.fn());
@@ -44,6 +46,12 @@ const mockWorkspaceState = vi.hoisted(() => ({
 
 vi.mock("@tauri-apps/plugin-shell", () => ({
   open: mockOpenExternal,
+}));
+
+vi.mock("./codexIpc", () => ({
+  ipc: {
+    openPathWithDefaultApp: mockOpenPathWithDefaultApp,
+  },
 }));
 
 vi.mock("../stores/fileStore", () => ({
@@ -100,6 +108,7 @@ import {
 describe("fileLinkNavigation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubGlobal("window", { dispatchEvent: mockDispatchEvent });
     mockWorkspaceState.activeWorkspaceId = "ws-1";
     mockWorkspaceState.activeRepoId = "repo-1";
     mockWorkspaceState.workspaces = [
@@ -133,6 +142,7 @@ describe("fileLinkNavigation", () => {
       },
     ];
     mockOpenExternal.mockResolvedValue(undefined);
+    mockOpenPathWithDefaultApp.mockResolvedValue(undefined);
     mockOpenFileAtLocation.mockResolvedValue(undefined);
     mockSetLayoutMode.mockResolvedValue(undefined);
   });
@@ -219,6 +229,22 @@ describe("fileLinkNavigation", () => {
       filePath: "src/app.ts",
       line: 11,
     });
+
+    expect(
+      resolveLocalFileLinkTarget("C:/Users/dev/repo/My%20File.md#L13", {
+        workspaceRoot: "C:/Users/dev",
+        repos: [{ id: "repo-1", path: "C:/Users/dev/repo" }],
+      }),
+    ).toMatchObject({
+      rootPath: "C:/Users/dev/repo",
+      filePath: "My File.md",
+      absolutePath: "C:/Users/dev/repo/My File.md",
+      line: 13,
+    });
+  });
+
+  it("ignores malformed percent-encoding in absolute paths", () => {
+    expect(classifyLinkTarget("C:/Users/dev/repo/%ZZ.md")).toBe("other");
   });
 
   it("prefers the deepest matching repo root before falling back to the workspace root", () => {
@@ -350,30 +376,29 @@ describe("fileLinkNavigation", () => {
     expect(extractTextLinkMatches("ignore example.com and version 1.2.3")).toEqual([]);
   });
 
-  it("opens local links internally only on shift-click", async () => {
+  it("opens local links with the system default app on click and internally on shift-click", async () => {
     await expect(
       navigateLinkTarget("/workspace/apps/app/src/main.ts#L12C4", { shiftKey: false }),
-    ).resolves.toBe("ignored");
+    ).resolves.toBe("system");
 
-    expect(mockOpenFileAtLocation).not.toHaveBeenCalled();
-    expect(mockSetLayoutMode).not.toHaveBeenCalled();
-    expect(mockShowSurface).not.toHaveBeenCalled();
-    expect(mockSetActiveView).not.toHaveBeenCalled();
-    expect(mockSetExplorerOpen).not.toHaveBeenCalled();
+    expect(mockOpenPathWithDefaultApp).toHaveBeenCalledWith(
+      "/workspace/apps/app/src/main.ts",
+    );
+    expect(mockDispatchEvent).not.toHaveBeenCalled();
 
     await expect(
       navigateLinkTarget("/workspace/apps/app/src/main.ts#L12C4", { shiftKey: true }),
     ).resolves.toBe("internal");
 
-    expect(mockOpenFileAtLocation).toHaveBeenCalledWith(
-      "/workspace/apps/app",
-      "src/main.ts",
-      { line: 12, column: 4 },
-    );
-    expect(mockShowSurface).toHaveBeenCalledWith("ws-1", "editor");
-    expect(mockSetActiveView).toHaveBeenCalledWith("chat");
-    expect(mockSetExplorerOpen).toHaveBeenCalledWith(false);
-    expect(mockSetLayoutMode).not.toHaveBeenCalled();
+    const event = mockDispatchEvent.mock.calls[0]?.[0] as CustomEvent;
+    expect(event.type).toBe("codex-open-file");
+    expect(event.detail).toEqual({
+      rootPath: "/workspace/apps/app",
+      filePath: "src/main.ts",
+      line: 12,
+      column: 4,
+    });
+    expect(mockOpenPathWithDefaultApp).toHaveBeenCalledTimes(1);
   });
 
   it("opens repo-relative local links against the active repo on shift-click", async () => {
@@ -381,27 +406,44 @@ describe("fileLinkNavigation", () => {
       navigateLinkTarget("src/main.ts:12:4", { shiftKey: true }),
     ).resolves.toBe("internal");
 
-    expect(mockOpenFileAtLocation).toHaveBeenCalledWith(
-      "/workspace/apps/app",
-      "src/main.ts",
-      { line: 12, column: 4 },
-    );
-    expect(mockShowSurface).toHaveBeenCalledWith("ws-1", "editor");
-    expect(mockSetExplorerOpen).toHaveBeenCalledWith(false);
-    expect(mockSetLayoutMode).not.toHaveBeenCalled();
+    const event = mockDispatchEvent.mock.calls[0]?.[0] as CustomEvent;
+    expect(event.type).toBe("codex-open-file");
+    expect(event.detail).toEqual({
+      rootPath: "/workspace/apps/app",
+      filePath: "src/main.ts",
+      line: 12,
+      column: 4,
+    });
   });
 
-  it("opens external links through the shell only on shift-click", async () => {
+  it("opens external links through the system shell on a normal click", async () => {
     await expect(
       navigateLinkTarget("https://example.com/docs", { shiftKey: false }),
-    ).resolves.toBe("ignored");
-
-    expect(mockOpenExternal).not.toHaveBeenCalled();
-
-    await expect(
-      navigateLinkTarget("https://example.com/docs", { shiftKey: true }),
     ).resolves.toBe("external");
 
     expect(mockOpenExternal).toHaveBeenCalledWith("https://example.com/docs");
+  });
+
+  it("hands absolute local links outside the workspace to the system default app", async () => {
+    await expect(
+      navigateLinkTarget("/other/place/demo.mp4", { shiftKey: false }),
+    ).resolves.toBe("system");
+
+    expect(mockOpenPathWithDefaultApp).toHaveBeenCalledWith("/other/place/demo.mp4");
+    expect(mockDispatchEvent).not.toHaveBeenCalled();
+  });
+
+  it("decodes the exact Markdown-encoded folder link before opening it", async () => {
+    await expect(
+      navigateLinkTarget(
+        "C:/Users/lemondoo/Documents/Panes%20Memory%20Leak%20Investigation%202026-08-29",
+        { shiftKey: false },
+      ),
+    ).resolves.toBe("system");
+
+    expect(mockOpenPathWithDefaultApp).toHaveBeenCalledWith(
+      "C:/Users/lemondoo/Documents/Panes Memory Leak Investigation 2026-08-29",
+    );
+    expect(mockDispatchEvent).not.toHaveBeenCalled();
   });
 });

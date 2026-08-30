@@ -1,0 +1,102 @@
+{
+  "attachments": {
+    "viewer": {
+      "open": "Open image",
+      "copy": "Copy image",
+      "copySuccess": "Image copied to clipboard.",
+      "copyFailed": "Failed to copy image.",
+      "resetZoom": "Reset zoom",
+      "close": "Close viewer",
+      "loading": "Loading image...",
+      "loadFailed": "Unable to load this image."
+    }
+  },
+  "panel": {
+    "approvalActions": {
+      "deny": "Deny"
+    }
+  },
+  "messageBlocks": {
+    "diffFallback": "diff ({{scope}})",
+    "parsing": "Parsing...",
+    "parsingDiff": "Parsing diff...",
+    "noChanges": "No changes",
+    "thinking": "Thinking",
+    "thinkingDone": "Thought for {{seconds}}s",
+    "actionStatus": {
+      "done": "Done",
+      "running": "Running",
+      "error": "Error",
+      "pending": "Pending"
+    },
+    "deferredOutput": {
+      "loadingFull": "Loading full action output...",
+      "loading": "Loading action output...",
+      "failed": "Failed to load action output.",
+      "retry": "Retry"
+    },
+    "outputTruncated": "Showing latest action output only (older chunks truncated for performance).",
+    "actionGroup": {
+      "summary_one": "{{count}} action completed",
+      "summary_other": "{{count}} actions completed",
+      "errorCount_one": "{{count}} error",
+      "errorCount_other": "{{count}} errors",
+      "types": {
+        "command": "cmd",
+        "file_read": "read",
+        "file_write": "write",
+        "file_edit": "edit",
+        "file_delete": "del",
+        "git": "git",
+        "search": "search",
+        "other": "other"
+      }
+    },
+    "approval": {
+      "decision": {
+        "answered": "Answered",
+        "denied": "Denied",
+        "canceled": "Canceled",
+        "approved": "Approved"
+      },
+      "invalidJson": "Invalid JSON: {{error}}",
+      "payloadMustBeObject": "Payload must be a JSON object.",
+      "actionCount_one": "{{count}} action in this request",
+      "actionCount_other": "{{count}} actions in this request",
+      "execPolicyAmendment": "Exec policy amendment available for {{value}}",
+      "networkAmendment": "Network amendment available for {{value}}",
+      "dynamicTool": "Dynamic tool: {{name}}",
+      "showDetails": "Show details",
+      "hideDetails": "Hide details",
+      "pendingQuestions_one": "{{count}} question pending input.",
+      "pendingQuestions_other": "{{count}} questions pending input.",
+      "answeredQuestions_one": "{{count}} question answered.",
+      "answeredQuestions_other": "{{count}} questions answered.",
+      "dynamicToolPrompt": "Respond to the dynamic tool call without hand-writing JSON.",
+      "dynamicToolSuccess": "Success",
+      "dynamicToolFailure": "Failure",
+      "toolResponsePlaceholder": "Tool response text (optional)",
+      "imageUrlPlaceholder": "Image URL (optional)",
+      "sendToolResponse": "Send tool response",
+      "customPayloadHint": "This request supports a structured response form below. Advanced JSON is still available for edge cases.",
+      "sendPayload": "Send payload"
+    },
+    "contextCompaction": {
+      "summary": "Summary",
+      "prompt": "Compacted prompt"
+    },
+    "toolInput": {
+      "answerInComposer": "Answer this in the chat box below.",
+      "questionCounter": "{{current}} / {{total}}",
+      "recommended": "Recommended",
+      "customAnswerPlaceholder": "Type your own answer",
+      "customAnswerPlaceholderOptional": "Type your own answer, or leave this blank to use the selected option",
+      "selectedOptionFallback": "Type your own answer, or leave this blank to use the selected option",
+      "answerRequiredHint": "Type an answer to continue.",
+      "previousQuestion": "Back",
+      "nextQuestion": "Next question",
+      "otherAnswerPlaceholder": "Other answer (optional)",
+      "sendAnswers": "Send answers"
+    }
+  }
+}

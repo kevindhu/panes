@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import type { EngineHealth, EngineInfo, EngineRuntimeUpdatedEvent } from "../types";
-import { ipc } from "../lib/ipc";
+import { ipc } from "../lib/codexIpc";
 
 interface EngineState {
   engines: EngineInfo[];

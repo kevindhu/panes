@@ -2,6 +2,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -27,6 +28,7 @@ import {
   Copy,
   Check,
   MessageSquare,
+  Search,
 } from "lucide-react";
 import type {
   ActionBlock,
@@ -47,7 +49,6 @@ import {
   isMcpElicitationApproval,
   isPermissionsRequestApproval,
   isRequestUserInputApproval,
-  isSupportedClaudeToolInputApproval,
   parseApprovalCommand,
   parseApprovalReason,
   parseDynamicToolCallArguments,
@@ -78,11 +79,16 @@ import {
   getWorkspacePaneLeafIdFromEventTarget,
   navigateLinkTarget,
 } from "../../lib/fileLinkNavigation";
+import {
+  recordTranscriptLinkPointerDown,
+  transcriptLinkShouldNavigate,
+} from "../../lib/transcriptSelection";
+import { webSearchDetails } from "../../lib/codexTranscript";
 interface Props {
   blocks?: ContentBlock[];
   status?: MessageStatus;
-  engineId?: string;
   workspaceRootPath?: string | null;
+  selectionNamespace?: string;
   onApproval: (approvalId: string, response: ApprovalResponse) => void;
   onLoadActionOutput?: (actionId: string) => Promise<void>;
 }
@@ -92,6 +98,21 @@ const CONTEXT_COMPACTION_PROMPT_DETAIL_PREFIX = "prompt::";
 
 function isBlockLike(value: unknown): value is { type: string } {
   return typeof value === "object" && value !== null && "type" in value;
+}
+
+function getSelectionBlockScopeKey(
+  block: ContentBlock,
+  index: number,
+  blocks: ContentBlock[],
+): string {
+  if (block.type === "action") return `action:${block.actionId}`;
+  if (block.type === "approval") return `approval:${block.approvalId}`;
+  if (block.type === "steer") return `steer:${block.steerId}`;
+  let ordinal = 0;
+  for (let current = 0; current < index; current += 1) {
+    if (blocks[current]?.type === block.type) ordinal += 1;
+  }
+  return `${block.type}:${ordinal}`;
 }
 
 function dedupeDiffBlocksByScope(blocks: ContentBlock[]): ContentBlock[] {
@@ -155,25 +176,25 @@ function handlePlainTextLinkClick(
     return;
   }
 
-  const selection = globalThis.getSelection?.();
-  if (selection && !selection.isCollapsed && selection.toString().trim().length > 0) {
-    event.preventDefault();
-    return;
-  }
-
   event.preventDefault();
-  if (!event.shiftKey) {
-    return;
-  }
-
+  if (!transcriptLinkShouldNavigate(event, event.currentTarget)) return;
   event.stopPropagation();
   void navigateLinkTarget(target, {
-    shiftKey: true,
+    shiftKey: event.shiftKey,
     sourceLeafId: getWorkspacePaneLeafIdFromEventTarget(event.currentTarget),
   });
 }
 
-function LinkifiedPlainText({ text }: { text: string }) {
+export const ACTION_HEADER_MAX_CHARS = 160;
+
+export function truncateActionHeader(text: string): string {
+  if (text.length <= ACTION_HEADER_MAX_CHARS) {
+    return text;
+  }
+  return `${text.slice(0, ACTION_HEADER_MAX_CHARS).trimEnd()}\u2026`;
+}
+
+export function LinkifiedPlainText({ text }: { text: string }) {
   const matches = useMemo(() => extractTextLinkMatches(text), [text]);
   if (matches.length === 0) {
     return <>{text}</>;
@@ -191,6 +212,7 @@ function LinkifiedPlainText({ text }: { text: string }) {
         href={match.text}
         className="chat-plain-link"
         rel="noreferrer noopener"
+        onMouseDown={(event) => recordTranscriptLinkPointerDown(event, event.currentTarget)}
         onClick={(event) => handlePlainTextLinkClick(event, match.text)}
       >
         {match.text}
@@ -212,6 +234,7 @@ const actionIcons: Record<string, typeof Terminal> = {
   file_edit: FileCode2,
   file_read: FileCode2,
   file_delete: FileCode2,
+  search: Search,
 };
 
 /* ── Action Group Segmentation ── */
@@ -241,56 +264,6 @@ function isCardSegment(seg: BlockSegment): seg is InnerSegment {
     return true;
   }
   return false;
-}
-
-function isCompletedActionSegment(
-  segment: InnerSegment,
-): segment is { kind: "single"; block: ActionBlock; index: number } {
-  return (
-    segment.kind === "single" &&
-    segment.block.type === "action" &&
-    segment.block.status !== "running" &&
-    segment.block.status !== "pending"
-  );
-}
-
-function groupCompletedActionsInCard(cardSegments: InnerSegment[]): InnerSegment[] {
-  const actionBlocks: ActionBlock[] = [];
-  const indices: number[] = [];
-  for (const segment of cardSegments) {
-    if (segment.kind === "action-group") {
-      actionBlocks.push(...segment.blocks);
-      indices.push(...segment.indices);
-    } else if (isCompletedActionSegment(segment)) {
-      actionBlocks.push(segment.block);
-      indices.push(segment.index);
-    }
-  }
-
-  if (actionBlocks.length < ACTION_GROUP_MIN_SIZE) {
-    return cardSegments;
-  }
-
-  let insertedGroup = false;
-  const groupedSegment: InnerSegment = {
-    kind: "action-group",
-    blocks: actionBlocks,
-    indices,
-  };
-
-  const groupedSegments: InnerSegment[] = [];
-  for (const segment of cardSegments) {
-    if (segment.kind === "action-group" || isCompletedActionSegment(segment)) {
-      if (insertedGroup) {
-        continue;
-      }
-      insertedGroup = true;
-      groupedSegments.push(groupedSegment);
-      continue;
-    }
-    groupedSegments.push(segment);
-  }
-  return groupedSegments;
 }
 
 function buildBlockSegments(blocks: ContentBlock[], isStreaming?: boolean): BlockSegment[] {
@@ -363,7 +336,10 @@ function buildBlockSegments(blocks: ContentBlock[], isStreaming?: boolean): Bloc
     }
     segments.push({
       kind: "action-card",
-      segments: groupCompletedActionsInCard(cardSegments),
+      // Card styling may span adjacent activity-like blocks, but chronology may
+      // not. Completed actions separated by a thought, diff, or approval must
+      // remain on their original sides of that boundary.
+      segments: cardSegments,
     });
   }
   return segments;
@@ -448,10 +424,12 @@ function ThinkingBlockView({
   block,
   isStreaming,
   workspaceRootPath,
+  selectionScopeId,
 }: {
   block: ThinkingBlock;
   isStreaming: boolean;
   workspaceRootPath?: string | null;
+  selectionScopeId: string;
 }) {
   const { t } = useTranslation("chat");
   const [expanded, setExpanded] = useState(false);
@@ -509,6 +487,7 @@ function ThinkingBlockView({
             content={content}
             className="prose"
             workspaceRootPath={workspaceRootPath}
+            selectionScopeId={selectionScopeId}
             style={{
               fontSize: 12.5,
               color: "var(--text-2)",
@@ -522,300 +501,7 @@ function ThinkingBlockView({
   );
 }
 
-function buildFallbackTurnStatusNotice(
-  blocks: ContentBlock[],
-  status: MessageStatus,
-): NoticeBlock {
-  let actionsTotal = 0;
-  let actionsDone = 0;
-  let actionsError = 0;
-  let actionsRunning = 0;
-  let actionsPending = 0;
-  let approvalsPending = 0;
-  let approvalsAnswered = 0;
-  let diffBlocks = 0;
-  let errorBlocks = 0;
-
-  for (const block of blocks) {
-    if (block.type === "action") {
-      actionsTotal += 1;
-      if (block.status === "done") {
-        actionsDone += 1;
-      } else if (block.status === "error") {
-        actionsError += 1;
-      } else if (block.status === "pending") {
-        actionsPending += 1;
-      } else {
-        actionsRunning += 1;
-      }
-      continue;
-    }
-
-    if (block.type === "approval") {
-      if (block.status === "pending") {
-        approvalsPending += 1;
-      } else {
-        approvalsAnswered += 1;
-      }
-      continue;
-    }
-
-    if (block.type === "diff") {
-      diffBlocks += 1;
-      continue;
-    }
-
-    if (block.type === "error") {
-      errorBlocks += 1;
-    }
-  }
-
-  const details: string[] = [];
-  if (actionsTotal > 0) {
-    details.push(
-      `Actions: ${actionsTotal} total, ${actionsDone} done, ${actionsError} error, ${actionsRunning} running, ${actionsPending} pending`,
-    );
-  }
-  if (approvalsPending > 0 || approvalsAnswered > 0) {
-    details.push(`Approvals: ${approvalsPending} pending, ${approvalsAnswered} answered`);
-  }
-  if (diffBlocks > 0) {
-    details.push(`Diff blocks: ${diffBlocks}`);
-  }
-  if (errorBlocks > 0) {
-    details.push(`Error blocks: ${errorBlocks}`);
-  }
-  if (details.length === 0) {
-    details.push("No tool, approval, diff, or error activity has been recorded yet.");
-  }
-
-  if (approvalsPending > 0) {
-    return {
-      type: "notice",
-      kind: "turn_status",
-      level: "warning",
-      title: status === "streaming" ? "Waiting for approval" : "Approval still pending",
-      message:
-        status === "streaming"
-          ? "Waiting for approval before the turn can continue."
-          : "The turn reached a terminal state while an approval was still unresolved.",
-      details,
-      status: "awaiting_approval",
-    };
-  }
-
-  const terminalPresentation =
-    status === "completed"
-      ? {
-          level: "info" as const,
-          title: "Turn completed",
-          message: "The turn reached a terminal completion.",
-          noticeStatus: "completed",
-        }
-      : status === "interrupted"
-        ? {
-            level: "warning" as const,
-            title: "Turn interrupted",
-            message: "The turn ended before a normal completion.",
-            noticeStatus: "interrupted",
-          }
-        : status === "error"
-          ? {
-              level: "error" as const,
-              title: "Turn failed",
-              message: "The turn ended with an error.",
-              noticeStatus: "failed",
-            }
-          : {
-              level: "info" as const,
-              title: "Turn still open",
-              message: "No terminal completion event has been recorded yet.",
-              noticeStatus: "streaming",
-            };
-
-  return {
-    type: "notice",
-    kind: "turn_status",
-    level: terminalPresentation.level,
-    title: terminalPresentation.title,
-    message: terminalPresentation.message,
-    details,
-    status: terminalPresentation.noticeStatus,
-  };
-}
-
-function humanizeTurnStatusSource(source?: string): string | null {
-  switch (source) {
-    case "engine":
-      return "engine";
-    case "reconciled_stream_lost":
-      return "reconciled after stream loss";
-    case "reconciled_timeout":
-      return "reconciled after timeout";
-    case "timeout_fallback":
-      return "timeout fallback";
-    default:
-      return null;
-  }
-}
-
-function formatTaskDuration(durationMs?: number): string | null {
-  if (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs < 0) {
-    return null;
-  }
-
-  if (durationMs < 1000) {
-    return `${Math.max(0, Math.round(durationMs))}ms`;
-  }
-
-  const totalSeconds = Math.max(1, Math.round(durationMs / 1000));
-  if (totalSeconds < 60) {
-    return `${totalSeconds}s`;
-  }
-
-  const totalMinutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  if (totalMinutes < 60) {
-    return seconds > 0 ? `${totalMinutes}m ${seconds}s` : `${totalMinutes}m`;
-  }
-
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
-  return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
-}
-
-function TurnStatusNoticeView({ block }: { block: NoticeBlock }) {
-  const { t } = useTranslation("chat");
-  const [expanded, setExpanded] = useState(() => block.level !== "info");
-
-  useEffect(() => {
-    if (block.level !== "info") {
-      setExpanded(true);
-    }
-  }, [block.level, block.message]);
-
-  const toggleExpanded = useCallback(() => setExpanded((value) => !value), []);
-  const status = String(block.status ?? "");
-  const sourceLabel = humanizeTurnStatusSource(block.source);
-  const details = Array.isArray(block.details) ? block.details : [];
-  const durationLabel = formatTaskDuration(block.durationMs);
-
-  let Icon = Info;
-  let accent = "var(--info)";
-  let background = "rgba(56, 189, 248, 0.10)";
-  let border = "rgba(56, 189, 248, 0.18)";
-
-  if (status === "completed") {
-    Icon = CheckCircle2;
-    accent = "var(--success)";
-    background = "rgba(34, 197, 94, 0.10)";
-    border = "rgba(34, 197, 94, 0.18)";
-  } else if (status === "failed") {
-    Icon = XCircle;
-    accent = "var(--danger)";
-    background = "rgba(248, 113, 113, 0.10)";
-    border = "rgba(248, 113, 113, 0.18)";
-  } else if (status === "interrupted" || status === "awaiting_approval") {
-    Icon = AlertTriangle;
-    accent = "var(--warning)";
-    background = "rgba(245, 158, 11, 0.10)";
-    border = "rgba(245, 158, 11, 0.18)";
-  } else if (status === "streaming") {
-    Icon = Loader2;
-  }
-
-  return (
-    <div
-      className="msg-notice-block"
-      style={{
-        border: `1px solid ${border}`,
-        background,
-        alignItems: "flex-start",
-      }}
-    >
-      <Icon
-        size={14}
-        style={{
-          flexShrink: 0,
-          color: accent,
-          marginTop: 1,
-          animation: status === "streaming" ? "spin 1s linear infinite" : undefined,
-        }}
-      />
-      <div style={{ minWidth: 0, flex: 1, display: "flex", flexDirection: "column", gap: 6 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-          <div style={{ fontSize: 11, fontWeight: 600, color: accent }}>
-            {block.title}
-          </div>
-          {sourceLabel && (
-            <span
-              style={{
-                fontSize: 10,
-                lineHeight: 1.4,
-                padding: "1px 6px",
-                borderRadius: 999,
-                border: `1px solid ${border}`,
-                color: "var(--text-3)",
-              }}
-            >
-              {sourceLabel}
-            </span>
-          )}
-        </div>
-        <div style={{ color: "var(--text-2)" }}>{block.message}</div>
-        {details.length > 0 && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            <button
-              type="button"
-              className="acard-toggle"
-              onClick={toggleExpanded}
-              style={{ alignSelf: "flex-start" }}
-            >
-              {expanded
-                ? t("messageBlocks.approval.hideDetails")
-                : t("messageBlocks.approval.showDetails")}
-            </button>
-            {expanded && (
-              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                {details.map((detail, index) => (
-                  <div
-                    key={`${detail}:${index}`}
-                    style={{
-                      fontSize: 11.5,
-                      color: "var(--text-2)",
-                      fontFamily: '"JetBrains Mono", monospace',
-                      whiteSpace: "pre-wrap",
-                      wordBreak: "break-word",
-                    }}
-                  >
-                    <LinkifiedPlainText text={detail} />
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-        {durationLabel && (
-          <div
-            style={{
-              color: "var(--text-3)",
-              fontSize: 11,
-              fontFamily: '"JetBrains Mono", monospace',
-            }}
-          >
-            Task took {durationLabel}.
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
 function NoticeBlockView({ block }: { block: NoticeBlock }) {
-  if (block.kind === "turn_status") {
-    return <TurnStatusNoticeView block={block} />;
-  }
-
   if (
     block.kind === "context_compacted" ||
     block.kind.startsWith("codex_context_compaction_")
@@ -966,6 +652,15 @@ function SteerBlockView({ block }: { block: SteerBlock }) {
             })}
           </div>
         )}
+        {block.status && block.status !== "accepted" && (
+          <div className={`msg-steer-status ${block.status}`}>
+            {block.status === "pending"
+              ? "Sending interruption…"
+              : block.status === "failed"
+                ? `Interruption failed${block.error ? `: ${block.error}` : "."}`
+                : "Interruption delivery was not confirmed."}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -985,7 +680,7 @@ function ActionStatusBadge({ status }: { status: string }) {
   if (status === "running") {
     return (
       <span style={{ display: "flex", alignItems: "center", gap: 3, color: "var(--warning)", fontSize: 10, fontWeight: 500 }}>
-        <Loader2 size={11} style={{ animation: "spin 1s linear infinite" }} />
+        <Loader2 size={11} className="animate-spin" />
         {t("messageBlocks.actionStatus.running")}
       </span>
     );
@@ -1036,10 +731,47 @@ function ActionBlockView({
     [outputChunks],
   );
   const Icon = actionIcons[block.actionType] ?? Terminal;
-  const isRunning = block.status === "running";
-  const isPending = block.status === "pending";
-  const hasBody = outputChunks.length > 0 || Boolean(block.result?.error) || outputDeferred;
   const actionDetails = (block.details ?? {}) as Record<string, unknown>;
+  const searchDetails = useMemo(
+    () => block.actionType === "search" ? webSearchDetails(actionDetails) : null,
+    [actionDetails, block.actionType],
+  );
+  const displaySummary = useMemo(() => {
+    if (!searchDetails) return block.summary;
+    if (searchDetails.queries.length > 1) {
+      return `Searched ${searchDetails.queries[0]} +${searchDetails.queries.length - 1} more`;
+    }
+    if (searchDetails.query) return `Searched ${searchDetails.query}`;
+    if (searchDetails.results.length > 0) {
+      return `Read ${searchDetails.results.length} ${searchDetails.results.length === 1 ? "source" : "sources"}`;
+    }
+    return block.summary;
+  }, [block.summary, searchDetails]);
+  const inputDetail = useMemo(() => {
+    const pretty = (value: unknown) => {
+      try {
+        return JSON.stringify(value, null, 2) ?? String(value);
+      } catch {
+        return String(value);
+      }
+    };
+    if (block.actionType === "command") {
+      const command = typeof actionDetails.command === "string" ? actionDetails.command : block.summary;
+      return { label: "Command", content: command };
+    }
+    if (block.actionType === "search") {
+      if (!searchDetails) return { label: "Web search", content: pretty(actionDetails) };
+      const operation = searchDetails.actionType ?? (searchDetails.queries.length > 0 ? "search" : "browse");
+      const queryLines = searchDetails.queries.length > 0
+        ? searchDetails.queries.map((query) => `- ${query}`).join("\n")
+        : "(no textual query emitted)";
+      return { label: "Web search", content: `operation: ${operation}\nqueries:\n${queryLines}` };
+    }
+    if (Object.keys(actionDetails).length > 0) {
+      return { label: "Tool input", content: pretty(actionDetails) };
+    }
+    return { label: "Tool input", content: block.summary };
+  }, [actionDetails, block.actionType, block.summary, searchDetails]);
   const outputTruncated =
     "outputTruncated" in actionDetails && actionDetails.outputTruncated === true;
   const progressMessage =
@@ -1050,7 +782,7 @@ function ActionBlockView({
   const [loadingDeferredOutput, setLoadingDeferredOutput] = useState(false);
   const [deferredOutputError, setDeferredOutputError] = useState<string | null>(null);
   const deferredOutputRequestedRef = useRef(false);
-  const canToggle = hasBody;
+  const canToggle = true;
 
   const requestDeferredOutput = useCallback(() => {
     if (!onLoadDeferredOutput || deferredOutputRequestedRef.current) {
@@ -1085,7 +817,7 @@ function ActionBlockView({
 
   const toggleExpanded = useCallback(() => setExpanded((v) => !v), []);
   return (
-    <div>
+    <div className="msg-action">
       <div
         className={canToggle ? "msg-block-header msg-block-header--compact" : undefined}
         style={canToggle ? undefined : { display: "flex", alignItems: "center", gap: 6, padding: "3px 12px" }}
@@ -1104,8 +836,8 @@ function ActionBlockView({
           />
         )}
         <Icon size={12} style={{ color: "var(--text-3)", flexShrink: 0 }} />
-        <span style={{ fontSize: 11.5, color: "var(--text-2)", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {block.summary}
+        <span className="msg-action-title" title={displaySummary}>
+          {truncateActionHeader(displaySummary)}
         </span>
         <ActionStatusBadge status={block.status} />
         {block.result?.durationMs != null && block.status === "done" && (
@@ -1130,13 +862,40 @@ function ActionBlockView({
         </div>
       )}
 
-      {expanded && (outputChunks.length > 0 || block.result?.error || outputDeferred) && (
-        <div style={{
-          margin: "2px 12px 4px",
-          borderRadius: "var(--radius-sm)",
-          border: "1px solid var(--border)",
-          overflow: "hidden",
-        }}>
+      {expanded && (
+        <div className="legacy-action-details">
+          <div className="legacy-action-input">
+            <span>{inputDetail.label}</span>
+            <pre className="action-output-pre"><LinkifiedPlainText text={inputDetail.content} /></pre>
+          </div>
+
+          {searchDetails && searchDetails.results.length > 0 && (
+            <div className="legacy-web-search-results">
+              <span>Results ({searchDetails.results.length})</span>
+              <div className="codex-native-search-results">
+                {searchDetails.results.map((result, index) => (
+                  <details className="codex-native-search-result" key={`${result.refId ?? result.url ?? result.title}:${index}`}>
+                    <summary>
+                      <span>{result.title}</span>
+                      {result.domain && <small>{result.domain}</small>}
+                      <ChevronRight size={11} />
+                    </summary>
+                    <div className="codex-native-search-result-body">
+                      {result.snippet && <p>{result.snippet}</p>}
+                      {result.url && <div className="codex-native-search-url"><LinkifiedPlainText text={result.url} /></div>}
+                      {(result.refId || result.resultType) && (
+                        <div className="codex-native-search-result-meta">
+                          {result.refId && <span>{result.refId}</span>}
+                          {result.resultType && <span>{result.resultType}</span>}
+                        </div>
+                      )}
+                    </div>
+                  </details>
+                ))}
+              </div>
+            </div>
+          )}
+
           {outputDeferred && outputChunks.length === 0 && (
             <div
               style={{
@@ -1154,7 +913,7 @@ function ActionBlockView({
             >
               <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
                 {loadingDeferredOutput && (
-                  <Loader2 size={12} style={{ animation: "spin 1s linear infinite" }} />
+                  <Loader2 size={12} className="animate-spin" />
                 )}
                 {loadingDeferredOutput
                   ? t("messageBlocks.deferredOutput.loadingFull")
@@ -1213,6 +972,13 @@ function ActionBlockView({
             >
               <LinkifiedPlainText text={String(block.result.error)} />
             </pre>
+          )}
+
+          {!outputDeferred && outputChunks.length === 0 && !block.result?.error && !searchDetails && (
+            <div className="legacy-action-empty-output">No output was emitted.</div>
+          )}
+          {!outputDeferred && outputChunks.length === 0 && !block.result?.error && searchDetails && searchDetails.results.length === 0 && block.status !== "running" && (
+            <div className="legacy-action-empty-output">Codex completed this web action without emitting search results.</div>
           )}
         </div>
       )}
@@ -1274,7 +1040,7 @@ function ActionGroupView({
 
   const toggleExpanded = useCallback(() => setExpanded((v) => !v), []);
   return (
-    <div className="animate-slide-up">
+    <div className="animate-slide-up action-group">
       <div
         className="msg-block-header"
         role="button"
@@ -1415,7 +1181,7 @@ function ToolInputApprovalCard({
   isPending,
 }: {
   block: ApprovalBlock;
-  questions: { id: string; question: string }[];
+  questions: { id: string; question: string; secret?: boolean }[];
   isPending: boolean;
   decisionLabel: string;
   decisionBackground: string;
@@ -1463,7 +1229,7 @@ function ToolInputApprovalCard({
             if (!text) return null;
             return (
               <div key={q.id} className="tool-input-qa-row">
-                {q.question} → <strong>{text}</strong>
+                {q.question} → <strong>{q.secret ? "••••••" : text}</strong>
               </div>
             );
           })}
@@ -1473,42 +1239,15 @@ function ToolInputApprovalCard({
   );
 }
 
-export function shouldShowClaudeUnsupportedApproval(
-  details: Record<string, unknown>,
-  isPending: boolean,
-  isClaudeThread: boolean,
-): boolean {
-  if (!isPending || !isClaudeThread) {
-    return false;
-  }
-
-  const isToolInputRequest = isRequestUserInputApproval(details);
-  const proposedExecpolicyAmendment = parseProposedExecpolicyAmendment(details);
-  const proposedNetworkPolicyAmendments = parseProposedNetworkPolicyAmendments(details);
-
-  return (
-    (isToolInputRequest && !isSupportedClaudeToolInputApproval(details)) ||
-    (!isToolInputRequest &&
-      (isDynamicToolCallApproval(details) ||
-        isMcpElicitationApproval(details) ||
-        requiresCustomApprovalPayload(details))) ||
-    proposedExecpolicyAmendment.length > 0 ||
-    proposedNetworkPolicyAmendments.length > 0
-  );
-}
-
 function ApprovalCard({
   block,
-  engineId,
   onApproval,
 }: {
   block: ApprovalBlock;
-  engineId?: string;
   onApproval: (approvalId: string, response: ApprovalResponse) => void;
 }) {
   const { t } = useTranslation("chat");
   const isPending = block.status === "pending";
-  const isClaudeThread = engineId === "claude";
   const details = block.details ?? {};
   const isToolInputRequest = isRequestUserInputApproval(details);
   const isDynamicToolCall = isDynamicToolCallApproval(details);
@@ -1521,11 +1260,6 @@ function ApprovalCard({
   const proposedExecpolicyAmendment = parseProposedExecpolicyAmendment(details);
   const proposedNetworkPolicyAmendments = parseProposedNetworkPolicyAmendments(details);
   const requestedPermissions = isPermissionsRequest ? parseRequestedPermissions(details) : null;
-  const showClaudeUnsupportedApproval = shouldShowClaudeUnsupportedApproval(
-    details,
-    isPending,
-    isClaudeThread,
-  );
   const dynamicToolName = parseDynamicToolCallName(details);
   const dynamicToolArguments = parseDynamicToolCallArguments(details);
   const mcpServerName = parseMcpElicitationServerName(details);
@@ -1578,7 +1312,7 @@ function ApprovalCard({
     decisionColor = "var(--success)";
   }
 
-  if (isToolInputRequest && toolInputQuestions.length > 0 && !showClaudeUnsupportedApproval) {
+  if (isToolInputRequest && toolInputQuestions.length > 0) {
     return (
       <div>
         <ToolInputApprovalCard
@@ -1712,24 +1446,7 @@ function ApprovalCard({
           )}
         </div>
       )}
-      {showClaudeUnsupportedApproval && (
-        <div className="acard-section">
-          <p className="acard-reason">
-            {t("messageBlocks.approval.claudeUnsupported")}
-          </p>
-          <div className="acard-advanced-footer">
-            <button
-              type="button"
-              className="approval-btn approval-btn-deny"
-              onClick={() => onApproval(block.approvalId, { decision: "decline" })}
-            >
-              {t("panel.approvalActions.deny")}
-            </button>
-          </div>
-        </div>
-      )}
-
-      {isPending && !isClaudeThread && isDynamicToolCall && (
+      {isPending && isDynamicToolCall && (
         <div className="acard-section">
           <div className="acard-advanced" style={{ gap: 10 }}>
             <p className="acard-reason">
@@ -1777,7 +1494,7 @@ function ApprovalCard({
         </div>
       )}
 
-      {isPending && !isClaudeThread && requiresAdvancedJsonFallback && (
+      {isPending && requiresAdvancedJsonFallback && (
         <div className="acard-section">
           <p className="acard-reason">
             {t("messageBlocks.approval.customPayloadHint")}
@@ -1788,7 +1505,7 @@ function ApprovalCard({
       {/* Standard approval — no inline buttons; the approval banner handles it */}
 
       {/* Advanced JSON — for custom payload requests and malformed tool-input fallbacks */}
-      {isPending && !isClaudeThread && requiresAdvancedJsonFallback && (
+      {isPending && requiresAdvancedJsonFallback && (
         <div className="acard-section">
           <div className="acard-advanced">
             <textarea
@@ -1828,12 +1545,13 @@ function renderSingleBlock(
   index: number,
   sourceBlocks: ContentBlock[],
   status: MessageStatus | undefined,
-  engineId: string | undefined,
   workspaceRootPath: string | null | undefined,
   onApproval: (approvalId: string, response: ApprovalResponse) => void,
   onLoadActionOutput: ((actionId: string) => Promise<void>) | undefined,
+  selectionNamespace: string,
 ) {
   const blockKey = getMessageBlockKey(block, index, sourceBlocks);
+  const selectionScopeId = `${selectionNamespace}:${getSelectionBlockScopeKey(block, index, sourceBlocks)}`;
 
   /* ── Text ── */
   if (block.type === "text") {
@@ -1847,9 +1565,10 @@ function renderSingleBlock(
           key={blockKey}
           content={textContent}
           streaming
-          className="prose"
+          className="prose chat-message-prose"
           workspaceRootPath={workspaceRootPath}
-          style={{ fontSize: 13, padding: "6px 14px" }}
+          selectionScopeId={selectionScopeId}
+          style={{ padding: "6px 14px" }}
         />
       );
     }
@@ -1858,9 +1577,10 @@ function renderSingleBlock(
       <MarkdownContent
         key={blockKey}
         content={textContent}
-        className="prose"
+        className="prose chat-message-prose"
         workspaceRootPath={workspaceRootPath}
-        style={{ fontSize: 13, padding: "6px 14px" }}
+        selectionScopeId={selectionScopeId}
+        style={{ padding: "6px 14px" }}
       />
     );
   }
@@ -1954,7 +1674,6 @@ function renderSingleBlock(
       <ApprovalCard
         key={blockKey}
         block={block}
-        engineId={engineId}
         onApproval={onApproval}
       />
     );
@@ -1970,6 +1689,7 @@ function renderSingleBlock(
           block={block}
           isStreaming={thinkingActive}
           workspaceRootPath={workspaceRootPath}
+          selectionScopeId={selectionScopeId}
         />
       </div>
     );
@@ -2001,35 +1721,38 @@ function renderSingleBlock(
 function MessageBlocksView({
   blocks = [],
   status,
-  engineId,
   workspaceRootPath,
+  selectionNamespace,
   onApproval,
   onLoadActionOutput,
 }: Props) {
+  const generatedSelectionNamespace = useId();
+  const resolvedSelectionNamespace = selectionNamespace ?? `message-blocks:${generatedSelectionNamespace}`;
   const safeBlocks = useMemo(
     () => dedupeDiffBlocksByScope(
-      (Array.isArray(blocks) ? blocks : []).filter(isBlockLike) as ContentBlock[],
+      (Array.isArray(blocks) ? blocks : [])
+        .filter(isBlockLike)
+        .filter(
+          (block) =>
+            block.type !== "notice" ||
+            block.kind !== "turn_status",
+        ) as ContentBlock[],
     ),
     [blocks],
   );
 
   const isStreaming = status === "streaming";
-  const renderedBlocks = useMemo(() => {
-    const hasTurnStatus = safeBlocks.some(
-      (block) => block.type === "notice" && block.kind === "turn_status",
-    );
-    if (hasTurnStatus || !status) {
-      return safeBlocks;
-    }
-    return [...safeBlocks, buildFallbackTurnStatusNotice(safeBlocks, status)];
-  }, [safeBlocks, status]);
   const blockSegments = useMemo(
-    () => buildBlockSegments(renderedBlocks, isStreaming),
-    [renderedBlocks, isStreaming],
+    () => buildBlockSegments(safeBlocks, isStreaming),
+    [safeBlocks, isStreaming],
   );
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+    <div
+      className="message-blocks"
+      data-transcript-selection-scope={resolvedSelectionNamespace}
+      style={{ display: "flex", flexDirection: "column", gap: 4 }}
+    >
       {blockSegments.map((segment, segIdx) => {
         if (segment.kind === "divider") {
           return <div key={`divider-${segIdx}`} className="msg-section-divider" />;
@@ -2054,12 +1777,19 @@ function MessageBlocksView({
                   const thinkingBlock = inner.block as ThinkingBlock;
                   const isLastBlock = inner.index === safeBlocks.length - 1;
                   const thinkingActive = status === "streaming" && isLastBlock;
+                  const blockKey = getMessageBlockKey(inner.block, inner.index, safeBlocks);
+                  const selectionBlockKey = getSelectionBlockScopeKey(
+                    inner.block,
+                    inner.index,
+                    safeBlocks,
+                  );
                   return (
                     <ThinkingBlockView
-                      key={getMessageBlockKey(inner.block, inner.index, safeBlocks)}
+                      key={blockKey}
                       block={thinkingBlock}
                       isStreaming={thinkingActive}
                       workspaceRootPath={workspaceRootPath}
+                      selectionScopeId={`${resolvedSelectionNamespace}:${selectionBlockKey}`}
                     />
                   );
                 }
@@ -2068,7 +1798,6 @@ function MessageBlocksView({
                     <ApprovalCard
                       key={(inner.block as ApprovalBlock).approvalId}
                       block={inner.block as ApprovalBlock}
-                      engineId={engineId}
                       onApproval={onApproval}
                     />
                   );
@@ -2112,10 +1841,10 @@ function MessageBlocksView({
           segment.index,
           safeBlocks,
           status,
-          engineId,
           workspaceRootPath,
           onApproval,
           onLoadActionOutput,
+          resolvedSelectionNamespace,
         );
       })}
     </div>
@@ -2127,8 +1856,8 @@ export const MessageBlocks = memo(
   (prev, next) =>
     prev.blocks === next.blocks &&
     prev.status === next.status &&
-    prev.engineId === next.engineId &&
     prev.workspaceRootPath === next.workspaceRootPath &&
+    prev.selectionNamespace === next.selectionNamespace &&
     prev.onApproval === next.onApproval &&
     prev.onLoadActionOutput === next.onLoadActionOutput,
 );

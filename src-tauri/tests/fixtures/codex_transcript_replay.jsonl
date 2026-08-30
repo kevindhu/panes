@@ -1,0 +1,26 @@
+{"method":"turn/started","params":{"threadId":"native-thread-1","turnId":"native-turn-1","turn":{"id":"native-turn-1","status":"inProgress"}}}
+{"method":"item/plan/delta","params":{"threadId":"native-thread-1","turnId":"native-turn-1","itemId":"plan-1","delta":"Inspect the protocol before editing."}}
+{"method":"item/started","params":{"threadId":"native-thread-1","turnId":"native-turn-1","item":{"id":"plan-1","type":"plan","status":"inProgress","text":"Initial plan"}}}
+{"method":"turn/plan/updated","params":{"threadId":"native-thread-1","turnId":"native-turn-1","plan":[{"step":"Inspect protocol","status":"completed"},{"step":"Persist events","status":"inProgress"}]}}
+{"method":"item/completed","params":{"threadId":"native-thread-1","turnId":"native-turn-1","item":{"id":"plan-1","type":"plan","status":"completed","text":"Authoritative final plan"}}}
+{"method":"item/started","params":{"threadId":"native-thread-1","turnId":"native-turn-1","item":{"id":"reason-1","type":"reasoning","status":"inProgress","summary":[],"content":[]}}}
+{"method":"item/reasoning/summaryPartAdded","params":{"threadId":"native-thread-1","turnId":"native-turn-1","itemId":"reason-1","summaryIndex":0}}
+{"method":"item/reasoning/summaryTextDelta","params":{"threadId":"native-thread-1","turnId":"native-turn-1","itemId":"reason-1","summaryIndex":0,"delta":"Checking ordering. "}}
+{"method":"item/reasoning/textDelta","params":{"threadId":"native-thread-1","turnId":"native-turn-1","itemId":"reason-1","contentIndex":0,"delta":"Full reasoning stream."}}
+{"method":"item/completed","params":{"threadId":"native-thread-1","turnId":"native-turn-1","item":{"id":"reason-1","type":"reasoning","status":"completed","summary":["Checking ordering."],"content":["Full reasoning stream."]}}}
+{"method":"item/started","params":{"threadId":"native-thread-1","turnId":"native-turn-1","item":{"id":"cmd-1","type":"commandExecution","status":"inProgress","command":"printf hello","cwd":"C:\\workspace","aggregatedOutput":""}}}
+{"method":"item/commandExecution/outputDelta","params":{"threadId":"native-thread-1","turnId":"native-turn-1","itemId":"cmd-1","stream":"stdout","delta":"hello\n"}}
+{"method":"item/completed","params":{"threadId":"native-thread-1","turnId":"native-turn-1","item":{"id":"cmd-1","type":"commandExecution","status":"completed","command":"printf hello","cwd":"C:\\workspace","aggregatedOutput":"hello\n","exitCode":0}}}
+{"method":"item/started","params":{"threadId":"native-thread-1","turnId":"native-turn-1","item":{"id":"file-1","type":"fileChange","status":"inProgress","changes":[]}}}
+{"method":"item/fileChange/patchUpdated","params":{"threadId":"native-thread-1","turnId":"native-turn-1","itemId":"file-1","changes":[{"path":"src/main.rs","kind":"update","diff":"@@ -1 +1 @@\n-old\n+new\n"}]}}
+{"method":"item/completed","params":{"threadId":"native-thread-1","turnId":"native-turn-1","item":{"id":"file-1","type":"fileChange","status":"completed","changes":[{"path":"src/main.rs","kind":"update","diff":"@@ -1 +1 @@\n-old\n+new\n"}]}}}
+{"method":"item/started","params":{"threadId":"native-thread-1","turnId":"native-turn-1","item":{"id":"mcp-1","type":"mcpToolCall","status":"inProgress","server":"docs","tool":"search","arguments":{"query":"streaming"}}}}
+{"method":"item/mcpToolCall/progress","params":{"threadId":"native-thread-1","turnId":"native-turn-1","itemId":"mcp-1","message":"Searching documentation"}}
+{"method":"item/completed","params":{"threadId":"native-thread-1","turnId":"native-turn-1","item":{"id":"mcp-1","type":"mcpToolCall","status":"completed","server":"docs","tool":"search","arguments":{"query":"streaming"},"result":{"content":[{"type":"text","text":"Found it"}]}}}}
+{"method":"item/started","params":{"threadId":"native-thread-1","turnId":"native-turn-1","item":{"id":"agent-1","type":"agentMessage","status":"inProgress","text":""}}}
+{"method":"item/agentMessage/delta","params":{"threadId":"native-thread-1","turnId":"native-turn-1","itemId":"agent-1","delta":"Final answer."}}
+{"method":"item/completed","params":{"threadId":"native-thread-1","turnId":"native-turn-1","item":{"id":"agent-1","type":"agentMessage","status":"completed","text":"Final answer."}}}
+{"id":"request-1","method":"item/tool/requestUserInput","params":{"threadId":"native-thread-1","turnId":"native-turn-1","itemId":"question-1","questions":[{"id":"choice","header":"Choice","question":"Continue?","options":[{"label":"Yes","description":"Continue"}]}]}}
+{"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread-1","turnId":"native-turn-1","tokenUsage":{"total":{"inputTokens":120,"cachedInputTokens":20,"cacheWriteInputTokens":4,"outputTokens":40,"reasoningOutputTokens":10,"totalTokens":160},"last":{"inputTokens":12,"cachedInputTokens":2,"cacheWriteInputTokens":1,"outputTokens":4,"reasoningOutputTokens":1,"totalTokens":16},"modelContextWindow":258400}}}
+{"method":"future/turnArtifact","params":{"threadId":"native-thread-1","turnId":"native-turn-1","opaque":{"nested":[1,2,3]},"text":"retain me"}}
+{"method":"turn/completed","params":{"threadId":"native-thread-1","turnId":"native-turn-1","turn":{"id":"native-turn-1","status":"completed"}}}

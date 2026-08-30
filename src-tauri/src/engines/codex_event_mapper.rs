@@ -68,6 +68,7 @@ impl TurnEventMapper {
         match method_key.as_str() {
             "turnstarted" => vec![EngineEvent::TurnStarted {
                 client_turn_id: None,
+                native_turn_id: extract_native_turn_id(params),
             }],
             "turncompleted" => {
                 let mut events = Vec::new();
@@ -304,6 +305,7 @@ impl TurnEventMapper {
                         Some(ParsedTurnStatus::Active) => {
                             out.push(EngineEvent::TurnStarted {
                                 client_turn_id: None,
+                                native_turn_id: extract_native_turn_id(result),
                             });
                         }
                         Some(ParsedTurnStatus::Terminal(completion_status)) => {
@@ -615,6 +617,7 @@ impl TurnEventMapper {
                         diff,
                         duration_ms,
                     },
+                    details: Some(item.clone()),
                 }]
             }
             "agentMessage" => {
@@ -1326,20 +1329,18 @@ struct RateLimitWindowInfo {
 
 const CONTEXT_WINDOW_BASELINE_TOKENS: u64 = 12_000;
 
-fn extract_context_tokens(token_usage: &Value) -> Option<u64> {
+fn context_token_bucket(token_usage: &Value) -> &Value {
     token_usage
         .get("last")
-        .and_then(|last| {
-            extract_any_u64(last, &["totalTokens", "total_tokens"])
-                .or_else(|| extract_any_u64(last, &["inputTokens", "input_tokens"]))
-        })
-        .or_else(|| {
-            token_usage.get("total").and_then(|total| {
-                extract_any_u64(total, &["totalTokens", "total_tokens"])
-                    .or_else(|| extract_any_u64(total, &["inputTokens", "input_tokens"]))
-            })
-        })
-        .or_else(|| extract_any_u64(token_usage, &["totalTokens", "total_tokens"]))
+        .filter(|value| value.is_object())
+        .or_else(|| token_usage.get("total").filter(|value| value.is_object()))
+        .unwrap_or(token_usage)
+}
+
+fn extract_context_tokens(token_usage: &Value) -> Option<u64> {
+    let bucket = context_token_bucket(token_usage);
+    extract_any_u64(bucket, &["totalTokens", "total_tokens"])
+        .or_else(|| extract_any_u64(bucket, &["inputTokens", "input_tokens"]))
 }
 
 fn calculate_context_window_percent_remaining(
@@ -1366,6 +1367,19 @@ fn extract_context_usage_limits(value: &Value) -> Option<UsageLimitsSnapshot> {
         .or_else(|| value.get("turn").and_then(|turn| turn.get("tokenUsage")))?;
 
     let current_tokens = extract_context_tokens(token_usage);
+    let bucket = context_token_bucket(token_usage);
+    let input_tokens = extract_any_u64(bucket, &["inputTokens", "input_tokens"]);
+    let cached_input_tokens =
+        extract_any_u64(bucket, &["cachedInputTokens", "cached_input_tokens"]);
+    let cache_write_input_tokens = extract_any_u64(
+        bucket,
+        &["cacheWriteInputTokens", "cache_write_input_tokens"],
+    );
+    let output_tokens = extract_any_u64(bucket, &["outputTokens", "output_tokens"]);
+    let reasoning_output_tokens = extract_any_u64(
+        bucket,
+        &["reasoningOutputTokens", "reasoning_output_tokens"],
+    );
 
     let max_context_tokens =
         extract_any_u64(token_usage, &["modelContextWindow", "model_context_window"]);
@@ -1385,6 +1399,11 @@ fn extract_context_usage_limits(value: &Value) -> Option<UsageLimitsSnapshot> {
         current_tokens,
         max_context_tokens,
         context_window_percent,
+        input_tokens,
+        cached_input_tokens,
+        cache_write_input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
         ..UsageLimitsSnapshot::default()
     })
 }
@@ -1393,6 +1412,11 @@ fn has_usage_limit_metrics(snapshot: &UsageLimitsSnapshot) -> bool {
     snapshot.current_tokens.is_some()
         || snapshot.max_context_tokens.is_some()
         || snapshot.context_window_percent.is_some()
+        || snapshot.input_tokens.is_some()
+        || snapshot.cached_input_tokens.is_some()
+        || snapshot.cache_write_input_tokens.is_some()
+        || snapshot.output_tokens.is_some()
+        || snapshot.reasoning_output_tokens.is_some()
         || snapshot.five_hour_percent.is_some()
         || snapshot.weekly_percent.is_some()
         || snapshot.five_hour_resets_at.is_some()
@@ -1417,6 +1441,26 @@ fn merge_context_usage_snapshot(
 
     if target.context_window_percent != context_update.context_window_percent {
         target.context_window_percent = context_update.context_window_percent;
+        changed = true;
+    }
+    if target.input_tokens != context_update.input_tokens {
+        target.input_tokens = context_update.input_tokens;
+        changed = true;
+    }
+    if target.cached_input_tokens != context_update.cached_input_tokens {
+        target.cached_input_tokens = context_update.cached_input_tokens;
+        changed = true;
+    }
+    if target.cache_write_input_tokens != context_update.cache_write_input_tokens {
+        target.cache_write_input_tokens = context_update.cache_write_input_tokens;
+        changed = true;
+    }
+    if target.output_tokens != context_update.output_tokens {
+        target.output_tokens = context_update.output_tokens;
+        changed = true;
+    }
+    if target.reasoning_output_tokens != context_update.reasoning_output_tokens {
+        target.reasoning_output_tokens = context_update.reasoning_output_tokens;
         changed = true;
     }
 
@@ -1649,6 +1693,14 @@ fn extract_any_string(value: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
+fn extract_native_turn_id(value: &Value) -> Option<String> {
+    extract_any_string(value, &["turnId", "turn_id"]).or_else(|| {
+        value
+            .get("turn")
+            .and_then(|turn| extract_any_string(turn, &["id", "turnId", "turn_id"]))
+    })
+}
+
 fn extract_any_u64(value: &Value, keys: &[&str]) -> Option<u64> {
     for key in keys {
         if let Some(found) = value.get(*key) {
@@ -1734,6 +1786,83 @@ fn join_string_array(items: Option<&Vec<Value>>) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn turn_started_carries_the_native_codex_turn_id() {
+        let mut mapper = TurnEventMapper::default();
+        let events = mapper.map_notification(
+            "turn/started",
+            &json!({ "turn": { "id": "turn-native-1" } }),
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [EngineEvent::TurnStarted {
+                native_turn_id: Some(turn_id),
+                ..
+            }] if turn_id == "turn-native-1"
+        ));
+    }
+
+    #[test]
+    fn web_search_completion_carries_the_authoritative_queries_and_results() {
+        let mut mapper = TurnEventMapper::default();
+        let started = json!({
+            "item": {
+                "type": "webSearch",
+                "id": "search-1",
+                "query": "",
+                "action": null,
+                "results": null
+            }
+        });
+        let completed = json!({
+            "item": {
+                "type": "webSearch",
+                "id": "search-1",
+                "query": "Shiro no Yakata game",
+                "action": {
+                    "type": "search",
+                    "query": "Shiro no Yakata game"
+                },
+                "results": [{
+                    "type": "text_result",
+                    "domain": "zell23.livedoor.blog",
+                    "ref_id": "turn0search0",
+                    "title": "Developer blog",
+                    "url": "https://zell23.livedoor.blog/"
+                }]
+            }
+        });
+
+        assert!(matches!(
+            mapper.map_notification("item/started", &started).as_slice(),
+            [EngineEvent::ActionStarted { details, .. }]
+                if details.get("action") == Some(&Value::Null)
+        ));
+        let events = mapper.map_notification("item/completed", &completed);
+        match events.as_slice() {
+            [EngineEvent::ActionCompleted {
+                result,
+                details: Some(details),
+                ..
+            }] => {
+                assert!(result.success);
+                assert_eq!(
+                    details.get("query").and_then(Value::as_str),
+                    Some("Shiro no Yakata game")
+                );
+                assert_eq!(
+                    details
+                        .get("results")
+                        .and_then(Value::as_array)
+                        .map(Vec::len),
+                    Some(1)
+                );
+            }
+            other => panic!("expected authoritative web-search completion, got {other:?}"),
+        }
+    }
 
     #[test]
     fn map_turn_result_keeps_non_terminal_status_aliases_active() {
@@ -1858,6 +1987,54 @@ mod tests {
                 assert_eq!(summary, "Qual linguagem usar?");
             }
             _ => panic!("expected approval request event"),
+        }
+    }
+
+    #[test]
+    fn map_server_request_preserves_current_user_input_question_contract() {
+        let mut mapper = TurnEventMapper::default();
+        let params = json!({
+            "threadId": "thr_123",
+            "turnId": "turn_123",
+            "itemId": "item_43",
+            "isBlocking": true,
+            "autoResolutionMs": null,
+            "questions": [{
+                "id": "scope",
+                "header": "Scope",
+                "question": "Which scope?",
+                "isOther": false,
+                "isSecret": false,
+                "options": [{
+                    "label": "Focused",
+                    "description": "Only the affected flow"
+                }]
+            }]
+        });
+
+        let approval = mapper
+            .map_server_request(
+                "request-current",
+                &json!(43),
+                "item/tool/requestUserInput",
+                &params,
+            )
+            .expect("expected approval request");
+
+        match approval.event {
+            EngineEvent::ApprovalRequested { details, .. } => {
+                assert_eq!(details.get("isBlocking"), Some(&json!(true)));
+                assert_eq!(details.pointer("/questions/0/isOther"), Some(&json!(false)));
+                assert_eq!(
+                    details.pointer("/questions/0/isSecret"),
+                    Some(&json!(false))
+                );
+                assert_eq!(
+                    details.pointer("/questions/0/options/0/description"),
+                    Some(&json!("Only the affected flow"))
+                );
+            }
+            other => panic!("expected approval request event, got {other:?}"),
         }
     }
 
@@ -2122,6 +2299,11 @@ mod tests {
             "turnId": "turn_123",
             "tokenUsage": {
                 "last": {
+                    "inputTokens": 24000,
+                    "cachedInputTokens": 10000,
+                    "cacheWriteInputTokens": 1000,
+                    "outputTokens": 6000,
+                    "reasoningOutputTokens": 2000,
                     "totalTokens": 30000
                 },
                 "total": {
@@ -2139,6 +2321,11 @@ mod tests {
                 assert_eq!(usage.current_tokens, Some(30000));
                 assert_eq!(usage.max_context_tokens, Some(200000));
                 assert_eq!(usage.context_window_percent, Some(90));
+                assert_eq!(usage.input_tokens, Some(24000));
+                assert_eq!(usage.cached_input_tokens, Some(10000));
+                assert_eq!(usage.cache_write_input_tokens, Some(1000));
+                assert_eq!(usage.output_tokens, Some(6000));
+                assert_eq!(usage.reasoning_output_tokens, Some(2000));
             }
             _ => panic!("expected usage limits update"),
         }

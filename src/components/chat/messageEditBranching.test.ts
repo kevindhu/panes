@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { Message } from "../../types";
 import {
+  canForkFromAssistantMessage,
   computeDroppedTurnsForEditedMessage,
+  computeTurnsAfterAssistantMessage,
   extractEditableMessageContext,
   isEditableUserTurn,
+  messagesBeforeEditableUserTurn,
   mergeUniqueChatAttachments,
   removeChatAttachmentById,
 } from "./messageEditBranching";
@@ -45,14 +48,19 @@ function createUserMessage(
   };
 }
 
-function createAssistantMessage(id: string, content: string): Message {
+function createAssistantMessage(
+  id: string,
+  content: string,
+  options?: { nativeTurnId?: string; status?: Message["status"] },
+): Message {
   return {
     id,
     threadId: "thread-1",
     role: "assistant",
     content,
     blocks: [{ type: "text", content }],
-    status: "completed",
+    nativeTurnId: options?.nativeTurnId,
+    status: options?.status ?? "completed",
     schemaVersion: 1,
     createdAt: "2026-05-19T12:00:00.000Z",
   };
@@ -96,6 +104,52 @@ describe("messageEditBranching", () => {
     expect(isEditableUserTurn(messages[2])).toBe(false);
     expect(computeDroppedTurnsForEditedMessage(messages, "user-1")).toBe(2);
     expect(computeDroppedTurnsForEditedMessage(messages, "steer-1")).toBeNull();
+  });
+
+  it("projects the retained history immediately when editing an earlier turn", () => {
+    const messages = [
+      createUserMessage("user-1", "First"),
+      createAssistantMessage("assistant-1", "Reply"),
+      createUserMessage("user-2", "Second"),
+      createAssistantMessage("assistant-2", "Reply"),
+    ];
+
+    expect(messagesBeforeEditableUserTurn(messages, "user-2")).toEqual(
+      messages.slice(0, 2),
+    );
+    expect(messagesBeforeEditableUserTurn(messages, "assistant-1")).toBeNull();
+  });
+
+  it("counts only later native turns when forking from an assistant response", () => {
+    const messages = [
+      createUserMessage("user-1", "First"),
+      createAssistantMessage("assistant-1", "Reply"),
+      createUserMessage("steer-1", "Follow this instead", { isSteer: true }),
+      createUserMessage("user-2", "Second"),
+      createAssistantMessage("assistant-2", "Reply"),
+      createUserMessage("user-3", "Third"),
+      createAssistantMessage("assistant-3", "Reply"),
+    ];
+
+    expect(computeTurnsAfterAssistantMessage(messages, "assistant-1")).toBe(2);
+    expect(computeTurnsAfterAssistantMessage(messages, "assistant-3")).toBe(0);
+    expect(computeTurnsAfterAssistantMessage(messages, "user-1")).toBeNull();
+  });
+
+  it("allows an active-source fork only from a terminal assistant with a native turn id", () => {
+    const anchored = createAssistantMessage("assistant-1", "Reply", {
+      nativeTurnId: "turn-native-1",
+    });
+    const legacy = createAssistantMessage("assistant-legacy", "Reply");
+    const streaming = createAssistantMessage("assistant-active", "Working", {
+      nativeTurnId: "turn-native-active",
+      status: "streaming",
+    });
+
+    expect(canForkFromAssistantMessage(anchored, true)).toBe(true);
+    expect(canForkFromAssistantMessage(legacy, true)).toBe(false);
+    expect(canForkFromAssistantMessage(legacy, false)).toBe(true);
+    expect(canForkFromAssistantMessage(streaming, true)).toBe(false);
   });
 
   it("extracts editable text, attachments, and plan mode from a user message", () => {

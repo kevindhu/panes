@@ -124,15 +124,9 @@ jobs:
       - name: Windows keep awake backend tests
         working-directory: src-tauri
         run: cargo test power::tests --lib
-      - name: Windows terminal tests
-        working-directory: src-tauri
-        run: cargo test terminal::tests --lib
       - name: Windows Codex engine tests
         working-directory: src-tauri
         run: cargo test codex::tests --lib
-      - name: Windows Claude sidecar tests
-        working-directory: src-tauri
-        run: cargo test claude_sidecar::tests --lib
 
   windows_bundle_check:
     runs-on: windows-latest
@@ -160,7 +154,7 @@ jobs:
         run: pnpm exec tauri build --ci --bundles nsis --config src-tauri/tauri.windows.bundle-check.conf.json --no-sign
         env:
           PANES_SKIP_DESKTOP_PREBUILD: "1"
-      - name: Validate local Windows NSIS install and bundled sidecar
+      - name: Validate local Windows NSIS install
         shell: pwsh
         run: |
           $setupExe = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter *-setup.exe | Select-Object -First 1
@@ -181,39 +175,6 @@ jobs:
           $appBinary = Get-ChildItem $installRoot -Recurse -Filter Panes.exe | Select-Object -First 1
           if (-not $appBinary) {
             throw "Unable to locate installed Panes.exe."
-          }
-
-          $sidecar = Get-ChildItem $installRoot -Recurse -Filter claude-agent-sdk-server.mjs | Select-Object -First 1
-          if (-not $sidecar) {
-            throw "Unable to locate bundled Claude sidecar in installed app."
-          }
-
-          Get-Command git | Out-Null
-          Get-Command node | Out-Null
-
-          $sidecarOut = Join-Path $env:RUNNER_TEMP "panes-bundle-check-sidecar.out"
-          $sidecarErr = Join-Path $env:RUNNER_TEMP "panes-bundle-check-sidecar.err"
-          if (Test-Path $sidecarOut) { Remove-Item -Force $sidecarOut }
-          if (Test-Path $sidecarErr) { Remove-Item -Force $sidecarErr }
-
-          $sidecarProc = Start-Process -FilePath node -ArgumentList $sidecar.FullName -PassThru -RedirectStandardOutput $sidecarOut -RedirectStandardError $sidecarErr
-          $ready = $false
-          for ($attempt = 1; $attempt -le 5; $attempt++) {
-            if ((Test-Path $sidecarOut) -and ((Get-Content $sidecarOut -Raw) -match '"type":"ready"')) {
-              $ready = $true
-              break
-            }
-            Start-Sleep -Seconds 2
-          }
-
-          if (-not $ready) {
-            if (Test-Path $sidecarOut) { Get-Content $sidecarOut }
-            if (Test-Path $sidecarErr) { Get-Content $sidecarErr }
-            throw "Bundled Claude sidecar did not reach ready state."
-          }
-
-          if (-not $sidecarProc.HasExited) {
-            Stop-Process -Id $sidecarProc.Id -Force
           }
 
           $appProc = Start-Process -FilePath $appBinary.FullName -WorkingDirectory $appBinary.Directory.FullName -PassThru
@@ -420,9 +381,6 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-
-      - name: Build platform Claude sidecar assets
-        run: pnpm run build:claude-sidecar
 
       - name: Build universal macOS bundles
         if: matrix.platform == 'macos-15'
@@ -693,7 +651,7 @@ jobs:
           }
           NODE
 
-      - name: Validate Debian package install and bundled sidecar
+      - name: Validate Debian package install
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -720,7 +678,6 @@ jobs:
           dpkg -s "$PACKAGE_NAME"
 
           DESKTOP_FILE="$(dpkg -L "$PACKAGE_NAME" | grep '/applications/.*\.desktop$' | head -n 1)"
-          SIDECAR_PATH="$(dpkg -L "$PACKAGE_NAME" | grep 'claude-agent-sdk-server\.mjs$' | head -n 1)"
           APP_BINARY="$(dpkg -L "$PACKAGE_NAME" | while IFS= read -r candidate; do
             if [ -f "$candidate" ] && [ -x "$candidate" ] && file "$candidate" | grep -q 'ELF'; then
               echo "$candidate"
@@ -734,12 +691,6 @@ jobs:
             exit 1
           fi
 
-          if [ -z "$SIDECAR_PATH" ]; then
-            echo "Unable to locate bundled Claude sidecar in installed package."
-            dpkg -L "$PACKAGE_NAME"
-            exit 1
-          fi
-
           if [ -z "$APP_BINARY" ]; then
             echo "Unable to locate installed Panes ELF binary."
             dpkg -L "$PACKAGE_NAME"
@@ -747,9 +698,6 @@ jobs:
           fi
 
           test -f "$DESKTOP_FILE"
-          test -f "$SIDECAR_PATH"
-          command -v git
-          command -v node
 
           timeout 20s xvfb-run -a "$APP_BINARY" >/tmp/panes-linux.out 2>/tmp/panes-linux.err || STATUS=$?
           if [ "${STATUS:-0}" -ne 0 ] && [ "${STATUS:-0}" -ne 124 ]; then
@@ -822,7 +770,7 @@ jobs:
           }
           NODE
 
-      - name: Validate universal DMG install and bundled sidecar
+      - name: Validate universal DMG install
         run: |
           DMG_PATH="$(find artifacts -maxdepth 1 -name '*.dmg' -print -quit)"
           if [ -z "$DMG_PATH" ]; then
@@ -858,33 +806,10 @@ jobs:
           cp -R /tmp/panes-mount/Panes.app /tmp/panes-app/Panes.app
 
           APP_BINARY="/tmp/panes-app/Panes.app/Contents/MacOS/Panes"
-          SIDECAR_PATH="$(find /tmp/panes-app/Panes.app/Contents/Resources -path '*claude-agent-sdk-server.mjs' -print -quit)"
-
           file "$APP_BINARY"
           lipo -info "$APP_BINARY"
           file "$APP_BINARY" | grep -Eq 'arm64|aarch64'
           file "$APP_BINARY" | grep -q 'x86_64'
-          test -n "$SIDECAR_PATH"
-          command -v git
-          command -v node
-
-          node "$SIDECAR_PATH" >/tmp/panes-sidecar.out 2>/tmp/panes-sidecar.err &
-          SIDECAR_PID=$!
-          for attempt in 1 2 3 4 5; do
-            if grep -q '"type":"ready"' /tmp/panes-sidecar.out; then
-              break
-            fi
-            if [ "$attempt" -eq 5 ]; then
-              cat /tmp/panes-sidecar.out || true
-              cat /tmp/panes-sidecar.err || true
-              echo "Bundled Claude sidecar did not reach ready state."
-              exit 1
-            fi
-            sleep 2
-          done
-          if kill -0 "$SIDECAR_PID" 2>/dev/null; then
-            kill "$SIDECAR_PID"
-          fi
 
           open -g /tmp/panes-app/Panes.app
           for attempt in 1 2 3 4 5; do
@@ -990,7 +915,7 @@ jobs:
           '@
           node -e $script
 
-      - name: Validate Windows NSIS install and bundled sidecar
+      - name: Validate Windows NSIS install
         shell: pwsh
         run: |
           $setupExe = Get-ChildItem artifacts -Filter *-setup.exe | Select-Object -First 1
@@ -1011,39 +936,6 @@ jobs:
           $appBinary = Get-ChildItem $installRoot -Recurse -Filter Panes.exe | Select-Object -First 1
           if (-not $appBinary) {
             throw "Unable to locate installed Panes.exe."
-          }
-
-          $sidecar = Get-ChildItem $installRoot -Recurse -Filter claude-agent-sdk-server.mjs | Select-Object -First 1
-          if (-not $sidecar) {
-            throw "Unable to locate bundled Claude sidecar in installed app."
-          }
-
-          Get-Command git | Out-Null
-          Get-Command node | Out-Null
-
-          $sidecarOut = Join-Path $env:RUNNER_TEMP "panes-sidecar.out"
-          $sidecarErr = Join-Path $env:RUNNER_TEMP "panes-sidecar.err"
-          if (Test-Path $sidecarOut) { Remove-Item -Force $sidecarOut }
-          if (Test-Path $sidecarErr) { Remove-Item -Force $sidecarErr }
-
-          $sidecarProc = Start-Process -FilePath node -ArgumentList $sidecar.FullName -PassThru -RedirectStandardOutput $sidecarOut -RedirectStandardError $sidecarErr
-          $ready = $false
-          for ($attempt = 1; $attempt -le 5; $attempt++) {
-            if ((Test-Path $sidecarOut) -and ((Get-Content $sidecarOut -Raw) -match '"type":"ready"')) {
-              $ready = $true
-              break
-            }
-            Start-Sleep -Seconds 2
-          }
-
-          if (-not $ready) {
-            if (Test-Path $sidecarOut) { Get-Content $sidecarOut }
-            if (Test-Path $sidecarErr) { Get-Content $sidecarErr }
-            throw "Bundled Claude sidecar did not reach ready state."
-          }
-
-          if (-not $sidecarProc.HasExited) {
-            Stop-Process -Id $sidecarProc.Id -Force
           }
 
           $appProc = Start-Process -FilePath $appBinary.FullName -WorkingDirectory $appBinary.Directory.FullName -PassThru
