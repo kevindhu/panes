@@ -79,15 +79,10 @@ export function computeTurnsAfterAssistantMessage(
 
 export function canForkFromAssistantMessage(
   message: Message,
-  sourceTurnActive: boolean,
 ): boolean {
-  if (message.role !== "assistant" || message.status === "streaming") {
-    return false;
-  }
-
-  // A native turn id gives Codex an immutable boundary even if a newer turn is
-  // only optimistically visible in the frontend and has not reached app-server yet.
-  return !sourceTurnActive || Boolean(message.nativeTurnId?.trim());
+  // The backend validates this exact completed local boundary. Messages with a
+  // native turn id take the fast native path; legacy messages use compatibility.
+  return message.role === "assistant" && message.status !== "streaming";
 }
 
 export interface EditableMessageContext {

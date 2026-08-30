@@ -160,6 +160,46 @@ afterEach(async () => {
 });
 
 describe("CodexChat submission", () => {
+  it("shows compatibility rollback progress before the user tries to send", async () => {
+    const pendingThread: Thread = {
+      ...thread,
+      engineMetadata: {
+        codexCompatibilityFork: true,
+        engineRollbackPending: true,
+      },
+    };
+    useThreadStore.setState({
+      threads: [pendingThread],
+      threadsByWorkspace: { "workspace-1": [pendingThread] },
+    });
+
+    await act(async () => root.render(<CodexChat />));
+
+    expect(container.querySelector('[role="status"]')?.textContent)
+      .toContain("Confirming compatibility rollback in Codex");
+    expect(container.querySelector<HTMLTextAreaElement>("textarea")?.disabled).toBe(false);
+  });
+
+  it("shows a persisted background rollback failure without waiting for send", async () => {
+    const failedThread: Thread = {
+      ...thread,
+      engineMetadata: {
+        codexCompatibilityFork: true,
+        engineRollbackPending: true,
+        engineRollbackError: "durable marker missing",
+      },
+    };
+    useThreadStore.setState({
+      threads: [failedThread],
+      threadsByWorkspace: { "workspace-1": [failedThread] },
+    });
+
+    await act(async () => root.render(<CodexChat />));
+
+    expect(container.querySelector('[role="alert"]')?.textContent)
+      .toContain("Rollback preparation failed");
+  });
+
   it("toggles Fast mode from the composer toolbar", async () => {
     mockIpc.setThreadCodexConfig.mockResolvedValueOnce({
       ...thread,

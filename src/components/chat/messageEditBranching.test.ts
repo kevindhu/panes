@@ -136,7 +136,7 @@ describe("messageEditBranching", () => {
     expect(computeTurnsAfterAssistantMessage(messages, "user-1")).toBeNull();
   });
 
-  it("allows an active-source fork only from a terminal assistant with a native turn id", () => {
+  it("allows completed legacy and native responses but not a streaming response", () => {
     const anchored = createAssistantMessage("assistant-1", "Reply", {
       nativeTurnId: "turn-native-1",
     });
@@ -146,10 +146,9 @@ describe("messageEditBranching", () => {
       status: "streaming",
     });
 
-    expect(canForkFromAssistantMessage(anchored, true)).toBe(true);
-    expect(canForkFromAssistantMessage(legacy, true)).toBe(false);
-    expect(canForkFromAssistantMessage(legacy, false)).toBe(true);
-    expect(canForkFromAssistantMessage(streaming, true)).toBe(false);
+    expect(canForkFromAssistantMessage(anchored)).toBe(true);
+    expect(canForkFromAssistantMessage(legacy)).toBe(true);
+    expect(canForkFromAssistantMessage(streaming)).toBe(false);
   });
 
   it("extracts editable text, attachments, and plan mode from a user message", () => {

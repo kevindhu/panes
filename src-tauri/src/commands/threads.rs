@@ -19,7 +19,7 @@ use crate::{
     engines::SandboxPolicy,
     engines::ThreadSyncSnapshot,
     models::{
-        CodexRemoteThreadDto, CodexRemoteThreadPageDto, MessageStatusDto,
+        CodexRemoteThreadDto, CodexRemoteThreadPageDto, MessageDto, MessageStatusDto,
         ReasoningEffortOptionDto, RepoDto, ThreadDto,
         ThreadStatusDto, TrustLevelDto,
     },
@@ -1033,6 +1033,7 @@ pub async fn sync_thread_from_engine(
     let has_local_turn = state.turns.get(&thread_id).await.is_some();
     let has_active_remote_turn =
         !snapshot.active_flags.is_empty() || imported_messages_have_streaming_turn(&snapshot);
+    let compatibility_fork = is_codex_compatibility_fork(thread.engine_metadata.as_ref());
     let should_import_messages =
         !has_local_turn && !has_active_remote_turn && !snapshot.imported_messages.is_empty();
     if should_import_messages {
@@ -1074,6 +1075,11 @@ pub async fn sync_thread_from_engine(
     );
     codex_thread_metadata::set_confirmed_remote_turn(&mut metadata, has_active_remote_turn);
     let metadata = mark_codex_transcript_imported(metadata, should_import_messages);
+    let metadata = if compatibility_fork && !has_local_turn && !has_active_remote_turn {
+        mark_codex_compatibility_history_complete(metadata)
+    } else {
+        metadata
+    };
     let next_status = resolve_codex_sync_thread_status(&snapshot, has_local_turn);
 
     run_db(db, {
@@ -1228,9 +1234,10 @@ struct CodexForkPoint {
 }
 
 fn has_stable_active_fork_boundary(fork_point: Option<&CodexForkPoint>) -> bool {
-    fork_point.is_some_and(|fork_point| {
-        fork_point.source_message_id.is_some() && fork_point.last_turn_id.is_some()
-    })
+    // The database validates that this exact message is a completed assistant
+    // response. A native turn id keeps the fast native-fork path; a legacy message
+    // without one is materialized through the compatibility path instead.
+    fork_point.is_some_and(|fork_point| fork_point.source_message_id.is_some())
 }
 
 /// Metadata key marking a branch whose engine-level Codex fork has not completed yet.
@@ -1241,6 +1248,13 @@ const ENGINE_FORK_SOURCE_KEY: &str = "engineForkSourceEngineThreadId";
 const ENGINE_FORK_LAST_TURN_KEY: &str = "engineForkLastTurnId";
 /// Optional number of trailing turns to drop when resolving the fork point.
 const ENGINE_FORK_TURNS_AFTER_KEY: &str = "engineForkTurnsAfter";
+const ENGINE_FORK_ERROR_KEY: &str = "engineForkError";
+/// Marks a branch whose engine thread was rebuilt from sanitized visible history.
+const CODEX_COMPATIBILITY_FORK_KEY: &str = "codexCompatibilityFork";
+/// Confirms that the display mirror contains both the durable injected prefix and
+/// native app-server turns for a compatibility fork.
+const CODEX_COMPATIBILITY_HISTORY_COMPLETE_KEY: &str =
+    "codexCompatibilityHistoryComplete";
 
 /// Everything the deferred background fork needs to materialize the engine thread for a
 /// branch, captured from the source thread at branch-creation time.
@@ -1249,6 +1263,10 @@ struct EngineForkIntent {
     source_engine_thread_id: String,
     last_turn_id: Option<String>,
     turns_after: Option<u32>,
+}
+
+fn fork_boundary_requires_compatibility(intent: &EngineForkIntent) -> bool {
+    intent.turns_after.is_some() && intent.last_turn_id.is_none()
 }
 
 pub fn is_engine_fork_pending(metadata: Option<&Value>) -> bool {
@@ -1296,6 +1314,7 @@ fn mark_engine_fork_pending(mut metadata: Value, intent: &EngineForkIntent) -> V
     }
     if let Some(object) = metadata.as_object_mut() {
         object.insert(ENGINE_FORK_PENDING_KEY.to_string(), json!(true));
+        object.remove(ENGINE_FORK_ERROR_KEY);
         object.insert(
             ENGINE_FORK_SOURCE_KEY.to_string(),
             json!(intent.source_engine_thread_id),
@@ -1327,6 +1346,27 @@ fn clear_engine_fork_pending(mut metadata: Value) -> Value {
         object.remove(ENGINE_FORK_SOURCE_KEY);
         object.remove(ENGINE_FORK_LAST_TURN_KEY);
         object.remove(ENGINE_FORK_TURNS_AFTER_KEY);
+        object.remove(ENGINE_FORK_ERROR_KEY);
+    }
+    metadata
+}
+
+fn is_codex_compatibility_fork(metadata: Option<&Value>) -> bool {
+    metadata
+        .and_then(|value| value.get(CODEX_COMPATIBILITY_FORK_KEY))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn mark_codex_compatibility_history_complete(mut metadata: Value) -> Value {
+    if !metadata.is_object() {
+        metadata = json!({});
+    }
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert(
+            CODEX_COMPATIBILITY_HISTORY_COMPLETE_KEY.to_string(),
+            json!(true),
+        );
     }
     metadata
 }
@@ -1338,6 +1378,12 @@ const ENGINE_ROLLBACK_PHASE_KEY: &str = "engineRollbackPhase";
 const ENGINE_ROLLBACK_NUM_TURNS_KEY: &str = "engineRollbackNumTurns";
 const ENGINE_ROLLBACK_SOURCE_TURN_COUNT_KEY: &str = "engineRollbackSourceTurnCount";
 const ENGINE_ROLLBACK_TARGET_TURN_COUNT_KEY: &str = "engineRollbackTargetTurnCount";
+const ENGINE_ROLLBACK_ERROR_KEY: &str = "engineRollbackError";
+/// Codex-owned durable marker counts bracketing a compatibility rollback request.
+/// Unlike `Thread.turns`, these include a definitive persisted completion signal even
+/// when most model-visible history came from `thread/inject_items`.
+const ENGINE_ROLLBACK_MARKERS_BEFORE_KEY: &str = "engineRollbackMarkersBefore";
+const ENGINE_ROLLBACK_MARKERS_AFTER_KEY: &str = "engineRollbackMarkersAfter";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum EngineRollbackPhase {
@@ -1357,6 +1403,75 @@ struct EngineRollbackIntent {
 #[serde(rename_all = "camelCase")]
 struct CodexRollbackMaterializedEvent {
     thread_id: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexCompatibilityForkMaterializedEvent {
+    thread_id: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadUpdatedEvent {
+    thread_id: String,
+    workspace_id: String,
+    thread: Option<ThreadDto>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexHistoryMutationFailedEvent {
+    thread_id: String,
+    operation: String,
+    message: String,
+}
+
+fn emit_codex_compatibility_fork_materialized(
+    app: &tauri::AppHandle,
+    thread_id: &str,
+) {
+    if let Err(error) = app.emit(
+        "codex-compatibility-fork-materialized",
+        CodexCompatibilityForkMaterializedEvent {
+            thread_id: thread_id.to_string(),
+        },
+    ) {
+        log::warn!(
+            "failed to emit materialized compatibility fork for thread {thread_id}: {error}"
+        );
+    }
+}
+
+fn emit_thread_updated(app: &tauri::AppHandle, thread: ThreadDto) {
+    let event = ThreadUpdatedEvent {
+        thread_id: thread.id.clone(),
+        workspace_id: thread.workspace_id.clone(),
+        thread: Some(thread),
+    };
+    if let Err(error) = app.emit("thread-updated", event) {
+        log::warn!("failed to emit materialized thread update: {error}");
+    }
+}
+
+fn emit_codex_history_mutation_failed(
+    app: &tauri::AppHandle,
+    thread_id: &str,
+    operation: &str,
+    message: &str,
+) {
+    if let Err(error) = app.emit(
+        "codex-history-mutation-failed",
+        CodexHistoryMutationFailedEvent {
+            thread_id: thread_id.to_string(),
+            operation: operation.to_string(),
+            message: message.to_string(),
+        },
+    ) {
+        log::warn!(
+            "failed to emit Codex {operation} failure for thread {thread_id}: {error}"
+        );
+    }
 }
 
 pub fn emit_codex_rollback_materialized(app: &tauri::AppHandle, thread_id: &str) {
@@ -1437,6 +1552,9 @@ fn mark_engine_rollback_pending(mut metadata: Value, intent: &EngineRollbackInte
             ENGINE_ROLLBACK_TARGET_TURN_COUNT_KEY.to_string(),
             json!(intent.target_turn_count),
         );
+        object.remove(ENGINE_ROLLBACK_ERROR_KEY);
+        object.remove(ENGINE_ROLLBACK_MARKERS_BEFORE_KEY);
+        object.remove(ENGINE_ROLLBACK_MARKERS_AFTER_KEY);
     }
     metadata
 }
@@ -1448,21 +1566,62 @@ fn clear_engine_rollback_pending(mut metadata: Value) -> Value {
         object.remove(ENGINE_ROLLBACK_NUM_TURNS_KEY);
         object.remove(ENGINE_ROLLBACK_SOURCE_TURN_COUNT_KEY);
         object.remove(ENGINE_ROLLBACK_TARGET_TURN_COUNT_KEY);
+        object.remove(ENGINE_ROLLBACK_ERROR_KEY);
+        object.remove(ENGINE_ROLLBACK_MARKERS_BEFORE_KEY);
+        object.remove(ENGINE_ROLLBACK_MARKERS_AFTER_KEY);
     }
     metadata
 }
 
+fn engine_rollback_marker_expectation(metadata: Option<&Value>) -> Option<(u64, u64)> {
+    let metadata = metadata?;
+    let before = metadata
+        .get(ENGINE_ROLLBACK_MARKERS_BEFORE_KEY)
+        .and_then(Value::as_u64)?;
+    let after = metadata
+        .get(ENGINE_ROLLBACK_MARKERS_AFTER_KEY)
+        .and_then(Value::as_u64)?;
+    (before.checked_add(1) == Some(after)).then_some((before, after))
+}
+
+fn mark_engine_rollback_marker_expectation(mut metadata: Value, before: u64) -> Result<Value, String> {
+    let after = next_engine_rollback_marker_count(before)?;
+    if !metadata.is_object() {
+        metadata = json!({});
+    }
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert(ENGINE_ROLLBACK_MARKERS_BEFORE_KEY.to_string(), json!(before));
+        object.insert(ENGINE_ROLLBACK_MARKERS_AFTER_KEY.to_string(), json!(after));
+    }
+    Ok(metadata)
+}
+
+fn next_engine_rollback_marker_count(before: u64) -> Result<u64, String> {
+    before
+        .checked_add(1)
+        .ok_or_else(|| "Codex rollback marker count overflow".to_string())
+}
+
 #[tauri::command]
 pub async fn fork_codex_thread(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     thread_id: String,
     profile_operation_id: Option<String>,
 ) -> Result<ThreadDto, String> {
-    fork_codex_thread_inner(state.inner(), thread_id, None, profile_operation_id).await
+    fork_codex_thread_inner(
+        state.inner(),
+        thread_id,
+        None,
+        profile_operation_id,
+        Some(app),
+    )
+    .await
 }
 
 #[tauri::command]
 pub async fn fork_codex_thread_at_turn(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     thread_id: String,
     source_message_id: Option<String>,
@@ -1483,6 +1642,7 @@ pub async fn fork_codex_thread_at_turn(
             turns_after,
         }),
         profile_operation_id,
+        Some(app),
     )
     .await
 }
@@ -1492,6 +1652,7 @@ async fn fork_codex_thread_inner(
     thread_id: String,
     fork_point: Option<CodexForkPoint>,
     profile_operation_id: Option<String>,
+    app: Option<tauri::AppHandle>,
 ) -> Result<ThreadDto, String> {
     let profile_operation_id = profile_operation_id
         .as_deref()
@@ -1639,7 +1800,7 @@ async fn fork_codex_thread_inner(
     );
 
     // Best-effort prefetch so the engine thread is usually ready before the user sends.
-    spawn_engine_fork_prefetch(state.clone(), created.id.clone());
+    spawn_engine_fork_prefetch(app, state.clone(), created.id.clone());
 
     Ok(created)
 }
@@ -1690,36 +1851,82 @@ async fn perform_engine_fork(
     branch: &ThreadDto,
     intent: &EngineForkIntent,
 ) -> Result<ThreadDto, String> {
-    let last_turn_id = match intent.last_turn_id.clone() {
-        Some(last_turn_id) => Some(last_turn_id),
-        None => match intent.turns_after {
-            Some(turns_after) if turns_after > 0 => Some(
-                state
-                    .engines
-                    .resolve_codex_fork_turn_id(&intent.source_engine_thread_id, turns_after)
-                    .await
-                    .map_err(err_to_string)?,
-            ),
-            _ => None,
-        },
+    let (cwd, model_id, sandbox) = build_codex_branch_context(state, branch).await?;
+    // A partial fork without a native turn id points inside injected/legacy history.
+    // `Thread.turns` cannot represent that boundary, even when the current rollout is
+    // otherwise safe to fork natively, so materialize the exact cloned prefix.
+    let compatibility_fork = if fork_boundary_requires_compatibility(intent) {
+        true
+    } else {
+        match state
+            .engines
+            .codex_fork_requires_compatibility(&intent.source_engine_thread_id)
+            .await
+        {
+            Ok(required) => required,
+            Err(error) => {
+                // An unreadable or malformed lineage cannot be proven safe for opaque
+                // encrypted reasoning, so prefer the sanitized path.
+                log::warn!(
+                    "could not verify native fork safety for Codex thread {}; using compatibility fork: {error:#}",
+                    intent.source_engine_thread_id
+                );
+                true
+            }
+        }
     };
 
-    let (cwd, model_id, sandbox) = build_codex_branch_context(state, branch).await?;
-
     let remote_fork_started_at = Instant::now();
-    let forked = state
-        .engines
-        .fork_codex_thread(
-            &intent.source_engine_thread_id,
-            &cwd,
-            &model_id,
-            last_turn_id.as_deref(),
-            sandbox,
-        )
-        .await
-        .map_err(err_to_string)?;
+    let forked = if compatibility_fork {
+        let history_items = run_db(state.db.clone(), {
+            let branch_id = branch.id.clone();
+            move |db| {
+                let messages = db::messages::get_thread_messages(db, &branch_id)?;
+                Ok(build_codex_compatibility_history_items(&messages))
+            }
+        })
+        .await?;
+        state
+            .engines
+            .create_codex_compatibility_fork(&cwd, &model_id, sandbox, history_items)
+            .await
+            .map_err(err_to_string)?
+    } else {
+        let last_turn_id = match intent.last_turn_id.clone() {
+            Some(last_turn_id) => Some(last_turn_id),
+            None => match intent.turns_after {
+                Some(turns_after) if turns_after > 0 => Some(
+                    state
+                        .engines
+                        .resolve_codex_fork_turn_id(
+                            &intent.source_engine_thread_id,
+                            turns_after,
+                        )
+                        .await
+                        .map_err(err_to_string)?,
+                ),
+                _ => None,
+            },
+        };
+        state
+            .engines
+            .fork_codex_thread(
+                &intent.source_engine_thread_id,
+                &cwd,
+                &model_id,
+                last_turn_id.as_deref(),
+                sandbox,
+            )
+            .await
+            .map_err(err_to_string)?
+    };
     log::info!(
-        "materialized deferred codex fork for thread {} in {}ms (engine_thread_id={})",
+        "materialized deferred codex {} fork for thread {} in {}ms (engine_thread_id={})",
+        if forked.compatibility_fork {
+            "compatibility"
+        } else {
+            "native"
+        },
         branch.id,
         format_elapsed_ms(remote_fork_started_at),
         forked.engine_thread_id,
@@ -1728,12 +1935,128 @@ async fn perform_engine_fork(
     attach_forked_engine_to_branch(state, branch, &forked).await
 }
 
+fn build_codex_compatibility_history_items(messages: &[MessageDto]) -> Vec<Value> {
+    messages
+        .iter()
+        .filter_map(|message| {
+            let role = match message.role.as_str() {
+                "user" => "user",
+                "assistant" => "assistant",
+                _ => return None,
+            };
+            let text = compatibility_message_text(message)?;
+            let content_type = if role == "assistant" {
+                "output_text"
+            } else {
+                "input_text"
+            };
+            Some(json!({
+                "type": "message",
+                "role": role,
+                "content": [{
+                    "type": content_type,
+                    "text": text,
+                }],
+            }))
+        })
+        .collect()
+}
+
+fn compatibility_message_text(message: &MessageDto) -> Option<String> {
+    if let Some(content) = message
+        .content
+        .as_ref()
+        .filter(|content| !content.trim().is_empty())
+    {
+        return Some(content.clone());
+    }
+
+    let text = message
+        .blocks
+        .as_ref()
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("content").and_then(Value::as_str))
+        .filter(|content| !content.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then_some(text)
+}
+
+async fn persist_pending_mutation_error(
+    state: &AppState,
+    thread_id: &str,
+    metadata_key: &'static str,
+    error: &str,
+) -> Result<ThreadDto, String> {
+    let message = error.chars().take(600).collect::<String>();
+    run_db(state.db.clone(), {
+        let thread_id = thread_id.to_string();
+        move |db| {
+            let thread = db::threads::get_thread(db, &thread_id)?
+                .ok_or_else(|| anyhow::anyhow!("thread not found: {thread_id}"))?;
+            let mutation_is_still_pending = match metadata_key {
+                ENGINE_FORK_ERROR_KEY => is_engine_fork_pending(thread.engine_metadata.as_ref()),
+                ENGINE_ROLLBACK_ERROR_KEY => {
+                    is_engine_rollback_pending(thread.engine_metadata.as_ref())
+                }
+                _ => false,
+            };
+            if !mutation_is_still_pending {
+                return Ok(thread);
+            }
+
+            let mut metadata = thread.engine_metadata.clone().unwrap_or_else(|| json!({}));
+            if !metadata.is_object() {
+                metadata = json!({});
+            }
+            if let Some(object) = metadata.as_object_mut() {
+                object.insert(metadata_key.to_string(), json!(message));
+            }
+            db::threads::update_engine_metadata(db, &thread_id, &metadata)?;
+            db::threads::get_thread(db, &thread_id)?
+                .ok_or_else(|| anyhow::anyhow!("thread not found after recording error: {thread_id}"))
+        }
+    })
+    .await
+}
+
 /// Fires off the background prefetch that materializes a branch's engine thread. Errors
 /// are swallowed — the fork will simply be retried on first use of the branch.
-fn spawn_engine_fork_prefetch(state: AppState, thread_id: String) {
+fn spawn_engine_fork_prefetch(
+    app: Option<tauri::AppHandle>,
+    state: AppState,
+    thread_id: String,
+) {
     tokio::spawn(async move {
-        if let Err(error) = resolve_pending_engine_fork(&state, &thread_id).await {
-            log::warn!("background codex fork prefetch for thread {thread_id} failed: {error}");
+        match resolve_pending_engine_fork(&state, &thread_id).await {
+            Ok(thread) => {
+                let compatibility_fork =
+                    is_codex_compatibility_fork(thread.engine_metadata.as_ref());
+                if let Some(app) = app.as_ref() {
+                    emit_thread_updated(app, thread);
+                    if compatibility_fork {
+                        emit_codex_compatibility_fork_materialized(app, &thread_id);
+                    }
+                }
+            }
+            Err(error) => {
+                log::warn!("background codex fork prefetch for thread {thread_id} failed: {error}");
+                if let Some(app) = app.as_ref() {
+                    if let Ok(thread) = persist_pending_mutation_error(
+                        &state,
+                        &thread_id,
+                        ENGINE_FORK_ERROR_KEY,
+                        &error,
+                    )
+                    .await
+                    {
+                        emit_thread_updated(app, thread);
+                    }
+                    emit_codex_history_mutation_failed(app, &thread_id, "fork", &error);
+                }
+            }
         }
     });
 }
@@ -1928,6 +2251,10 @@ async fn perform_engine_rollback(
     thread: &ThreadDto,
     intent: &EngineRollbackIntent,
 ) -> Result<ThreadDto, String> {
+    if is_codex_compatibility_fork(thread.engine_metadata.as_ref()) {
+        return perform_compatibility_engine_rollback(state, thread, intent).await;
+    }
+
     let mut persistence_thread = thread.clone();
     let rollback_snapshot = match intent.phase {
         EngineRollbackPhase::Prepared => {
@@ -1980,6 +2307,202 @@ async fn perform_engine_rollback(
     .await
 }
 
+async fn perform_compatibility_engine_rollback(
+    state: &AppState,
+    thread: &ThreadDto,
+    intent: &EngineRollbackIntent,
+) -> Result<ThreadDto, String> {
+    let engine_thread_id = thread
+        .engine_thread_id
+        .as_deref()
+        .ok_or_else(|| "Codex thread has not been initialized yet".to_string())?;
+    let mut persistence_thread = thread.clone();
+
+    let rollback_snapshot = match intent.phase {
+        EngineRollbackPhase::Prepared => {
+            let marker_state = state
+                .engines
+                .codex_rollback_marker_state(engine_thread_id)
+                .await
+                .map_err(err_to_string)?;
+            persistence_thread = persist_compatibility_rollback_marker_expectation(
+                state,
+                thread,
+                marker_state.count,
+                true,
+            )
+            .await?;
+            let expected_marker_count =
+                next_engine_rollback_marker_count(marker_state.count)?;
+            execute_compatibility_engine_rollback(
+                state,
+                &persistence_thread,
+                intent,
+                expected_marker_count,
+            )
+            .await?
+        }
+        EngineRollbackPhase::Started => {
+            let marker_state = state
+                .engines
+                .codex_rollback_marker_state(engine_thread_id)
+                .await
+                .map_err(err_to_string)?;
+
+            if let Some((before, after)) =
+                engine_rollback_marker_expectation(thread.engine_metadata.as_ref())
+            {
+                if marker_state.count == after {
+                    read_codex_rollback_snapshot(state, thread).await?
+                } else if marker_state.count == before {
+                    execute_compatibility_engine_rollback(state, thread, intent, after).await?
+                } else {
+                    return Err(format!(
+                        "Codex compatibility thread {} changed while rollback was pending: found {} durable rollback markers, expected {before} or {after}",
+                        thread.id, marker_state.count
+                    ));
+                }
+            } else if legacy_compatibility_rollback_completed(thread, &marker_state) {
+                // Compatibility rollbacks created before durable marker expectations were
+                // added can still be recovered without guessing from the lossy native turn
+                // list. A newer Codex-owned marker proves that the remote request completed.
+                read_codex_rollback_snapshot(state, thread).await?
+            } else {
+                persistence_thread = persist_compatibility_rollback_marker_expectation(
+                    state,
+                    thread,
+                    marker_state.count,
+                    false,
+                )
+                .await?;
+                let expected_marker_count =
+                    next_engine_rollback_marker_count(marker_state.count)?;
+                execute_compatibility_engine_rollback(
+                    state,
+                    &persistence_thread,
+                    intent,
+                    expected_marker_count,
+                )
+                .await?
+            }
+        }
+    };
+
+    run_db(state.db.clone(), move |db| {
+        persist_codex_in_place_rollback(db, &persistence_thread, &rollback_snapshot)
+    })
+    .await
+}
+
+async fn persist_compatibility_rollback_marker_expectation(
+    state: &AppState,
+    thread: &ThreadDto,
+    before: u64,
+    mark_started: bool,
+) -> Result<ThreadDto, String> {
+    run_db(state.db.clone(), {
+        let thread_id = thread.id.clone();
+        move |db| {
+            let current = if mark_started {
+                db::threads::mark_pending_rollback_started(db, &thread_id)?
+            } else {
+                db::threads::get_thread(db, &thread_id)?.ok_or_else(|| {
+                    anyhow::anyhow!("thread not found while recording rollback marker: {thread_id}")
+                })?
+            };
+            let metadata = mark_engine_rollback_marker_expectation(
+                current
+                    .engine_metadata
+                    .clone()
+                    .unwrap_or_else(|| json!({})),
+                before,
+            )
+            .map_err(anyhow::Error::msg)?;
+            db::threads::update_engine_metadata(db, &thread_id, &metadata)?;
+            db::threads::get_thread(db, &thread_id)?.ok_or_else(|| {
+                anyhow::anyhow!("thread not found after recording rollback marker: {thread_id}")
+            })
+        }
+    })
+    .await
+}
+
+fn legacy_compatibility_rollback_completed(
+    thread: &ThreadDto,
+    marker_state: &crate::engines::codex::CodexRollbackMarkerState,
+) -> bool {
+    let Some(marker_timestamp) = marker_state.latest_timestamp.as_deref() else {
+        return false;
+    };
+    let Some(sync_timestamp) = thread
+        .engine_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("codexSyncUpdatedAt"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let Ok(marker_timestamp) = DateTime::parse_from_rfc3339(marker_timestamp) else {
+        return false;
+    };
+    let Ok(sync_timestamp) = DateTime::parse_from_rfc3339(sync_timestamp) else {
+        return false;
+    };
+    marker_timestamp > sync_timestamp
+}
+
+async fn read_codex_rollback_snapshot(
+    state: &AppState,
+    thread: &ThreadDto,
+) -> Result<ThreadSyncSnapshot, String> {
+    let engine_thread_id = thread
+        .engine_thread_id
+        .as_deref()
+        .ok_or_else(|| "Codex thread has not been initialized yet".to_string())?;
+    state
+        .engines
+        .read_thread_sync_snapshot(thread)
+        .await
+        .map_err(err_to_string)?
+        .ok_or_else(|| format!("Codex thread {engine_thread_id} could not be read"))
+}
+
+async fn execute_compatibility_engine_rollback(
+    state: &AppState,
+    thread: &ThreadDto,
+    intent: &EngineRollbackIntent,
+    expected_marker_count: u64,
+) -> Result<ThreadSyncSnapshot, String> {
+    let engine_thread_id = thread
+        .engine_thread_id
+        .as_deref()
+        .ok_or_else(|| "Codex thread has not been initialized yet".to_string())?;
+    let remote_rollback_started_at = Instant::now();
+    let snapshot = state
+        .engines
+        .rollback_codex_thread(engine_thread_id, intent.num_turns)
+        .await
+        .map_err(err_to_string)?;
+    let marker_state = state
+        .engines
+        .codex_rollback_marker_state(engine_thread_id)
+        .await
+        .map_err(err_to_string)?;
+    if marker_state.count != expected_marker_count {
+        return Err(format!(
+            "Codex compatibility rollback for thread {} returned without its durable marker: found {} markers, expected {expected_marker_count}",
+            thread.id, marker_state.count
+        ));
+    }
+    log::info!(
+        "materialized remote-authoritative compatibility rollback for thread {} in {}ms (durable_markers={})",
+        thread.id,
+        format_elapsed_ms(remote_rollback_started_at),
+        marker_state.count,
+    );
+    Ok(snapshot)
+}
+
 async fn execute_native_engine_rollback(
     state: &AppState,
     thread: &ThreadDto,
@@ -2025,12 +2548,24 @@ fn spawn_engine_rollback_prefetch(
     thread_id: String,
 ) {
     tokio::spawn(async move {
-        if let Err(error) =
-            resolve_pending_engine_rollback(&state, &thread_id, Some(&app)).await
-        {
-            log::warn!(
-                "background codex rollback prefetch for thread {thread_id} failed: {error}"
-            );
+        match resolve_pending_engine_rollback(&state, &thread_id, Some(&app)).await {
+            Ok(thread) => emit_thread_updated(&app, thread),
+            Err(error) => {
+                log::warn!(
+                    "background codex rollback prefetch for thread {thread_id} failed: {error}"
+                );
+                if let Ok(thread) = persist_pending_mutation_error(
+                    &state,
+                    &thread_id,
+                    ENGINE_ROLLBACK_ERROR_KEY,
+                    &error,
+                )
+                .await
+                {
+                    emit_thread_updated(&app, thread);
+                }
+                emit_codex_history_mutation_failed(&app, &thread_id, "rollback", &error);
+            }
         }
     });
 }
@@ -2783,6 +3318,7 @@ async fn attach_forked_engine_to_branch(
         let preview = forked.preview.clone();
         let raw_status = forked.raw_status.clone();
         let active_flags = forked.active_flags.clone();
+        let compatibility_fork = forked.compatibility_fork;
         move |db| {
             db::threads::set_engine_thread_id(db, &branch.id, &forked_engine_thread_id)?;
 
@@ -2792,6 +3328,16 @@ async fn attach_forked_engine_to_branch(
             if let Some(object) = metadata.as_object_mut() {
                 object.insert("lastModelId".to_string(), json!(forked_model_id));
                 object.insert("codexTranscriptImported".to_string(), json!(true));
+                if compatibility_fork {
+                    object.insert(CODEX_COMPATIBILITY_FORK_KEY.to_string(), json!(true));
+                    object.insert(
+                        CODEX_COMPATIBILITY_HISTORY_COMPLETE_KEY.to_string(),
+                        json!(true),
+                    );
+                } else {
+                    object.remove(CODEX_COMPATIBILITY_FORK_KEY);
+                    object.remove(CODEX_COMPATIBILITY_HISTORY_COMPLETE_KEY);
+                }
             }
             let mut metadata = merge_codex_runtime_metadata(
                 Some(metadata),
@@ -2821,10 +3367,26 @@ async fn attach_forked_engine_to_branch(
 }
 
 fn is_codex_thread_sync_required(metadata: Option<&Value>) -> bool {
+    let Some(metadata) = metadata else {
+        return false;
+    };
     metadata
-        .and_then(|value| value.get("codexSyncRequired"))
+        .get("codexSyncRequired")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+        || metadata
+            .get(ENGINE_FORK_PENDING_KEY)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || metadata
+            .get(ENGINE_ROLLBACK_PENDING_KEY)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || (is_codex_compatibility_fork(Some(metadata))
+            && metadata
+                .get(CODEX_COMPATIBILITY_HISTORY_COMPLETE_KEY)
+                .and_then(Value::as_bool)
+                != Some(true))
 }
 
 fn should_clone_local_branch_history(source_thread: &ThreadDto) -> bool {
@@ -2833,11 +3395,14 @@ fn should_clone_local_branch_history(source_thread: &ThreadDto) -> bool {
 }
 
 fn codex_thread_has_local_transcript_for_history_tools(thread: &ThreadDto) -> bool {
+    if is_codex_thread_sync_required(thread.engine_metadata.as_ref()) {
+        return false;
+    }
     if codex_transcript_imported(thread.engine_metadata.as_ref()) {
         return true;
     }
 
-    !is_codex_thread_sync_required(thread.engine_metadata.as_ref()) && thread.message_count > 0
+    thread.message_count > 0
 }
 
 fn persist_codex_in_place_rollback(
@@ -3645,6 +4210,68 @@ mod tests {
         .expect("failed to create thread")
     }
 
+    fn compatibility_test_message(
+        role: &str,
+        content: Option<&str>,
+        blocks: Option<Value>,
+    ) -> MessageDto {
+        MessageDto {
+            id: Uuid::new_v4().to_string(),
+            thread_id: "thread".to_string(),
+            role: role.to_string(),
+            content: content.map(str::to_string),
+            blocks,
+            native_turn_id: None,
+            turn_engine_id: Some("codex".to_string()),
+            turn_model_id: Some("gpt-5.4".to_string()),
+            turn_reasoning_effort: None,
+            schema_version: 1,
+            status: MessageStatusDto::Completed,
+            token_usage: None,
+            created_at: "2026-08-29T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn compatibility_history_contains_only_visible_user_and_assistant_text() {
+        let messages = vec![
+            compatibility_test_message("user", Some("Old question"), None),
+            compatibility_test_message(
+                "assistant",
+                None,
+                Some(json!([
+                    { "type": "thinking", "content": "hidden reasoning" },
+                    { "type": "text", "content": "Old answer" },
+                    { "type": "action", "actionId": "stale-call" }
+                ])),
+            ),
+            compatibility_test_message("system", Some("do not replay"), None),
+            compatibility_test_message("assistant", Some("   "), None),
+        ];
+
+        let items = build_codex_compatibility_history_items(&messages);
+
+        assert_eq!(
+            items,
+            vec![
+                json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "Old question" }]
+                }),
+                json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "Old answer" }]
+                }),
+            ]
+        );
+        let serialized = serde_json::to_string(&items).expect("serialize compatibility history");
+        assert!(!serialized.contains("encrypted_content"));
+        assert!(!serialized.contains("stale-call"));
+        assert!(!serialized.contains("hidden reasoning"));
+    }
+
     #[test]
     fn thread_allow_network_reads_explicit_override_in_full_access_mode() {
         let metadata = json!({
@@ -4039,6 +4666,17 @@ mod tests {
             "codexSyncRequired": true,
         }));
         assert!(!should_clone_local_branch_history(&thread));
+
+        thread.engine_metadata = Some(json!({
+            "codexCompatibilityFork": true,
+        }));
+        assert!(!should_clone_local_branch_history(&thread));
+
+        thread.engine_metadata = Some(json!({
+            "codexCompatibilityFork": true,
+            "codexCompatibilityHistoryComplete": true,
+        }));
+        assert!(should_clone_local_branch_history(&thread));
     }
 
     #[test]
@@ -4077,12 +4715,27 @@ mod tests {
         assert!(!codex_thread_has_local_transcript_for_history_tools(
             &thread
         ));
+
+        thread.engine_metadata = Some(json!({
+            "codexTranscriptImported": true,
+            "codexCompatibilityFork": true,
+        }));
+        assert!(!codex_thread_has_local_transcript_for_history_tools(
+            &thread
+        ));
+
+        thread.engine_metadata = Some(json!({
+            "codexTranscriptImported": true,
+            "codexCompatibilityFork": true,
+            "codexCompatibilityHistoryComplete": true,
+        }));
+        assert!(codex_thread_has_local_transcript_for_history_tools(&thread));
     }
 
     #[test]
-    fn active_codex_fork_boundary_requires_both_local_and_native_anchors() {
+    fn active_codex_fork_boundary_accepts_an_exact_completed_local_message() {
         assert!(!has_stable_active_fork_boundary(None));
-        assert!(!has_stable_active_fork_boundary(Some(&CodexForkPoint {
+        assert!(has_stable_active_fork_boundary(Some(&CodexForkPoint {
             source_message_id: Some("assistant-message-1".to_string()),
             last_turn_id: None,
             turns_after: 1,
@@ -4099,6 +4752,25 @@ mod tests {
         })));
     }
 
+    #[test]
+    fn missing_native_boundary_forces_a_compatibility_fork() {
+        assert!(fork_boundary_requires_compatibility(&EngineForkIntent {
+            source_engine_thread_id: "legacy".to_string(),
+            last_turn_id: None,
+            turns_after: Some(4),
+        }));
+        assert!(!fork_boundary_requires_compatibility(&EngineForkIntent {
+            source_engine_thread_id: "native".to_string(),
+            last_turn_id: Some("turn-1".to_string()),
+            turns_after: Some(4),
+        }));
+        assert!(!fork_boundary_requires_compatibility(&EngineForkIntent {
+            source_engine_thread_id: "whole-thread".to_string(),
+            last_turn_id: None,
+            turns_after: None,
+        }));
+    }
+
     #[tokio::test]
     async fn active_codex_fork_rejects_unbounded_requests_but_accepts_stable_gate() {
         let state = test_app_state();
@@ -4110,7 +4782,7 @@ mod tests {
                 .await
         );
 
-        let unbounded_error = fork_codex_thread_inner(&state, source.id.clone(), None, None)
+        let unbounded_error = fork_codex_thread_inner(&state, source.id.clone(), None, None, None)
             .await
             .expect_err("an unbounded active-source fork must remain blocked");
         assert!(unbounded_error.contains("cannot fork an active thread"));
@@ -4124,6 +4796,7 @@ mod tests {
                 turns_after: 1,
             }),
             None,
+            None,
         )
         .await
         .expect_err("the fixture has no initialized engine thread");
@@ -4133,7 +4806,8 @@ mod tests {
         state.turns.finish(&source.id).await;
         db::threads::update_thread_status(&state.db, &source.id, ThreadStatusDto::Streaming)
             .expect("mark the persisted source runtime active");
-        let persisted_active_error = fork_codex_thread_inner(&state, source.id.clone(), None, None)
+        let persisted_active_error =
+            fork_codex_thread_inner(&state, source.id.clone(), None, None, None)
             .await
             .expect_err("persisted active runtime must enforce the same stable boundary");
         assert!(persisted_active_error.contains("cannot fork an active thread"));
@@ -4206,6 +4880,48 @@ mod tests {
         assert!(!is_engine_rollback_pending(Some(&cleared)));
         assert_eq!(engine_rollback_intent(Some(&cleared)), None);
         assert_eq!(cleared.get("lastModelId"), Some(&json!("gpt-5.4")));
+    }
+
+    #[test]
+    fn compatibility_rollback_marker_expectation_round_trips_and_clears() {
+        let metadata = mark_engine_rollback_marker_expectation(
+            json!({
+                "engineRollbackPending": true,
+                "engineRollbackError": "old background failure",
+                "lastModelId": "gpt-5.6-luna"
+            }),
+            4,
+        )
+        .expect("expected marker metadata");
+
+        assert_eq!(engine_rollback_marker_expectation(Some(&metadata)), Some((4, 5)));
+        let cleared = clear_engine_rollback_pending(metadata);
+        assert_eq!(engine_rollback_marker_expectation(Some(&cleared)), None);
+        assert_eq!(cleared.get(ENGINE_ROLLBACK_ERROR_KEY), None);
+        assert_eq!(cleared.get("lastModelId"), Some(&json!("gpt-5.6-luna")));
+    }
+
+    #[test]
+    fn legacy_compatibility_rollback_uses_newer_codex_marker_not_native_turn_count() {
+        let state = test_app_state();
+        let mut thread = test_thread(&state, "codex", "gpt-5.6-luna");
+        thread.engine_metadata = Some(json!({
+            "codexCompatibilityFork": true,
+            "codexSyncUpdatedAt": "2026-08-30T06:39:22.772146900+00:00",
+            "engineRollbackPending": true,
+            "engineRollbackPhase": "started"
+        }));
+        let completed = crate::engines::codex::CodexRollbackMarkerState {
+            count: 1,
+            latest_timestamp: Some("2026-08-30T06:40:48.615Z".to_string()),
+        };
+        let stale = crate::engines::codex::CodexRollbackMarkerState {
+            count: 1,
+            latest_timestamp: Some("2026-08-30T06:38:48.615Z".to_string()),
+        };
+
+        assert!(legacy_compatibility_rollback_completed(&thread, &completed));
+        assert!(!legacy_compatibility_rollback_completed(&thread, &stale));
     }
 
     #[test]

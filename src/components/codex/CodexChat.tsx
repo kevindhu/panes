@@ -139,6 +139,10 @@ function readMetadataString(thread: Thread | null, key: string): string | null {
   return typeof value === "string" && value.trim() ? value : null;
 }
 
+function readMetadataBoolean(thread: Thread | null, key: string): boolean {
+  return thread?.engineMetadata?.[key] === true;
+}
+
 function CopyMessageButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
   return (
@@ -232,9 +236,21 @@ export function CodexChat() {
   const planModeThreadIsBound = composerModeScope.kind === "thread" && composerModeScope.threadId === boundThreadId;
   const canForkMessages = canForkCodexMessageHistory(activeThread);
   const canRollbackMessages = canEditCodexMessageHistory(activeThread, streaming);
-  const sourceTurnActive = streaming ||
-    activeThread?.status === "streaming" ||
-    activeThread?.status === "awaiting_approval";
+  const engineForkPending = readMetadataBoolean(activeThread, "engineForkPending");
+  const engineRollbackPending = readMetadataBoolean(activeThread, "engineRollbackPending");
+  const compatibilityFork = readMetadataBoolean(activeThread, "codexCompatibilityFork");
+  const engineMutationError = engineForkPending
+    ? readMetadataString(activeThread, "engineForkError")
+    : engineRollbackPending
+      ? readMetadataString(activeThread, "engineRollbackError")
+      : null;
+  const engineMutationStatus = engineForkPending
+    ? "Preparing conversation fork in Codex…"
+    : engineRollbackPending
+      ? compatibilityFork
+        ? "Confirming compatibility rollback in Codex…"
+        : "Confirming rollback in Codex…"
+      : null;
   const displayedMessages = useMemo(() => {
     if (!rollingBackMessageId) return messages;
     return messagesBeforeEditableUserTurn(messages, rollingBackMessageId) ?? messages;
@@ -472,7 +488,7 @@ export function CodexChat() {
       !canForkMessages ||
       forkingMessageId !== null ||
       rollingBackMessageId !== null ||
-      !canForkFromAssistantMessage(message, sourceTurnActive)
+      !canForkFromAssistantMessage(message)
     ) {
       return;
     }
@@ -484,7 +500,6 @@ export function CodexChat() {
     }
 
     setForkingMessageId(message.id);
-    const sourceTurnWasActive = sourceTurnActive;
     try {
       const forked = await forkCodexThreadAtTurn(
         activeThread.id,
@@ -496,15 +511,12 @@ export function CodexChat() {
         throw new Error(useThreadStore.getState().error ?? "Codex did not return a forked thread.");
       }
       await activateThreadContext(forked);
-      toast.success(sourceTurnWasActive
-        ? "Forked conversation. The original is still running in the background."
-        : "Forked conversation from here.");
     } catch (forkError) {
       toast.error(`Could not fork this message: ${String(forkError)}`);
     } finally {
       setForkingMessageId((current) => (current === message.id ? null : current));
     }
-  }, [activeThread, canForkMessages, forkingMessageId, forkCodexThreadAtTurn, messages, rollingBackMessageId, sourceTurnActive]);
+  }, [activeThread, canForkMessages, forkingMessageId, forkCodexThreadAtTurn, messages, rollingBackMessageId]);
 
   const rollbackToMessage = useCallback(async (message: Message) => {
     if (
@@ -795,7 +807,7 @@ export function CodexChat() {
       .filter((block) => block.type === "text")
       .map((block) => block.content)
       .join("\n\n");
-    const canForkMessage = canForkFromAssistantMessage(message, sourceTurnActive) && canForkMessages;
+    const canForkMessage = canForkFromAssistantMessage(message) && canForkMessages;
     const canRollbackMessage = message.role === "user" && canRollbackMessages && isEditableUserTurn(message);
     const isForkingMessage = forkingMessageId === message.id;
     const isRollingBackMessage = rollingBackMessageId === message.id;
@@ -959,6 +971,19 @@ export function CodexChat() {
       </div>
 
       <div className={`codex-composer-wrap ${planMode ? "plan" : ""} ${showSpecialComposer ? "special" : ""}`}>
+        {engineMutationStatus && (
+          <div
+            className={`codex-history-mutation-status ${engineMutationError ? "error" : ""}`}
+            role={engineMutationError ? "alert" : "status"}
+          >
+            {!engineMutationError && <LoaderCircle size={13} className="codex-spin" />}
+            <span>
+              {engineMutationError
+                ? `${engineForkPending ? "Fork" : "Rollback"} preparation failed. Sending will retry automatically.`
+                : engineMutationStatus}
+            </span>
+          </div>
+        )}
         {hasUnseenOutput && (
           <button
             type="button"

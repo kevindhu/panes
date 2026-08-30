@@ -771,7 +771,6 @@ export function CodexSidebar() {
 
     expandWorkspace(forked.workspaceId);
     await activateThreadContext(forked);
-    toast.success(`Forked “${thread.title || "Untitled"}”.`);
   }
 
   async function archiveThread(thread: Thread) {

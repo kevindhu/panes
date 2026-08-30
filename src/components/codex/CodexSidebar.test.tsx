@@ -441,6 +441,38 @@ describe("CodexSidebar", () => {
     expect(document.activeElement).toBe(actions);
   });
 
+  it("does not show a success toast for a normal fork", async () => {
+    const workspace = makeWorkspace("workspace-a", "Alpha");
+    const source = makeThread({
+      id: "source",
+      workspaceId: workspace.id,
+      title: "Source session",
+    });
+    const forked = makeThread({
+      id: "forked",
+      workspaceId: workspace.id,
+      title: "Source session",
+    });
+    mocks.forkThread.mockResolvedValue(forked);
+    setWorkspaceState([workspace], workspace.id);
+    setThreadState({ [workspace.id]: [source] }, source.id);
+    await renderSidebar();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(
+        'button[aria-label="Actions for Source session"]',
+      )?.click();
+    });
+    await act(async () => {
+      buttonWithText(document.body, "ForkF").click();
+      await Promise.resolve();
+    });
+
+    expect(mocks.forkThread).toHaveBeenCalledWith(source.id);
+    expect(mocks.activateThreadContext).toHaveBeenCalledWith(forked);
+    expect(mocks.toast.success).not.toHaveBeenCalled();
+  });
+
   it("renames a session inline with a trimmed title", async () => {
     const workspace = makeWorkspace("workspace-a", "Alpha");
     const thread = makeThread({

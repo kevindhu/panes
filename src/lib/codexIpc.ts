@@ -116,6 +116,16 @@ export interface CodexRollbackMaterializedEvent {
   threadId: string;
 }
 
+export interface CodexCompatibilityForkMaterializedEvent {
+  threadId: string;
+}
+
+export interface CodexHistoryMutationFailedEvent {
+  threadId: string;
+  operation: "fork" | "rollback";
+  message: string;
+}
+
 export async function listenThreadEvents(threadId: string, onEvent: (event: StreamEvent) => void): Promise<UnlistenFn> {
   return listen<StreamEvent>(`stream-event-${threadId}`, ({ payload }) => onEvent(payload));
 }
@@ -130,6 +140,12 @@ export async function listenCodexTranscriptUpdated(onEvent: (event: CodexTranscr
 }
 export async function listenCodexRollbackMaterialized(onEvent: (event: CodexRollbackMaterializedEvent) => void): Promise<UnlistenFn> {
   return listen<CodexRollbackMaterializedEvent>("codex-rollback-materialized", ({ payload }) => onEvent(payload));
+}
+export async function listenCodexCompatibilityForkMaterialized(onEvent: (event: CodexCompatibilityForkMaterializedEvent) => void): Promise<UnlistenFn> {
+  return listen<CodexCompatibilityForkMaterializedEvent>("codex-compatibility-fork-materialized", ({ payload }) => onEvent(payload));
+}
+export async function listenCodexHistoryMutationFailed(onEvent: (event: CodexHistoryMutationFailedEvent) => void): Promise<UnlistenFn> {
+  return listen<CodexHistoryMutationFailedEvent>("codex-history-mutation-failed", ({ payload }) => onEvent(payload));
 }
 export async function listenEngineRuntimeUpdated(onEvent: (event: EngineRuntimeUpdatedEvent) => void): Promise<UnlistenFn> {
   return listen<EngineRuntimeUpdatedEvent>("engine-runtime-updated", ({ payload }) => onEvent(payload));

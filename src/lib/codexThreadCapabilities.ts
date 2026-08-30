@@ -1,5 +1,8 @@
 import type { Thread } from "../types";
-import { isCodexThreadSyncRequired } from "./codexThreadRuntime";
+import {
+  hasVerifiedCodexCompatibilityHistory,
+  isCodexThreadSyncRequired,
+} from "./codexThreadRuntime";
 
 export function hasCodexTranscriptForNativeTools(
   thread: Thread | null | undefined,
@@ -40,6 +43,7 @@ export function canForkCodexMessageHistory(
   return (
     thread?.engineId === "codex" &&
     !!thread.engineThreadId &&
+    hasVerifiedCodexCompatibilityHistory(thread) &&
     hasCodexTranscriptForNativeTools(thread)
   );
 }

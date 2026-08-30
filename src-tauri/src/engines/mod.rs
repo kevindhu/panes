@@ -10,7 +10,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     engines::{
-        codex::{CodexEngine, CodexForkedThread, CodexReviewStarted},
+        codex::{
+            CodexEngine, CodexForkedThread, CodexReviewStarted, CodexRollbackMarkerState,
+        },
     },
     models::{
         CodexAppDto, CodexSkillDto, EngineCapabilitiesDto, EngineHealthDto, EngineInfoDto,
@@ -436,6 +438,34 @@ impl EngineManager {
             .await
     }
 
+    pub async fn codex_fork_requires_compatibility(
+        &self,
+        engine_thread_id: &str,
+    ) -> anyhow::Result<bool> {
+        self.codex
+            .fork_requires_compatibility(engine_thread_id)
+            .await
+    }
+
+    pub async fn create_codex_compatibility_fork(
+        &self,
+        cwd: &str,
+        model: &str,
+        sandbox: SandboxPolicy,
+        history_items: Vec<Value>,
+    ) -> anyhow::Result<CodexForkedThread> {
+        self.codex
+            .create_compatibility_fork(cwd, model, sandbox, history_items)
+            .await
+    }
+
+    pub async fn codex_rollback_marker_state(
+        &self,
+        engine_thread_id: &str,
+    ) -> anyhow::Result<CodexRollbackMarkerState> {
+        self.codex.rollback_marker_state(engine_thread_id).await
+    }
+
     pub async fn resolve_codex_fork_turn_id(
         &self,
         engine_thread_id: &str,
@@ -649,7 +679,15 @@ impl EngineManager {
         match thread.engine_id.as_str() {
             "codex" => self
                 .codex
-                .read_thread_sync_snapshot(engine_thread_id)
+                .read_thread_sync_snapshot(
+                    engine_thread_id,
+                    thread
+                        .engine_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("codexCompatibilityFork"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                )
                 .await
                 .map(Some),
             _ => anyhow::bail!("unsupported engine_id {}", thread.engine_id),

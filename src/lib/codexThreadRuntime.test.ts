@@ -29,6 +29,22 @@ describe("Codex thread runtime metadata", () => {
     expect(isCodexThreadSyncRequired(makeThread({ codexSyncRequired: "true" }))).toBe(false);
   });
 
+  it("reconciles pending Codex history mutations when the thread is opened", () => {
+    expect(isCodexThreadSyncRequired(makeThread({ engineForkPending: true }))).toBe(true);
+    expect(isCodexThreadSyncRequired(makeThread({ engineRollbackPending: true }))).toBe(true);
+    expect(isCodexThreadSyncRequired(makeThread({ engineRollbackPending: "true" }))).toBe(false);
+  });
+
+  it("repairs compatibility forks whose durable injected prefix is unverified", () => {
+    expect(isCodexThreadSyncRequired(makeThread({
+      codexCompatibilityFork: true,
+    }))).toBe(true);
+    expect(isCodexThreadSyncRequired(makeThread({
+      codexCompatibilityFork: true,
+      codexCompatibilityHistoryComplete: true,
+    }))).toBe(false);
+  });
+
   it("does not infer an active remote turn from a diagnostic reason", () => {
     expect(
       hasConfirmedCodexRemoteTurn(makeThread({ codexRemoteTurnActive: true })),

@@ -77,4 +77,16 @@ describe("codexThreadCapabilities", () => {
     expect(canForkCodexMessageHistory(makeThread({ status: "streaming" }))).toBe(true);
     expect(canForkCodexMessageHistory(makeThread({ engineThreadId: null }))).toBe(false);
   });
+
+  it("waits for remote-authoritative compatibility history repair before another fork", () => {
+    expect(canForkCodexMessageHistory(makeThread({
+      engineMetadata: { codexCompatibilityFork: true },
+    }))).toBe(false);
+    expect(canForkCodexMessageHistory(makeThread({
+      engineMetadata: {
+        codexCompatibilityFork: true,
+        codexCompatibilityHistoryComplete: true,
+      },
+    }))).toBe(true);
+  });
 });

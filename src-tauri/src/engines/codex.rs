@@ -1,6 +1,5 @@
 use std::{
-    collections::BTreeSet,
-    collections::HashMap,
+    collections::{BTreeSet, HashMap, HashSet},
     env,
     ffi::OsString,
     path::{Path, PathBuf},
@@ -15,6 +14,7 @@ use serde::Deserialize;
 use tokio::time::timeout;
 use tokio::{
     fs as tokio_fs,
+    io::{AsyncBufReadExt, BufReader},
     process::Command,
     sync::{broadcast, mpsc, oneshot, Mutex},
 };
@@ -55,6 +55,7 @@ const THREAD_UNARCHIVE_METHODS: &[&str] = &["thread/unarchive"];
 const THREAD_SET_NAME_METHODS: &[&str] = &["thread/name/set"];
 const THREAD_LIST_METHODS: &[&str] = &["thread/list"];
 const THREAD_FORK_METHODS: &[&str] = &["thread/fork"];
+const THREAD_INJECT_ITEMS_METHODS: &[&str] = &["thread/inject_items"];
 const THREAD_ROLLBACK_METHODS: &[&str] = &["thread/rollback"];
 const THREAD_COMPACT_START_METHODS: &[&str] = &["thread/compact/start"];
 const REVIEW_START_METHODS: &[&str] = &["review/start"];
@@ -136,6 +137,7 @@ struct CodexState {
     approval_requests: HashMap<String, PendingApproval>,
     active_turn_ids: HashMap<String, String>,
     thread_runtimes: HashMap<String, ThreadRuntime>,
+    fork_compatibility_cache: HashMap<String, bool>,
     runtime_model_cache: Option<Vec<ModelInfo>>,
     sandbox_probe_completed: bool,
     force_external_sandbox: bool,
@@ -217,6 +219,13 @@ pub struct CodexForkedThread {
     pub preview: Option<String>,
     pub raw_status: Option<String>,
     pub active_flags: Vec<String>,
+    pub compatibility_fork: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexRollbackMarkerState {
+    pub count: u64,
+    pub latest_timestamp: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1436,6 +1445,88 @@ impl CodexEngine {
         }
     }
 
+    /// Returns true when a native durable fork could carry forward encrypted
+    /// reasoning written before rollout items had stable persisted ids.
+    ///
+    /// A recent child can still contain legacy ciphertext copied from an older
+    /// ancestor, so inspect the complete fork lineage instead of looking only at
+    /// the source thread's own CLI version.
+    pub async fn fork_requires_compatibility(
+        &self,
+        engine_thread_id: &str,
+    ) -> anyhow::Result<bool> {
+        let transport = self.ensure_ready_transport().await?;
+        let mut current_thread_id = engine_thread_id.to_string();
+        let mut visited = HashSet::new();
+        let mut inspected = Vec::new();
+
+        for _ in 0..64 {
+            if !visited.insert(current_thread_id.clone()) {
+                anyhow::bail!(
+                    "cycle detected in Codex fork lineage at thread {current_thread_id}"
+                );
+            }
+            let cached_requirement = {
+                let state = self.state.lock().await;
+                state
+                    .fork_compatibility_cache
+                    .get(&current_thread_id)
+                    .copied()
+            };
+            if let Some(required) = cached_requirement {
+                let mut state = self.state.lock().await;
+                for thread_id in inspected {
+                    state
+                        .fork_compatibility_cache
+                        .insert(thread_id, required);
+                }
+                return Ok(required);
+            }
+
+            let response = request_with_fallback(
+                transport.as_ref(),
+                THREAD_READ_METHODS,
+                serde_json::json!({
+                    "threadId": current_thread_id,
+                    "includeTurns": false,
+                }),
+                DEFAULT_TIMEOUT,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to inspect Codex fork lineage at thread {current_thread_id}"
+                )
+            })?;
+            let thread = response.get("thread").unwrap_or(&response);
+            inspected.push(current_thread_id.clone());
+            let cli_version = extract_any_string(thread, &["cliVersion", "cli_version"]);
+            if !cli_version
+                .as_deref()
+                .is_some_and(codex_version_supports_safe_durable_history_forks)
+            {
+                let mut state = self.state.lock().await;
+                for thread_id in inspected {
+                    state.fork_compatibility_cache.insert(thread_id, true);
+                }
+                return Ok(true);
+            }
+
+            match extract_any_string(thread, &["forkedFromId", "forked_from_id"]) {
+                Some(parent_thread_id) => current_thread_id = parent_thread_id,
+                None => {
+                    let mut state = self.state.lock().await;
+                    for thread_id in inspected {
+                        state.fork_compatibility_cache.insert(thread_id, false);
+                    }
+                    return Ok(false);
+                }
+            }
+        }
+
+        anyhow::bail!("Codex fork lineage exceeded the 64-thread safety limit")
+    }
+
     pub async fn fork_thread(
         &self,
         engine_thread_id: &str,
@@ -1502,6 +1593,11 @@ impl CodexEngine {
         );
         self.store_thread_runtime(&new_engine_thread_id, runtime)
             .await;
+        self.state
+            .lock()
+            .await
+            .fork_compatibility_cache
+            .insert(new_engine_thread_id.clone(), false);
 
         let forked_thread = CodexForkedThread {
             engine_thread_id: new_engine_thread_id.clone(),
@@ -1511,6 +1607,7 @@ impl CodexEngine {
             preview: extract_thread_preview(&response),
             raw_status: extract_thread_runtime_status_type(&response),
             active_flags: extract_thread_runtime_active_flags(&response),
+            compatibility_fork: false,
         };
 
         if let Err(error) = self
@@ -1523,6 +1620,185 @@ impl CodexEngine {
         }
 
         Ok(forked_thread)
+    }
+
+    /// Creates a clean durable thread and rehydrates only model-visible text
+    /// messages. Opaque reasoning ciphertext and historical tool identifiers are
+    /// deliberately excluded because their ids cannot be safely rewritten.
+    pub async fn create_compatibility_fork(
+        &self,
+        cwd: &str,
+        model: &str,
+        sandbox: SandboxPolicy,
+        history_items: Vec<serde_json::Value>,
+    ) -> anyhow::Result<CodexForkedThread> {
+        let transport = self.ensure_ready_transport().await?;
+        let approval_policy = sandbox
+            .approval_policy
+            .clone()
+            .unwrap_or_else(default_codex_approval_policy);
+        let force_external_sandbox = self.resolve_external_sandbox_mode().await;
+        let sandbox_mode = sandbox_mode_from_policy(&sandbox, force_external_sandbox);
+        let sandbox_policy = sandbox_policy_to_json(&sandbox, force_external_sandbox);
+        let requested_runtime = ThreadRuntime {
+            cwd: cwd.to_string(),
+            model_id: model.to_string(),
+            approval_policy: approval_policy.clone(),
+            permission_profile: sandbox.permission_profile.clone(),
+            approvals_reviewer: sandbox.approvals_reviewer.clone(),
+            sandbox_policy: sandbox_policy.clone(),
+            reasoning_effort: sandbox.reasoning_effort.clone(),
+            service_tier: sandbox.service_tier.clone(),
+            personality: sandbox.personality.clone(),
+            output_schema: sandbox.output_schema.clone(),
+            native_plan_mode_active: false,
+        };
+
+        let response = request_with_fallback(
+            transport.as_ref(),
+            THREAD_START_METHODS,
+            build_thread_start_params(
+                model,
+                cwd,
+                &approval_policy,
+                &sandbox_mode,
+                &sandbox,
+            ),
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .context("failed to start Codex compatibility fork")?;
+        let new_engine_thread_id = extract_thread_id(&response)
+            .ok_or_else(|| anyhow::anyhow!("missing thread id in compatibility thread/start response"))?;
+
+        if !history_items.is_empty() {
+            if let Err(error) = request_with_fallback(
+                transport.as_ref(),
+                THREAD_INJECT_ITEMS_METHODS,
+                serde_json::json!({
+                    "threadId": new_engine_thread_id,
+                    "items": history_items,
+                }),
+                DEFAULT_TIMEOUT,
+            )
+            .await
+            {
+                if let Err(cleanup_error) = request_with_fallback(
+                    transport.as_ref(),
+                    THREAD_ARCHIVE_METHODS,
+                    serde_json::json!({ "threadId": new_engine_thread_id }),
+                    DEFAULT_TIMEOUT,
+                )
+                .await
+                {
+                    log::warn!(
+                        "failed to archive incomplete compatibility fork {new_engine_thread_id}: {cleanup_error:#}"
+                    );
+                }
+                if let Err(release_error) = self
+                    .release_thread_subscription(&new_engine_thread_id)
+                    .await
+                {
+                    log::warn!(
+                        "failed to release incomplete compatibility fork {new_engine_thread_id}: {release_error:#}"
+                    );
+                }
+                return Err(error).context("failed to inject sanitized compatibility history");
+            }
+        }
+
+        self.store_thread_runtime(&new_engine_thread_id, requested_runtime)
+            .await;
+        self.state
+            .lock()
+            .await
+            .fork_compatibility_cache
+            .insert(new_engine_thread_id.clone(), false);
+        let forked_thread = CodexForkedThread {
+            engine_thread_id: new_engine_thread_id.clone(),
+            model_id: extract_any_string(&response, &["model"])
+                .unwrap_or_else(|| model.to_string()),
+            title: extract_thread_title(&response),
+            preview: extract_thread_preview(&response),
+            raw_status: extract_thread_runtime_status_type(&response),
+            active_flags: extract_thread_runtime_active_flags(&response),
+            compatibility_fork: true,
+        };
+
+        if let Err(error) = self
+            .release_thread_subscription(&new_engine_thread_id)
+            .await
+        {
+            log::warn!(
+                "failed to release idle compatibility fork {new_engine_thread_id}: {error:#}"
+            );
+        }
+
+        Ok(forked_thread)
+    }
+
+    /// Reads the durable Codex-owned rollback journal for a thread.
+    ///
+    /// Compatibility forks inject model-visible Responses items that intentionally do
+    /// not appear in app-server's lossy `Thread.turns` projection. A persisted
+    /// `thread_rolled_back` rollout marker is therefore the authoritative completion
+    /// signal for rollback, whereas comparing `Thread.turns.len()` is invalid.
+    pub async fn rollback_marker_state(
+        &self,
+        engine_thread_id: &str,
+    ) -> anyhow::Result<CodexRollbackMarkerState> {
+        let transport = self.ensure_ready_transport().await?;
+        let response = request_with_fallback(
+            transport.as_ref(),
+            THREAD_READ_METHODS,
+            serde_json::json!({
+                "threadId": engine_thread_id,
+                "includeTurns": false,
+            }),
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .with_context(|| {
+            format!("failed to read Codex thread {engine_thread_id} before rollback")
+        })?;
+        let thread = response.get("thread").unwrap_or(&response);
+        let rollout_path = extract_any_string(thread, &["path"])
+            .filter(|path| !path.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Codex thread {engine_thread_id} did not expose its durable rollout path"
+                )
+            })?;
+
+        let file = tokio_fs::File::open(&rollout_path)
+            .await
+            .with_context(|| format!("failed to open Codex rollout {rollout_path}"))?;
+        let mut lines = BufReader::new(file).lines();
+        let mut count = 0u64;
+        let mut latest_timestamp = None;
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .with_context(|| format!("failed to read Codex rollout {rollout_path}"))?
+        {
+            let record: serde_json::Value = serde_json::from_str(&line)
+                .with_context(|| format!("failed to parse Codex rollout {rollout_path}"))?;
+            if is_codex_rollback_marker_record(&record) {
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("Codex rollback marker count overflow"))?;
+                latest_timestamp = record
+                    .get("timestamp")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .or(latest_timestamp);
+            }
+        }
+
+        Ok(CodexRollbackMarkerState {
+            count,
+            latest_timestamp,
+        })
     }
 
     pub async fn rollback_thread(
@@ -2365,6 +2641,7 @@ impl CodexEngine {
     pub async fn read_thread_sync_snapshot(
         &self,
         engine_thread_id: &str,
+        compatibility_fork: bool,
     ) -> anyhow::Result<ThreadSyncSnapshot> {
         let transport = self.ensure_ready_transport().await?;
         let params = serde_json::json!({
@@ -2381,14 +2658,32 @@ impl CodexEngine {
         .await
         .context("failed to read codex thread metadata")?;
 
+        let mut imported_messages = self
+            .list_thread_import_messages(transport.as_ref(), engine_thread_id)
+            .await?;
+        if compatibility_fork {
+            let thread = result.get("thread").unwrap_or(&result);
+            let rollout_path = extract_any_string(thread, &["path"])
+                .filter(|path| !path.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Codex compatibility thread {engine_thread_id} did not expose its durable rollout path"
+                    )
+                })?;
+            let injected_prefix = read_compatibility_rollout_history(
+                &rollout_path,
+                extract_any_string(thread, &["model", "modelId", "model_id"]).as_deref(),
+            )
+            .await?;
+            imported_messages = merge_compatibility_history(injected_prefix, imported_messages);
+        }
+
         Ok(ThreadSyncSnapshot {
             title: extract_thread_title(&result),
             preview: extract_thread_preview(&result),
             raw_status: extract_thread_runtime_status_type(&result),
             active_flags: extract_thread_runtime_active_flags(&result),
-            imported_messages: self
-                .list_thread_import_messages(transport.as_ref(), engine_thread_id)
-                .await?,
+            imported_messages,
         })
     }
 
@@ -3863,8 +4158,242 @@ fn codex_health_checks() -> Vec<String> {
     codex_health_checks_for_platform(runtime_env::platform_id())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompatibilityHistoryTurnOrigin {
+    Injected(usize),
+    Native,
+}
+
+#[derive(Default)]
+struct CompatibilityRolloutHistory {
+    injection_started: bool,
+    injection_closed: bool,
+    awaiting_native_user: bool,
+    injected_turns: Vec<Vec<ImportedThreadMessage>>,
+    current_turns: Vec<CompatibilityHistoryTurnOrigin>,
+}
+
+impl CompatibilityRolloutHistory {
+    fn observe(
+        &mut self,
+        record: &serde_json::Value,
+        model_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if !self.injection_closed
+            && record.get("type").and_then(serde_json::Value::as_str)
+                == Some("turn_context")
+        {
+            self.injection_started = true;
+            return Ok(());
+        }
+
+        if codex_rollout_event_type(record) == Some("task_started") {
+            self.injection_closed = true;
+            self.awaiting_native_user = true;
+            return Ok(());
+        }
+
+        if let Some(num_turns) = codex_rollback_marker_num_turns(record) {
+            let num_turns = usize::try_from(num_turns)
+                .map_err(|_| anyhow::anyhow!("Codex rollback turn count exceeds usize"))?;
+            if num_turns > self.current_turns.len() {
+                anyhow::bail!(
+                    "Codex compatibility rollout rolls back {num_turns} turns after only {} observable turns",
+                    self.current_turns.len()
+                );
+            }
+            self.current_turns
+                .truncate(self.current_turns.len() - num_turns);
+            self.awaiting_native_user = false;
+            return Ok(());
+        }
+
+        let Some(message) = compatibility_message_from_rollout_record(record, model_id) else {
+            return Ok(());
+        };
+
+        if self.injection_started && !self.injection_closed {
+            if message.role == "user" {
+                let turn_index = self.injected_turns.len();
+                self.injected_turns.push(vec![message]);
+                self.current_turns
+                    .push(CompatibilityHistoryTurnOrigin::Injected(turn_index));
+            } else if message.role == "assistant" {
+                if let Some(turn) = self.injected_turns.last_mut() {
+                    turn.push(message);
+                }
+            }
+        } else if self.injection_closed
+            && self.awaiting_native_user
+            && message.role == "user"
+        {
+            self.current_turns
+                .push(CompatibilityHistoryTurnOrigin::Native);
+            self.awaiting_native_user = false;
+        }
+
+        Ok(())
+    }
+
+    fn finish(self) -> anyhow::Result<Vec<ImportedThreadMessage>> {
+        let retained_injected_turns = self
+            .current_turns
+            .iter()
+            .filter(|origin| matches!(origin, CompatibilityHistoryTurnOrigin::Injected(_)))
+            .count();
+        if retained_injected_turns > self.injected_turns.len() {
+            anyhow::bail!("Codex compatibility rollout retained an invalid injected prefix");
+        }
+
+        Ok(self
+            .injected_turns
+            .into_iter()
+            .take(retained_injected_turns)
+            .flatten()
+            .collect())
+    }
+}
+
+async fn read_compatibility_rollout_history(
+    rollout_path: &str,
+    model_id: Option<&str>,
+) -> anyhow::Result<Vec<ImportedThreadMessage>> {
+    let file = tokio_fs::File::open(rollout_path)
+        .await
+        .with_context(|| format!("failed to open Codex compatibility rollout {rollout_path}"))?;
+    let mut lines = BufReader::new(file).lines();
+    let mut history = CompatibilityRolloutHistory::default();
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .with_context(|| format!("failed to read Codex compatibility rollout {rollout_path}"))?
+    {
+        let record: serde_json::Value = serde_json::from_str(&line)
+            .with_context(|| format!("failed to parse Codex compatibility rollout {rollout_path}"))?;
+        history.observe(&record, model_id)?;
+    }
+    history.finish()
+}
+
+fn compatibility_message_from_rollout_record(
+    record: &serde_json::Value,
+    model_id: Option<&str>,
+) -> Option<ImportedThreadMessage> {
+    if record.get("type").and_then(serde_json::Value::as_str) != Some("response_item") {
+        return None;
+    }
+    let payload = record.get("payload")?;
+    if payload.get("type").and_then(serde_json::Value::as_str) != Some("message") {
+        return None;
+    }
+    let role = payload.get("role").and_then(serde_json::Value::as_str)?;
+    if role != "user" && role != "assistant" {
+        return None;
+    }
+    let text = payload
+        .get("content")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        return None;
+    }
+
+    Some(ImportedThreadMessage {
+        role: role.to_string(),
+        content: Some(text.clone()),
+        blocks: serde_json::Value::Array(vec![json_text_block(text)]),
+        status: "completed".to_string(),
+        native_turn_id: None,
+        turn_engine_id: Some("codex".to_string()),
+        turn_model_id: model_id.map(str::to_string),
+        turn_reasoning_effort: None,
+        token_input: 0,
+        token_output: 0,
+        created_at: record
+            .get("timestamp")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+fn codex_rollout_event_type(record: &serde_json::Value) -> Option<&str> {
+    let payload = record.get("payload")?;
+    if record.get("type").and_then(serde_json::Value::as_str) == Some("event_msg") {
+        return payload.get("type").and_then(serde_json::Value::as_str);
+    }
+    if payload.get("type").and_then(serde_json::Value::as_str) == Some("event_msg") {
+        return payload
+            .get("payload")?
+            .get("type")
+            .and_then(serde_json::Value::as_str);
+    }
+    None
+}
+
+fn codex_rollback_marker_num_turns(record: &serde_json::Value) -> Option<u64> {
+    let payload = record.get("payload").unwrap_or(record);
+    let event = if payload.get("type").and_then(serde_json::Value::as_str) == Some("event_msg") {
+        payload.get("payload")?
+    } else {
+        payload
+    };
+    (event.get("type").and_then(serde_json::Value::as_str) == Some("thread_rolled_back"))
+        .then(|| event.get("num_turns").and_then(serde_json::Value::as_u64))
+        .flatten()
+}
+
+fn merge_compatibility_history(
+    mut injected_prefix: Vec<ImportedThreadMessage>,
+    native_messages: Vec<ImportedThreadMessage>,
+) -> Vec<ImportedThreadMessage> {
+    if injected_prefix.is_empty() {
+        return native_messages;
+    }
+    let native_already_contains_prefix = native_messages.len() >= injected_prefix.len()
+        && native_messages
+            .iter()
+            .zip(injected_prefix.iter())
+            .all(|(native, injected)| {
+                native.role == injected.role
+                    && native.content.as_deref().map(str::trim)
+                        == injected.content.as_deref().map(str::trim)
+            });
+    if native_already_contains_prefix {
+        return native_messages;
+    }
+
+    injected_prefix.extend(native_messages);
+    injected_prefix
+}
+
+fn is_codex_rollback_marker_record(record: &serde_json::Value) -> bool {
+    let payload = record.get("payload").unwrap_or(record);
+    let payload_type = payload.get("type").and_then(serde_json::Value::as_str);
+    let nested_type = payload
+        .get("payload")
+        .and_then(|value| value.get("type"))
+        .and_then(serde_json::Value::as_str);
+    payload_type == Some("thread_rolled_back")
+        || (payload_type == Some("event_msg") && nested_type == Some("thread_rolled_back"))
+}
+
 fn codex_version_supports_fast_durable_forks(raw: &str) -> bool {
-    let Some(version) = raw.split_whitespace().find_map(|token| {
+    parse_codex_version(raw).is_some_and(|version| version >= FAST_DURABLE_FORK_MIN_VERSION)
+}
+
+fn codex_version_supports_safe_durable_history_forks(raw: &str) -> bool {
+    // 0.150.1 is the first locally verified rollout format where newly written
+    // encrypted reasoning carries stable item ids. Earlier ancestors must be
+    // rehydrated without their opaque ciphertext.
+    parse_codex_version(raw).is_some_and(|version| version >= FAST_DURABLE_FORK_MIN_VERSION)
+}
+
+fn parse_codex_version(raw: &str) -> Option<(u64, u64, u64)> {
+    raw.split_whitespace().find_map(|token| {
         let token = token.trim_start_matches('v');
         let core = token.split(['-', '+']).next()?;
         let mut parts = core.split('.');
@@ -3873,11 +4402,7 @@ fn codex_version_supports_fast_durable_forks(raw: &str) -> bool {
             parts.next()?.parse::<u64>().ok()?,
             parts.next()?.parse::<u64>().ok()?,
         ))
-    }) else {
-        return false;
-    };
-
-    version >= FAST_DURABLE_FORK_MIN_VERSION
+    })
 }
 
 fn codex_health_checks_for_platform(platform: &str) -> Vec<String> {
@@ -9695,6 +10220,104 @@ mod tests {
         assert!(codex_version_supports_fast_durable_forks(
             "codex-cli 0.151.0-alpha.1"
         ));
+        assert!(!codex_version_supports_safe_durable_history_forks(
+            "0.144.0"
+        ));
+        assert!(codex_version_supports_safe_durable_history_forks(
+            "0.150.1"
+        ));
+    }
+
+    #[test]
+    fn rollback_marker_parser_accepts_current_and_legacy_rollout_shapes() {
+        assert!(is_codex_rollback_marker_record(&serde_json::json!({
+            "timestamp": "2026-08-30T06:40:48.615Z",
+            "payload": { "type": "thread_rolled_back", "num_turns": 1 }
+        })));
+        assert!(is_codex_rollback_marker_record(&serde_json::json!({
+            "payload": {
+                "type": "event_msg",
+                "payload": { "type": "thread_rolled_back", "num_turns": 1 }
+            }
+        })));
+        assert!(!is_codex_rollback_marker_record(&serde_json::json!({
+            "payload": { "type": "task_complete" }
+        })));
+    }
+
+    #[test]
+    fn compatibility_rollout_history_restores_injected_prefix_and_applies_rollbacks() {
+        let records = vec![
+            json!({
+                "type": "response_item",
+                "payload": { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "bootstrap" }] }
+            }),
+            json!({ "type": "turn_context", "payload": { "turn_id": "auto-compact-0" } }),
+            json!({
+                "timestamp": "2026-08-30T07:00:00Z",
+                "type": "response_item",
+                "payload": { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "First" }] }
+            }),
+            json!({
+                "timestamp": "2026-08-30T07:00:01Z",
+                "type": "response_item",
+                "payload": { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "Reply one" }] }
+            }),
+            json!({
+                "type": "response_item",
+                "payload": { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "Second" }] }
+            }),
+            json!({
+                "type": "response_item",
+                "payload": { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "Reply two" }] }
+            }),
+            json!({ "type": "event_msg", "payload": { "type": "task_started" } }),
+            json!({
+                "type": "response_item",
+                "payload": { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "Native turn" }] }
+            }),
+            // Remove the native turn and the second injected turn. The durable
+            // compatibility prefix must therefore end after the first pair.
+            json!({
+                "type": "event_msg",
+                "payload": { "type": "thread_rolled_back", "num_turns": 2 }
+            }),
+        ];
+        let mut history = CompatibilityRolloutHistory::default();
+        for record in &records {
+            history
+                .observe(record, Some("gpt-test"))
+                .expect("rollout record should parse");
+        }
+
+        let messages = history.finish().expect("history should finish");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content.as_deref(), Some("First"));
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].content.as_deref(), Some("Reply one"));
+        assert_eq!(messages[1].native_turn_id, None);
+    }
+
+    #[test]
+    fn compatibility_history_merge_does_not_duplicate_an_exposed_prefix() {
+        let prefix = vec![ImportedThreadMessage {
+            role: "user".to_string(),
+            content: Some("Existing".to_string()),
+            blocks: json!([{ "type": "text", "content": "Existing" }]),
+            status: "completed".to_string(),
+            native_turn_id: None,
+            turn_engine_id: Some("codex".to_string()),
+            turn_model_id: None,
+            turn_reasoning_effort: None,
+            token_input: 0,
+            token_output: 0,
+            created_at: None,
+        }];
+
+        let merged = merge_compatibility_history(prefix.clone(), prefix);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].content.as_deref(), Some("Existing"));
     }
 
     #[test]

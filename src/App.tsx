@@ -11,11 +11,14 @@ import {
 import { useCodexUiStore } from "./stores/codexUiStore";
 import { useEngineStore } from "./stores/engineStore";
 import { useThreadStore } from "./stores/threadStore";
+import { toast } from "./stores/toastStore";
 import { useUpdateStore } from "./stores/updateStore";
 import { useWorkspaceStore } from "./stores/workspaceStore";
 import {
   ipc,
   listenChatTurnFinished,
+  listenCodexCompatibilityForkMaterialized,
+  listenCodexHistoryMutationFailed,
   listenEngineRuntimeUpdated,
   listenMenuAction,
   listenThreadUpdated,
@@ -118,6 +121,13 @@ export function App() {
       ) {
         void ipc.showAgentNotification("Codex", event.preview?.trim() || (event.status === "error" ? "The turn failed." : "The turn finished."));
       }
+    }).then((unlisten) => unlisteners.push(unlisten));
+    void listenCodexCompatibilityForkMaterialized(() => {
+      toast.info("Compatibility fork created for older Codex history.");
+    }).then((unlisten) => unlisteners.push(unlisten));
+    void listenCodexHistoryMutationFailed((event) => {
+      const label = event.operation === "fork" ? "fork" : "rollback";
+      toast.error(`Codex ${label} preparation failed: ${event.message}`);
     }).then((unlisten) => unlisteners.push(unlisten));
     void listenEngineRuntimeUpdated((event) => {
       if (event.engineId === "codex") useEngineStore.getState().applyRuntimeUpdate(event);
