@@ -641,6 +641,13 @@ impl EngineManager {
         self.codex.uses_external_sandbox().await
     }
 
+    pub async fn generate_codex_thread_title(
+        &self,
+        opening_message: &str,
+    ) -> anyhow::Result<String> {
+        self.codex.generate_thread_title(opening_message).await
+    }
+
     pub async fn read_thread_preview(
         &self,
         thread: &ThreadDto,
