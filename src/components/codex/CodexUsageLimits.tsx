@@ -69,20 +69,17 @@ export function formatTokenCount(value: number | null | undefined): string | nul
   return String(tokens);
 }
 
-type ContextWindowSegmentKey =
-  | "input"
-  | "cache-write"
-  | "cached"
-  | "output"
-  | "reasoning"
-  | "other"
-  | "used"
-  | "free";
+export interface ContextWindowTotals {
+  usedTokens: number | null;
+  freeTokens: number | null;
+  usedPercent: number | null;
+  freePercent: number | null;
+}
 
-export interface ContextWindowSegment {
-  key: ContextWindowSegmentKey;
+interface ContextWindowDetail {
+  key: "used" | "free";
   label: string;
-  tokens: number;
+  tokens: number | null;
   percent: number | null;
 }
 
@@ -92,80 +89,35 @@ function finiteTokens(value: number | null | undefined): number | null {
     : null;
 }
 
-function formatSegmentPercent(value: number | null): string {
+function formatContextPercent(value: number | null): string {
   if (value === null) return "\u2014";
   return `${value.toFixed(1).replace(/\.0$/, "")}%`;
 }
 
-export function contextWindowSegments(
+export function contextWindowTotals(
   usage: ContextUsage | null | undefined,
-): ContextWindowSegment[] {
+): ContextWindowTotals {
   const currentTokens = finiteTokens(usage?.currentTokens);
   const maxContextTokens = finiteTokens(usage?.maxContextTokens);
-  if (currentTokens === null) return [];
+  const hasContextCapacity = maxContextTokens !== null && maxContextTokens > 0;
+  const usedTokens = currentTokens === null
+    ? null
+    : hasContextCapacity
+      ? Math.min(currentTokens, maxContextTokens)
+      : currentTokens;
+  const freeTokens = usedTokens !== null && hasContextCapacity
+    ? Math.max(0, maxContextTokens - usedTokens)
+    : null;
+  const usedPercent = usedTokens !== null && hasContextCapacity
+    ? (usedTokens / maxContextTokens) * 100
+    : contextWindowUsedPercent(usage);
 
-  const usedTokens = maxContextTokens === null
-    ? currentTokens
-    : Math.min(currentTokens, maxContextTokens);
-  const toSegment = (
-    key: ContextWindowSegmentKey,
-    label: string,
-    tokens: number,
-  ): ContextWindowSegment => ({
-    key,
-    label,
-    tokens,
-    percent: maxContextTokens !== null && maxContextTokens > 0
-      ? (tokens / maxContextTokens) * 100
-      : null,
-  });
-
-  const breakdown = usage?.breakdown;
-  const occupied: ContextWindowSegment[] = [];
-  if (breakdown) {
-    const inputTokens = Math.min(finiteTokens(breakdown.inputTokens) ?? 0, usedTokens);
-    const outputTokens = Math.min(
-      finiteTokens(breakdown.outputTokens) ?? 0,
-      Math.max(0, usedTokens - inputTokens),
-    );
-    const cachedInputTokens = Math.min(
-      finiteTokens(breakdown.cachedInputTokens) ?? 0,
-      inputTokens,
-    );
-    const cacheWriteInputTokens = Math.min(
-      finiteTokens(breakdown.cacheWriteInputTokens) ?? 0,
-      Math.max(0, inputTokens - cachedInputTokens),
-    );
-    const uncachedInputTokens = Math.max(
-      0,
-      inputTokens - cachedInputTokens - cacheWriteInputTokens,
-    );
-    const reasoningOutputTokens = Math.min(
-      finiteTokens(breakdown.reasoningOutputTokens) ?? 0,
-      outputTokens,
-    );
-    const regularOutputTokens = Math.max(0, outputTokens - reasoningOutputTokens);
-    const otherTokens = Math.max(0, usedTokens - inputTokens - outputTokens);
-
-    for (const [key, label, tokens] of [
-      ["input", "Input context", uncachedInputTokens],
-      ["cache-write", "Cache-write input", cacheWriteInputTokens],
-      ["cached", "Cached input", cachedInputTokens],
-      ["output", "Output", regularOutputTokens],
-      ["reasoning", "Reasoning output", reasoningOutputTokens],
-      ["other", "Other context", otherTokens],
-    ] as const) {
-      if (tokens > 0) occupied.push(toSegment(key, label, tokens));
-    }
-  } else if (usedTokens > 0) {
-    occupied.push(toSegment("used", "Used context", usedTokens));
-  }
-
-  if (maxContextTokens !== null && maxContextTokens > 0) {
-    occupied.push(toSegment("free", "Free space", Math.max(0, maxContextTokens - usedTokens)));
-  }
-
-  return occupied;
+  return {
+    usedTokens,
+    freeTokens,
+    usedPercent,
+    freePercent: usedPercent === null ? null : Math.max(0, 100 - usedPercent),
+  };
 }
 
 function usageTone(usedPercent: number | null): "normal" | "warning" | "danger" {
@@ -234,13 +186,26 @@ function UsageWindowRow({ label, remainingPercent, resetsAt }: UsageWindowRowPro
 }
 
 function ContextWindowRow({ usage }: { usage: ContextUsage | null }) {
-  const breakdownId = useId();
+  const detailsId = useId();
   const [expanded, setExpanded] = useState(false);
   const usedPercent = contextWindowUsedPercent(usage);
   const currentTokens = formatTokenCount(usage?.currentTokens);
   const maxContextTokens = formatTokenCount(usage?.maxContextTokens);
-  const segments = contextWindowSegments(usage);
-  const occupiedSegments = segments.filter((segment) => segment.key !== "free");
+  const totals = contextWindowTotals(usage);
+  const details: ContextWindowDetail[] = [
+    {
+      key: "used",
+      label: "Used context",
+      tokens: totals.usedTokens,
+      percent: totals.usedPercent,
+    },
+    {
+      key: "free",
+      label: "Free space",
+      tokens: totals.freeTokens,
+      percent: totals.freePercent,
+    },
+  ];
   const summary = currentTokens !== null && maxContextTokens !== null && usedPercent !== null
     ? `${currentTokens} / ${maxContextTokens} (${usedPercent}%)`
     : usedPercent !== null
@@ -253,7 +218,7 @@ function ContextWindowRow({ usage }: { usage: ContextUsage | null }) {
         className="codex-context-window-toggle"
         type="button"
         aria-expanded={expanded}
-        aria-controls={breakdownId}
+        aria-controls={detailsId}
         onClick={() => setExpanded((current) => !current)}
       >
         <span className="codex-context-window-label">Context window</span>
@@ -269,31 +234,18 @@ function ContextWindowRow({ usage }: { usage: ContextUsage | null }) {
         aria-valuenow={usedPercent ?? undefined}
         aria-valuetext={usedPercent === null ? undefined : summary}
       >
-        {occupiedSegments.map((segment) => (
-          <span
-            key={segment.key}
-            className={`codex-context-segment ${segment.key}`}
-            data-context-segment={segment.key}
-            style={{ width: `${segment.percent ?? 0}%` }}
-            title={`${segment.label}: ${formatTokenCount(segment.tokens) ?? "0"} (${formatSegmentPercent(segment.percent)})`}
-          />
-        ))}
+        <span style={{ width: `${totals.usedPercent ?? 0}%` }} />
       </div>
       {expanded && (
-        <div id={breakdownId} className="codex-context-breakdown">
-          {segments.map((segment) => (
-            <div className="codex-context-breakdown-row" key={segment.key}>
-              <span className={`codex-context-swatch ${segment.key}`} aria-hidden="true" />
-              <span>{segment.label}</span>
-              <small>{formatTokenCount(segment.tokens) ?? "0"}</small>
-              <strong>{formatSegmentPercent(segment.percent)}</strong>
+        <div id={detailsId} className="codex-context-details">
+          {details.map((detail) => (
+            <div className="codex-context-detail-row" key={detail.key}>
+              <span className={`codex-context-detail-swatch ${detail.key}`} aria-hidden="true" />
+              <span>{detail.label}</span>
+              <small>{formatTokenCount(detail.tokens) ?? "\u2014"}</small>
+              <strong>{formatContextPercent(detail.percent)}</strong>
             </div>
           ))}
-          {usage?.breakdown && (
-            <p>
-              Codex groups system prompts, tools, skills, and messages inside input context.
-            </p>
-          )}
         </div>
       )}
     </section>
