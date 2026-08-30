@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { CodexChat } from "./components/codex/CodexChat";
-import { CodexSearchOverlay, CodexSetupOverlay } from "./components/codex/CodexOverlays";
+import { CodexSearchOverlay } from "./components/codex/CodexOverlays";
 import { CodexSidebar } from "./components/codex/CodexSidebar";
 import { CodexWindowFrame } from "./components/codex/CodexWindowFrame";
 import { ToastContainer } from "./components/shared/ToastContainer";
@@ -179,7 +179,6 @@ export function App() {
         <CodexChat />
       </div>
       <CodexSearchOverlay />
-      <CodexSetupOverlay />
       <ToastContainer />
     </div>
   );

@@ -1,11 +1,9 @@
-import { MessageSquare, RefreshCw, Search, X } from "lucide-react";
+import { MessageSquare, Search, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ipc } from "../../lib/codexIpc";
 import { activateThreadContext } from "../../lib/threadActivation";
 import { useCodexUiStore } from "../../stores/codexUiStore";
-import { useEngineStore } from "../../stores/engineStore";
 import { useThreadStore } from "../../stores/threadStore";
-import { useUpdateStore } from "../../stores/updateStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
 import type { SearchResult } from "../../types";
 
@@ -77,36 +75,6 @@ export function CodexSearchOverlay() {
           {loading && <div className="codex-search-hint">Searching…</div>}
           {!loading && query.trim().length >= 2 && !localThreads.length && !messageResults.length && <div className="codex-search-hint">No matches.</div>}
         </div>
-      </div>
-    </div>
-  );
-}
-
-export function CodexSetupOverlay() {
-  const open = useCodexUiStore((state) => state.setupOpen);
-  const setOpen = useCodexUiStore((state) => state.setSetupOpen);
-  const health = useEngineStore((state) => state.health.codex);
-  const loading = useEngineStore((state) => state.healthLoading.codex);
-  const ensureHealth = useEngineStore((state) => state.ensureHealth);
-  const updateStatus = useUpdateStore((state) => state.status);
-  const updateVersion = useUpdateStore((state) => state.version);
-  const checkForUpdate = useUpdateStore((state) => state.checkForUpdate);
-  const downloadAndInstall = useUpdateStore((state) => state.downloadAndInstall);
-
-  useEffect(() => { if (open) void ensureHealth("codex", { force: true }); }, [ensureHealth, open]);
-  if (!open) return null;
-
-  return (
-    <div className="codex-overlay" onMouseDown={(event) => { if (event.target === event.currentTarget) setOpen(false); }}>
-      <div className="codex-setup-dialog">
-        <header><div><h2>Codex runtime</h2><p>Only the Codex app-server is used by this client.</p></div><button type="button" onClick={() => setOpen(false)}><X size={16} /></button></header>
-        <div className={`codex-health-card ${health?.available ? "available" : "unavailable"}`}>
-          <div><strong>{health?.available ? "Ready" : loading ? "Checking…" : "Unavailable"}</strong><span>{health?.version || health?.details || "Codex CLI was not detected."}</span></div>
-          <button type="button" disabled={loading} onClick={() => void ensureHealth("codex", { force: true })}><RefreshCw size={13} /> Check again</button>
-        </div>
-        {health?.warnings?.map((warning) => <p className="codex-setup-warning" key={warning}>{warning}</p>)}
-        {health?.fixes && health.fixes.length > 0 && <section><h3>Suggested fixes</h3>{health.fixes.map((fix) => <code key={fix}>{fix}</code>)}</section>}
-        <section><h3>Updates</h3><div className="codex-update-row"><span>{updateStatus === "available" ? `Version ${updateVersion} is available.` : updateStatus === "ready" ? "Restarting…" : "Check for a newer Panes release."}</span>{updateStatus === "available" ? <button type="button" onClick={() => void downloadAndInstall()}>Install update</button> : <button type="button" disabled={updateStatus === "checking" || updateStatus === "downloading"} onClick={() => void checkForUpdate()}>Check</button>}</div></section>
       </div>
     </div>
   );

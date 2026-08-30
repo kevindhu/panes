@@ -178,7 +178,7 @@ beforeEach(() => {
     threadModes: {},
     newThreadModesByWorkspaceId: {},
   });
-  useCodexUiStore.setState({ searchOpen: false, setupOpen: false });
+  useCodexUiStore.setState({ searchOpen: false });
   useEngineStore.setState({ health: {} });
 });
 
@@ -200,6 +200,26 @@ describe("CodexSidebar", () => {
     expect(container.querySelector("select")).toBeNull();
     expect(container.querySelector(".codex-brand")).toBeNull();
     expect(container.textContent).not.toContain("New conversation");
+  });
+
+  it("shows the Codex CLI version as subtle non-interactive footer text", async () => {
+    useEngineStore.setState({
+      health: {
+        codex: {
+          id: "codex",
+          available: true,
+          version: "codex-cli 0.150.1",
+          warnings: [],
+          checks: [],
+          fixes: [],
+        },
+      },
+    });
+    await renderSidebar();
+
+    const version = container.querySelector<HTMLElement>(".codex-cli-version");
+    expect(version?.textContent).toBe("Codex CLI 0.150.1");
+    expect(version?.closest("button")).toBeNull();
   });
 
   it("resizes from the right edge and persists the chosen width", async () => {

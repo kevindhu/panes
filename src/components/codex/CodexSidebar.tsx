@@ -1,7 +1,6 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Archive,
-  CheckCircle2,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -11,7 +10,6 @@ import {
   Plus,
   RotateCcw,
   Search,
-  Settings2,
 } from "lucide-react";
 import {
   useCallback,
@@ -501,7 +499,9 @@ export function CodexSidebar() {
   );
   const health = useEngineStore((state) => state.health.codex);
   const setSearchOpen = useCodexUiStore((state) => state.setSearchOpen);
-  const setSetupOpen = useCodexUiStore((state) => state.setSetupOpen);
+  const codexCliVersion = health?.version
+    ?.replace(/^codex-cli\s*/i, "")
+    .trim();
 
   const workspaceIds = useMemo(
     () => workspaces.map((workspace) => workspace.id),
@@ -1296,12 +1296,9 @@ export function CodexSidebar() {
         >
           <Archive size={14} /><span>Archived</span>
         </button>
-        <button type="button" onClick={() => setSetupOpen(true)}>
-          {health?.available
-            ? <CheckCircle2 size={14} className="healthy" />
-            : <Settings2 size={14} />}
-          <span>Codex {health?.available ? health.version || "ready" : "setup"}</span>
-        </button>
+        <span className="codex-cli-version" aria-label="Codex CLI version">
+          Codex CLI{codexCliVersion ? ` ${codexCliVersion}` : ""}
+        </span>
       </div>
 
       <div className="codex-sr-only" aria-live="polite">{dragAnnouncement}</div>
