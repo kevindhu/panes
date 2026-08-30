@@ -111,6 +111,30 @@ describe("transcript selection", () => {
     expect(document.getSelection()?.toString()).toBe(selectedText);
   });
 
+  it("records the message IDs containing both selection endpoints", () => {
+    container.innerHTML = [
+      '<div id="transcript">',
+      '<article data-message-id="message-1"><div data-transcript-selection-scope="message:1">First response</div></article>',
+      '<article data-message-id="message-2"><div data-transcript-selection-scope="message:2">Second response</div></article>',
+      "</div>",
+    ].join("");
+    const transcript = container.querySelector("#transcript") as HTMLDivElement;
+    const first = transcript.querySelector('[data-message-id="message-1"]')?.textContent;
+    expect(first).toBe("First response");
+    const firstText = transcript.querySelector('[data-message-id="message-1"]')?.querySelector("div")?.firstChild as Text;
+    const secondText = transcript.querySelector('[data-message-id="message-2"]')?.querySelector("div")?.firstChild as Text;
+    const range = document.createRange();
+    range.setStart(firstText, 0);
+    range.setEnd(secondText, 6);
+    document.getSelection()?.removeAllRanges();
+    document.getSelection()?.addRange(range);
+
+    expect(captureTranscriptSelection(transcript)).toMatchObject({
+      anchor: { messageId: "message-1" },
+      focus: { messageId: "message-2" },
+    });
+  });
+
   it("automatically restores an active selection across a live React rerender", async () => {
     const onActiveChange = vi.fn();
     await act(async () => {

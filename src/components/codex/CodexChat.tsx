@@ -17,7 +17,6 @@ import {
 import {
   useCallback,
   useEffect,
-  useLayoutEffect,
   lazy,
   useMemo,
   useRef,
@@ -30,6 +29,10 @@ import { buildCodexInputItems } from "../chat/codexInputItems";
 import { AttachmentChip } from "../chat/AttachmentChip";
 import { ToolInputQuestionnaire } from "../chat/ToolInputQuestionnaire";
 import { CodexUsageLimits } from "./CodexUsageLimits";
+import {
+  VirtualMessageTranscript,
+  type VirtualMessageTranscriptHandle,
+} from "./VirtualMessageTranscript";
 import { findLatestPendingToolInputApproval } from "../chat/toolInputApproval";
 import {
   canForkFromAssistantMessage,
@@ -54,7 +57,6 @@ import {
 import {
   captureChatScrollPosition,
   readChatScrollPosition,
-  restoreChatScrollPosition,
   saveChatScrollPosition,
 } from "../../lib/chatScrollPosition";
 import { useTranscriptSelection } from "../../lib/transcriptSelection";
@@ -85,7 +87,6 @@ import type { ApprovalResponse, ChatAttachment, CodexApp, CodexSkill, ContentBlo
 const PLAN_IMPLEMENTATION_QUESTION_ID = "plan_implementation_decision";
 const PLAN_IMPLEMENTATION_CHOICE = "Implement the plan";
 const STAY_IN_PLAN_MODE_CHOICE = "Stay in plan mode";
-const SCROLL_RESTORE_SETTLE_MS = 2_500;
 const PLAN_IMPLEMENTATION_QUESTION_DETAILS: Record<string, unknown> = {
   questions: [{
     id: PLAN_IMPLEMENTATION_QUESTION_ID,
@@ -156,11 +157,10 @@ function CopyMessageButton({ text }: { text: string }) {
 
 export function CodexChat() {
   const viewportRef = useRef<HTMLDivElement>(null);
+  const transcriptRef = useRef<VirtualMessageTranscriptHandle>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const nearBottomRef = useRef(true);
   const selectionPausedFollowRef = useRef(false);
-  const scrollRestoreActiveRef = useRef(false);
-  const scrollRestoreCleanupRef = useRef<(() => void) | null>(null);
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [selectedModelId, setSelectedModelId] = useState("");
@@ -238,6 +238,10 @@ export function CodexChat() {
     if (!rollingBackMessageId) return messages;
     return messagesBeforeEditableUserTurn(messages, rollingBackMessageId) ?? messages;
   }, [messages, rollingBackMessageId]);
+  const savedScrollPosition = useMemo(
+    () => boundThreadId ? readChatScrollPosition(boundThreadId) : null,
+    [boundThreadId],
+  );
   const visibleTranscriptRevision = useMemo(
     () => displayedMessages
       .map((message) => `${message.id}:${transcriptSequences[message.id] ?? 0}`)
@@ -278,9 +282,7 @@ export function CodexChat() {
   const showSpecialComposer = !rollingBackMessageId && Boolean(pendingToolInputApproval || showPlanImplementationPrompt);
 
   const stopScrollRestoration = useCallback(() => {
-    scrollRestoreActiveRef.current = false;
-    scrollRestoreCleanupRef.current?.();
-    scrollRestoreCleanupRef.current = null;
+    transcriptRef.current?.cancelRestore();
   }, []);
 
   const handleTranscriptSelectionActiveChange = useCallback((active: boolean) => {
@@ -293,6 +295,7 @@ export function CodexChat() {
   const {
     active: transcriptSelectionActive,
     clearSelection: clearTranscriptSelection,
+    selectedMessageRange,
   } = useTranscriptSelection({
     rootRef: viewportRef,
     resetKey: `${activeThreadId ?? ""}:${boundThreadId ?? ""}`,
@@ -306,8 +309,7 @@ export function CodexChat() {
     nearBottomRef.current = true;
     setHasUnseenOutput(false);
     window.requestAnimationFrame(() => {
-      const viewport = viewportRef.current;
-      if (viewport) viewport.scrollTop = viewport.scrollHeight;
+      transcriptRef.current?.scrollToEnd();
     });
   }, [clearTranscriptSelection, stopScrollRestoration]);
 
@@ -332,75 +334,9 @@ export function CodexChat() {
     };
   }, []);
 
-  useLayoutEffect(() => {
-    const viewport = viewportRef.current;
-    if (!viewport || !boundThreadId) {
-      nearBottomRef.current = true;
-      stopScrollRestoration();
-      return;
-    }
-
-    const saved = readChatScrollPosition(boundThreadId);
-    nearBottomRef.current = saved?.nearBottom ?? true;
-    stopScrollRestoration();
-    if (!saved) {
-      viewport.scrollTop = viewport.scrollHeight;
-      return;
-    }
-
-    scrollRestoreActiveRef.current = true;
-    const restore = () => {
-      if (!scrollRestoreActiveRef.current) return;
-      restoreChatScrollPosition(viewport, saved);
-    };
-    restore();
-
-    let frame = 0;
-    const resizeObserver = typeof ResizeObserver === "function"
-      ? new ResizeObserver(restore)
-      : null;
-    const observeMessages = () => {
-      if (!resizeObserver) return;
-      viewport
-        .querySelectorAll<HTMLElement>("[data-message-id]")
-        .forEach((message) => resizeObserver.observe(message));
-    };
-    observeMessages();
-
-    const mutationObserver = typeof MutationObserver === "function"
-      ? new MutationObserver(() => {
-          observeMessages();
-          restore();
-        })
-      : null;
-    mutationObserver?.observe(viewport, { childList: true, subtree: true });
-
-    let settleTimer = 0;
-    const cleanup = () => {
-      window.cancelAnimationFrame(frame);
-      window.clearTimeout(settleTimer);
-      resizeObserver?.disconnect();
-      mutationObserver?.disconnect();
-    };
-    scrollRestoreCleanupRef.current = cleanup;
-
-    // One extra frame covers the synchronous cached-history commit followed by
-    // React's lazy transcript boundary resolving in the same paint cycle.
-    frame = window.requestAnimationFrame(restore);
-    settleTimer = window.setTimeout(() => {
-      scrollRestoreActiveRef.current = false;
-      if (scrollRestoreCleanupRef.current === cleanup) {
-        scrollRestoreCleanupRef.current = null;
-      }
-      cleanup();
-    }, SCROLL_RESTORE_SETTLE_MS);
-    return () => {
-      if (scrollRestoreCleanupRef.current === cleanup) {
-        scrollRestoreCleanupRef.current = null;
-      }
-      cleanup();
-    };
-  }, [boundThreadId, stopScrollRestoration]);
+  useEffect(() => {
+    nearBottomRef.current = savedScrollPosition?.nearBottom ?? true;
+  }, [boundThreadId, savedScrollPosition]);
 
   useEffect(() => {
     const preferredModel = readMetadataString(activeThread, "lastModelId") ?? activeThread?.modelId;
@@ -504,7 +440,7 @@ export function CodexChat() {
     const viewport = viewportRef.current;
     if (!viewport) return;
     if (nearBottomRef.current && !selectionPausedFollowRef.current) {
-      viewport.scrollTop = viewport.scrollHeight;
+      transcriptRef.current?.scrollToEnd();
       setHasUnseenOutput(false);
       return;
     }
@@ -602,8 +538,7 @@ export function CodexChat() {
     stopScrollRestoration();
     nearBottomRef.current = true;
     requestAnimationFrame(() => {
-      const viewport = viewportRef.current;
-      if (viewport) viewport.scrollTop = viewport.scrollHeight;
+      transcriptRef.current?.scrollToEnd();
       textareaRef.current?.focus();
     });
 
@@ -853,6 +788,88 @@ export function CodexChat() {
     void updateServiceTier(enabled ? "fast" : "inherit");
   }
 
+  function renderMessage(message: Message) {
+    const blocks = messageBlocks(message);
+    const copyText = message.content ?? blocks
+      .filter((block) => block.type === "text")
+      .map((block) => block.content)
+      .join("\n\n");
+    const canForkMessage = canForkFromAssistantMessage(message, sourceTurnActive) && canForkMessages;
+    const canRollbackMessage = message.role === "user" && canRollbackMessages && isEditableUserTurn(message);
+    const isForkingMessage = forkingMessageId === message.id;
+    const isRollingBackMessage = rollingBackMessageId === message.id;
+    return (
+      <article
+        className={`codex-message ${message.role}`}
+        data-message-id={message.id}
+        data-transcript-selection-scope={`message:${message.id}`}
+      >
+        {message.role === "user" && (
+          <div className="codex-message-label">
+            <CopyMessageButton text={copyText} />
+            {canRollbackMessage && (
+              <button
+                className="codex-rollback-message"
+                type="button"
+                title={isRollingBackMessage ? "Rolling back conversation" : "Roll back to here"}
+                aria-label={isRollingBackMessage ? "Rolling back conversation" : "Roll back to here"}
+                disabled={forkingMessageId !== null || rollingBackMessageId !== null}
+                onClick={() => void rollbackToMessage(message)}
+              >
+                {isRollingBackMessage
+                  ? <LoaderCircle size={12} className="codex-spin" />
+                  : <RotateCcw size={12} />}
+              </button>
+            )}
+          </div>
+        )}
+        <Suspense fallback={<div className="codex-loading">Rendering…</div>}>
+          {message.role === "assistant" ? (
+            <CodexTurnTranscript
+              messageId={message.id}
+              blocks={blocks}
+              status={message.status}
+              tokenUsage={message.tokenUsage}
+              workspaceRootPath={workspace?.rootPath ?? ""}
+              refreshSequence={transcriptSequences[message.id] ?? 0}
+              onApproval={approval}
+              onLoadActionOutput={(actionId) => hydrateActionOutput(message.id, actionId)}
+              onPlanText={recordNativePlanText}
+            />
+          ) : (
+            <MessageBlocks
+              blocks={blocks}
+              status={message.status}
+              workspaceRootPath={workspace?.rootPath ?? ""}
+              selectionNamespace={`message:${message.id}:blocks`}
+              onApproval={approval}
+              onLoadActionOutput={(actionId) => hydrateActionOutput(message.id, actionId)}
+            />
+          )}
+        </Suspense>
+        {message.role === "assistant" && message.status !== "streaming" && (
+          <div className="codex-message-actions">
+            <CopyMessageButton text={copyText} />
+            {canForkMessage && (
+              <button
+                className="codex-fork-message"
+                type="button"
+                title={isForkingMessage ? "Forking conversation" : "Fork from here"}
+                aria-label={isForkingMessage ? "Forking conversation" : "Fork from here"}
+                disabled={forkingMessageId !== null || rollingBackMessageId !== null}
+                onClick={() => void forkFromMessage(message)}
+              >
+                {isForkingMessage
+                  ? <LoaderCircle size={12} className="codex-spin" />
+                  : <GitBranch size={12} />}
+              </button>
+            )}
+          </div>
+        )}
+      </article>
+    );
+  }
+
   if (!workspace) {
     return <main className="codex-empty"><div className="codex-mark large">C</div><h1>Open a workspace</h1><p>Choose a folder to start working with Codex.</p></main>;
   }
@@ -926,90 +943,16 @@ export function CodexChat() {
         )}
         {!activeThread && <div className="codex-welcome"><h1>What should we work on?</h1><p>Codex can inspect, edit, test, and explain anything in {workspace.name}.</p></div>}
         {activeThread && boundThreadId !== activeThread.id && <div className="codex-loading">Loading conversation…</div>}
-        {displayedMessages.map((message) => {
-          const blocks = messageBlocks(message);
-          const copyText = message.content ?? blocks.filter((block) => block.type === "text").map((block) => block.content).join("\n\n");
-          const canForkMessage =
-            canForkFromAssistantMessage(message, sourceTurnActive) &&
-            canForkMessages;
-          const canRollbackMessage =
-            message.role === "user" &&
-            canRollbackMessages &&
-            isEditableUserTurn(message);
-          const isForkingMessage = forkingMessageId === message.id;
-          const isRollingBackMessage = rollingBackMessageId === message.id;
-          return (
-            <article
-              key={message.id}
-              className={`codex-message ${message.role}`}
-              data-message-id={message.id}
-              data-transcript-selection-scope={`message:${message.id}`}
-            >
-              {message.role === "user" && (
-                <div className="codex-message-label">
-                  <CopyMessageButton text={copyText} />
-                  {canRollbackMessage && (
-                    <button
-                      className="codex-rollback-message"
-                      type="button"
-                      title={isRollingBackMessage ? "Rolling back conversation" : "Roll back to here"}
-                      aria-label={isRollingBackMessage ? "Rolling back conversation" : "Roll back to here"}
-                      disabled={forkingMessageId !== null || rollingBackMessageId !== null}
-                      onClick={() => void rollbackToMessage(message)}
-                    >
-                      {isRollingBackMessage
-                        ? <LoaderCircle size={12} className="codex-spin" />
-                        : <RotateCcw size={12} />}
-                    </button>
-                  )}
-                </div>
-              )}
-              <Suspense fallback={<div className="codex-loading">Rendering…</div>}>
-                {message.role === "assistant" ? (
-                  <CodexTurnTranscript
-                    messageId={message.id}
-                    blocks={blocks}
-                    status={message.status}
-                    tokenUsage={message.tokenUsage}
-                    workspaceRootPath={workspace.rootPath}
-                    refreshSequence={transcriptSequences[message.id] ?? 0}
-                    onApproval={approval}
-                    onLoadActionOutput={(actionId) => hydrateActionOutput(message.id, actionId)}
-                    onPlanText={recordNativePlanText}
-                  />
-                ) : (
-                  <MessageBlocks
-                    blocks={blocks}
-                    status={message.status}
-                    workspaceRootPath={workspace.rootPath}
-                    selectionNamespace={`message:${message.id}:blocks`}
-                    onApproval={approval}
-                    onLoadActionOutput={(actionId) => hydrateActionOutput(message.id, actionId)}
-                  />
-                )}
-              </Suspense>
-              {message.role === "assistant" && message.status !== "streaming" && (
-                <div className="codex-message-actions">
-                  <CopyMessageButton text={copyText} />
-                  {canForkMessage && (
-                    <button
-                      className="codex-fork-message"
-                      type="button"
-                      title={isForkingMessage ? "Forking conversation" : "Fork from here"}
-                      aria-label={isForkingMessage ? "Forking conversation" : "Fork from here"}
-                      disabled={forkingMessageId !== null || rollingBackMessageId !== null}
-                      onClick={() => void forkFromMessage(message)}
-                    >
-                      {isForkingMessage
-                        ? <LoaderCircle size={12} className="codex-spin" />
-                        : <GitBranch size={12} />}
-                    </button>
-                  )}
-                </div>
-              )}
-            </article>
-          );
-        })}
+        <VirtualMessageTranscript
+          key={boundThreadId ?? "unbound"}
+          ref={transcriptRef}
+          messages={displayedMessages}
+          viewportRef={viewportRef}
+          restorePosition={savedScrollPosition}
+          selectedMessageRange={selectedMessageRange}
+          layoutRevision={`${hasOlderMessages}:${loadingOlderMessages}:${showSpecialComposer}`}
+          renderMessage={renderMessage}
+        />
         {error && <div className="codex-error">{error}</div>}
       </div>
 

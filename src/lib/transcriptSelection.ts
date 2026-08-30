@@ -25,6 +25,7 @@ const TRANSCRIPT_SELECTION_IGNORED_SELECTOR = [
 
 export interface TranscriptSelectionEndpoint {
   scopeId: string;
+  messageId: string | null;
   offset: number;
   before: string;
   after: string;
@@ -62,6 +63,12 @@ interface UseTranscriptSelectionOptions {
 interface TranscriptSelectionController {
   active: boolean;
   clearSelection: () => void;
+  selectedMessageRange: TranscriptSelectionMessageRange | null;
+}
+
+export interface TranscriptSelectionMessageRange {
+  anchorMessageId: string;
+  focusMessageId: string;
 }
 
 function eventElement(target: EventTarget | null): Element | null {
@@ -104,8 +111,10 @@ function endpointForSelectionPoint(
   const textOffset = scopeTextOffset(scope, node, offset);
   if (textOffset === null) return null;
   const scopeText = scope.textContent ?? "";
+  const message = scope.closest<HTMLElement>("[data-message-id]");
   return {
     scopeId,
+    messageId: message?.dataset.messageId ?? null,
     offset: textOffset,
     before: scopeText.slice(Math.max(0, textOffset - ENDPOINT_CONTEXT_CHARS), textOffset),
     after: scopeText.slice(textOffset, textOffset + ENDPOINT_CONTEXT_CHARS),
@@ -402,6 +411,7 @@ export function useTranscriptSelection({
   onActiveChange,
 }: UseTranscriptSelectionOptions): TranscriptSelectionController {
   const [active, setActive] = useState(false);
+  const [selectedMessageRange, setSelectedMessageRange] = useState<TranscriptSelectionMessageRange | null>(null);
   const activeRef = useRef(false);
   const bookmarkRef = useRef<TranscriptSelectionBookmark | null>(null);
   const observerRef = useRef<MutationObserver | null>(null);
@@ -427,6 +437,7 @@ export function useTranscriptSelection({
 
   const deactivate = useCallback(() => {
     bookmarkRef.current = null;
+    setSelectedMessageRange(null);
     stopObserving();
     setSelectionActive(false);
   }, [setSelectionActive, stopObserving]);
@@ -470,6 +481,18 @@ export function useTranscriptSelection({
     const bookmark = captureTranscriptSelection(root);
     if (!bookmark) return false;
     bookmarkRef.current = bookmark;
+    const nextRange = bookmark.anchor.messageId && bookmark.focus.messageId
+      ? {
+          anchorMessageId: bookmark.anchor.messageId,
+          focusMessageId: bookmark.focus.messageId,
+        }
+      : null;
+    setSelectedMessageRange((current) => (
+      current?.anchorMessageId === nextRange?.anchorMessageId &&
+      current?.focusMessageId === nextRange?.focusMessageId
+        ? current
+        : nextRange
+    ));
     setSelectionActive(true);
     startObserving();
     return true;
@@ -565,5 +588,5 @@ export function useTranscriptSelection({
     clearSelection();
   }, [clearSelection, resetKey]);
 
-  return { active, clearSelection };
+  return { active, clearSelection, selectedMessageRange };
 }
