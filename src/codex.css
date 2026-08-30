@@ -82,7 +82,7 @@ button { color: inherit; }
 .codex-workspace-add:focus-visible,
 .codex-session-main:focus-visible,
 .codex-session-menu-button:focus-visible,
-.codex-archived-session-row button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.codex-archived-session-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .codex-workspace-add {
   width: 28px; height: 28px; flex: 0 0 28px; border: 0; border-radius: 6px; padding: 0; background: transparent;
   display: grid; place-items: center; color: var(--text-2); opacity: .84;
@@ -178,15 +178,12 @@ button { color: inherit; }
 .codex-archive-error button { width: fit-content; border: 0; padding: 0; background: transparent; color: var(--accent); font-size: 10.5px; }
 .codex-archived-workspace-list { display: grid; gap: 9px; }
 .codex-archived-workspace-name { height: 27px; padding: 0 6px; display: flex; align-items: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); font-size: 11.5px; font-weight: 540; }
-.codex-archived-session-row { min-width: 0; height: 34px; border-radius: 8px; padding-left: 12px; display: flex; align-items: center; gap: 9px; color: var(--text-3); }
-.codex-archived-session-row:hover,
-.codex-archived-session-row:focus-within { background: var(--surface-hover); color: var(--text-2); }
+.codex-archived-session-row { width: 100%; min-width: 0; height: 34px; border: 0; border-radius: 8px; padding: 0 7px 0 12px; background: transparent; display: flex; align-items: center; gap: 9px; color: var(--text-3); text-align: left; }
+.codex-archived-session-row:hover:not(:disabled),
+.codex-archived-session-row:focus-visible { background: var(--surface-hover); color: var(--text-2); }
 .codex-archived-session-row > span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-1); font-size: 11.5px; }
-.codex-archived-session-row > button { width: 28px; height: 28px; flex: 0 0 28px; border: 0; border-radius: 6px; padding: 0; background: transparent; display: grid; place-items: center; color: var(--text-2); opacity: 0; }
-.codex-archived-session-row:hover > button:not(:disabled),
-.codex-archived-session-row:focus-within > button:not(:disabled) { opacity: .8; }
-.codex-archived-session-row > button:hover:not(:disabled) { background: color-mix(in srgb, var(--surface-hover) 72%, transparent); color: var(--text-1); opacity: 1; }
-.codex-archived-session-row > button:disabled { opacity: .45; }
+.codex-archived-session-row:disabled { opacity: .45; }
+.codex-archived-restore-icon { width: 28px; flex: 0 0 28px; color: var(--text-2); opacity: .7; }
 .codex-sidebar-footer { padding: 7px; border-top: 1px solid var(--border); display: grid; gap: 2px; }
 .codex-cli-version { min-width: 0; padding: 4px 9px 1px; overflow: hidden; color: var(--text-3); font-size: 9px; line-height: 1.2; text-overflow: ellipsis; white-space: nowrap; user-select: text; }
 .codex-sr-only { position: absolute !important; width: 1px !important; height: 1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; }

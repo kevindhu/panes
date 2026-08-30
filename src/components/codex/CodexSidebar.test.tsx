@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => ({
   removeThread: vi.fn(async (_threadId: string) => true),
   renameThread: vi.fn(async (_threadId: string, _title: string) => null as Thread | null),
   reorderWorkspaces: vi.fn(async (_workspaceIds: string[]) => {}),
+  restoreWorkspace: vi.fn(async (_workspaceId: string) => {}),
   restoreThread: vi.fn(async (_threadId: string) => null as Thread | null),
   toast: {
     success: vi.fn(),
@@ -70,10 +71,14 @@ function makeThread(overrides: Partial<Thread> & Pick<Thread, "id" | "workspaceI
   };
 }
 
-function setWorkspaceState(workspaces: Workspace[], activeWorkspaceId: string | null = null) {
+function setWorkspaceState(
+  workspaces: Workspace[],
+  activeWorkspaceId: string | null = null,
+  archivedWorkspaces: Workspace[] = [],
+) {
   useWorkspaceStore.setState({
     workspaces,
-    archivedWorkspaces: [],
+    archivedWorkspaces,
     activeWorkspaceId,
     repos: [],
     activeRepoId: null,
@@ -81,6 +86,7 @@ function setWorkspaceState(workspaces: Workspace[], activeWorkspaceId: string | 
     loading: false,
     error: undefined,
     reorderWorkspaces: mocks.reorderWorkspaces,
+    restoreWorkspace: mocks.restoreWorkspace,
   });
 }
 
@@ -167,6 +173,18 @@ beforeEach(() => {
   mocks.refreshArchived.mockResolvedValue(undefined);
   mocks.removeThread.mockResolvedValue(true);
   mocks.reorderWorkspaces.mockResolvedValue(undefined);
+  mocks.restoreThread.mockResolvedValue(null);
+  mocks.restoreWorkspace.mockImplementation(async (workspaceId) => {
+    const state = useWorkspaceStore.getState();
+    const restored = state.archivedWorkspaces.find((workspace) => workspace.id === workspaceId);
+    if (!restored) return;
+    useWorkspaceStore.setState({
+      workspaces: [restored, ...state.workspaces],
+      archivedWorkspaces: state.archivedWorkspaces.filter(
+        (workspace) => workspace.id !== workspaceId,
+      ),
+    });
+  });
   mocks.renameThread.mockImplementation(async (threadId, title) => {
     const thread = useThreadStore.getState().threads.find((item) => item.id === threadId);
     return thread ? { ...thread, title } : null;
@@ -702,7 +720,7 @@ describe("CodexSidebar", () => {
 
     await act(async () => {
       container.querySelector<HTMLButtonElement>(
-        'button[aria-label="Restore Archived work"]',
+        'button[aria-label="Restore and open Archived work"]',
       )?.click();
       await Promise.resolve();
     });
@@ -711,5 +729,50 @@ describe("CodexSidebar", () => {
     expect(mocks.activateThreadContext).toHaveBeenCalledWith(archived);
     expect(container.querySelector(".codex-archive-drawer")).toBeNull();
     expect(mocks.toast.success).toHaveBeenCalledWith("Restored “Archived work”.");
+  });
+
+  it("restores an archived conversation's original workspace before opening it", async () => {
+    const activeWorkspace = makeWorkspace("workspace-a", "Alpha");
+    const archivedWorkspace = makeWorkspace("workspace-b", "Archived Beta");
+    const archived = makeThread({
+      id: "archived-thread",
+      workspaceId: archivedWorkspace.id,
+      title: "Archived work",
+    });
+    mocks.restoreThread.mockResolvedValue(archived);
+    setWorkspaceState([activeWorkspace], activeWorkspace.id, [archivedWorkspace]);
+    setThreadState(
+      { [activeWorkspace.id]: [] },
+      null,
+      { [archivedWorkspace.id]: [archived] },
+    );
+    await renderSidebar();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(
+        ".codex-sidebar-footer button:first-child",
+      )?.click();
+      await Promise.resolve();
+    });
+
+    expect(mocks.refreshArchived).toHaveBeenCalledWith([
+      activeWorkspace.id,
+      archivedWorkspace.id,
+    ]);
+    expect(container.querySelector(".codex-archive-drawer")?.textContent)
+      .toContain("Archived Beta");
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(
+        'button[aria-label="Restore and open Archived work"]',
+      )?.click();
+      await Promise.resolve();
+    });
+
+    expect(mocks.restoreWorkspace).toHaveBeenCalledWith(archivedWorkspace.id);
+    expect(mocks.restoreWorkspace.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.restoreThread.mock.invocationCallOrder[0]);
+    expect(mocks.restoreThread).toHaveBeenCalledWith(archived.id);
+    expect(mocks.activateThreadContext).toHaveBeenCalledWith(archived);
   });
 });

@@ -477,8 +477,10 @@ export function CodexSidebar() {
   const threadRowRefs = useRef(new Map<string, HTMLDivElement>());
 
   const workspaces = useWorkspaceStore((state) => state.workspaces);
+  const archivedWorkspaces = useWorkspaceStore((state) => state.archivedWorkspaces);
   const activeWorkspaceId = useWorkspaceStore((state) => state.activeWorkspaceId);
   const openWorkspace = useWorkspaceStore((state) => state.openWorkspace);
+  const restoreWorkspace = useWorkspaceStore((state) => state.restoreWorkspace);
   const reorderWorkspaces = useWorkspaceStore((state) => state.reorderWorkspaces);
   const threadsByWorkspace = useThreadStore((state) => state.threadsByWorkspace);
   const finishedTurnNotifications = useThreadStore(
@@ -507,6 +509,19 @@ export function CodexSidebar() {
     () => workspaces.map((workspace) => workspace.id),
     [workspaces],
   );
+  const archiveWorkspaces = useMemo(
+    () => [
+      ...workspaces,
+      ...archivedWorkspaces.filter(
+        (workspace) => !workspaces.some((active) => active.id === workspace.id),
+      ),
+    ],
+    [archivedWorkspaces, workspaces],
+  );
+  const archiveWorkspaceIds = useMemo(
+    () => archiveWorkspaces.map((workspace) => workspace.id),
+    [archiveWorkspaces],
+  );
   const renderedWorkspaces = useMemo(() => {
     const order = workspacePreviewOrder ?? workspaceIds;
     return order.flatMap((workspaceId) => {
@@ -515,13 +530,13 @@ export function CodexSidebar() {
     });
   }, [workspaceIds, workspacePreviewOrder, workspaces]);
   const archivedWorkspaceGroups = useMemo(
-    () => workspaces
+    () => archiveWorkspaces
       .map((workspace) => ({
         workspace,
         threads: archivedThreadsByWorkspace[workspace.id] ?? EMPTY_THREADS,
       }))
       .filter((group) => group.threads.length > 0),
-    [archivedThreadsByWorkspace, workspaces],
+    [archiveWorkspaces, archivedThreadsByWorkspace],
   );
   const archivedThreadCount = useMemo(
     () => archivedWorkspaceGroups.reduce((total, group) => total + group.threads.length, 0),
@@ -799,7 +814,7 @@ export function CodexSidebar() {
 
   async function loadArchivedSessions() {
     setArchiveLoadError(null);
-    await refreshAllArchivedThreads(workspaceIds);
+    await refreshAllArchivedThreads(archiveWorkspaceIds);
     setArchiveLoadError(useThreadStore.getState().error ?? null);
   }
 
@@ -813,17 +828,36 @@ export function CodexSidebar() {
   async function restoreArchivedThread(thread: Thread) {
     if (restoringThreadId) return;
     setRestoringThreadId(thread.id);
-    const restored = await restoreThread(thread.id);
-    setRestoringThreadId(null);
-    if (!restored) {
-      toast.error(useThreadStore.getState().error ?? "Could not restore the conversation.");
-      return;
-    }
+    try {
+      const workspaceState = useWorkspaceStore.getState();
+      const workspaceIsActive = workspaceState.workspaces.some(
+        (workspace) => workspace.id === thread.workspaceId,
+      );
+      if (!workspaceIsActive) {
+        await restoreWorkspace(thread.workspaceId);
+        if (!useWorkspaceStore.getState().workspaces.some(
+          (workspace) => workspace.id === thread.workspaceId,
+        )) {
+          toast.error(
+            useWorkspaceStore.getState().error ?? "Could not restore the conversation's workspace.",
+          );
+          return;
+        }
+      }
 
-    expandWorkspace(restored.workspaceId);
-    setSidebarView("workspaces");
-    await activateThreadContext(restored);
-    toast.success(`Restored “${restored.title || "Untitled"}”.`);
+      const restored = await restoreThread(thread.id);
+      if (!restored) {
+        toast.error(useThreadStore.getState().error ?? "Could not restore the conversation.");
+        return;
+      }
+
+      expandWorkspace(restored.workspaceId);
+      setSidebarView("workspaces");
+      await activateThreadContext(restored);
+      toast.success(`Restored “${restored.title || "Untitled"}”.`);
+    } finally {
+      setRestoringThreadId(null);
+    }
   }
 
   async function persistWorkspaceOrder(nextWorkspaceIds: string[], announcement: string) {
@@ -1265,21 +1299,21 @@ export function CodexSidebar() {
                 <section className="codex-archived-workspace-group" key={workspace.id}>
                   <div className="codex-archived-workspace-name">{workspace.name}</div>
                   {threads.map((thread) => (
-                    <div className="codex-archived-session-row" key={thread.id}>
+                    <button
+                      className="codex-archived-session-row"
+                      key={thread.id}
+                      type="button"
+                      disabled={restoringThreadId !== null}
+                      title={`Restore and open ${thread.title || "Untitled"}`}
+                      aria-label={`Restore and open ${thread.title || "Untitled"}`}
+                      onClick={() => void restoreArchivedThread(thread)}
+                    >
                       <Archive size={12} aria-hidden="true" />
                       <span title={thread.title || "Untitled"}>{thread.title || "Untitled"}</span>
-                      <button
-                        type="button"
-                        disabled={restoringThreadId !== null}
-                        title={`Restore ${thread.title || "Untitled"}`}
-                        aria-label={`Restore ${thread.title || "Untitled"}`}
-                        onClick={() => void restoreArchivedThread(thread)}
-                      >
-                        {restoringThreadId === thread.id
-                          ? <LoaderCircle size={13} className="codex-spin" />
-                          : <RotateCcw size={13} />}
-                      </button>
-                    </div>
+                      {restoringThreadId === thread.id
+                        ? <LoaderCircle size={13} className="codex-archived-restore-icon codex-spin" />
+                        : <RotateCcw size={13} className="codex-archived-restore-icon" />}
+                    </button>
                   ))}
                 </section>
               ))}

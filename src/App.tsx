@@ -95,13 +95,19 @@ export function App() {
 
     const unlisteners: Array<() => void> = [];
     void listenThreadUpdated((event) => {
-      if (event.thread?.engineId !== "codex") return;
-      const applied = useThreadStore.getState().applyThreadUpdateLocal(event.thread);
+      if (event.thread && event.thread.engineId !== "codex") return;
+      const threadStore = useThreadStore.getState();
+      const applied = event.thread
+        ? threadStore.applyThreadUpdateLocal(event.thread)
+        : false;
       const workspaceExists = useWorkspaceStore
         .getState()
         .workspaces.some((workspace) => workspace.id === event.workspaceId);
       if (!applied && workspaceExists) {
-        void useThreadStore.getState().refreshThreads(event.workspaceId);
+        void Promise.all([
+          threadStore.refreshThreads(event.workspaceId),
+          threadStore.refreshArchivedThreads(event.workspaceId),
+        ]);
       }
     }).then((unlisten) => unlisteners.push(unlisten));
     void listenChatTurnFinished((event) => {

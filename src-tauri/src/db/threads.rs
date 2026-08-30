@@ -188,9 +188,10 @@ pub fn archive_thread(db: &Database, thread_id: &str) -> anyhow::Result<()> {
             params![thread_id],
         )
         .context("failed to archive thread")?;
+    drop(conn);
 
-    if affected == 0 {
-        anyhow::bail!("thread not found or already archived: {thread_id}");
+    if affected == 0 && get_thread(db, thread_id)?.is_none() {
+        anyhow::bail!("thread not found after archive: {thread_id}");
     }
 
     Ok(())
@@ -198,19 +199,15 @@ pub fn archive_thread(db: &Database, thread_id: &str) -> anyhow::Result<()> {
 
 pub fn restore_thread(db: &Database, thread_id: &str) -> anyhow::Result<ThreadDto> {
     let conn = db.connect()?;
-    let affected = conn
-        .execute(
-            "UPDATE threads
+    conn.execute(
+        "UPDATE threads
        SET archived_at = NULL
        WHERE id = ?1
          AND archived_at IS NOT NULL",
-            params![thread_id],
-        )
-        .context("failed to restore thread")?;
-
-    if affected == 0 {
-        anyhow::bail!("thread not found or not archived: {thread_id}");
-    }
+        params![thread_id],
+    )
+    .context("failed to restore thread")?;
+    drop(conn);
 
     get_thread(db, thread_id)?
         .ok_or_else(|| anyhow::anyhow!("thread not found after restore: {thread_id}"))
@@ -230,10 +227,7 @@ pub fn update_engine_metadata(
     Ok(())
 }
 
-pub fn mark_pending_rollback_started(
-    db: &Database,
-    thread_id: &str,
-) -> anyhow::Result<ThreadDto> {
+pub fn mark_pending_rollback_started(db: &Database, thread_id: &str) -> anyhow::Result<ThreadDto> {
     let conn = db.connect()?;
     let affected = conn
         .execute(
@@ -311,6 +305,16 @@ pub fn refresh_thread_message_stats(db: &Database, thread_id: &str) -> anyhow::R
     )
     .context("failed to persist recalculated thread message stats")?;
 
+    Ok(())
+}
+
+pub fn touch_thread_activity(db: &Database, thread_id: &str) -> anyhow::Result<()> {
+    let conn = db.connect()?;
+    conn.execute(
+        "UPDATE threads SET last_activity_at = datetime('now') WHERE id = ?1",
+        params![thread_id],
+    )
+    .context("failed to update thread activity")?;
     Ok(())
 }
 
@@ -927,5 +931,19 @@ mod tests {
 
         assert!(listed_ids.contains(&visible.id));
         assert!(!listed_ids.contains(&hidden.id));
+    }
+
+    #[test]
+    fn archive_and_restore_thread_are_idempotent() {
+        let db = test_db();
+        let thread = test_thread(&db, "Archived");
+        archive_thread(&db, &thread.id).unwrap();
+        archive_thread(&db, &thread.id).unwrap();
+
+        let restored = restore_thread(&db, &thread.id).unwrap();
+        let restored_again = restore_thread(&db, &thread.id).unwrap();
+
+        assert_eq!(restored.id, thread.id);
+        assert_eq!(restored_again.id, thread.id);
     }
 }
