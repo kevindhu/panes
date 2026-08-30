@@ -136,7 +136,14 @@ export function rewriteMarkdownImageSources(
     if (title) {
       image.setAttribute("title", title);
     }
-    anchor.replaceWith(image);
+    const inlineCode = anchor.parentElement;
+    const imageIsOnlyInlineCodeContent =
+      inlineCode?.tagName.toLowerCase() === "code"
+      && inlineCode.parentElement?.tagName.toLowerCase() !== "pre"
+      && Array.from(inlineCode.childNodes).every(
+        (child) => child === anchor || (child.nodeType === Node.TEXT_NODE && !child.textContent?.trim()),
+      );
+    (imageIsOnlyInlineCodeContent ? inlineCode : anchor)?.replaceWith(image);
     changed = true;
   }
 

@@ -521,6 +521,25 @@ describe("MarkdownContent", () => {
     );
   });
 
+  it("removes the inline-code pill around a promoted local image path", async () => {
+    await act(async () => {
+      root.render(
+        <MarkdownContent
+          content={String.raw`The original \`C:\Users\lemondoo\Downloads\dva.gif\` file is gone.`}
+        />,
+      );
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const figure = container.querySelector(".chat-image-figure-markdown");
+    expect(figure).not.toBeNull();
+    expect(figure?.closest("code")).toBeNull();
+    expect(container.querySelector("code")).toBeNull();
+  });
+
   it("loads UNC images without requiring a workspace root", async () => {
     const uncPath = String.raw`\\media-server\translations\translated page.webp`;
 
