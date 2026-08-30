@@ -119,7 +119,7 @@ button { color: inherit; }
 }
 .codex-session-status.streaming:not(.notification) {
   border-color: var(--accent); background: var(--accent);
-  animation: codex-session-working-pulse 2.2s ease-in-out infinite;
+  animation: codex-session-working-pulse 1.7s ease-in-out infinite;
 }
 .codex-session-status.attention,
 .codex-session-status.awaiting_approval { border-color: var(--warning); background: var(--warning); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warning) 14%, transparent); }
@@ -127,8 +127,8 @@ button { color: inherit; }
 .codex-session-status.notification { border-color: var(--success); background: var(--success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 14%, transparent); }
 .codex-session-status.error.notification { border-color: var(--danger); background: var(--danger); box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 14%, transparent); }
 @keyframes codex-session-working-pulse {
-  0%, 100% { opacity: .82; box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 9%, transparent); }
-  50% { opacity: 1; box-shadow: 0 0 0 3px var(--accent-soft); }
+  0%, 100% { opacity: .68; box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 10%, transparent); }
+  50% { opacity: 1; box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 30%, transparent); }
 }
 @media (prefers-reduced-motion: reduce) {
   .codex-session-status.streaming:not(.notification) { animation: none; box-shadow: 0 0 0 3px var(--accent-soft); }

@@ -334,7 +334,7 @@ describe("CodexSidebar", () => {
     ).toBeNull();
   });
 
-  it("reveals sessions in batches of 20 independently for each workspace", async () => {
+  it("reveals sessions in batches of 10 independently for each workspace", async () => {
     const workspaceA = makeWorkspace("workspace-a", "Alpha");
     const workspaceB = makeWorkspace("workspace-b", "Beta");
     const makeThreads = (workspaceId: string, count: number) => Array.from(
@@ -350,35 +350,35 @@ describe("CodexSidebar", () => {
     );
     setWorkspaceState([workspaceA, workspaceB]);
     setThreadState({
-      [workspaceA.id]: makeThreads(workspaceA.id, 43),
-      [workspaceB.id]: makeThreads(workspaceB.id, 22),
+      [workspaceA.id]: makeThreads(workspaceA.id, 23),
+      [workspaceB.id]: makeThreads(workspaceB.id, 12),
     });
     await renderSidebar();
 
     const groups = container.querySelectorAll<HTMLElement>(".codex-workspace-group");
     const alphaGroup = groups[0];
     const betaGroup = groups[1];
-    expect(alphaGroup?.querySelectorAll(".codex-session-row")).toHaveLength(20);
-    expect(betaGroup?.querySelectorAll(".codex-session-row")).toHaveLength(20);
+    expect(alphaGroup?.querySelectorAll(".codex-session-row")).toHaveLength(10);
+    expect(betaGroup?.querySelectorAll(".codex-session-row")).toHaveLength(10);
     expect(alphaGroup?.querySelector(".codex-session-show-more")?.textContent?.trim())
-      .toBe("Show 20 more");
+      .toBe("Show 10 more");
     expect(betaGroup?.querySelector(".codex-session-show-more")?.textContent?.trim())
       .toBe("Show 2 more");
 
     await act(async () => {
-      buttonWithText(alphaGroup, "Show 20 more").click();
+      buttonWithText(alphaGroup, "Show 10 more").click();
     });
 
-    expect(alphaGroup?.querySelectorAll(".codex-session-row")).toHaveLength(40);
+    expect(alphaGroup?.querySelectorAll(".codex-session-row")).toHaveLength(20);
     expect(alphaGroup?.querySelector(".codex-session-show-more")?.textContent?.trim())
       .toBe("Show 3 more");
-    expect(betaGroup?.querySelectorAll(".codex-session-row")).toHaveLength(20);
+    expect(betaGroup?.querySelectorAll(".codex-session-row")).toHaveLength(10);
 
     await act(async () => {
       buttonWithText(alphaGroup, "Show 3 more").click();
     });
 
-    expect(alphaGroup?.querySelectorAll(".codex-session-row")).toHaveLength(43);
+    expect(alphaGroup?.querySelectorAll(".codex-session-row")).toHaveLength(23);
     expect(alphaGroup?.querySelector(".codex-session-show-more")).toBeNull();
   });
 
