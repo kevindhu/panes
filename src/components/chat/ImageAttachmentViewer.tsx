@@ -1,6 +1,6 @@
 import {
   useEffect,
-  useMemo,
+  useLayoutEffect,
   useRef,
   useState,
   type MouseEvent as ReactMouseEvent,
@@ -9,11 +9,8 @@ import {
 import { createPortal } from "react-dom";
 import { Copy, RotateCcw, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import {
-  copyAttachmentImage,
-  getAttachmentImageSources,
-  prewarmImageBlobFromSources,
-} from "../../lib/attachmentImages";
+import { copyAttachmentImage } from "../../lib/attachmentImages";
+import { recordPerfMetric } from "../../lib/perfTelemetry";
 import { toast } from "../../stores/toastStore";
 
 interface ImageAttachmentViewerProps {
@@ -26,8 +23,6 @@ interface ImageAttachmentViewerProps {
   requestPreview?: () => Promise<string | null>;
   onClose: () => void;
 }
-
-type SourceState = "preferred" | "fallback" | "failed";
 
 interface DragState {
   startX: number;
@@ -54,56 +49,78 @@ export function ImageAttachmentViewer({
   const { t } = useTranslation("chat");
   const dialogRef = useRef<HTMLDivElement>(null);
   const dragStateRef = useRef<DragState | null>(null);
+  const failedSourcesRef = useRef(new Set<string>());
+  const openStartedAtRef = useRef(0);
+  const firstPixelRecordedRef = useRef(false);
   const [scale, setScale] = useState(MIN_SCALE);
   const [offset, setOffset] = useState(DEFAULT_OFFSET);
   const [copying, setCopying] = useState(false);
-  const [sourceState, setSourceState] = useState<SourceState>("preferred");
+  const [displaySrc, setDisplaySrc] = useState<string | null>(previewSrc ?? originalSrc);
   const [dragging, setDragging] = useState(false);
-  const [imageLoaded, setImageLoaded] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const currentSrc = [displaySrc, previewSrc, originalSrc].find(
+    (source): source is string => Boolean(
+      source && !failedSourcesRef.current.has(source),
+    ),
+  ) ?? null;
+  const hasAnySource = Boolean(currentSrc || previewSrc || originalSrc || requestPreview);
 
-  const { primarySrc, fallbackSrc } = useMemo(
-    () => getAttachmentImageSources(originalSrc, previewSrc),
-    [originalSrc, previewSrc],
-  );
-  const hasAnySource = Boolean(primarySrc || fallbackSrc);
-
-  const currentSrc = sourceState === "preferred"
-    ? primarySrc
-    : sourceState === "fallback"
-      ? fallbackSrc
-      : null;
-
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!open) {
       return;
     }
+    openStartedAtRef.current = performance.now();
+    firstPixelRecordedRef.current = false;
+    failedSourcesRef.current.clear();
     setScale(MIN_SCALE);
     setOffset(DEFAULT_OFFSET);
     setCopying(false);
-    setSourceState("preferred");
+    setDisplaySrc(previewSrc ?? originalSrc);
     setDragging(false);
-    setImageLoaded(false);
+    setFailed(false);
     dragStateRef.current = null;
   }, [fileName, filePath, open]);
 
   useEffect(() => {
-    if (!open || !currentSrc) {
+    if (!open || displaySrc) {
       return;
     }
-    setImageLoaded(false);
-  }, [currentSrc, open]);
+    const immediateSource = previewSrc ?? originalSrc;
+    if (immediateSource) {
+      setDisplaySrc(immediateSource);
+      setFailed(false);
+    }
+  }, [displaySrc, open, originalSrc, previewSrc]);
 
   useEffect(() => {
-    if (!open || !currentSrc || !imageLoaded) {
+    if (
+      !open
+      || !originalSrc
+      || originalSrc === currentSrc
+      || failedSourcesRef.current.has(originalSrc)
+    ) {
       return;
     }
-    prewarmImageBlobFromSources(
-      sourceState === "fallback"
-        ? [fallbackSrc, primarySrc]
-        : [primarySrc, fallbackSrc],
-      mimeType,
-    );
-  }, [currentSrc, fallbackSrc, imageLoaded, mimeType, open, primarySrc, sourceState]);
+
+    let cancelled = false;
+    const startedAt = performance.now();
+    void decodeImageSource(originalSrc)
+      .then(() => {
+        if (cancelled) {
+          return;
+        }
+        setDisplaySrc(originalSrc);
+        setFailed(false);
+        recordPerfMetric("chat.image.viewer_full_decode.ms", performance.now() - startedAt);
+      })
+      .catch(() => {
+        failedSourcesRef.current.add(originalSrc);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [currentSrc, open, originalSrc]);
 
   useEffect(() => {
     if (!open || currentSrc || !requestPreview) {
@@ -113,13 +130,19 @@ export function ImageAttachmentViewer({
     let cancelled = false;
     void requestPreview()
       .then((nextPreviewSrc) => {
-        if (!cancelled && !nextPreviewSrc) {
-          setSourceState("failed");
+        if (cancelled) {
+          return;
+        }
+        if (nextPreviewSrc) {
+          setDisplaySrc(nextPreviewSrc);
+          setFailed(false);
+        } else {
+          setFailed(true);
         }
       })
       .catch(() => {
         if (!cancelled) {
-          setSourceState("failed");
+          setFailed(true);
         }
       });
 
@@ -159,7 +182,7 @@ export function ImageAttachmentViewer({
 
     window.addEventListener("keydown", onKeyDown, true);
     return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [copying, currentSrc, fallbackSrc, filePath, mimeType, onClose, open, primarySrc, sourceState, t]);
+  }, [copying, currentSrc, filePath, mimeType, onClose, open, originalSrc, previewSrc, t]);
 
   useEffect(() => {
     if (!open || !dragging) {
@@ -203,9 +226,7 @@ export function ImageAttachmentViewer({
     try {
       await copyAttachmentImage(
         filePath,
-        sourceState === "fallback"
-          ? [currentSrc, primarySrc]
-          : [currentSrc, fallbackSrc],
+        [currentSrc, originalSrc, previewSrc],
         mimeType,
       );
       toast.success(t("attachments.viewer.copySuccess"));
@@ -251,25 +272,50 @@ export function ImageAttachmentViewer({
     setDragging(true);
   }
 
+  function handleImageLoad() {
+    if (!firstPixelRecordedRef.current) {
+      firstPixelRecordedRef.current = true;
+      recordPerfMetric(
+        "chat.image.viewer_first_pixel.ms",
+        performance.now() - openStartedAtRef.current,
+      );
+    }
+  }
+
   async function handleImageError() {
-    if (sourceState === "preferred" && fallbackSrc) {
-      setSourceState("fallback");
+    if (!currentSrc) {
+      setFailed(true);
+      return;
+    }
+    failedSourcesRef.current.add(currentSrc);
+
+    const nextKnownSource = [previewSrc, originalSrc].find(
+      (source): source is string => Boolean(
+        source
+        && source !== currentSrc
+        && !failedSourcesRef.current.has(source),
+      ),
+    );
+    if (nextKnownSource) {
+      setDisplaySrc(nextKnownSource);
       return;
     }
 
-    if (sourceState === "preferred" && requestPreview) {
+    if (requestPreview) {
       try {
         const nextPreviewSrc = await requestPreview();
-        if (nextPreviewSrc) {
-          setSourceState(originalSrc ? "fallback" : "preferred");
+        if (nextPreviewSrc && !failedSourcesRef.current.has(nextPreviewSrc)) {
+          setDisplaySrc(nextPreviewSrc);
+          setFailed(false);
           return;
         }
       } catch {
-        // Ignore and fall through to the failure state below.
+        // Fall through to the failure state.
       }
     }
 
-    setSourceState("failed");
+    setDisplaySrc(null);
+    setFailed(true);
   }
 
   return createPortal(
@@ -337,10 +383,10 @@ export function ImageAttachmentViewer({
               }}
               draggable={false}
               decoding="async"
-              onLoad={() => setImageLoaded(true)}
+              onLoad={handleImageLoad}
               onError={() => void handleImageError()}
             />
-          ) : sourceState === "failed" || !hasAnySource ? (
+          ) : failed || !hasAnySource ? (
             <div className="chat-image-viewer-status">{t("attachments.viewer.loadFailed")}</div>
           ) : (
             <div className="chat-image-viewer-status">{t("attachments.viewer.loading")}</div>
@@ -350,6 +396,22 @@ export function ImageAttachmentViewer({
     </div>,
     document.body,
   );
+}
+
+function decodeImageSource(source: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.decoding = "async";
+    image.onload = () => {
+      if (typeof image.decode !== "function") {
+        resolve();
+        return;
+      }
+      void image.decode().then(resolve, () => resolve());
+    };
+    image.onerror = () => reject(new Error("Unable to decode full-resolution image."));
+    image.src = source;
+  });
 }
 
 function clampScale(value: number): number {

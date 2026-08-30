@@ -13,12 +13,14 @@ use rusqlite::{params, Connection, Transaction};
 use crate::{path_utils, runtime_env};
 
 pub mod actions;
+pub mod codex_transcript;
 pub mod messages;
 pub mod repos;
 pub mod threads;
 pub mod workspaces;
 
 const SQLITE_POOL_MAX_IDLE: usize = 8;
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct Database {
@@ -121,8 +123,11 @@ impl Database {
 
     fn run_migrations(&self) -> anyhow::Result<()> {
         let mut conn = self.connect()?;
+        enable_wal_mode(&conn)?;
         conn.execute_batch(include_str!("migrations/001_initial.sql"))
             .context("failed to apply migrations")?;
+        conn.execute_batch(include_str!("migrations/002_codex_transcript.sql"))
+            .context("failed to apply Codex transcript migration")?;
         ensure_archived_columns(&conn)?;
         ensure_workspace_sort_order_column(&conn)?;
         ensure_workspace_git_columns(&conn)?;
@@ -138,16 +143,27 @@ impl Database {
 }
 
 fn configure_connection(conn: &Connection) -> anyhow::Result<()> {
+    // Install the busy handler before any pragma that may need to coordinate
+    // with another SQLite connection. Session synchronization performs a
+    // bounded transcript replacement while live turns can still persist
+    // events, so a five-second/default-zero wait is too aggressive here.
+    conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
+        .context("failed to set sqlite busy timeout")?;
     conn.pragma_update(None, "foreign_keys", "ON")
         .context("failed to enable sqlite foreign keys")?;
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .context("failed to enable sqlite WAL mode")?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .context("failed to set sqlite synchronous mode")?;
     conn.pragma_update(None, "temp_store", "MEMORY")
         .context("failed to set sqlite temp_store mode")?;
-    conn.busy_timeout(Duration::from_millis(5_000))
-        .context("failed to set sqlite busy timeout")?;
+    Ok(())
+}
+
+fn enable_wal_mode(conn: &Connection) -> anyhow::Result<()> {
+    // journal_mode is persistent database state. Set it during database
+    // initialization/migration rather than every time the pool grows under
+    // load; ordinary connections inherit WAL mode from the database.
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .context("failed to enable sqlite WAL mode")?;
     Ok(())
 }
 
@@ -231,6 +247,8 @@ fn ensure_runtime_columns(conn: &Connection) -> anyhow::Result<()> {
 }
 
 fn ensure_messages_audit_columns(conn: &Connection) -> anyhow::Result<()> {
+    ensure_column(conn, "messages", "native_turn_id", "TEXT")?;
+
     let mut has_turn_engine_id = false;
     let mut has_turn_model_id = false;
     let mut has_turn_reasoning_effort = false;
@@ -268,6 +286,18 @@ fn ensure_messages_audit_columns(conn: &Connection) -> anyhow::Result<()> {
         )
         .context("failed to add messages.turn_reasoning_effort column")?;
     }
+
+    conn.execute(
+        "UPDATE messages
+         SET native_turn_id = turn_engine_id
+         WHERE native_turn_id IS NULL
+           AND thread_id IN (SELECT id FROM threads WHERE engine_id = 'codex')
+           AND turn_engine_id IS NOT NULL
+           AND trim(turn_engine_id) <> ''
+           AND lower(turn_engine_id) <> 'codex'",
+        [],
+    )
+    .context("failed to backfill messages.native_turn_id")?;
 
     Ok(())
 }
@@ -808,6 +838,21 @@ mod tests {
     }
 
     #[test]
+    fn pooled_connections_use_wal_and_extended_busy_timeout() {
+        let db = test_db();
+        let conn = db.connect().expect("failed to open configured connection");
+        let journal_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("failed to read journal mode");
+        let busy_timeout_ms: i64 = conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .expect("failed to read busy timeout");
+
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(busy_timeout_ms, SQLITE_BUSY_TIMEOUT.as_millis() as i64);
+    }
+
+    #[test]
     fn migrations_promote_legacy_remote_turn_reason_to_typed_metadata() {
         let db = test_db();
         let conn = Connection::open(&db.path).expect("failed to open raw sqlite db");
@@ -952,10 +997,6 @@ mod tests {
         assert_eq!(workspaces[0].root_path, r"C:\Users\panes\repo");
         assert_eq!(workspaces[0].scan_depth, 7);
 
-        let startup_preset =
-            workspaces::get_workspace_startup_preset_json(&db, active_workspace_id)
-                .expect("failed to load migrated startup preset");
-        assert_eq!(startup_preset.as_deref(), Some(r#"{"layout":"split"}"#));
         assert!(workspaces::find_workspace_by_id(&db, archived_workspace_id)
             .expect("failed to check archived workspace removal")
             .is_none());

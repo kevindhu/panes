@@ -1,18 +1,19 @@
 #!/usr/bin/env node
-import { execFileSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const repoRoot = resolve(new URL("..", import.meta.url).pathname);
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(scriptDir, "..");
+const contractPath = join(scriptDir, "codex-app-server-contract.json");
 
 function parseArgs(argv) {
   const args = { schemaDir: null, keepSchema: false };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (arg === "--") {
-      continue;
-    }
+    if (arg === "--") continue;
     if (arg === "--schema-dir") {
       args.schemaDir = argv[index + 1] ?? null;
       index += 1;
@@ -30,236 +31,230 @@ function loadJson(path) {
 }
 
 function assert(condition, message) {
-  if (!condition) {
-    throw new Error(message);
-  }
+  if (!condition) throw new Error(message);
 }
 
-function requireFile(schemaRoot, file) {
-  const path = join(schemaRoot, "v2", file);
-  assert(existsSync(path), `Missing Codex app-server schema file: v2/${file}`);
+function requireFile(schemaRoot, relativePath) {
+  const path = join(schemaRoot, relativePath);
+  assert(existsSync(path), `Missing Codex app-server schema file: ${relativePath}`);
   return path;
 }
 
-function requireRootFile(schemaRoot, file) {
-  const path = join(schemaRoot, file);
-  assert(existsSync(path), `Missing Codex app-server schema file: ${file}`);
-  return path;
+function sorted(values) {
+  return [...values].sort((left, right) => left.localeCompare(right));
 }
 
-function assertProperties(schemaRoot, file, properties) {
-  const schema = loadJson(requireFile(schemaRoot, file));
-  for (const property of properties) {
-    assert(
-      schema.properties && Object.prototype.hasOwnProperty.call(schema.properties, property),
-      `v2/${file} is missing property ${property}`,
-    );
-  }
-}
-
-function assertSourceContains(path, tokens) {
-  const source = readFileSync(join(repoRoot, path), "utf8");
-  for (const token of tokens) {
-    assert(source.includes(token), `${path} is missing token ${token}`);
-  }
-}
-
-function assertSourceOmits(path, tokens) {
-  const source = readFileSync(join(repoRoot, path), "utf8");
-  for (const token of tokens) {
-    assert(!source.includes(token), `${path} still contains deprecated token ${token}`);
-  }
-}
-
-function assertSourceMatches(path, patterns) {
-  const source = readFileSync(join(repoRoot, path), "utf8");
-  for (const [label, pattern] of patterns) {
-    assert(pattern.test(source), `${path} is missing expected implementation: ${label}`);
-  }
-}
-
-function assertDefinitionEnum(schemaRoot, file, definitionName, expectedValues) {
-  const schema = loadJson(requireFile(schemaRoot, file));
-  const enumValues = schema.definitions?.[definitionName]?.enum;
-  assert(Array.isArray(enumValues), `v2/${file} definition ${definitionName} is missing enum`);
-  for (const value of expectedValues) {
-    assert(
-      enumValues.includes(value),
-      `v2/${file} definition ${definitionName} is missing enum value ${value}`,
-    );
-  }
-}
-
-function assertPermissionProfileShape(schemaRoot, file) {
-  const schema = loadJson(requireFile(schemaRoot, file));
-  const variants = schema.definitions?.PermissionProfile?.oneOf;
-  assert(Array.isArray(variants), `v2/${file} is missing PermissionProfile variants`);
-  const variantByType = new Map();
-  for (const variant of variants) {
-    const typeEnum = variant.properties?.type?.enum;
-    if (Array.isArray(typeEnum) && typeEnum.length === 1) {
-      variantByType.set(typeEnum[0], variant);
-    }
-  }
-  assert(variantByType.has("managed"), `v2/${file} PermissionProfile is missing managed`);
-  assert(variantByType.has("external"), `v2/${file} PermissionProfile is missing external`);
-  assert(variantByType.has("disabled"), `v2/${file} PermissionProfile is missing disabled`);
-  for (const required of ["type", "fileSystem", "network"]) {
-    assert(
-      variantByType.get("managed").required?.includes(required),
-      `v2/${file} managed PermissionProfile is missing required ${required}`,
-    );
-  }
-  for (const required of ["type", "network"]) {
-    assert(
-      variantByType.get("external").required?.includes(required),
-      `v2/${file} external PermissionProfile is missing required ${required}`,
-    );
-  }
-}
-
-function assertRootRequestMethods(schemaRoot, expectedMethods) {
-  const schema = loadJson(requireRootFile(schemaRoot, "ServerRequest.json"));
-  const requestMethods = new Set(
-    (schema.oneOf ?? [])
-      .flatMap((variant) => variant.properties?.method?.enum ?? [])
-      .filter((method) => typeof method === "string"),
+function assertSameSet(actualValues, expectedValues, label) {
+  const actual = new Set(actualValues);
+  const expected = new Set(expectedValues);
+  const missing = sorted([...expected].filter((value) => !actual.has(value)));
+  const unexpected = sorted([...actual].filter((value) => !expected.has(value)));
+  assert(
+    missing.length === 0 && unexpected.length === 0,
+    `${label} drifted. Missing: ${missing.join(", ") || "none"}. ` +
+      `Unreviewed: ${unexpected.join(", ") || "none"}. ` +
+      "Review the generated schema and update scripts/codex-app-server-contract.json.",
   );
-  for (const method of expectedMethods) {
-    assert(requestMethods.has(method), `ServerRequest.json is missing request method ${method}`);
+}
+
+function extractMethods(schema) {
+  return (schema.oneOf ?? [])
+    .flatMap((variant) => variant.properties?.method?.enum ?? [])
+    .filter((method) => typeof method === "string");
+}
+
+function extractThreadItemTypes(threadReadSchema) {
+  const variants = threadReadSchema.definitions?.ThreadItem?.oneOf;
+  assert(Array.isArray(variants), "v2/ThreadReadResponse.json has no ThreadItem union");
+  const types = variants.flatMap((variant) => variant.properties?.type?.enum ?? []);
+  assert(types.every((value) => typeof value === "string"), "ThreadItem contains a non-string type");
+  return types;
+}
+
+function assertContainsAll(actualValues, expectedValues, label) {
+  const actual = new Set(actualValues);
+  const missing = expectedValues.filter((value) => !actual.has(value));
+  assert(missing.length === 0, `${label} is missing: ${missing.join(", ")}`);
+}
+
+function assertSourceContains(relativePath, tokens) {
+  const source = readFileSync(join(repoRoot, relativePath), "utf8");
+  for (const token of tokens) {
+    assert(source.includes(token), `${relativePath} is missing required implementation token: ${token}`);
   }
+}
+
+function assertSourceExcludes(relativePath, tokens) {
+  const source = readFileSync(join(repoRoot, relativePath), "utf8");
+  for (const token of tokens) {
+    assert(!source.includes(token), `${relativePath} still contains forbidden lossy path: ${token}`);
+  }
+}
+
+function quoteCmdArgument(value) {
+  return `"${String(value).replaceAll('"', '""')}"`;
+}
+
+function generateSchema(outputDirectory) {
+  const args = ["app-server", "generate-json-schema", "--out", outputDirectory, "--experimental"];
+  if (process.platform === "win32") {
+    // npm installs Codex as a .cmd shim on Windows. execFileSync cannot launch .cmd files
+    // directly, while execSync intentionally resolves the shim through cmd.exe.
+    execSync(["codex", ...args.map(quoteCmdArgument)].join(" "), { stdio: "pipe" });
+    return;
+  }
+  execFileSync("codex", args, { stdio: "pipe" });
 }
 
 const args = parseArgs(process.argv.slice(2));
+const contract = loadJson(contractPath);
 let generatedDir = null;
 let schemaRoot = args.schemaDir ? resolve(args.schemaDir) : null;
 
 if (!schemaRoot) {
   generatedDir = mkdtempSync(join(tmpdir(), "panes-codex-schema-"));
-  execFileSync("codex", ["app-server", "generate-json-schema", "--out", generatedDir], {
-    stdio: "pipe",
-  });
+  generateSchema(generatedDir);
   schemaRoot = generatedDir;
 }
 
 try {
-  const requiredFiles = [
-    "../ChatgptAuthTokensRefreshParams.json",
-    "../ChatgptAuthTokensRefreshResponse.json",
-    "../McpServerElicitationRequestParams.json",
-    "../McpServerElicitationRequestResponse.json",
-    "../PermissionsRequestApprovalParams.json",
-    "../PermissionsRequestApprovalResponse.json",
-    "../ServerRequest.json",
-    "ThreadTurnsListParams.json",
-    "ThreadTurnsListResponse.json",
-    "ThreadStartParams.json",
-    "ThreadResumeParams.json",
-    "ThreadForkParams.json",
-    "TurnStartParams.json",
-    "TurnSteerParams.json",
-    "ReviewStartParams.json",
-    "ThreadCompactStartParams.json",
-    "FeedbackUploadParams.json",
-    "ThreadInjectItemsParams.json",
-    "McpResourceReadParams.json",
-    "McpServerToolCallParams.json",
-    "WarningNotification.json",
-    "GuardianWarningNotification.json",
-    "ModelVerificationNotification.json",
-    "ItemGuardianApprovalReviewStartedNotification.json",
-    "ItemGuardianApprovalReviewCompletedNotification.json",
-    "FileChangePatchUpdatedNotification.json",
-    "CommandExecOutputDeltaNotification.json",
-    "ThreadRealtimeStartedNotification.json",
-    "ThreadRealtimeTranscriptDeltaNotification.json",
-    "ThreadRealtimeTranscriptDoneNotification.json",
-    "ThreadRealtimeItemAddedNotification.json",
-    "ThreadRealtimeClosedNotification.json",
-    "ThreadRealtimeErrorNotification.json",
-  ];
-  for (const file of requiredFiles) {
-    if (file.startsWith("../")) {
-      requireRootFile(schemaRoot, file.slice(3));
-    } else {
-      requireFile(schemaRoot, file);
-    }
-  }
+  const threadRead = loadJson(requireFile(schemaRoot, join("v2", "ThreadReadResponse.json")));
+  const turnStart = loadJson(requireFile(schemaRoot, join("v2", "TurnStartParams.json")));
+  const turnPlanUpdated = loadJson(requireFile(schemaRoot, join("v2", "TurnPlanUpdatedNotification.json")));
+  const threadTokenUsageUpdated = loadJson(
+    requireFile(schemaRoot, join("v2", "ThreadTokenUsageUpdatedNotification.json")),
+  );
+  const toolRequestUserInput = loadJson(requireFile(schemaRoot, "ToolRequestUserInputParams.json"));
+  const toolRequestUserInputResponse = loadJson(requireFile(schemaRoot, "ToolRequestUserInputResponse.json"));
+  const serverNotifications = loadJson(requireFile(schemaRoot, "ServerNotification.json"));
+  const serverRequests = loadJson(requireFile(schemaRoot, "ServerRequest.json"));
 
-  assertProperties(schemaRoot, "ThreadTurnsListParams.json", [
-    "threadId",
-    "cursor",
-    "limit",
-    "itemsView",
-  ]);
-  assertProperties(schemaRoot, "ThreadForkParams.json", ["lastTurnId"]);
-  for (const file of [
-    "ThreadStartParams.json",
-    "ThreadResumeParams.json",
-    "ThreadForkParams.json",
-    "TurnStartParams.json",
-  ]) {
-    assertProperties(schemaRoot, file, ["permissionProfile", "approvalsReviewer"]);
-    assertDefinitionEnum(schemaRoot, file, "ApprovalsReviewer", [
-      "user",
-      "auto_review",
-      "guardian_subagent",
-    ]);
-    assertPermissionProfileShape(schemaRoot, file);
-  }
-
-  assertRootRequestMethods(schemaRoot, [
-    "account/chatgptAuthTokens/refresh",
-    "item/permissions/requestApproval",
-    "item/tool/call",
-    "item/tool/requestUserInput",
-    "mcpServer/elicitation/request",
-  ]);
-
-  assertSourceContains("src-tauri/src/engines/codex.rs", [
-    "THREAD_TURNS_LIST_METHODS",
-    "thread/turns/list",
-    '"itemsView"',
-    '"permissionProfile"',
-    '"approvalsReviewer"',
-    '"lastTurnId"',
-    "account/chatgptAuthTokens/refresh",
-    "thread/realtime/transcriptdone",
-  ]);
-  assertSourceOmits("src-tauri/src/engines/codex.rs", ["thread/rollback"]);
-  assertSourceMatches("src-tauri/src/engines/codex.rs", [
+  assert(turnStart.properties?.collaborationMode, "TurnStartParams has no collaborationMode");
+  assertContainsAll(
+    turnStart.definitions?.ModeKind?.enum ?? [],
+    ["plan", "default"],
+    "TurnStartParams collaboration modes",
+  );
+  assertContainsAll(
+    Object.keys(turnStart.definitions?.Settings?.properties ?? {}),
+    ["model", "reasoning_effort", "developer_instructions"],
+    "TurnStartParams collaboration settings",
+  );
+  assertContainsAll(
+    toolRequestUserInput.required ?? [],
+    ["isBlocking", "itemId", "questions", "threadId", "turnId"],
+    "ToolRequestUserInputParams required fields",
+  );
+  assertContainsAll(
+    toolRequestUserInput.definitions?.ToolRequestUserInputQuestion?.required ?? [],
+    ["header", "id", "question"],
+    "ToolRequestUserInputQuestion required fields",
+  );
+  assertContainsAll(
+    Object.keys(toolRequestUserInput.definitions?.ToolRequestUserInputQuestion?.properties ?? {}),
+    ["isOther", "isSecret", "options"],
+    "ToolRequestUserInputQuestion fields",
+  );
+  assertContainsAll(
+    toolRequestUserInputResponse.required ?? [],
+    ["answers"],
+    "ToolRequestUserInputResponse required fields",
+  );
+  assertContainsAll(
+    turnPlanUpdated.definitions?.TurnPlanStepStatus?.enum ?? [],
+    ["pending", "inProgress", "completed"],
+    "TurnPlanUpdatedNotification statuses",
+  );
+  assertContainsAll(
+    Object.keys(threadTokenUsageUpdated.definitions?.ThreadTokenUsage?.properties ?? {}),
+    ["last", "modelContextWindow", "total"],
+    "ThreadTokenUsage fields",
+  );
+  assertContainsAll(
+    Object.keys(threadTokenUsageUpdated.definitions?.TokenUsageBreakdown?.properties ?? {}),
     [
-      "thread turns list is used for transcript import",
-      /fetch_paginated_data\([\s\S]{0,800}THREAD_TURNS_LIST_METHODS/,
+      "cacheWriteInputTokens",
+      "cachedInputTokens",
+      "inputTokens",
+      "outputTokens",
+      "reasoningOutputTokens",
+      "totalTokens",
     ],
+    "TokenUsageBreakdown fields",
+  );
+
+  const reviewedItemTypes = Object.keys(contract.threadItemTypes ?? {});
+  for (const [itemType, projection] of Object.entries(contract.threadItemTypes ?? {})) {
+    assert(
+      projection === "specialized" || projection === "raw",
+      `Invalid projection classification for ${itemType}: ${projection}`,
+    );
+  }
+
+  assertSameSet(
+    extractThreadItemTypes(threadRead),
+    reviewedItemTypes,
+    "Codex ThreadItem union",
+  );
+  assertContainsAll(
+    extractMethods(serverNotifications),
+    contract.requiredNotifications ?? [],
+    "ServerNotification.json",
+  );
+  assertContainsAll(
+    extractMethods(serverRequests),
+    contract.requiredServerRequests ?? [],
+    "ServerRequest.json",
+  );
+
+  for (const requiredPath of [
+    join("v2", "ThreadStartParams.json"),
+    join("v2", "ThreadResumeParams.json"),
+    join("v2", "ThreadForkParams.json"),
+    join("v2", "TurnStartParams.json"),
+    join("v2", "TurnSteerParams.json"),
+    join("v2", "TurnStartedNotification.json"),
+    join("v2", "TurnCompletedNotification.json"),
+    join("v2", "ThreadTokenUsageUpdatedNotification.json"),
+    join("v2", "ItemStartedNotification.json"),
+    join("v2", "ItemCompletedNotification.json"),
+  ]) {
+    requireFile(schemaRoot, requiredPath);
+  }
+
+  assertSourceContains("src-tauri/src/db/codex_transcript.rs", [
+    "record_native_event_batch",
+    "load_turn_snapshot",
+    "params_json",
+    "completed_json",
+    "Codex item completion is authoritative",
+  ]);
+  assertSourceContains("src-tauri/src/engines/codex_transport.rs", [
+    "is_lossless_conversation_signature",
+    "CodexNativeEvent",
+    "source_sequence",
+    "capture_native_message",
+  ]);
+  assertSourceContains("src-tauri/src/engines/codex.rs", [
+    "capture_response",
+  ]);
+  assertSourceExcludes("src-tauri/src/engines/codex_protocol.rs", [
+    "parse_large_output_params",
+    "parse_item_completed_params",
+    "parse_trimmed_json_string",
+  ]);
+  assertSourceExcludes("src-tauri/src/engines/codex_transport.rs", [
+    "trim_buffered_incoming_message",
+    "trim_large_output_params",
   ]);
 
-  assertSourceContains("src-tauri/src/engines/codex_event_mapper.rs", [
-    '"warning"',
-    '"guardianwarning"',
-    '"modelverification"',
-    '"itemguardianapprovalreviewstarted"',
-    '"itemguardianapprovalreviewcompleted"',
-    '"itemfilechangepatchupdated"',
-    '"commandexecoutputdelta"',
-    '"threadrealtimetranscriptdelta"',
-    '"threadrealtimetranscriptdone"',
-    '"threadrealtimeitemadded"',
-    '"mcpserverelicitationrequest"',
-    '"itempermissionsrequestapproval"',
-    '"itemtoolcall"',
-  ]);
-  assertSourceContains("src/components/chat/ChatPanel.tsx", [
-    "permissionProfile",
-  ]);
-  assertSourceContains("src/components/chat/CodexRuntimePicker.tsx", [
-    "config.permissionProfile",
-    "config.approvalsReviewer",
-  ]);
-
-  console.log(`Codex app-server chat parity schema check passed: ${schemaRoot}`);
+  console.log(
+    `Codex app-server transcript contract passed (${reviewedItemTypes.length} item types): ${schemaRoot}`,
+  );
 } finally {
   if (generatedDir && !args.keepSchema) {
     rmSync(generatedDir, { recursive: true, force: true });
+  } else if (generatedDir) {
+    console.log(`Kept generated Codex schema at ${generatedDir}`);
   }
 }

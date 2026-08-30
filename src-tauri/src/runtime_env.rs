@@ -6,18 +6,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use tokio::{
-    process::Command,
-    sync::OnceCell,
-    time::{timeout, Duration},
-};
+use tokio::{process::Command, sync::OnceCell};
+#[cfg(not(target_os = "windows"))]
+use tokio::time::{timeout, Duration};
 
+#[cfg(not(target_os = "windows"))]
 const LOGIN_ENV_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(not(target_os = "windows"))]
 const LOGIN_ENV_PROBE_MARKER: &str = "__PANES_LOGIN_ENV_START__";
 
 static LOGIN_SHELL_ENV: OnceCell<HashMap<OsString, OsString>> = OnceCell::const_new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(not(target_os = "windows"))]
 enum ShellFlavor {
     Bash,
     Fish,
@@ -29,6 +30,7 @@ enum ShellFlavor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(not(target_os = "windows"))]
 pub struct ShellLaunchSpec {
     pub program: PathBuf,
     pub args: Vec<String>,
@@ -213,27 +215,7 @@ pub fn terminal_shell() -> PathBuf {
     )
 }
 
-pub fn terminal_shell_args(shell: &Path) -> Vec<String> {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = shell;
-        return Vec::new();
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    match shell_flavor(shell) {
-        ShellFlavor::Bash
-        | ShellFlavor::Fish
-        | ShellFlavor::Zsh
-        | ShellFlavor::Sh
-        | ShellFlavor::Cmd
-        | ShellFlavor::PowerShell
-        | ShellFlavor::Other => {
-            vec!["-l".to_string(), "-i".to_string()]
-        }
-    }
-}
-
+#[cfg(not(target_os = "windows"))]
 pub fn command_shell_for_string(command: &str) -> ShellLaunchSpec {
     let program = command_shell_program();
     let args = command_shell_args_for(&program, command);
@@ -287,6 +269,7 @@ fn login_env_probe_shell_args(shell: &Path) -> Vec<String> {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn parse_login_shell_env_output(stdout: &[u8]) -> HashMap<OsString, OsString> {
     let mut parsed = HashMap::new();
     let mut after_marker = false;
@@ -318,6 +301,7 @@ fn parse_login_shell_env_output(stdout: &[u8]) -> HashMap<OsString, OsString> {
     parsed
 }
 
+#[cfg(not(target_os = "windows"))]
 fn os_string_from_bytes(bytes: &[u8]) -> OsString {
     #[cfg(unix)]
     {
@@ -362,22 +346,6 @@ pub fn parse_login_probe_output(stdout: &str) -> Option<(String, String)> {
     let path = lines.find(|line| line.starts_with('/'))?.to_string();
     let version = lines.next().unwrap_or("").to_string();
     Some((path, version))
-}
-
-#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
-pub fn parse_windows_login_probe_output(stdout: &str) -> Option<(String, String)> {
-    let mut lines = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty());
-
-    while let Some(line) = lines.next() {
-        if looks_like_windows_absolute_path(line) {
-            return Some((line.to_string(), lines.next().unwrap_or("").to_string()));
-        }
-    }
-
-    None
 }
 
 #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
@@ -567,10 +535,8 @@ fn terminal_shell_for(
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn command_shell_program() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    let shell_env = env::var("COMSPEC").ok();
-    #[cfg(not(target_os = "windows"))]
     let shell_env = env::var("SHELL").ok();
 
     command_shell_program_for(
@@ -580,6 +546,7 @@ fn command_shell_program() -> PathBuf {
     )
 }
 
+#[cfg(not(target_os = "windows"))]
 fn command_shell_program_for(
     shell_env: Option<&str>,
     home: Option<&Path>,
@@ -602,9 +569,6 @@ fn command_shell_program_for(
         return shell;
     }
 
-    #[cfg(target_os = "windows")]
-    let fallback_shells = ["cmd", "powershell", "pwsh"];
-    #[cfg(not(target_os = "windows"))]
     let fallback_shells = ["zsh", "bash", "fish", "sh"];
 
     for shell in fallback_shells {
@@ -613,15 +577,7 @@ fn command_shell_program_for(
         }
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        PathBuf::from("cmd.exe")
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        PathBuf::from("/bin/sh")
-    }
+    PathBuf::from("/bin/sh")
 }
 
 fn resolve_from_entries(binary: &str, entries: &[PathBuf]) -> Option<PathBuf> {
@@ -630,6 +586,7 @@ fn resolve_from_entries(binary: &str, entries: &[PathBuf]) -> Option<PathBuf> {
     which::which_in(binary, Some(joined), cwd).ok()
 }
 
+#[cfg(not(target_os = "windows"))]
 fn command_shell_args_for(program: &Path, command: &str) -> Vec<String> {
     match shell_flavor(program) {
         ShellFlavor::Bash | ShellFlavor::Zsh | ShellFlavor::Sh => {
@@ -642,6 +599,7 @@ fn command_shell_args_for(program: &Path, command: &str) -> Vec<String> {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn shell_flavor(path: &Path) -> ShellFlavor {
     match path
         .file_name()
@@ -696,6 +654,7 @@ fn login_probe_shells_for(shell_env: Option<&str>, current_path: Option<&OsStr>)
         .collect()
 }
 
+#[cfg(not(target_os = "windows"))]
 fn resolve_shell_candidate(candidate: &str, entries: &[PathBuf]) -> Option<PathBuf> {
     let has_separator = candidate.contains('/') || candidate.contains('\\');
     if has_separator {
@@ -1026,41 +985,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn terminal_shell_args_match_shell_type() {
-        #[cfg(target_os = "windows")]
-        {
-            assert_eq!(
-                terminal_shell_args(Path::new("cmd.exe")),
-                Vec::<String>::new()
-            );
-            assert_eq!(
-                terminal_shell_args(Path::new("pwsh.exe")),
-                Vec::<String>::new()
-            );
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            assert_eq!(
-                terminal_shell_args(Path::new("/bin/bash")),
-                vec!["-l".to_string(), "-i".to_string()]
-            );
-            assert_eq!(
-                terminal_shell_args(Path::new("/bin/zsh")),
-                vec!["-l".to_string(), "-i".to_string()]
-            );
-            assert_eq!(
-                terminal_shell_args(Path::new("/bin/sh")),
-                vec!["-l".to_string(), "-i".to_string()]
-            );
-            assert_eq!(
-                terminal_shell_args(Path::new("/usr/bin/fish")),
-                vec!["-l".to_string(), "-i".to_string()]
-            );
-        }
-    }
-
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn command_shell_args_match_shell_type() {
         assert_eq!(
@@ -1125,6 +1050,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn parse_login_shell_env_output_starts_after_marker() {
         let mut output = b"profile noise\n".to_vec();
@@ -1160,19 +1086,6 @@ mod tests {
         assert!(should_import_login_shell_env_var(OsStr::new(
             "OPENROUTER_API_KEY"
         )));
-    }
-
-    #[test]
-    fn parse_windows_login_probe_output_skips_profile_noise() {
-        assert_eq!(
-            parse_windows_login_probe_output(
-                "Loading profile...\nC:\\Users\\panes\\AppData\\Roaming\\npm\\codex.cmd\n0.42.0\n",
-            ),
-            Some((
-                "C:\\Users\\panes\\AppData\\Roaming\\npm\\codex.cmd".to_string(),
-                "0.42.0".to_string(),
-            ))
-        );
     }
 
     #[test]

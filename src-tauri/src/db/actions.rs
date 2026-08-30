@@ -40,17 +40,45 @@ pub fn update_action_completed(
     db: &Database,
     action_id: &str,
     result: &ActionResult,
+    completed_details: Option<&Value>,
 ) -> anyhow::Result<()> {
     let status = if result.success { "done" } else { "error" };
     let conn = db.connect()?;
+    let merged_details_json = if let Some(completed_details) = completed_details {
+        let existing = conn
+            .query_row(
+                "SELECT details_json FROM actions WHERE id = ?1",
+                params![action_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .context("failed to load existing action details")?;
+        let mut merged = existing
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        match (&mut merged, completed_details) {
+            (Value::Object(existing), Value::Object(completed)) => {
+                for (key, value) in completed {
+                    existing.insert(key.clone(), value.clone());
+                }
+            }
+            (_, completed) => merged = completed.clone(),
+        }
+        Some(serde_json::to_string(&merged)?)
+    } else {
+        None
+    };
     conn.execute(
         "UPDATE actions
-     SET status = ?1, result_json = ?2, duration_ms = ?3
-     WHERE id = ?4",
+     SET status = ?1, result_json = ?2, duration_ms = ?3,
+         details_json = COALESCE(?4, details_json)
+     WHERE id = ?5",
         params![
             status,
             serde_json::to_string(result)?,
             result.duration_ms as i64,
+            merged_details_json,
             action_id
         ],
     )

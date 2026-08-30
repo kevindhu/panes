@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * Generates latest.json for the Tauri updater from GitHub Release assets.
  *

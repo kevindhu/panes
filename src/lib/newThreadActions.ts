@@ -1,14 +1,6 @@
-import { t } from "../i18n";
-import { useTerminalStore } from "../stores/terminalStore";
 import { useThreadStore } from "../stores/threadStore";
-import { useUiStore } from "../stores/uiStore";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { activateThreadContext } from "./threadActivation";
-import { resolveNewThreadTargetLayoutMode } from "./newThreadLayout";
-import {
-  applyWorkspaceLayoutMode,
-  getWorkspacePaneLayoutMode,
-} from "./workspacePaneNavigation";
 
 export async function createAndActivateWorkspaceThread(
   workspaceId: string | null | undefined,
@@ -19,16 +11,6 @@ export async function createAndActivateWorkspaceThread(
 
   const workspaceStore = useWorkspaceStore.getState();
   const activeWorkspaceId = workspaceStore.activeWorkspaceId;
-  const terminalStore = useTerminalStore.getState();
-  const currentLayoutMode =
-    (activeWorkspaceId ? getWorkspacePaneLayoutMode(activeWorkspaceId) : null) ??
-    (activeWorkspaceId
-      ? terminalStore.workspaces[activeWorkspaceId]?.layoutMode
-      : terminalStore.workspaces[workspaceId]?.layoutMode) ?? null;
-  const targetLayoutMode = resolveNewThreadTargetLayoutMode(currentLayoutMode);
-
-  useUiStore.getState().setActiveView("chat");
-
   // New Chat is an explicit scope. Clear the previous session before any
   // workspace or creation awaits so its composer state cannot bleed through.
   await activateThreadContext(null);
@@ -37,13 +19,13 @@ export async function createAndActivateWorkspaceThread(
     await workspaceStore.setActiveWorkspace(workspaceId);
   }
 
-  applyWorkspaceLayoutMode(workspaceId, targetLayoutMode);
   useWorkspaceStore.getState().setActiveRepo(null, { remember: false });
 
   const threadId = await useThreadStore.getState().createThread({
     workspaceId,
     repoId: null,
-    title: t("app:sidebar.newThreadTitle"),
+    engineId: "codex",
+    title: "New conversation",
   });
 
   if (!threadId) {

@@ -1,8 +1,10 @@
 use anyhow::Context;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{Duration as ChronoDuration, NaiveDateTime, Utc};
 use std::collections::HashMap;
 
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
+use rusqlite::{
+    params, params_from_iter, Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
+};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -19,6 +21,7 @@ pub struct ImportedMessageRecord {
     pub content: Option<String>,
     pub blocks: Value,
     pub status: MessageStatusDto,
+    pub native_turn_id: Option<String>,
     pub turn_engine_id: Option<String>,
     pub turn_model_id: Option<String>,
     pub turn_reasoning_effort: Option<String>,
@@ -97,6 +100,41 @@ pub fn clone_thread_messages_for_branch(
     clone_message_slice(db, target_thread_id, &messages[..retained_count])
 }
 
+pub fn clone_thread_messages_for_branch_at_message(
+    db: &Database,
+    source_thread_id: &str,
+    target_thread_id: &str,
+    source_message_id: &str,
+    expected_native_turn_id: Option<&str>,
+) -> anyhow::Result<usize> {
+    let messages = get_thread_messages(db, source_thread_id)?;
+    let retained_count = retained_message_count_through_assistant_message(
+        &messages,
+        source_message_id,
+        expected_native_turn_id,
+    )?;
+    clone_message_slice(db, target_thread_id, &messages[..retained_count])
+}
+
+pub fn validate_thread_branch_cutoff(
+    db: &Database,
+    thread_id: &str,
+    turns_after: u32,
+) -> anyhow::Result<()> {
+    let messages = get_thread_messages(db, thread_id)?;
+    let turn_count = messages
+        .iter()
+        .filter(|message| message.role == "user" && !message_has_steer_marker(message))
+        .count();
+    let turns_after = usize::try_from(turns_after).unwrap_or(usize::MAX);
+    if turn_count <= turns_after {
+        anyhow::bail!(
+            "cannot fork with {turns_after} later turns from local history with only {turn_count} turns"
+        );
+    }
+    Ok(())
+}
+
 fn clone_message_slice(
     db: &Database,
     target_thread_id: &str,
@@ -108,6 +146,7 @@ fn clone_message_slice(
         .context("failed to start thread message clone transaction")?;
 
     for message in messages.iter() {
+        let target_message_id = Uuid::new_v4().to_string();
         let token_usage = message
             .token_usage
             .as_ref()
@@ -121,10 +160,10 @@ fn clone_message_slice(
             "INSERT INTO messages (
                 id, thread_id, role, content, blocks_json, turn_engine_id, turn_model_id,
                 turn_reasoning_effort, schema_version, stream_seq, status, token_input,
-                token_output, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13)",
+                token_output, created_at, native_turn_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14)",
             params![
-                Uuid::new_v4().to_string(),
+                target_message_id,
                 target_thread_id,
                 message.role,
                 message.content,
@@ -137,9 +176,19 @@ fn clone_message_slice(
                 token_usage.input as i64,
                 token_usage.output as i64,
                 message.created_at.as_str(),
+                message.native_turn_id,
             ],
         )
         .context("failed to clone thread message")?;
+
+        if message.role == "assistant" {
+            super::codex_transcript::clone_turn_snapshot_for_message(
+                &tx,
+                &message.id,
+                target_thread_id,
+                &target_message_id,
+            )?;
+        }
     }
 
     tx.commit()
@@ -177,6 +226,43 @@ fn retained_message_count_after_rollback(
     Ok(user_message_indexes[user_message_indexes.len() - turns_to_drop])
 }
 
+fn retained_message_count_through_assistant_message(
+    messages: &[MessageDto],
+    source_message_id: &str,
+    expected_native_turn_id: Option<&str>,
+) -> anyhow::Result<usize> {
+    let source_message_id = source_message_id.trim();
+    if source_message_id.is_empty() {
+        anyhow::bail!("source message id cannot be empty");
+    }
+
+    let (message_index, message) = messages
+        .iter()
+        .enumerate()
+        .find(|(_, message)| message.id == source_message_id)
+        .ok_or_else(|| anyhow::anyhow!("fork source message not found: {source_message_id}"))?;
+    if message.role != "assistant" {
+        anyhow::bail!("fork source message must be an assistant response");
+    }
+    if message.status == MessageStatusDto::Streaming {
+        anyhow::bail!("cannot fork through an assistant response that is still streaming");
+    }
+
+    if let Some(expected_native_turn_id) = expected_native_turn_id {
+        let expected_native_turn_id = expected_native_turn_id.trim();
+        if expected_native_turn_id.is_empty() {
+            anyhow::bail!("native turn id cannot be empty");
+        }
+        if message.native_turn_id.as_deref() != Some(expected_native_turn_id) {
+            anyhow::bail!(
+                "fork source message does not match native turn {expected_native_turn_id}"
+            );
+        }
+    }
+
+    Ok(message_index + 1)
+}
+
 pub fn replace_thread_messages(
     db: &Database,
     thread_id: &str,
@@ -184,7 +270,7 @@ pub fn replace_thread_messages(
 ) -> anyhow::Result<usize> {
     let mut conn = db.connect()?;
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("failed to start thread message import transaction")?;
 
     tx.execute(
@@ -204,19 +290,41 @@ pub fn replace_thread_messages(
     .context("failed to clear imported thread messages")?;
 
     let fallback_created_at_base = Utc::now();
+    let mut previous_created_at = None;
     for (index, message) in messages.iter().enumerate() {
-        let created_at = message.created_at.clone().unwrap_or_else(|| {
-            (fallback_created_at_base + ChronoDuration::milliseconds(index as i64))
-                .format("%Y-%m-%d %H:%M:%S%.3f")
-                .to_string()
-        });
+        let requested_created_at = message
+            .created_at
+            .as_deref()
+            .and_then(|value| {
+                NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+                    .ok()
+                    .map(|timestamp| timestamp.and_utc())
+                    .or_else(|| {
+                        chrono::DateTime::parse_from_rfc3339(value)
+                            .ok()
+                            .map(|timestamp| timestamp.with_timezone(&Utc))
+                    })
+            })
+            .unwrap_or_else(|| {
+                fallback_created_at_base + ChronoDuration::milliseconds(index as i64)
+            });
+        let ordered_created_at = match previous_created_at {
+            Some(previous) if requested_created_at <= previous => {
+                previous + ChronoDuration::milliseconds(1)
+            }
+            _ => requested_created_at,
+        };
+        previous_created_at = Some(ordered_created_at);
+        let created_at = ordered_created_at
+            .format("%Y-%m-%d %H:%M:%S%.3f")
+            .to_string();
 
         tx.execute(
             "INSERT INTO messages (
                 id, thread_id, role, content, blocks_json, turn_engine_id, turn_model_id,
                 turn_reasoning_effort, schema_version, stream_seq, status, token_input,
-                token_output, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, 0, ?9, ?10, ?11, ?12)",
+                token_output, created_at, native_turn_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, 0, ?9, ?10, ?11, ?12, ?13)",
             params![
                 Uuid::new_v4().to_string(),
                 thread_id,
@@ -230,9 +338,36 @@ pub fn replace_thread_messages(
                 message.token_input as i64,
                 message.token_output as i64,
                 created_at,
+                message.native_turn_id,
             ],
         )
         .context("failed to insert imported thread message")?;
+    }
+
+    let refreshed = tx
+        .execute(
+            "UPDATE threads
+             SET message_count = (
+                   SELECT COUNT(*) FROM messages WHERE thread_id = ?1
+                 ),
+                 total_tokens = (
+                   SELECT COALESCE(
+                     SUM(COALESCE(token_input, 0) + COALESCE(token_output, 0)),
+                     0
+                   )
+                   FROM messages
+                   WHERE thread_id = ?1
+                 ),
+                 last_activity_at = COALESCE(
+                   (SELECT MAX(created_at) FROM messages WHERE thread_id = ?1),
+                   datetime('now')
+                 )
+             WHERE id = ?1",
+            params![thread_id],
+        )
+        .context("failed to refresh imported thread message stats")?;
+    if refreshed == 0 {
+        anyhow::bail!("thread not found while importing messages: {thread_id}");
     }
 
     tx.commit()
@@ -243,6 +378,90 @@ pub fn replace_thread_messages(
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn drop_last_turns(db: &Database, thread_id: &str, num_turns: u32) -> anyhow::Result<usize> {
     let messages = get_thread_messages(db, thread_id)?;
+    let message_ids = rollback_message_ids(&messages, num_turns)?;
+    if message_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut conn = db.connect()?;
+    let tx = conn
+        .transaction()
+        .context("failed to start thread rollback transaction")?;
+    delete_rollback_messages(&tx, thread_id, &message_ids)?;
+    tx.commit()
+        .context("failed to commit thread rollback transaction")?;
+    Ok(message_ids.len())
+}
+
+pub fn thread_turn_count(db: &Database, thread_id: &str) -> anyhow::Result<u32> {
+    let count = get_thread_messages(db, thread_id)?
+        .iter()
+        .filter(|message| message.role == "user" && !message_has_steer_marker(message))
+        .count();
+    u32::try_from(count).context("thread turn count exceeds u32")
+}
+
+/// Atomically records a deferred rollback intent and projects the retained local
+/// transcript. The projection remains authoritative locally after Codex confirms
+/// the native rollback reached the expected turn count.
+pub fn prepare_pending_thread_rollback(
+    db: &Database,
+    thread_id: &str,
+    num_turns: u32,
+    pending_metadata: &Value,
+) -> anyhow::Result<usize> {
+    let messages = get_thread_messages(db, thread_id)?;
+    let message_ids = rollback_message_ids(&messages, num_turns)?;
+    if message_ids.is_empty() {
+        anyhow::bail!("rollback did not identify any messages to remove");
+    }
+
+    let mut conn = db.connect()?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("failed to start pending thread rollback transaction")?;
+    let marked = tx
+        .execute(
+            "UPDATE threads
+             SET engine_metadata_json = ?1
+             WHERE id = ?2
+               AND COALESCE(json_extract(engine_metadata_json, '$.engineRollbackPending'), 0) = 0",
+            params![pending_metadata.to_string(), thread_id],
+        )
+        .context("failed to record pending thread rollback")?;
+    if marked == 0 {
+        anyhow::bail!("thread not found or another rollback is already pending: {thread_id}");
+    }
+
+    delete_rollback_messages(&tx, thread_id, &message_ids)?;
+    tx.execute(
+        "UPDATE threads
+         SET message_count = (
+               SELECT COUNT(*) FROM messages WHERE thread_id = ?1
+             ),
+             total_tokens = (
+               SELECT COALESCE(
+                 SUM(COALESCE(token_input, 0) + COALESCE(token_output, 0)),
+                 0
+               )
+               FROM messages
+               WHERE thread_id = ?1
+             ),
+             last_activity_at = COALESCE(
+               (SELECT MAX(created_at) FROM messages WHERE thread_id = ?1),
+               datetime('now')
+             )
+         WHERE id = ?1",
+        params![thread_id],
+    )
+    .context("failed to refresh pending rollback thread stats")?;
+
+    tx.commit()
+        .context("failed to commit pending thread rollback transaction")?;
+    Ok(message_ids.len())
+}
+
+fn rollback_message_ids(messages: &[MessageDto], num_turns: u32) -> anyhow::Result<Vec<String>> {
     let user_message_indexes = messages
         .iter()
         .enumerate()
@@ -263,20 +482,18 @@ pub fn drop_last_turns(db: &Database, thread_id: &str, num_turns: u32) -> anyhow
     }
 
     let cutoff_index = user_message_indexes[user_message_indexes.len() - turns_to_drop];
-    let message_ids = messages
+    Ok(messages
         .iter()
         .skip(cutoff_index)
         .map(|message| message.id.clone())
-        .collect::<Vec<_>>();
-    if message_ids.is_empty() {
-        return Ok(0);
-    }
+        .collect())
+}
 
-    let mut conn = db.connect()?;
-    let tx = conn
-        .transaction()
-        .context("failed to start thread rollback transaction")?;
-
+fn delete_rollback_messages(
+    tx: &Transaction<'_>,
+    thread_id: &str,
+    message_ids: &[String],
+) -> anyhow::Result<()> {
     for chunk in message_ids.chunks(500) {
         let placeholders = std::iter::repeat_n("?", chunk.len())
             .collect::<Vec<_>>()
@@ -311,10 +528,22 @@ pub fn drop_last_turns(db: &Database, thread_id: &str, num_turns: u32) -> anyhow
     // removed by the chunked delete_approvals_sql above, which scopes deletions to
     // message_id IN (...). The previous thread-wide pending approval sweep is intentionally
     // removed here to avoid deleting pending approvals that belong to retained messages.
+    Ok(())
+}
 
-    tx.commit()
-        .context("failed to commit thread rollback transaction")?;
-    Ok(message_ids.len())
+pub fn validate_thread_branch_message_cutoff(
+    db: &Database,
+    thread_id: &str,
+    source_message_id: &str,
+    expected_native_turn_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let messages = get_thread_messages(db, thread_id)?;
+    retained_message_count_through_assistant_message(
+        &messages,
+        source_message_id,
+        expected_native_turn_id,
+    )?;
+    Ok(())
 }
 
 fn message_has_steer_marker(message: &MessageDto) -> bool {
@@ -421,11 +650,37 @@ pub fn update_assistant_turn_model_id(
     Ok(())
 }
 
+pub fn update_assistant_native_turn_id(
+    db: &Database,
+    message_id: &str,
+    native_turn_id: &str,
+) -> anyhow::Result<()> {
+    let native_turn_id = native_turn_id.trim();
+    if native_turn_id.is_empty() {
+        anyhow::bail!("native turn id cannot be empty");
+    }
+
+    let conn = db.connect()?;
+    let updated = conn
+        .execute(
+            "UPDATE messages
+             SET native_turn_id = ?1
+             WHERE id = ?2 AND role = 'assistant'",
+            params![native_turn_id, message_id],
+        )
+        .context("failed to update assistant native turn id")?;
+    if updated == 0 {
+        anyhow::bail!("assistant message not found: {message_id}");
+    }
+    Ok(())
+}
+
 pub fn get_thread_messages(db: &Database, thread_id: &str) -> anyhow::Result<Vec<MessageDto>> {
     let conn = db.connect()?;
     let mut stmt = conn.prepare(
         "SELECT id, thread_id, role, content, blocks_json, schema_version, status,
-            token_input, token_output, turn_engine_id, turn_model_id, turn_reasoning_effort, created_at
+            token_input, token_output, turn_engine_id, turn_model_id, turn_reasoning_effort, created_at,
+            native_turn_id
      FROM messages
      WHERE thread_id = ?1
      ORDER BY created_at ASC, rowid ASC",
@@ -473,7 +728,8 @@ pub fn get_thread_messages_window(
     let conn = db.connect()?;
     let mut stmt = conn.prepare(
         "SELECT id, thread_id, role, content, blocks_json, schema_version, status,
-            token_input, token_output, turn_engine_id, turn_model_id, turn_reasoning_effort, created_at, rowid
+            token_input, token_output, turn_engine_id, turn_model_id, turn_reasoning_effort, created_at,
+            rowid, native_turn_id
      FROM messages
      WHERE thread_id = ?1
        AND (
@@ -563,6 +819,7 @@ pub fn get_message_blocks(db: &Database, message_id: &str) -> anyhow::Result<Opt
     let mut blocks = raw_blocks
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_else(|| serde_json::json!([]));
+    remove_legacy_turn_status_notices(&mut blocks);
     reconcile_answered_approvals_for_message(&conn, message_id, &mut blocks)?;
     Ok(Some(blocks))
 }
@@ -731,6 +988,7 @@ pub fn search_messages(
      JOIN threads t ON t.id = m.thread_id
      JOIN workspaces w ON w.id = t.workspace_id
      WHERE t.workspace_id = ?1
+       AND t.engine_id = 'codex'
        AND t.archived_at IS NULL
        AND messages_fts MATCH ?2
      ORDER BY rank
@@ -947,7 +1205,8 @@ fn insert_message(
     let conn = db.connect()?;
     conn.query_row(
         "SELECT id, thread_id, role, content, blocks_json, schema_version, status,
-            token_input, token_output, turn_engine_id, turn_model_id, turn_reasoning_effort, created_at
+            token_input, token_output, turn_engine_id, turn_model_id, turn_reasoning_effort, created_at,
+            native_turn_id
      FROM messages
      WHERE id = ?1",
         params![id],
@@ -960,12 +1219,19 @@ fn map_message_row(row: &Row<'_>) -> rusqlite::Result<MessageDto> {
     let blocks_raw: Option<String> = row.get(4)?;
     let token_input: i64 = row.get(7)?;
     let token_output: i64 = row.get(8)?;
+    let blocks = blocks_raw
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .map(|mut blocks| {
+            remove_legacy_turn_status_notices(&mut blocks);
+            blocks
+        });
     Ok(MessageDto {
         id: row.get(0)?,
         thread_id: row.get(1)?,
         role: row.get(2)?,
         content: row.get(3)?,
-        blocks: blocks_raw.and_then(|raw| serde_json::from_str(&raw).ok()),
+        blocks,
+        native_turn_id: row.get("native_turn_id")?,
         turn_engine_id: row.get(9)?,
         turn_model_id: row.get(10)?,
         turn_reasoning_effort: row.get(11)?,
@@ -981,6 +1247,18 @@ fn map_message_row(row: &Row<'_>) -> rusqlite::Result<MessageDto> {
         },
         created_at: row.get(12)?,
     })
+}
+
+fn remove_legacy_turn_status_notices(blocks: &mut Value) -> bool {
+    let Some(items) = blocks.as_array_mut() else {
+        return false;
+    };
+    let original_len = items.len();
+    items.retain(|block| {
+        block.get("type").and_then(Value::as_str) != Some("notice")
+            || block.get("kind").and_then(Value::as_str) != Some("turn_status")
+    });
+    items.len() != original_len
 }
 
 fn apply_resolved_approvals_to_blocks(
@@ -1216,8 +1494,10 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        db::{actions, threads, workspaces, ConnectionPool, SQLITE_POOL_MAX_IDLE},
-        engines::events::ActionType,
+        db::{
+            actions, codex_transcript, threads, workspaces, ConnectionPool, SQLITE_POOL_MAX_IDLE,
+        },
+        engines::events::{ActionType, CodexNativeEvent, CodexNativeEventKind},
     };
 
     use super::*;
@@ -1287,6 +1567,146 @@ mod tests {
         let items = blocks.as_array()?;
         let approval = items.first()?.as_object()?;
         approval.get("responseData")
+    }
+
+    #[test]
+    fn replacing_imported_messages_refreshes_thread_stats_in_the_same_transaction() {
+        let db = test_db();
+        let thread_id = test_thread(&db);
+        let imported = vec![
+            ImportedMessageRecord {
+                role: "user".to_string(),
+                content: Some("question".to_string()),
+                blocks: json!([{ "type": "text", "content": "question" }]),
+                status: MessageStatusDto::Completed,
+                native_turn_id: None,
+                turn_engine_id: Some("codex".to_string()),
+                turn_model_id: Some("gpt-5.3-codex".to_string()),
+                turn_reasoning_effort: Some("medium".to_string()),
+                token_input: 3,
+                token_output: 0,
+                created_at: Some("2026-07-25 10:00:00.000".to_string()),
+            },
+            ImportedMessageRecord {
+                role: "assistant".to_string(),
+                content: Some("answer".to_string()),
+                blocks: json!([{ "type": "text", "content": "answer" }]),
+                status: MessageStatusDto::Completed,
+                native_turn_id: None,
+                turn_engine_id: Some("codex".to_string()),
+                turn_model_id: Some("gpt-5.3-codex".to_string()),
+                turn_reasoning_effort: Some("medium".to_string()),
+                token_input: 5,
+                token_output: 7,
+                created_at: Some("2026-07-25 10:00:01.000".to_string()),
+            },
+        ];
+
+        let replaced = replace_thread_messages(&db, &thread_id, &imported)
+            .expect("failed to replace imported messages");
+        let thread = threads::get_thread(&db, &thread_id)
+            .expect("failed to reload imported thread")
+            .expect("imported thread missing");
+
+        assert_eq!(replaced, 2);
+        assert_eq!(thread.message_count, 2);
+        assert_eq!(thread.total_tokens, 15);
+        assert_eq!(thread.last_activity_at, "2026-07-25 10:00:01.000");
+    }
+
+    #[test]
+    fn replacing_imported_messages_makes_source_order_timestamp_monotonic() {
+        let db = test_db();
+        let thread_id = test_thread(&db);
+        let imported = vec![
+            ImportedMessageRecord {
+                role: "user".to_string(),
+                content: Some("first".to_string()),
+                blocks: json!([{ "type": "text", "content": "first" }]),
+                status: MessageStatusDto::Completed,
+                native_turn_id: Some("turn-1".to_string()),
+                turn_engine_id: Some("codex".to_string()),
+                turn_model_id: None,
+                turn_reasoning_effort: None,
+                token_input: 0,
+                token_output: 0,
+                created_at: Some("2026-07-25 10:00:05.000".to_string()),
+            },
+            ImportedMessageRecord {
+                role: "assistant".to_string(),
+                content: Some("second".to_string()),
+                blocks: json!([{ "type": "text", "content": "second" }]),
+                status: MessageStatusDto::Completed,
+                native_turn_id: Some("turn-1".to_string()),
+                turn_engine_id: Some("codex".to_string()),
+                turn_model_id: None,
+                turn_reasoning_effort: None,
+                token_input: 0,
+                token_output: 0,
+                created_at: Some("2026-07-25 10:00:04.000".to_string()),
+            },
+            ImportedMessageRecord {
+                role: "user".to_string(),
+                content: Some("third".to_string()),
+                blocks: json!([{ "type": "text", "content": "third" }]),
+                status: MessageStatusDto::Completed,
+                native_turn_id: Some("turn-2".to_string()),
+                turn_engine_id: Some("codex".to_string()),
+                turn_model_id: None,
+                turn_reasoning_effort: None,
+                token_input: 0,
+                token_output: 0,
+                created_at: Some("2026-07-25 10:00:03.000".to_string()),
+            },
+        ];
+
+        replace_thread_messages(&db, &thread_id, &imported).unwrap();
+        let messages = get_thread_messages(&db, &thread_id).unwrap();
+
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.content.as_deref().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+        assert!(messages
+            .windows(2)
+            .all(|pair| pair[0].created_at < pair[1].created_at));
+    }
+
+    #[test]
+    fn message_window_cursor_preserves_row_order_when_timestamps_are_identical() {
+        let db = test_db();
+        let thread_id = test_thread(&db);
+        let mut inserted_ids = Vec::new();
+        for content in ["one", "two", "three", "four"] {
+            inserted_ids.push(
+                insert_user_message(&db, &thread_id, content, None, None, None, None)
+                    .unwrap()
+                    .id,
+            );
+        }
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE messages SET created_at = '2026-07-25 10:00:00.000' WHERE thread_id = ?1",
+            params![thread_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let latest = get_thread_messages_window(&db, &thread_id, None, 2).unwrap();
+        let older =
+            get_thread_messages_window(&db, &thread_id, latest.next_cursor.as_ref(), 2).unwrap();
+        let combined = older
+            .messages
+            .into_iter()
+            .chain(latest.messages)
+            .map(|message| message.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(combined, inserted_ids);
+        assert!(older.next_cursor.is_none());
     }
 
     #[test]
@@ -1605,6 +2025,29 @@ mod tests {
     }
 
     #[test]
+    fn update_assistant_native_turn_id_persists_the_codex_fork_key() {
+        let db = test_db();
+        let thread_id = test_thread(&db);
+        let message = insert_message(
+            &db,
+            &thread_id,
+            "assistant",
+            None,
+            Some(json!([])),
+            MessageStatusDto::Streaming,
+            Some("codex"),
+            Some("gpt-5.4"),
+            None,
+        )
+        .unwrap();
+
+        update_assistant_native_turn_id(&db, &message.id, "turn-native-1").unwrap();
+
+        let reloaded = get_thread_messages(&db, &thread_id).unwrap();
+        assert_eq!(reloaded[0].native_turn_id.as_deref(), Some("turn-native-1"));
+    }
+
+    #[test]
     fn get_thread_messages_window_reconciles_stale_approval_blocks() {
         let db = test_db();
         let thread_id = test_thread(&db);
@@ -1794,11 +2237,80 @@ mod tests {
             &source_thread_id,
             "assistant",
             Some("Created branch preview".to_string()),
-            Some(json!([{ "type": "text", "content": "Created branch preview" }])),
+            Some(json!([
+                { "type": "text", "content": "Created branch preview" },
+                {
+                    "type": "notice",
+                    "kind": "turn_status",
+                    "level": "info",
+                    "title": "Turn completed",
+                    "message": "Legacy terminal card"
+                }
+            ])),
             MessageStatusDto::Completed,
             Some("codex"),
             Some("gpt-5.3-codex"),
             Some("medium"),
+        )
+        .unwrap();
+        let native_thread_id = "native-thread-for-branch";
+        let native_turn_id = "native-turn-for-branch";
+        let native_event = |source_sequence, method: &str, params: Value| CodexNativeEvent {
+            source_sequence,
+            observed_at_ms: 1_700_000_000_000 + source_sequence as i64,
+            event_kind: CodexNativeEventKind::Notification,
+            method: method.to_string(),
+            request_id: None,
+            native_thread_id: native_thread_id.to_string(),
+            native_turn_id: Some(native_turn_id.to_string()),
+            params_json: params.to_string(),
+        };
+        codex_transcript::record_native_event_batch(
+            &db,
+            &source_thread_id,
+            &assistant_message.id,
+            &[
+                native_event(
+                    1,
+                    "turn/started",
+                    json!({ "turn": { "id": native_turn_id, "status": "inProgress" } }),
+                ),
+                native_event(
+                    2,
+                    "item/started",
+                    json!({
+                        "item": {
+                            "id": "answer-1",
+                            "type": "agentMessage",
+                            "status": "inProgress",
+                            "phase": "final"
+                        }
+                    }),
+                ),
+                native_event(
+                    3,
+                    "item/agentMessage/delta",
+                    json!({ "itemId": "answer-1", "delta": "Created branch preview" }),
+                ),
+                native_event(
+                    4,
+                    "item/completed",
+                    json!({
+                        "item": {
+                            "id": "answer-1",
+                            "type": "agentMessage",
+                            "status": "completed",
+                            "phase": "final",
+                            "text": "Created branch preview"
+                        }
+                    }),
+                ),
+                native_event(
+                    5,
+                    "turn/completed",
+                    json!({ "turn": { "id": native_turn_id, "status": "completed" } }),
+                ),
+            ],
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -1848,6 +2360,26 @@ mod tests {
         );
         assert_eq!(target_messages[1].status, MessageStatusDto::Completed);
         assert_eq!(
+            source_messages[1]
+                .blocks
+                .as_ref()
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            target_messages[1]
+                .blocks
+                .as_ref()
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
             target_messages[1]
                 .token_usage
                 .as_ref()
@@ -1856,6 +2388,70 @@ mod tests {
         );
         assert_eq!(target_messages[0].created_at, "2026-05-19 12:00:00.000");
         assert_eq!(target_messages[1].created_at, "2026-05-19 12:00:01.000");
+
+        let source_snapshot = codex_transcript::load_turn_snapshot(&db, &source_messages[1].id)
+            .unwrap()
+            .expect("source native transcript");
+        let target_snapshot = codex_transcript::load_turn_snapshot(&db, &target_messages[1].id)
+            .unwrap()
+            .expect("cloned native transcript");
+        assert_eq!(target_snapshot.turn.id, target_messages[1].id);
+        assert_eq!(target_snapshot.turn.message_id, target_messages[1].id);
+        assert_eq!(target_snapshot.turn.thread_id, target_thread_id);
+        assert_eq!(
+            target_snapshot.turn.native_thread_id,
+            source_snapshot.turn.native_thread_id
+        );
+        assert_eq!(
+            target_snapshot.turn.native_turn_id,
+            source_snapshot.turn.native_turn_id
+        );
+        assert_eq!(target_snapshot.turn.status, "completed");
+        assert_eq!(target_snapshot.events.len(), source_snapshot.events.len());
+        assert_eq!(target_snapshot.items, source_snapshot.items);
+        assert_eq!(target_snapshot.chunks.len(), source_snapshot.chunks.len());
+        assert_eq!(
+            target_snapshot
+                .events
+                .iter()
+                .map(|event| (
+                    event.source_sequence,
+                    event.method.as_str(),
+                    event.params_json.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            source_snapshot
+                .events
+                .iter()
+                .map(|event| (
+                    event.source_sequence,
+                    event.method.as_str(),
+                    event.params_json.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            target_snapshot
+                .chunks
+                .iter()
+                .map(|chunk| (
+                    chunk.source_sequence,
+                    chunk.chunk_index,
+                    chunk.stream_kind.as_str(),
+                    chunk.content.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            source_snapshot
+                .chunks
+                .iter()
+                .map(|chunk| (
+                    chunk.source_sequence,
+                    chunk.chunk_index,
+                    chunk.stream_kind.as_str(),
+                    chunk.content.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+        );
     }
 
     #[test]
@@ -1910,6 +2506,88 @@ mod tests {
         assert_eq!(target_messages.len(), 2);
         assert_eq!(target_messages[0].content.as_deref(), Some("turn 1"));
         assert_eq!(target_messages[1].content.as_deref(), Some("answer 1"));
+    }
+
+    #[test]
+    fn clone_thread_messages_for_branch_at_message_ignores_a_newer_streaming_suffix() {
+        let db = test_db();
+        let source_thread_id = test_thread(&db);
+        let target_thread_id = test_thread(&db);
+
+        insert_user_message(&db, &source_thread_id, "turn 1", None, None, None, None).unwrap();
+        let completed_assistant = insert_message(
+            &db,
+            &source_thread_id,
+            "assistant",
+            Some("answer 1".to_string()),
+            Some(json!([{ "type": "text", "content": "answer 1" }])),
+            MessageStatusDto::Completed,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        update_assistant_native_turn_id(&db, &completed_assistant.id, "turn-native-1").unwrap();
+        insert_user_message(&db, &source_thread_id, "turn 2", None, None, None, None).unwrap();
+        insert_assistant_placeholder(&db, &source_thread_id, None, None, None).unwrap();
+
+        let mismatched_native_turn = validate_thread_branch_message_cutoff(
+            &db,
+            &source_thread_id,
+            &completed_assistant.id,
+            Some("turn-native-wrong"),
+        )
+        .expect_err("local and native fork anchors must describe the same turn");
+        assert!(mismatched_native_turn
+            .to_string()
+            .contains("does not match native turn"));
+
+        validate_thread_branch_message_cutoff(
+            &db,
+            &source_thread_id,
+            &completed_assistant.id,
+            Some("turn-native-1"),
+        )
+        .unwrap();
+        let cloned = clone_thread_messages_for_branch_at_message(
+            &db,
+            &source_thread_id,
+            &target_thread_id,
+            &completed_assistant.id,
+            Some("turn-native-1"),
+        )
+        .unwrap();
+
+        assert_eq!(cloned, 2);
+        let target_messages = get_thread_messages(&db, &target_thread_id).unwrap();
+        assert_eq!(target_messages.len(), 2);
+        assert_eq!(target_messages[0].content.as_deref(), Some("turn 1"));
+        assert_eq!(target_messages[1].content.as_deref(), Some("answer 1"));
+        assert_eq!(
+            target_messages[1].native_turn_id.as_deref(),
+            Some("turn-native-1")
+        );
+    }
+
+    #[test]
+    fn branch_message_cutoff_rejects_a_streaming_assistant_boundary() {
+        let db = test_db();
+        let source_thread_id = test_thread(&db);
+        insert_user_message(&db, &source_thread_id, "turn 1", None, None, None, None).unwrap();
+        let streaming_assistant =
+            insert_assistant_placeholder(&db, &source_thread_id, None, None, None).unwrap();
+        update_assistant_native_turn_id(&db, &streaming_assistant.id, "turn-native-active")
+            .unwrap();
+
+        let error = validate_thread_branch_message_cutoff(
+            &db,
+            &source_thread_id,
+            &streaming_assistant.id,
+            Some("turn-native-active"),
+        )
+        .expect_err("streaming boundaries must not be forkable");
+
+        assert!(error.to_string().contains("still streaming"));
     }
 
     #[test]

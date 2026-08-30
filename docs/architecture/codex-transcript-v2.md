@@ -1,0 +1,173 @@
+# Codex transcript v2: lossless capture and replay contract
+
+Status: Phase 1 capture/replay and Phase 2 native presentation implemented on
+`feature/codex-transcript-v2`.
+
+## Purpose
+
+Panes must be able to reconstruct a Codex turn after a restart without depending on the
+lossy legacy `ContentBlock` projection. The native app-server stream is the durable source;
+message blocks remain only as a compatibility projection for pre-v2 history and non-native
+events.
+
+The current Codex app-server contract defines `item/*` notifications as the source of truth
+for turn items. `item/started` carries the initial item and `item/completed` carries the
+authoritative final item. Deltas are ordered additions to an item, not replacements for the
+completed item.
+
+## Non-negotiable invariants
+
+1. **Capture before projection.** A matching native notification or server request is sent to
+   the transcript recorder before its derived `EngineEvent` is produced for the legacy UI.
+2. **No storage truncation.** Native params, started/completed items, deltas, diffs, command
+   output, errors, and structured tool results have no character cap in the v2 tables.
+3. **Stable identity.** A local assistant message owns exactly one `codex_turns` row. Native
+   `threadId`, `turnId`, and `itemId` values are retained independently.
+4. **Stable order.** Each capture has a monotonically increasing source sequence. Events and
+   chunks replay in `(source_sequence, chunk_index)` order.
+5. **Idempotent replay.** Re-applying the same `(turn, source_sequence)` event is a no-op when
+   its bytes match and an error when they conflict.
+6. **Authoritative completion.** `item/completed` may differ from streamed deltas and always
+   becomes the final item snapshot. The deltas remain available as the historical stream.
+7. **Delta-before-start is valid.** A placeholder item may be created by a delta and enriched
+   later by `item/started` or `item/completed`.
+8. **Unknown means retained.** Unknown methods and unknown `ThreadItem.type` values are stored
+   in `codex_turn_events`; unknown items also receive a normal `codex_turn_items` row.
+9. **UI limits are not storage limits.** Paging, virtualization, and preview caps may be used
+   by renderers. They never mutate or replace the native ledger.
+10. **One projector.** Live rendering, history reload, recovery, and deterministic fixture
+    replay will consume the same ordered snapshot API.
+11. **Branch parity.** Forking a conversation clones each retained assistant message's native
+    turn ledger in the same transaction and remaps its local message/thread ownership. A fork
+    must not silently fall back to a different transcript renderer.
+
+## Durability boundary
+
+The lossless guarantee begins when a conversation-scoped JSON-RPC message is successfully
+parsed, matched to an active turn subscription, and accepted by that turn's native recorder
+channel. The lossless router performs this handoff before the legacy mapper sees the message.
+Panes does not promise to reconstruct data that an older Panes version already truncated, data
+that Codex never emitted, or messages emitted outside an active turn subscription.
+
+The recorder uses a bounded, backpressured channel and batched SQLite transactions. Normal turn
+completion closes and joins the recorder so all accepted events are committed before the turn
+is considered fully drained. Process or hardware failure can still lose the currently executing
+SQLite transaction; WAL and SQLite durability govern that failure window.
+
+## Native-to-local flow
+
+```text
+Codex JSONL stdout
+  -> exact RawValue params
+  -> lossless turn-scoped router
+  -> CodexNativeEvent (ordered)
+  -> batched SQLite recorder
+  -> codex_turns / codex_turn_events / codex_turn_items / codex_item_stream_chunks
+  -> native snapshot projector and renderer
+  -> EngineEvent / ContentBlock compatibility projection (dual-write fallback)
+```
+
+The legacy mapper may continue to trim data for an in-memory preview. It must never be the only
+copy of native data.
+
+## Tables
+
+### `codex_turns`
+
+One row per local assistant message and native Codex turn. It owns lifecycle state, native IDs,
+the latest plan and usage snapshots, exact turn-start/turn-complete params, and the last accepted
+source sequence.
+
+### `codex_turn_events`
+
+Append-only ordered native envelopes. It stores event kind, method, optional request ID, exact
+params JSON, observed time, and source sequence. The uniqueness constraint on turn and sequence
+is the replay idempotency boundary.
+
+### `codex_turn_items`
+
+One row per native `itemId`. It stores type, phase, status, first/last sequence, and complete
+started/completed item JSON. Completed JSON is authoritative.
+
+### `codex_item_stream_chunks`
+
+Ordered decoded content chunks associated with their native event. It covers agent text, plans,
+reasoning summaries/content, command/file output, terminal input, MCP progress, and realtime
+transcript text. Raw event JSON remains available for fields not yet projected.
+
+## Schema drift policy
+
+`scripts/codex-app-server-contract.json` is the reviewed inventory of the installed app-server
+surface. `pnpm check:codex-schema` generates the current CLI schema and fails when:
+
+- a known item disappears;
+- an unreviewed item appears;
+- a required conversation notification disappears; or
+- the raw fallback/storage hooks are removed.
+
+A new Codex item is never dropped at runtime: the raw fallback stores it. Updating the reviewed
+inventory is nevertheless required so schema changes are visible during development.
+
+## Rollout
+
+Phase 1 remains additive and dual-write; it does not delete legacy blocks or rewrite existing
+messages. Phase 2 selects the native renderer whenever a v2 ledger exists. The legacy reader
+remains the compatibility path for pre-v2 history. Conversation forks copy the retained v2
+ledger alongside their messages so renderer selection remains stable after branching.
+
+## Phase 2 presentation contract
+
+The Codex chat renderer loads an initial native snapshot for each assistant message and merges
+subsequent slices by source sequence. The recorder emits `codex-transcript-updated` only after a
+SQLite batch commits, so the UI never races an update notification against uncommitted data.
+While a turn is active, a low-frequency incremental read is retained as recovery if the desktop
+event listener is temporarily unavailable. History reload and live streaming therefore share the
+same projector and ordering rules.
+
+The semantic timeline renders agent messages in source order and groups adjacent native
+activities. Every activity row is independently expandable, including successful commands and
+web searches that emitted no output. Specialized bodies cover commands, stdout/stderr/stdin,
+file diffs, MCP/dynamic/collaboration tools, web-search queries and actions, plans, reasoning,
+images, review events, compaction, and unknown future item types. Started and completed item
+payloads remain separately inspectable; completion is labeled authoritative.
+
+An exact native-event drawer exposes every retained JSON-RPC params string. Large values are
+collapsed to a bounded DOM preview but can be fully revealed or copied; this is a presentation
+limit only and does not mutate the snapshot. The turn footer derives elapsed time, per-turn token
+usage, structured plan progress, lifecycle state, and current activity from the same snapshot.
+Message status is authoritative when a locally stopped turn has a stale in-progress native
+snapshot, so activity spinners settle immediately and the footer reports `Stopped`.
+
+Terminal lifecycle is not duplicated into a `ContentBlock` notice. Message status and the native
+turn record are authoritative; unfinished action and approval blocks are terminalized in place.
+Historical terminal-status notice blocks are discarded at compatibility read/render boundaries.
+
+Messages without a v2 ledger continue through the legacy reader. Its action rows remain
+expandable and expose whatever command/search input the older message retained, including an
+explicit no-output state. It does not claim to reconstruct fields that older Panes versions
+discarded.
+
+## Phase 1 acceptance gates
+
+- Exact preservation of an output payload larger than all legacy caps.
+- Exact event and chunk order after database close/reopen.
+- Duplicate replay is idempotent; conflicting duplicate sequence fails loudly.
+- Completion without start and delta before start both produce valid item snapshots.
+- Completed item JSON replaces started state without deleting streamed chunks.
+- Every reviewed `ThreadItem` type and an unknown future type survive replay.
+- Existing-database migration is idempotent.
+- Windows schema generation and parity checks pass against the installed Codex CLI.
+
+## Phase 2 acceptance gates
+
+- A completed command with an empty output stream always expands to its complete command and cwd.
+- A native web search always exposes its query/action; MCP browser tools expose arguments,
+  progress, results, and errors.
+- Started-only fields and authoritative completed fields remain accessible independently.
+- Live committed slices and a fresh full snapshot project to the same ordered timeline.
+- All reviewed item types and an unknown future item receive a visible semantic or raw activity.
+- The footer updates elapsed time, current activity, token usage, and plan completion without
+  depending on legacy blocks.
+- Forked turns replay the same native events, items, and chunks under remapped local IDs.
+- Stopping a turn settles unfinished native activities and the footer without a legacy status card.
+- Pre-v2 zero-output command/search rows remain expandable as a compatibility fallback.

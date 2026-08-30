@@ -1,5 +1,4 @@
 import { Component, type ReactNode } from "react";
-import { t } from "../../i18n";
 
 interface Props {
   children: ReactNode;
@@ -29,7 +28,9 @@ export class AppErrorBoundary extends Component<Props, State> {
       return (
         <div style={{ padding: 16 }}>
           <div className="surface" style={{ padding: 12, borderColor: "var(--danger)" }}>
-            <p style={{ margin: 0, fontWeight: 700 }}>{t("app:shared.uiRuntimeError")}</p>
+            <p style={{ margin: 0, fontWeight: 700 }}>
+              The interface hit an unexpected error.
+            </p>
             <pre
               style={{
                 margin: "8px 0 0",

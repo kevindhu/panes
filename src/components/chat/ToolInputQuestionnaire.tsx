@@ -1,214 +1,192 @@
-import { useEffect, useMemo, useState } from "react";
-import { useTranslation } from "react-i18next";
+import { useEffect, useMemo, useState, type KeyboardEvent } from "react";
 import type { ApprovalResponse } from "../../types";
 import {
   buildToolInputResponseFromSelections,
   defaultToolInputSelections,
   parseToolInputQuestions,
+  toolInputQuestionAllowsCustomAnswer,
   type ToolInputSelections,
 } from "./toolInputApproval";
 
 interface Props {
   details: Record<string, unknown>;
-  onSubmit: (response: ApprovalResponse) => void;
-  onCancel?: () => void;
-  onDecline?: () => void;
-  allowCustomAnswer?: boolean;
+  onSubmit: (response: ApprovalResponse) => void | Promise<void>;
+  onStop?: () => void | Promise<void>;
   submitLabel?: string;
 }
 
-function buildQuestionSignature(questions: ReturnType<typeof parseToolInputQuestions>): string {
-  return questions
-    .map((question) => {
-      const optionsSignature = question.options.map((option) => option.label).join(",");
-      const modeSignature = question.multiple ? "multiple" : "single";
-      const customSignature = question.custom === false ? "no-custom" : "custom";
-      return `${question.id}:${question.question}:${modeSignature}:${customSignature}:${optionsSignature}`;
-    })
-    .join("|");
+function questionSignature(questions: ReturnType<typeof parseToolInputQuestions>): string {
+  return questions.map((question) => JSON.stringify({
+    id: question.id,
+    question: question.question,
+    options: question.options.map((option) => option.label),
+    multiple: question.multiple,
+    custom: question.custom,
+    secret: question.secret,
+  })).join("|");
 }
 
-function formatOptionLabel(label: string): string {
-  return label.replace(/\s*\((recommended|recomendado)\)\s*$/i, "").trim();
+function visibleOptionLabel(label: string): string {
+  return label.replace(/\s*\(recommended\)\s*$/i, "").trim();
 }
 
 export function ToolInputQuestionnaire({
   details,
   onSubmit,
-  onCancel,
-  onDecline,
-  allowCustomAnswer = true,
-  submitLabel,
+  onStop,
+  submitLabel = "Send answers",
 }: Props) {
-  const { t } = useTranslation("chat");
   const questions = useMemo(() => parseToolInputQuestions(details), [details]);
-  const questionSignature = useMemo(() => buildQuestionSignature(questions), [questions]);
+  const signature = useMemo(() => questionSignature(questions), [questions]);
   const [selectedByQuestion, setSelectedByQuestion] = useState<ToolInputSelections>(() =>
     defaultToolInputSelections(questions),
   );
   const [customByQuestion, setCustomByQuestion] = useState<Record<string, string>>({});
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+  const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
     setSelectedByQuestion(defaultToolInputSelections(questions));
     setCustomByQuestion({});
     setCurrentQuestionIndex(0);
-  }, [questionSignature]); // eslint-disable-line react-hooks/exhaustive-deps -- questions identity changes with signature
+    setSubmitting(false);
+  }, [signature]); // eslint-disable-line react-hooks/exhaustive-deps -- signature is the stable request identity
 
-  if (!questions.length) {
-    return null;
+  if (questions.length === 0) return null;
+
+  const safeQuestionIndex = Math.min(currentQuestionIndex, questions.length - 1);
+  const question = questions[safeQuestionIndex];
+  const selectedAnswers = selectedByQuestion[question.id] ?? [];
+  const customAnswer = customByQuestion[question.id] ?? "";
+  const allowsCustomAnswer = toolInputQuestionAllowsCustomAnswer(question);
+  const isLastQuestion = safeQuestionIndex === questions.length - 1;
+  const canAdvance = selectedAnswers.length > 0 || (allowsCustomAnswer && customAnswer.trim().length > 0);
+
+  function selectOption(label: string) {
+    setSelectedByQuestion((current) => {
+      const currentAnswers = current[question.id] ?? [];
+      const selected = currentAnswers.includes(label);
+      const nextAnswers = question.multiple
+        ? selected
+          ? currentAnswers.filter((answer) => answer !== label)
+          : [...currentAnswers, label]
+        : [label];
+      return { ...current, [question.id]: nextAnswers };
+    });
   }
 
-  const currentQuestion = questions[Math.min(currentQuestionIndex, questions.length - 1)];
-  const currentSelectedAnswers = selectedByQuestion[currentQuestion.id] ?? [];
-  const currentCustomAnswer = customByQuestion[currentQuestion.id] ?? "";
-  const questionAllowsCustomAnswer = allowCustomAnswer && currentQuestion.custom !== false;
-  const isLastQuestion = currentQuestionIndex >= questions.length - 1;
-  const canAdvance =
-    (questionAllowsCustomAnswer && currentCustomAnswer.trim().length > 0) ||
-    currentSelectedAnswers.length > 0;
-
-  function handleAdvance() {
-    if (!canAdvance) {
-      return;
-    }
-
+  async function advance() {
+    if (!canAdvance || submitting) return;
     if (!isLastQuestion) {
       setCurrentQuestionIndex((current) => Math.min(current + 1, questions.length - 1));
       return;
     }
 
-    onSubmit(
-      buildToolInputResponseFromSelections(
+    setSubmitting(true);
+    try {
+      await onSubmit(buildToolInputResponseFromSelections(
         questions,
         selectedByQuestion,
         customByQuestion,
-      ),
-    );
+      ));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  function handleAnswerKeyDown(event: KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) {
+    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+      event.preventDefault();
+      void advance();
+    }
   }
 
   return (
-    <div className="chat-tool-input-panel">
-      <div className="chat-tool-input-step">
-        <span className="chat-tool-input-step-count">
-          {t("messageBlocks.toolInput.questionCounter", {
-            current: currentQuestionIndex + 1,
-            total: questions.length,
-          })}
-        </span>
-        {currentQuestion.header ? (
-          <span className="chat-tool-input-step-label">{currentQuestion.header}</span>
-        ) : null}
+    <div className="codex-questionnaire" data-question-id={question.id}>
+      <div className="codex-questionnaire-step">
+        <span>Question {safeQuestionIndex + 1} of {questions.length}</span>
+        {question.header && <strong>{question.header}</strong>}
       </div>
 
-      <div className="chat-tool-input-question">{currentQuestion.question}</div>
+      <div className="codex-questionnaire-question">{question.question}</div>
 
-      {currentQuestion.options.length > 0 && (
-        <div className="chat-tool-input-options">
-          {currentQuestion.options.map((option) => {
-            const selected = currentSelectedAnswers.includes(option.label);
+      {question.options.length > 0 && (
+        <div className="codex-questionnaire-options" role={question.multiple ? "group" : "radiogroup"}>
+          {question.options.map((option) => {
+            const selected = selectedAnswers.includes(option.label);
             return (
               <button
                 key={option.label}
                 type="button"
-                className={`chat-tool-input-option${selected ? " chat-tool-input-option-active" : ""}`}
-                aria-pressed={selected}
-                onClick={() =>
-                  setSelectedByQuestion((current) => {
-                    const currentAnswers = current[currentQuestion.id] ?? [];
-                    const nextAnswers = currentQuestion.multiple
-                      ? selected
-                        ? currentAnswers.filter((answer) => answer !== option.label)
-                        : [...currentAnswers, option.label]
-                      : [option.label];
-
-                    return {
-                      ...current,
-                      [currentQuestion.id]: nextAnswers,
-                    };
-                  })
-                }
-                title={option.description}
+                className={selected ? "selected" : ""}
+                role={question.multiple ? "checkbox" : "radio"}
+                aria-checked={selected}
+                onClick={() => selectOption(option.label)}
               >
-                <span>{formatOptionLabel(option.label)}</span>
-                {option.recommended ? (
-                  <span className="chat-tool-input-option-badge">
-                    {t("messageBlocks.toolInput.recommended")}
-                  </span>
-                ) : null}
+                <span>{visibleOptionLabel(option.label)}</span>
+                {option.recommended && <small className="badge">Recommended</small>}
+                {option.description && <small className="description">{option.description}</small>}
               </button>
             );
           })}
         </div>
       )}
 
-      {questionAllowsCustomAnswer ? (
-        <div className="chat-tool-input-editor">
-          <textarea
-            value={currentCustomAnswer}
-            onChange={(event) =>
-              setCustomByQuestion((current) => ({
-                ...current,
-                [currentQuestion.id]: event.target.value,
-              }))
-            }
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                handleAdvance();
-              }
-            }}
-            placeholder={
-              currentQuestion.options.length > 0
-                ? t("messageBlocks.toolInput.customAnswerPlaceholderOptional")
-                : t("messageBlocks.toolInput.customAnswerPlaceholder")
-            }
-            className="chat-tool-input-textarea"
-            rows={3}
+      {allowsCustomAnswer && (
+        question.secret ? (
+          <input
+            key={question.id}
+            className="codex-questionnaire-answer"
+            type="password"
+            value={customAnswer}
+            autoFocus
+            autoComplete="off"
+            placeholder="Type your answer…"
+            aria-label={`Answer: ${question.question}`}
+            onChange={(event) => setCustomByQuestion((current) => ({
+              ...current,
+              [question.id]: event.target.value,
+            }))}
+            onKeyDown={handleAnswerKeyDown}
           />
-        </div>
-      ) : null}
+        ) : (
+          <textarea
+            key={question.id}
+            className="codex-questionnaire-answer"
+            rows={2}
+            value={customAnswer}
+            autoFocus
+            placeholder={question.options.length > 0 ? "Or type another answer…" : "Type your answer…"}
+            aria-label={`Answer: ${question.question}`}
+            onChange={(event) => setCustomByQuestion((current) => ({
+              ...current,
+              [question.id]: event.target.value,
+            }))}
+            onKeyDown={handleAnswerKeyDown}
+          />
+        )
+      )}
 
-      <div className="chat-tool-input-actions">
-        <div className="chat-tool-input-actions-left">
-          {onCancel ? (
+      <div className="codex-questionnaire-actions">
+        <div>
+          {onStop && (
+            <button type="button" className="secondary danger" disabled={submitting} onClick={() => void onStop()}>
+              Stop turn
+            </button>
+          )}
+          {safeQuestionIndex > 0 && (
             <button
               type="button"
-              className="chat-tool-input-btn-secondary"
-              onClick={onCancel}
+              className="secondary"
+              disabled={submitting}
+              onClick={() => setCurrentQuestionIndex((current) => Math.max(0, current - 1))}
             >
-              {t("panel.approvalActions.cancel")}
+              Previous
             </button>
-          ) : null}
-          {onDecline ? (
-            <button
-              type="button"
-              className="chat-tool-input-btn-secondary"
-              onClick={onDecline}
-            >
-              {t("panel.approvalActions.deny")}
-            </button>
-          ) : null}
-          {currentQuestionIndex > 0 ? (
-            <button
-              type="button"
-              className="chat-tool-input-btn-secondary"
-              onClick={() => setCurrentQuestionIndex((current) => Math.max(current - 1, 0))}
-            >
-              {t("messageBlocks.toolInput.previousQuestion")}
-            </button>
-          ) : null}
+          )}
         </div>
-
-        <button
-          type="button"
-          className="chat-tool-input-btn-primary"
-          onClick={handleAdvance}
-          disabled={!canAdvance}
-        >
-          {isLastQuestion
-            ? submitLabel ?? t("messageBlocks.toolInput.sendAnswers")
-            : t("messageBlocks.toolInput.nextQuestion")}
+        <button type="button" className="primary" disabled={!canAdvance || submitting} onClick={() => void advance()}>
+          {submitting ? "Sending…" : isLastQuestion ? submitLabel : "Next"}
         </button>
       </div>
     </div>

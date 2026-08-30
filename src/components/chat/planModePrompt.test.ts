@@ -1,365 +1,108 @@
 import { describe, expect, it } from "vitest";
 import type { Message } from "../../types";
 import {
-  getPlanImplementationCodingMessage,
-  latestAssistantMessage,
   messageHasStructuredPlan,
   resolvePlanImplementationDecision,
   shouldClearPendingPlanImplementationPrompt,
   shouldPromptToImplementPlan,
+  textHasStructuredPlan,
 } from "./planModePrompt";
 
-function buildAssistantMessage(content: string): Message {
+function message(id: string, role: "user" | "assistant", content: string): Message {
   return {
-    id: "assistant-1",
+    id,
     threadId: "thread-1",
-    role: "assistant",
+    role,
     status: "completed",
     schemaVersion: 1,
-    blocks: [
-      {
-        type: "thinking",
-        content,
-      },
-    ],
+    blocks: [{ type: role === "assistant" ? "thinking" : "text", content }],
     createdAt: new Date().toISOString(),
     hydration: "full",
     hasDeferredContent: false,
   };
 }
 
-describe("planModePrompt", () => {
-  it("uses the explicit exit-plan handoff only for Claude", () => {
-    expect(getPlanImplementationCodingMessage("claude")).toBe(
-      "Exit plan mode and implement the plan.",
-    );
-    expect(getPlanImplementationCodingMessage("codex")).toBe("Implement the plan.");
+const base = {
+  streaming: false,
+  status: "completed" as const,
+  activeThreadId: "thread-1",
+  armedThreadId: "thread-1",
+};
+
+describe("plan implementation handoff", () => {
+  it("recognizes structured updates and proposed-plan envelopes", () => {
+    expect(textHasStructuredPlan("- [completed] Inspect\n- [pending] Implement")).toBe(true);
+    expect(textHasStructuredPlan("<proposed_plan>\nDo the focused change.\n</proposed_plan>")).toBe(true);
+    expect(messageHasStructuredPlan(message(
+      "assistant-1",
+      "assistant",
+      "Plan:\n1. Inspect the flow\n2. Restore the UI",
+    ))).toBe(true);
   });
 
-  it("accepts only the exact implementation questionnaire choices", () => {
-    expect(
-      resolvePlanImplementationDecision(
-        "Implement the plan",
-        "Implement the plan",
-        "Stay in plan mode",
-      ),
-    ).toBe("implement");
-    expect(
-      resolvePlanImplementationDecision(
-        "Stay in plan mode",
-        "Implement the plan",
-        "Stay in plan mode",
-      ),
-    ).toBe("stay");
+  it("uses the authoritative native plan item even when legacy blocks are empty", () => {
+    expect(shouldPromptToImplementPlan({
+      ...base,
+      messages: [message("assistant-1", "assistant", "Plan is ready.")],
+      nativePlanText: "A complete native Codex plan",
+    })).toBe(true);
   });
 
-  it("fails closed for missing, misspelled, or altered questionnaire answers", () => {
-    const resolve = (answer: string | null | undefined) =>
-      resolvePlanImplementationDecision(
-        answer,
-        "Implement the plan",
-        "Stay in plan mode",
-      );
+  it("does not hand off on a clarification or an older plan before a newer user turn", () => {
+    expect(shouldPromptToImplementPlan({
+      ...base,
+      messages: [message("assistant-1", "assistant", "Which scope should I use?")],
+    })).toBe(false);
 
-    expect(resolve(undefined)).toBeNull();
-    expect(resolve(null)).toBeNull();
-    expect(resolve("")).toBeNull();
-    expect(resolve("Implement teh plan")).toBeNull();
-    expect(resolve("implement the plan")).toBeNull();
-    expect(resolve("Something else")).toBeNull();
-    expect(
-      resolvePlanImplementationDecision("Same", "Same", "Same"),
-    ).toBeNull();
-    expect(
-      resolvePlanImplementationDecision("Implement", "Implement", ""),
-    ).toBeNull();
-  });
-
-  it("detects structured plan output from assistant messages", () => {
-    const message = buildAssistantMessage(
-      [
-        "Implementation outline",
-        "- [completed] Inspect the current behavior",
-        "- [pending] Apply the fix",
-      ].join("\n"),
-    );
-
-    expect(messageHasStructuredPlan(message)).toBe(true);
-  });
-
-  it("ignores assistant messages without structured plan items", () => {
-    const message = buildAssistantMessage("I need one clarification before I continue.");
-
-    expect(messageHasStructuredPlan(message)).toBe(false);
-  });
-
-  it("detects prompt-guided plans that use generic markdown lists", () => {
-    const message = buildAssistantMessage(
-      [
-        "Plan:",
-        "1. Inspect the current flow",
-        "2. Reuse the same inline questionnaire",
-      ].join("\n"),
-    );
-
-    expect(messageHasStructuredPlan(message)).toBe(true);
-  });
-
-  it("detects markdown plan sections inside GPT thinking output", () => {
-    const message = buildAssistantMessage(
-      [
-        "**Finalizing the plan**",
-        "",
-        "# Docs Polish Plan",
-        "",
-        "## Summary",
-        "Update the README only, keeping the change very small.",
-        "",
-        "## Key Changes",
-        "- Add a short \"Which flow should I use?\" section.",
-        "- Explain that the JSON resume uses `generate.sh`.",
-        "",
-        "## Test Plan",
-        "- Run `git diff --check`.",
-        "- Read the updated README.",
-      ].join("\n"),
-    );
-
-    expect(messageHasStructuredPlan(message)).toBe(true);
-  });
-
-  it("detects Codex native plan updates that use camelCase inProgress statuses", () => {
-    const message = buildAssistantMessage(
-      [
-        "Plan update",
-        "- [inProgress] Inspect the current flow",
-        "- [pending] Apply the fix",
-      ].join("\n"),
-    );
-
-    expect(messageHasStructuredPlan(message)).toBe(true);
-  });
-
-  it("returns the latest assistant message in the transcript", () => {
-    const assistant = buildAssistantMessage("- [pending] Implement the fix");
-
-    const messages: Message[] = [
-      {
-        id: "user-1",
-        threadId: "thread-1",
-        role: "user",
-        status: "completed",
-        schemaVersion: 1,
-        blocks: [
-          {
-            type: "text",
-            content: "Plan this change",
-            planMode: true,
-          },
-        ],
-        createdAt: new Date().toISOString(),
-        hydration: "full",
-        hasDeferredContent: false,
-      },
-      assistant,
-    ];
-
-    expect(latestAssistantMessage(messages)).toEqual(assistant);
-  });
-
-  it("detects ExitPlanMode tool attempts as a plan completion signal", () => {
-    const message: Message = {
-      id: "assistant-1",
-      threadId: "thread-1",
-      role: "assistant",
-      status: "completed",
-      schemaVersion: 1,
-      blocks: [
-        { type: "text", content: "The plan is ready." },
-        {
-          type: "action",
-          actionId: "a1",
-          actionType: "other",
-          summary: "ExitPlanMode",
-          details: {},
-          outputChunks: [],
-          status: "error",
-        },
+    expect(shouldPromptToImplementPlan({
+      ...base,
+      messages: [
+        message("assistant-1", "assistant", "1. Inspect\n2. Implement"),
+        message("user-1", "user", "Use the focused scope"),
+        message("assistant-2", "assistant", "One more clarification"),
       ],
-      createdAt: new Date().toISOString(),
-      hydration: "full",
-      hasDeferredContent: false,
-    };
-
-    expect(
-      shouldPromptToImplementPlan({
-        streaming: false,
-        status: "completed",
-        activeThreadId: "thread-1",
-        armedThreadId: "thread-1",
-        engineId: "claude",
-        messages: [message],
-      }),
-    ).toBe(true);
+    })).toBe(false);
   });
 
-  it("ignores ExitPlanMode tool attempts for non-Claude engines", () => {
-    const message: Message = {
-      id: "assistant-1",
-      threadId: "thread-1",
-      role: "assistant",
-      status: "completed",
-      schemaVersion: 1,
-      blocks: [
-        { type: "text", content: "The plan is ready." },
-        {
-          type: "action",
-          actionId: "a1",
-          actionType: "other",
-          summary: "ExitPlanMode",
-          details: {},
-          outputChunks: [],
-          status: "error",
-        },
+  it("keeps a completed plan eligible across trailing assistant-only transcript entries", () => {
+    expect(shouldPromptToImplementPlan({
+      ...base,
+      messages: [
+        message("assistant-plan", "assistant", "1. Inspect\n2. Implement"),
+        message("assistant-status", "assistant", "Plan is ready."),
       ],
-      createdAt: new Date().toISOString(),
-      hydration: "full",
-      hasDeferredContent: false,
-    };
-
-    expect(
-      shouldPromptToImplementPlan({
-        streaming: false,
-        status: "completed",
-        activeThreadId: "thread-1",
-        armedThreadId: "thread-1",
-        engineId: "codex",
-        messages: [message],
-      }),
-    ).toBe(false);
+    })).toBe(true);
   });
 
-  it("prompts to implement only after a live plan turn completes", () => {
-    const latestAssistant = buildAssistantMessage(
-      "- [completed] Investigate\n- [pending] Implement",
-    );
-
-    expect(
-      shouldPromptToImplementPlan({
-        streaming: false,
-        status: "completed",
-        activeThreadId: "thread-1",
-        armedThreadId: "thread-1",
-        engineId: "codex",
-        messages: [latestAssistant],
-      }),
-    ).toBe(true);
-
-    expect(
-      shouldPromptToImplementPlan({
-        streaming: false,
-        status: "completed",
-        activeThreadId: "thread-1",
-        armedThreadId: "thread-2",
-        engineId: "codex",
-        messages: [latestAssistant],
-      }),
-    ).toBe(false);
-
-    expect(
-      shouldPromptToImplementPlan({
-        streaming: false,
-        status: "error",
-        activeThreadId: "thread-1",
-        armedThreadId: "thread-1",
-        engineId: "codex",
-        messages: [latestAssistant],
-      }),
-    ).toBe(false);
+  it("requires the active armed thread and a completed turn", () => {
+    const messages = [message("assistant-1", "assistant", "1. Inspect\n2. Implement")];
+    expect(shouldPromptToImplementPlan({ ...base, streaming: true, messages })).toBe(false);
+    expect(shouldPromptToImplementPlan({ ...base, status: "awaiting_approval", messages })).toBe(false);
+    expect(shouldPromptToImplementPlan({ ...base, armedThreadId: "thread-2", messages })).toBe(false);
   });
 
-  it("prompts when the last turn contains a plan followed by another assistant message", () => {
-    const planAssistant = buildAssistantMessage(
-      "- [completed] Inspect\n- [pending] Implement",
-    );
-    const trailingAssistant: Message = {
-      id: "assistant-2",
-      threadId: "thread-1",
-      role: "assistant",
-      status: "completed",
-      schemaVersion: 1,
-      blocks: [
-        {
-          type: "approval",
-          approvalId: "approval-1",
-          actionType: "other",
-          summary: "What should Panes do next?",
-          details: {},
-          status: "pending",
-        },
-      ],
-      createdAt: new Date().toISOString(),
-      hydration: "full",
-      hasDeferredContent: false,
-    };
-
-    expect(
-      shouldPromptToImplementPlan({
-        streaming: false,
-        status: "completed",
-        activeThreadId: "thread-1",
-        armedThreadId: "thread-1",
-        engineId: "codex",
-        messages: [
-          {
-            id: "user-1",
-            threadId: "thread-1",
-            role: "user",
-            status: "completed",
-            schemaVersion: 1,
-            blocks: [{ type: "text", content: "Plan this", planMode: true }],
-            createdAt: new Date().toISOString(),
-            hydration: "full",
-            hasDeferredContent: false,
-          },
-          planAssistant,
-          trailingAssistant,
-        ],
-      }),
-    ).toBe(true);
+  it("fails closed unless the implementation choice is exact", () => {
+    expect(resolvePlanImplementationDecision(
+      "Implement the plan",
+      "Implement the plan",
+      "Stay in plan mode",
+    )).toBe("implement");
+    expect(resolvePlanImplementationDecision(
+      "Stay in plan mode",
+      "Implement the plan",
+      "Stay in plan mode",
+    )).toBe("stay");
+    expect(resolvePlanImplementationDecision(
+      "implement the plan",
+      "Implement the plan",
+      "Stay in plan mode",
+    )).toBeNull();
   });
 
-  it("keeps the implementation prompt armed while a plan turn waits for user input", () => {
-    expect(shouldClearPendingPlanImplementationPrompt("awaiting_approval")).toBe(false);
-    expect(shouldClearPendingPlanImplementationPrompt("streaming")).toBe(false);
-    expect(shouldClearPendingPlanImplementationPrompt("completed")).toBe(false);
-    expect(shouldClearPendingPlanImplementationPrompt("idle")).toBe(true);
+  it("clears interrupted/error handoffs without clearing approval pauses", () => {
     expect(shouldClearPendingPlanImplementationPrompt("error")).toBe(true);
-  });
-
-  it("prompts after a user-input pause even without a fresh streaming transition", () => {
-    const latestAssistant = buildAssistantMessage(
-      [
-        "# Remove Legacy Locale Support",
-        "",
-        "## Summary",
-        "Make the app English-only.",
-        "",
-        "## Key Changes",
-        "- Remove legacy locale resources.",
-        "- Remove language switching.",
-      ].join("\n"),
-    );
-
-    expect(
-      shouldPromptToImplementPlan({
-        streaming: false,
-        status: "completed",
-        activeThreadId: "thread-1",
-        armedThreadId: "thread-1",
-        engineId: "codex",
-        messages: [latestAssistant],
-      }),
-    ).toBe(true);
+    expect(shouldClearPendingPlanImplementationPrompt("idle")).toBe(true);
+    expect(shouldClearPendingPlanImplementationPrompt("awaiting_approval")).toBe(false);
+    expect(shouldClearPendingPlanImplementationPrompt("completed")).toBe(false);
   });
 });

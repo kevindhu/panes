@@ -3,7 +3,7 @@ import {
   ipc,
   listenThreadEvents,
   type ChatTurnFinishedEvent,
-} from "../lib/ipc";
+} from "../lib/codexIpc";
 import {
   armPlanImplementationPrompt,
   disarmPlanImplementationPrompt,
@@ -24,6 +24,7 @@ import type {
   ChatAttachment,
   ChatInputItem,
   ContentBlock,
+  ContextTokenBreakdown,
   ContextUsage,
   MentionBlock,
   Message,
@@ -31,7 +32,7 @@ import type {
   NoticeBlock,
   SkillBlock,
   SteerBlock,
-  StreamTokenUsage,
+  SteerMessageReceipt,
   StreamEvent,
   Thread,
   TurnCompletionSource,
@@ -147,6 +148,58 @@ const pendingTurnMetaByThread = new Map<string, PendingTurnMeta>();
 const inflightActionOutputHydration = new Map<string, Promise<void>>();
 const bindingSeqByThread = new Map<string, number>();
 const queuedTurnFinishedEventsByThread = new Map<string, ChatTurnFinishedEvent[]>();
+const MAX_CACHED_THREAD_VIEWS = 8;
+
+interface CachedThreadView {
+  messages: Message[];
+  olderCursor: MessageWindowCursor | null;
+  hasOlderMessages: boolean;
+  status: ThreadStatus;
+  streaming: boolean;
+  usageLimits: ContextUsage | null;
+}
+
+const cachedThreadViews = new Map<string, CachedThreadView>();
+
+function writeCachedThreadView(threadId: string, view: CachedThreadView): void {
+  cachedThreadViews.delete(threadId);
+  cachedThreadViews.set(threadId, view);
+  while (cachedThreadViews.size > MAX_CACHED_THREAD_VIEWS) {
+    const oldestThreadId = cachedThreadViews.keys().next().value as string | undefined;
+    if (!oldestThreadId) break;
+    cachedThreadViews.delete(oldestThreadId);
+  }
+}
+
+function readCachedThreadView(threadId: string): CachedThreadView | null {
+  const cached = cachedThreadViews.get(threadId);
+  if (!cached) return null;
+  cachedThreadViews.delete(threadId);
+  cachedThreadViews.set(threadId, cached);
+  return cached;
+}
+
+function updateCachedThreadRuntimeState(
+  threadId: string,
+  status: ThreadStatus,
+  streaming: boolean,
+): void {
+  const cached = cachedThreadViews.get(threadId);
+  if (!cached) return;
+  writeCachedThreadView(threadId, { ...cached, status, streaming });
+}
+
+function cacheBoundThreadView(state: ChatState): void {
+  if (!state.threadId) return;
+  writeCachedThreadView(state.threadId, {
+    messages: state.messages,
+    olderCursor: state.olderCursor,
+    hasOlderMessages: state.hasOlderMessages,
+    status: state.status,
+    streaming: state.streaming,
+    usageLimits: state.usageLimits,
+  });
+}
 
 function pendingTurnMatchesFinishedEvent(
   pendingTurn: PendingTurnMeta,
@@ -182,7 +235,7 @@ function assistantMessageMatchesFinishedEvent(
 interface TurnFinishedProjection {
   messageStatus: Message["status"];
   runtimeStatus: ThreadStatus;
-  turnStatus: TurnStatusState;
+  terminalState: TerminalTurnState;
 }
 
 function projectTurnFinishedEvent(event: ChatTurnFinishedEvent): TurnFinishedProjection {
@@ -192,7 +245,7 @@ function projectTurnFinishedEvent(event: ChatTurnFinishedEvent): TurnFinishedPro
       : event.status === "interrupted"
         ? "interrupted"
         : "completed";
-  const turnStatus: TurnStatusState =
+  const terminalState: TerminalTurnState =
     event.status === "error"
       ? "failed"
       : event.status === "interrupted"
@@ -205,7 +258,7 @@ function projectTurnFinishedEvent(event: ChatTurnFinishedEvent): TurnFinishedPro
         ? "idle"
         : "completed";
 
-  return { messageStatus, runtimeStatus, turnStatus };
+  return { messageStatus, runtimeStatus, terminalState };
 }
 
 function applyTurnFinishedEventToMessages(
@@ -232,22 +285,13 @@ function applyTurnFinishedEventToMessages(
     return { matched: false, messages };
   }
 
-  const { messageStatus, turnStatus } = projectTurnFinishedEvent(event);
+  const { messageStatus, terminalState } = projectTurnFinishedEvent(event);
   let nextAssistant = assistant;
   if (assistant.status === "streaming") {
-    const source = turnStatusSourceFromBlocks(assistant.blocks);
-    const terminalizedBlocks = terminalizeUnresolvedTurnBlocks(
+    const blocks = terminalizeUnresolvedTurnBlocks(
       assistant.blocks ?? [],
-      turnStatus,
-      source,
+      terminalState,
     ) ?? [];
-    const blocks = upsertNoticeBlock(
-      terminalizedBlocks,
-      buildTurnStatusNotice(terminalizedBlocks, {
-        state: turnStatus,
-        source,
-      }),
-    );
     nextAssistant = {
       ...assistant,
       status: messageStatus,
@@ -405,12 +449,31 @@ function normalizeContextUsageCachePercent(value: unknown): number | null {
   return Math.max(0, Math.min(100, Math.round(value)));
 }
 
+function normalizeContextTokenBreakdown(
+  inputTokensValue: unknown,
+  cachedInputTokensValue: unknown,
+  cacheWriteInputTokensValue: unknown,
+  outputTokensValue: unknown,
+  reasoningOutputTokensValue: unknown,
+): ContextTokenBreakdown | null {
+  const breakdown: ContextTokenBreakdown = {
+    inputTokens: normalizeContextUsageCacheInteger(inputTokensValue),
+    cachedInputTokens: normalizeContextUsageCacheInteger(cachedInputTokensValue),
+    cacheWriteInputTokens: normalizeContextUsageCacheInteger(cacheWriteInputTokensValue),
+    outputTokens: normalizeContextUsageCacheInteger(outputTokensValue),
+    reasoningOutputTokens: normalizeContextUsageCacheInteger(reasoningOutputTokensValue),
+  };
+
+  return Object.values(breakdown).some((value) => value !== null) ? breakdown : null;
+}
+
 function hasContextUsageMetrics(usage: ContextUsage | null | undefined): usage is ContextUsage {
   return Boolean(
     usage &&
       (usage.currentTokens !== null ||
         usage.maxContextTokens !== null ||
-        usage.contextPercent !== null),
+        usage.contextPercent !== null ||
+        usage.breakdown !== null),
   );
 }
 
@@ -425,12 +488,24 @@ function contextUsageFromThreadMetadata(
   const cacheRecord = cache as Record<string, unknown>;
   const currentTokens = normalizeContextUsageCacheInteger(cacheRecord.currentTokens);
   const maxContextTokens = normalizeContextUsageCacheInteger(cacheRecord.maxContextTokens);
+  const breakdown = normalizeContextTokenBreakdown(
+    cacheRecord.inputTokens,
+    cacheRecord.cachedInputTokens,
+    cacheRecord.cacheWriteInputTokens,
+    cacheRecord.outputTokens,
+    cacheRecord.reasoningOutputTokens,
+  );
   let contextPercent = calculateContextPercentRemaining(currentTokens, maxContextTokens);
   if (contextPercent === null) {
     contextPercent = normalizeContextUsageCachePercent(cacheRecord.contextWindowPercent);
   }
 
-  if (currentTokens === null && maxContextTokens === null && contextPercent === null) {
+  if (
+    currentTokens === null &&
+    maxContextTokens === null &&
+    contextPercent === null &&
+    breakdown === null
+  ) {
     return null;
   }
 
@@ -438,6 +513,7 @@ function contextUsageFromThreadMetadata(
     currentTokens,
     maxContextTokens,
     contextPercent,
+    breakdown,
     windowFiveHourPercent: null,
     windowWeeklyPercent: null,
     windowFiveHourResetsAt: null,
@@ -460,6 +536,7 @@ function accountUsageWindowsFromUsageLimits(usage: ContextUsage | null): Context
     currentTokens: null,
     maxContextTokens: null,
     contextPercent: null,
+    breakdown: null,
     windowFiveHourPercent: usage.windowFiveHourPercent,
     windowWeeklyPercent: usage.windowWeeklyPercent,
     windowFiveHourResetsAt: usage.windowFiveHourResetsAt,
@@ -479,6 +556,11 @@ function mergeContextUsageCacheIntoThread(thread: Thread, usage: ContextUsage): 
     currentTokens: usage.currentTokens,
     maxContextTokens: usage.maxContextTokens,
     contextWindowPercent: usage.contextPercent,
+    inputTokens: usage.breakdown?.inputTokens ?? null,
+    cachedInputTokens: usage.breakdown?.cachedInputTokens ?? null,
+    cacheWriteInputTokens: usage.breakdown?.cacheWriteInputTokens ?? null,
+    outputTokens: usage.breakdown?.outputTokens ?? null,
+    reasoningOutputTokens: usage.breakdown?.reasoningOutputTokens ?? null,
   };
 
   if (
@@ -486,7 +568,15 @@ function mergeContextUsageCacheIntoThread(thread: Thread, usage: ContextUsage): 
     normalizeContextUsageCacheInteger(currentCache?.maxContextTokens) ===
       nextCache.maxContextTokens &&
     normalizeContextUsageCachePercent(currentCache?.contextWindowPercent) ===
-      nextCache.contextWindowPercent
+      nextCache.contextWindowPercent &&
+    normalizeContextUsageCacheInteger(currentCache?.inputTokens) === nextCache.inputTokens &&
+    normalizeContextUsageCacheInteger(currentCache?.cachedInputTokens) ===
+      nextCache.cachedInputTokens &&
+    normalizeContextUsageCacheInteger(currentCache?.cacheWriteInputTokens) ===
+      nextCache.cacheWriteInputTokens &&
+    normalizeContextUsageCacheInteger(currentCache?.outputTokens) === nextCache.outputTokens &&
+    normalizeContextUsageCacheInteger(currentCache?.reasoningOutputTokens) ===
+      nextCache.reasoningOutputTokens
   ) {
     return thread;
   }
@@ -522,6 +612,7 @@ export function resetUsageLimitCachesForTests(): void {
   pendingTurnMetaByThread.clear();
   bindingSeqByThread.clear();
   queuedTurnFinishedEventsByThread.clear();
+  cachedThreadViews.clear();
 }
 
 function isThreadTurnActive(status: ThreadStatus): boolean {
@@ -1054,6 +1145,8 @@ function createSteerBlock(
     attachments: attachments.length > 0 ? attachments : undefined,
     skills: skills.length > 0 ? skills : undefined,
     mentions: mentions.length > 0 ? mentions : undefined,
+    observedAtMs: Date.now(),
+    status: "pending",
   };
 }
 
@@ -1078,11 +1171,14 @@ function createSteerBlockFromMessage(message: Message): SteerBlock {
   return {
     type: "steer",
     steerId: message.id,
+    persistedMessageId: message.id,
     content,
     planMode: planMode || undefined,
     attachments: attachments.length > 0 ? attachments : undefined,
     skills: skills.length > 0 ? skills : undefined,
     mentions: mentions.length > 0 ? mentions : undefined,
+    observedAtMs: parseMessageCreatedAtTimestamp(message.createdAt) ?? undefined,
+    status: "accepted",
   };
 }
 
@@ -1165,6 +1261,38 @@ function removeSteerBlock(messages: Message[], steerId: string): Message[] {
     };
   }
 
+  return nextMessages;
+}
+
+function applySteerReceipt(
+  messages: Message[],
+  steerId: string,
+  receipt: SteerMessageReceipt,
+): Message[] {
+  let nextMessages = messages;
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    const blocks = message.blocks ?? [];
+    let changed = false;
+    const nextBlocks = blocks.map((block) => {
+      if (block.type !== "steer" || block.steerId !== steerId) return block;
+      changed = true;
+      return {
+        ...block,
+        persistedMessageId: receipt.messageId,
+        sourceSequence: receipt.sourceSequence,
+        status: receipt.acceptedSourceSequence === null ? "unconfirmed" as const : "accepted" as const,
+      };
+    });
+    if (!changed) continue;
+    if (nextMessages === messages) nextMessages = [...messages];
+    nextMessages[index] = {
+      ...message,
+      blocks: nextBlocks,
+      hydration: "full",
+      hasDeferredContent: hasDeferredActionOutput(nextBlocks),
+    };
+  }
   return nextMessages;
 }
 
@@ -1295,6 +1423,89 @@ function hasPersistedUserForCurrentOptimisticUser(
   return loadedAssistantIndex > 0 && mergedMessages[loadedAssistantIndex - 1]?.role === "user";
 }
 
+function mergeRuntimeAssistantOntoPersistedMessage(
+  persisted: Message,
+  runtime: Message,
+): Message {
+  return {
+    ...runtime,
+    id: persisted.id,
+    threadId: persisted.threadId,
+    createdAt: persisted.createdAt,
+    nativeTurnId: runtime.nativeTurnId ?? persisted.nativeTurnId,
+    turnEngineId: runtime.turnEngineId ?? persisted.turnEngineId,
+    turnModelId: runtime.turnModelId ?? persisted.turnModelId,
+    turnReasoningEffort:
+      runtime.turnReasoningEffort ?? persisted.turnReasoningEffort,
+  };
+}
+
+function reconcileAssistantMessageIdentity(
+  messages: Message[],
+  optimisticAssistantMessageId: string,
+  persistedAssistantMessageId: string,
+  clientTurnId: string,
+): Message[] {
+  let runtimeIndex = messages.findIndex(
+    (message) => message.role === "assistant" && message.id === optimisticAssistantMessageId,
+  );
+  if (runtimeIndex < 0) {
+    runtimeIndex = messages.findIndex(
+      (message) =>
+        message.role === "assistant" && message.clientTurnId === clientTurnId,
+    );
+  }
+  if (runtimeIndex < 0) {
+    return messages;
+  }
+
+  const persistedIndex = messages.findIndex(
+    (message) =>
+      message.role === "assistant" && message.id === persistedAssistantMessageId,
+  );
+  const runtimeAssistant = messages[runtimeIndex];
+  if (persistedIndex < 0) {
+    const nextMessages = [...messages];
+    nextMessages[runtimeIndex] = {
+      ...runtimeAssistant,
+      id: persistedAssistantMessageId,
+      clientTurnId,
+    };
+    return nextMessages;
+  }
+
+  if (persistedIndex === runtimeIndex) {
+    if (runtimeAssistant.clientTurnId === clientTurnId) {
+      return messages;
+    }
+    const nextMessages = [...messages];
+    nextMessages[runtimeIndex] = { ...runtimeAssistant, clientTurnId };
+    return nextMessages;
+  }
+
+  const persistedAssistant = messages[persistedIndex];
+  const reconciledAssistant = shouldPreferCurrentMessageDuringBind(
+    runtimeAssistant,
+    persistedAssistant,
+  )
+    ? mergeRuntimeAssistantOntoPersistedMessage(persistedAssistant, runtimeAssistant)
+    : { ...persistedAssistant, clientTurnId };
+  const optimisticUserIndex = runtimeIndex > 0 && messages[runtimeIndex - 1]?.role === "user"
+    ? runtimeIndex - 1
+    : -1;
+  const persistedUserExists = persistedIndex > 0 && messages[persistedIndex - 1]?.role === "user";
+
+  return messages.flatMap((message, index) => {
+    if (index === persistedIndex) {
+      return [reconciledAssistant];
+    }
+    if (index === runtimeIndex || (persistedUserExists && index === optimisticUserIndex)) {
+      return [];
+    }
+    return [message];
+  });
+}
+
 function mergeLoadedMessagesWithCurrentRuntimeMessages(
   loadedMessages: Message[],
   currentMessages: Message[],
@@ -1308,11 +1519,23 @@ function mergeLoadedMessagesWithCurrentRuntimeMessages(
   const mergedMessages = [...loadedMessages];
   const loadedIndexById = new Map<string, number>();
   const loadedAssistantIndexByClientTurnId = new Map<string, number>();
+  const loadedAssistantIndexByNativeTurnId = new Map<string, number>();
+  const pendingTurn = pendingTurnMetaByThread.get(threadId);
   for (let index = 0; index < mergedMessages.length; index += 1) {
     const message = mergedMessages[index];
     loadedIndexById.set(message.id, index);
     if (message.role === "assistant" && message.clientTurnId) {
       loadedAssistantIndexByClientTurnId.set(message.clientTurnId, index);
+    }
+    if (message.role === "assistant" && message.nativeTurnId) {
+      loadedAssistantIndexByNativeTurnId.set(message.nativeTurnId, index);
+    }
+    if (
+      message.role === "assistant" &&
+      pendingTurn?.clientTurnId &&
+      pendingTurn.assistantMessageId === message.id
+    ) {
+      loadedAssistantIndexByClientTurnId.set(pendingTurn.clientTurnId, index);
     }
   }
 
@@ -1321,7 +1544,9 @@ function mergeLoadedMessagesWithCurrentRuntimeMessages(
     if (loadedIndex !== undefined) {
       const loadedMessage = mergedMessages[loadedIndex];
       if (shouldPreferCurrentMessageDuringBind(currentMessage, loadedMessage)) {
-        mergedMessages[loadedIndex] = currentMessage;
+        mergedMessages[loadedIndex] = currentMessage.role === "assistant"
+          ? mergeRuntimeAssistantOntoPersistedMessage(loadedMessage, currentMessage)
+          : currentMessage;
       }
       continue;
     }
@@ -1332,16 +1557,19 @@ function mergeLoadedMessagesWithCurrentRuntimeMessages(
 
     const loadedAssistantIndex = loadedAssistantIndexByClientTurnId.get(
       currentMessage.clientTurnId,
-    );
+    ) ?? (currentMessage.nativeTurnId
+      ? loadedAssistantIndexByNativeTurnId.get(currentMessage.nativeTurnId)
+      : undefined);
     if (loadedAssistantIndex === undefined) {
       continue;
     }
 
     const loadedAssistant = mergedMessages[loadedAssistantIndex];
     if (shouldPreferCurrentMessageDuringBind(currentMessage, loadedAssistant)) {
-      loadedIndexById.delete(loadedAssistant.id);
-      mergedMessages[loadedAssistantIndex] = currentMessage;
-      loadedIndexById.set(currentMessage.id, loadedAssistantIndex);
+      mergedMessages[loadedAssistantIndex] = mergeRuntimeAssistantOntoPersistedMessage(
+        loadedAssistant,
+        currentMessage,
+      );
       loadedAssistantIndexByClientTurnId.set(
         currentMessage.clientTurnId,
         loadedAssistantIndex,
@@ -1392,6 +1620,40 @@ function mergeLoadedMessagesWithCurrentRuntimeMessages(
   }
 
   return mergedMessages;
+}
+
+function mergeLoadedWindowWithCachedOlderHistory(
+  loadedMessages: Message[],
+  cachedMessages: Message[],
+): { messages: Message[]; preservedOlderHistory: boolean } {
+  if (loadedMessages.length === 0 || cachedMessages.length === 0) {
+    return { messages: loadedMessages, preservedOlderHistory: false };
+  }
+
+  const firstLoaded = loadedMessages[0];
+  const firstLoadedCachedIndex = cachedMessages.findIndex(
+    (message) => message.id === firstLoaded.id,
+  );
+  if (firstLoadedCachedIndex < 0) {
+    // With no shared identity there is no canonical boundary between these
+    // windows. Timestamp inference can prepend stale pre-sync rows and corrupt
+    // the backend sequence, so use the authoritative loaded window as-is.
+    return { messages: loadedMessages, preservedOlderHistory: false };
+  }
+  const cachedOlderMessages = cachedMessages.slice(0, firstLoadedCachedIndex);
+
+  if (cachedOlderMessages.length === 0) {
+    return { messages: loadedMessages, preservedOlderHistory: false };
+  }
+
+  const loadedIds = new Set(loadedMessages.map((message) => message.id));
+  return {
+    messages: [
+      ...cachedOlderMessages.filter((message) => !loadedIds.has(message.id)),
+      ...loadedMessages,
+    ],
+    preservedOlderHistory: true,
+  };
 }
 
 function resolveAssistantMessageIndex(
@@ -1532,87 +1794,16 @@ function upsertNoticeBlock(blocks: ContentBlock[], block: NoticeBlock): ContentB
     return next;
   }
 
-  if (block.kind === "turn_status") {
-    return [...blocks, block];
-  }
-
-  return [block, ...blocks];
+  return [...blocks, block];
 }
 
-type TurnStatusState =
-  | "streaming"
-  | "awaiting_approval"
-  | "completed"
-  | "interrupted"
-  | "failed";
-
-interface TurnBlockStats {
-  actionsTotal: number;
-  actionsDone: number;
-  actionsError: number;
-  actionsRunning: number;
-  actionsPending: number;
-  approvalsPending: number;
-  approvalsAnswered: number;
-  diffBlocks: number;
-  errorBlocks: number;
-}
+type TerminalTurnState = "completed" | "interrupted" | "failed";
 
 function messagesHavePendingApprovals(messages: Message[]): boolean {
   return messages.some((message) =>
     message.role === "assistant" &&
     (message.blocks ?? []).some((block) => block.type === "approval" && block.status === "pending"),
   );
-}
-
-function collectTurnBlockStats(blocks: ContentBlock[]): TurnBlockStats {
-  const stats: TurnBlockStats = {
-    actionsTotal: 0,
-    actionsDone: 0,
-    actionsError: 0,
-    actionsRunning: 0,
-    actionsPending: 0,
-    approvalsPending: 0,
-    approvalsAnswered: 0,
-    diffBlocks: 0,
-    errorBlocks: 0,
-  };
-
-  for (const block of blocks) {
-    if (block.type === "action") {
-      stats.actionsTotal += 1;
-      if (block.status === "done") {
-        stats.actionsDone += 1;
-      } else if (block.status === "error") {
-        stats.actionsError += 1;
-      } else if (block.status === "pending") {
-        stats.actionsPending += 1;
-      } else {
-        stats.actionsRunning += 1;
-      }
-      continue;
-    }
-
-    if (block.type === "approval") {
-      if (block.status === "pending") {
-        stats.approvalsPending += 1;
-      } else {
-        stats.approvalsAnswered += 1;
-      }
-      continue;
-    }
-
-    if (block.type === "diff") {
-      stats.diffBlocks += 1;
-      continue;
-    }
-
-    if (block.type === "error") {
-      stats.errorBlocks += 1;
-    }
-  }
-
-  return stats;
 }
 
 function deriveRuntimeStateFromMessages(
@@ -1693,123 +1884,8 @@ function resolveBoundThreadRuntimeState(
   };
 }
 
-function describeTurnCompletionSource(source?: TurnCompletionSource | null): string | null {
-  switch (source) {
-    case "engine":
-      return "explicit engine terminal event";
-    case "recovered_snapshot":
-      return "recovered from Codex thread history";
-    case "reconciled_stream_lost":
-      return "reconciled from thread history after live stream loss";
-    case "reconciled_timeout":
-      return "reconciled from thread history after completion timeout";
-    case "timeout_fallback":
-      return "Panes timeout fallback";
-    default:
-      return null;
-  }
-}
-
-function turnStatusNoticeHasPendingApprovalConflict(
-  state: TurnStatusState,
-  stats: TurnBlockStats,
-  source?: TurnCompletionSource | null,
-): boolean {
-  return state !== "streaming" && stats.approvalsPending > 0 && Boolean(source);
-}
-
-function turnStatusNoticeLevel(state: TurnStatusState): NoticeBlock["level"] {
-  if (state === "failed") {
-    return "error";
-  }
-  if (state === "interrupted" || state === "awaiting_approval") {
-    return "warning";
-  }
-  return "info";
-}
-
-function turnStatusNoticeTitle(state: TurnStatusState): string {
-  switch (state) {
-    case "completed":
-      return "Turn completed";
-    case "interrupted":
-      return "Turn interrupted";
-    case "failed":
-      return "Turn failed";
-    case "awaiting_approval":
-      return "Waiting for approval";
-    default:
-      return "Turn still open";
-  }
-}
-
-function turnStatusNoticeMessage(
-  state: TurnStatusState,
-  source?: TurnCompletionSource | null,
-  hasPendingApprovalConflict = false,
-): string {
-  if (hasPendingApprovalConflict) {
-    return "A terminal result was recorded, but Panes still has unresolved approvals. The turn may have ended early or the approval protocol may be out of sync.";
-  }
-
-  switch (state) {
-    case "completed":
-      if (source === "engine") {
-        return "Codex reported a normal terminal completion.";
-      }
-      if (source === "recovered_snapshot") {
-        return "Panes recovered the completed turn from Codex thread history.";
-      }
-      if (source === "reconciled_timeout") {
-        return "Panes recovered the completed turn from thread history after the live completion timed out.";
-      }
-      return "The turn reached a terminal completion.";
-    case "interrupted":
-      return "The turn ended before a normal completion.";
-    case "failed":
-      if (source === "reconciled_stream_lost") {
-        return "Panes recovered the turn after losing the live Codex stream. The transcript may be incomplete.";
-      }
-      if (source === "timeout_fallback") {
-        return "Panes timed out waiting for Codex to finish and marked the turn as failed.";
-      }
-      return "The turn ended with a terminal failure.";
-    case "awaiting_approval":
-      return "Waiting for approval before the turn can continue.";
-    default:
-      return "No terminal completion event has been recorded yet.";
-  }
-}
-
-function normalizeDurationMs(value: unknown): number | null {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    return null;
-  }
-
-  return Math.round(value);
-}
-
-function resolveTurnDurationMs(threadId: string, event: StreamEvent): number | null {
-  if (event.type !== "TurnCompleted") {
-    return null;
-  }
-
-  const eventDurationMs =
-    normalizeDurationMs(event.duration_ms) ?? normalizeDurationMs(event.durationMs);
-  if (eventDurationMs !== null) {
-    return eventDurationMs;
-  }
-
-  const pendingTurnMeta = pendingTurnMetaByThread.get(threadId);
-  if (!pendingTurnMeta) {
-    return null;
-  }
-
-  return Math.max(0, Math.round(performance.now() - pendingTurnMeta.startedAt));
-}
-
 function unresolvedActionTerminalError(
-  state: TurnStatusState,
+  state: TerminalTurnState,
   source?: TurnCompletionSource | null,
 ): string {
   if (source === "reconciled_stream_lost") {
@@ -1833,10 +1909,10 @@ function unresolvedActionTerminalError(
 
 function terminalizeUnresolvedActionBlocks(
   blocks: ContentBlock[] | undefined,
-  state: TurnStatusState,
+  state: TerminalTurnState,
   source?: TurnCompletionSource | null,
 ): ContentBlock[] | undefined {
-  if (!Array.isArray(blocks) || state === "streaming" || state === "awaiting_approval") {
+  if (!Array.isArray(blocks)) {
     return blocks;
   }
 
@@ -1868,9 +1944,9 @@ function terminalizeUnresolvedActionBlocks(
 
 function terminalizePendingApprovalBlocks(
   blocks: ContentBlock[] | undefined,
-  state: TurnStatusState,
+  state: TerminalTurnState,
 ): ContentBlock[] | undefined {
-  if (!Array.isArray(blocks) || state === "streaming" || state === "awaiting_approval") {
+  if (!Array.isArray(blocks)) {
     return blocks;
   }
 
@@ -1893,7 +1969,7 @@ function terminalizePendingApprovalBlocks(
 
 function terminalizeUnresolvedTurnBlocks(
   blocks: ContentBlock[] | undefined,
-  state: TurnStatusState,
+  state: TerminalTurnState,
   source?: TurnCompletionSource | null,
 ): ContentBlock[] | undefined {
   return terminalizePendingApprovalBlocks(
@@ -1902,27 +1978,10 @@ function terminalizeUnresolvedTurnBlocks(
   );
 }
 
-function assistantMessageHasMeaningfulContent(message: Message | undefined): boolean {
-  return Boolean(
-    message?.role === "assistant" &&
-      (message.blocks ?? []).some((block) => {
-        if (block.type === "text") return Boolean(block.content?.trim());
-        if (block.type === "action" || block.type === "diff" || block.type === "code" || block.type === "approval") {
-          return true;
-        }
-        return false;
-      }),
-  );
-}
-
 function cancelActiveAssistantMessage(messages: Message[]): Message[] {
   const last = messages[messages.length - 1];
   if (last?.role !== "assistant") {
     return messages;
-  }
-
-  if (!assistantMessageHasMeaningfulContent(last)) {
-    return messages.slice(0, -1);
   }
 
   if (last.status !== "streaming") {
@@ -1939,101 +1998,7 @@ function cancelActiveAssistantMessage(messages: Message[]): Message[] {
   ];
 }
 
-function formatTurnActionStats(stats: TurnBlockStats): string | null {
-  if (stats.actionsTotal <= 0) {
-    return null;
-  }
-
-  return `Actions: ${stats.actionsTotal} total, ${stats.actionsDone} done, ${stats.actionsError} error, ${stats.actionsRunning} running, ${stats.actionsPending} pending`;
-}
-
-function formatTurnApprovalStats(stats: TurnBlockStats): string | null {
-  if (stats.approvalsPending <= 0 && stats.approvalsAnswered <= 0) {
-    return null;
-  }
-
-  return `Approvals: ${stats.approvalsPending} pending, ${stats.approvalsAnswered} answered`;
-}
-
-function stringArraysEqual(left: string[] | undefined, right: string[] | undefined): boolean {
-  if (left === right) {
-    return true;
-  }
-  if (!left || !right || left.length !== right.length) {
-    return false;
-  }
-
-  return left.every((value, index) => value === right[index]);
-}
-
-function refreshTurnStatusNotice(
-  blocks: ContentBlock[] | undefined,
-  state: TurnStatusState,
-  source?: TurnCompletionSource | null,
-): ContentBlock[] | undefined {
-  if (!Array.isArray(blocks)) {
-    return blocks;
-  }
-
-  const noticeIndex = blocks.findIndex(
-    (block) => block.type === "notice" && block.kind === "turn_status",
-  );
-  if (noticeIndex < 0) {
-    return blocks;
-  }
-
-  const notice = blocks[noticeIndex] as NoticeBlock;
-  const details = Array.isArray(notice.details) ? notice.details : [];
-  const stats = collectTurnBlockStats(blocks);
-  const resolvedSource = source ?? notice.source ?? null;
-  const hasPendingApprovalConflict = turnStatusNoticeHasPendingApprovalConflict(
-    state,
-    stats,
-    resolvedSource,
-  );
-  const actionStats = formatTurnActionStats(stats);
-  const approvalStats = formatTurnApprovalStats(stats);
-  const nextDetails = details.filter(
-    (detail) =>
-      !detail.startsWith("Actions: ") &&
-      !detail.startsWith("Approvals: ") &&
-      !detail.startsWith("Protocol warning: terminal result arrived while "),
-  );
-  if (actionStats) {
-    nextDetails.push(actionStats);
-  }
-  if (approvalStats) {
-    nextDetails.push(approvalStats);
-  }
-
-  const normalizedDetails = nextDetails.length > 0 ? nextDetails : undefined;
-  const nextNotice: NoticeBlock = {
-    ...notice,
-    level: hasPendingApprovalConflict ? "warning" : turnStatusNoticeLevel(state),
-    title: hasPendingApprovalConflict ? "Approval still pending" : turnStatusNoticeTitle(state),
-    message: turnStatusNoticeMessage(state, resolvedSource, hasPendingApprovalConflict),
-    details: normalizedDetails,
-    status: hasPendingApprovalConflict ? "awaiting_approval" : state,
-    source: resolvedSource ?? undefined,
-  };
-
-  if (
-    nextNotice.level === notice.level &&
-    nextNotice.title === notice.title &&
-    nextNotice.message === notice.message &&
-    nextNotice.status === notice.status &&
-    nextNotice.source === notice.source &&
-    stringArraysEqual(normalizedDetails, notice.details)
-  ) {
-    return blocks;
-  }
-
-  const nextBlocks = [...blocks];
-  nextBlocks[noticeIndex] = nextNotice;
-  return nextBlocks;
-}
-
-function terminalStateFromMessageStatus(status: Message["status"]): TurnStatusState | null {
+function terminalStateFromMessageStatus(status: Message["status"]): TerminalTurnState | null {
   switch (status) {
     case "completed":
       return "completed";
@@ -2046,21 +2011,6 @@ function terminalStateFromMessageStatus(status: Message["status"]): TurnStatusSt
   }
 }
 
-function turnStatusSourceFromBlocks(blocks: ContentBlock[] | undefined): TurnCompletionSource | null {
-  if (!Array.isArray(blocks)) {
-    return null;
-  }
-
-  for (let index = blocks.length - 1; index >= 0; index -= 1) {
-    const block = blocks[index];
-    if (block.type === "notice" && block.kind === "turn_status") {
-      return block.source ?? null;
-    }
-  }
-
-  return null;
-}
-
 function normalizeTerminalTurnBlocks(message: Message): Message {
   if (message.role !== "assistant") {
     return message;
@@ -2071,13 +2021,7 @@ function normalizeTerminalTurnBlocks(message: Message): Message {
     return message;
   }
 
-  const source = turnStatusSourceFromBlocks(message.blocks);
-  const terminalizedBlocks = terminalizeUnresolvedTurnBlocks(
-    message.blocks,
-    state,
-    source,
-  );
-  const nextBlocks = refreshTurnStatusNotice(terminalizedBlocks, state, source);
+  const nextBlocks = terminalizeUnresolvedTurnBlocks(message.blocks, state);
   if (nextBlocks === message.blocks) {
     return message;
   }
@@ -2088,73 +2032,6 @@ function normalizeTerminalTurnBlocks(message: Message): Message {
   };
 }
 
-function buildTurnStatusNotice(
-  blocks: ContentBlock[],
-  options: {
-    state: TurnStatusState;
-    source?: TurnCompletionSource | null;
-    tokenUsage?: StreamTokenUsage | null;
-    durationMs?: number | null;
-  },
-): NoticeBlock {
-  const { state, source, tokenUsage, durationMs } = options;
-  const stats = collectTurnBlockStats(blocks);
-  const details: string[] = [];
-  const sourceLabel = describeTurnCompletionSource(source);
-  const hasPendingApprovalConflict = turnStatusNoticeHasPendingApprovalConflict(
-    state,
-    stats,
-    source,
-  );
-
-  if (sourceLabel) {
-    details.push(`Completion source: ${sourceLabel}`);
-  }
-
-  if (tokenUsage) {
-    details.push(`Token usage: ${tokenUsage.input} input, ${tokenUsage.output} output`);
-  }
-
-  if (stats.actionsTotal > 0) {
-    details.push(formatTurnActionStats(stats)!);
-  }
-
-  if (stats.approvalsPending > 0 || stats.approvalsAnswered > 0) {
-    details.push(
-      `Approvals: ${stats.approvalsPending} pending, ${stats.approvalsAnswered} answered`,
-    );
-    if (hasPendingApprovalConflict) {
-      details.push(
-        `Protocol warning: terminal result arrived while ${stats.approvalsPending} approval(s) were still pending.`,
-      );
-    }
-  }
-
-  if (stats.diffBlocks > 0) {
-    details.push(`Diff blocks: ${stats.diffBlocks}`);
-  }
-
-  if (stats.errorBlocks > 0) {
-    details.push(`Error blocks: ${stats.errorBlocks}`);
-  }
-
-  if (state === "streaming" && details.length === 0) {
-    details.push("No tool, approval, diff, or error activity has been recorded yet.");
-  }
-
-  return {
-    type: "notice",
-    kind: "turn_status",
-    level: hasPendingApprovalConflict ? "warning" : turnStatusNoticeLevel(state),
-    title: hasPendingApprovalConflict ? "Approval still pending" : turnStatusNoticeTitle(state),
-    message: turnStatusNoticeMessage(state, source, hasPendingApprovalConflict),
-    details: details.length > 0 ? details : undefined,
-    status: hasPendingApprovalConflict ? "awaiting_approval" : state,
-    source: source ?? undefined,
-    durationMs: normalizeDurationMs(durationMs) ?? undefined,
-  };
-}
-
 function normalizeBlocks(blocks?: ContentBlock[]): ContentBlock[] | undefined {
   if (!Array.isArray(blocks)) {
     return blocks;
@@ -2162,6 +2039,11 @@ function normalizeBlocks(blocks?: ContentBlock[]): ContentBlock[] | undefined {
 
   const normalized: ContentBlock[] = [];
   for (const block of blocks) {
+    // Historical messages may still contain the removed terminal-status card.
+    // Drop it at the compatibility boundary instead of letting it reappear.
+    if (block.type === "notice" && block.kind === "turn_status") {
+      continue;
+    }
     const last = normalized[normalized.length - 1];
     if (block.type === "text" && last?.type === "text") {
       normalized[normalized.length - 1] = {
@@ -2318,48 +2200,15 @@ function parseMessageCreatedAtTimestamp(createdAt: string): number | null {
   return Number.isFinite(direct) ? direct : null;
 }
 
-function compareMessagesChronologically(
-  left: { message: Message; index: number },
-  right: { message: Message; index: number },
-): number {
-  const leftTimestamp = parseMessageCreatedAtTimestamp(left.message.createdAt);
-  const rightTimestamp = parseMessageCreatedAtTimestamp(right.message.createdAt);
-  if (leftTimestamp !== null && rightTimestamp !== null && leftTimestamp !== rightTimestamp) {
-    return leftTimestamp - rightTimestamp;
-  }
-  return left.index - right.index;
-}
-
-function sortMessagesChronologically(messages: Message[]): Message[] {
-  if (messages.length < 2) {
-    return messages;
-  }
-
-  const indexedMessages = messages.map((message, index) => ({ message, index }));
-  let needsSort = false;
-  for (let index = 1; index < indexedMessages.length; index += 1) {
-    if (
-      compareMessagesChronologically(indexedMessages[index - 1], indexedMessages[index]) > 0
-    ) {
-      needsSort = true;
-      break;
-    }
-  }
-
-  if (!needsSort) {
-    return messages;
-  }
-
-  return [...indexedMessages]
-    .sort(compareMessagesChronologically)
-    .map(({ message }) => message);
-}
-
 function normalizeMessages(
   messages: Message[],
   options?: { collapseTrailingSteers?: boolean },
 ): Message[] {
-  let nextMessages = sortMessagesChronologically(messages);
+  // SQLite and Codex already provide an authoritative sequence. Timestamps are
+  // metadata, not ordering keys: live user/assistant rows are commonly written
+  // in the same millisecond, and imported completion times can overlap the next
+  // turn. Preserve the source order all the way to the renderer.
+  let nextMessages = messages;
   for (let index = 0; index < nextMessages.length; index += 1) {
     const message = nextMessages[index];
     const normalizedBlocks = normalizeBlocks(message.blocks);
@@ -2438,6 +2287,13 @@ function mapUsageLimitsFromEvent(event: Extract<StreamEvent, { type: "UsageLimit
   const currentTokensRaw = usage.current_tokens;
   const maxContextTokensRaw = usage.max_context_tokens;
   const contextPercentRaw = usage.context_window_percent;
+  const breakdown = normalizeContextTokenBreakdown(
+    usage.input_tokens,
+    usage.cached_input_tokens,
+    usage.cache_write_input_tokens,
+    usage.output_tokens,
+    usage.reasoning_output_tokens,
+  );
   const fiveHourPercentRaw = usage.five_hour_percent;
   const weeklyPercentRaw = usage.weekly_percent;
 
@@ -2457,6 +2313,7 @@ function mapUsageLimitsFromEvent(event: Extract<StreamEvent, { type: "UsageLimit
 
   const hasAnyMetric =
     hasContextMetrics ||
+    breakdown !== null ||
     typeof contextPercentRaw === "number" ||
     typeof fiveHourPercentRaw === "number" ||
     typeof weeklyPercentRaw === "number";
@@ -2480,6 +2337,7 @@ function mapUsageLimitsFromEvent(event: Extract<StreamEvent, { type: "UsageLimit
     maxContextTokens,
     contextPercent:
       contextPercent === null ? null : Math.max(0, Math.min(100, contextPercent)),
+    breakdown,
     windowFiveHourPercent: toRemainingPercent(fiveHourPercentRaw),
     windowWeeklyPercent: toRemainingPercent(weeklyPercentRaw),
     windowFiveHourResetsAt: toIsoTimestamp(usage.five_hour_resets_at),
@@ -2503,6 +2361,7 @@ function mergeUsageLimits(
     currentTokens: next.currentTokens ?? previous.currentTokens,
     maxContextTokens: next.maxContextTokens ?? previous.maxContextTokens,
     contextPercent: next.contextPercent ?? previous.contextPercent,
+    breakdown: next.breakdown ?? previous.breakdown,
     windowFiveHourPercent: next.windowFiveHourPercent ?? previous.windowFiveHourPercent,
     windowWeeklyPercent: next.windowWeeklyPercent ?? previous.windowWeeklyPercent,
     windowFiveHourResetsAt: next.windowFiveHourResetsAt ?? previous.windowFiveHourResetsAt,
@@ -2552,6 +2411,9 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
 
   if (event.type === "TurnStarted" && typeof event.client_turn_id === "string") {
     assistant.clientTurnId = event.client_turn_id;
+  }
+  if (event.type === "TurnStarted" && typeof event.native_turn_id === "string") {
+    assistant.nativeTurnId = event.native_turn_id;
   }
 
   if (event.type === "TurnSnapshotRecovered") {
@@ -2709,8 +2571,15 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
     const actionId = String(event.action_id ?? "");
     assistant.blocks = patchActionBlock(blocks, actionId, (block) => {
       const result = (event.result as Record<string, unknown> | undefined) ?? {};
+      const completedDetails = event.details && typeof event.details === "object" && !Array.isArray(event.details)
+        ? event.details
+        : {};
       return {
         ...block,
+        details: {
+          ...((block.details ?? {}) as Record<string, unknown>),
+          ...completedDetails,
+        },
         status: result.success ? "done" : "error",
         result: {
           success: Boolean(result.success),
@@ -2798,19 +2667,20 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
   }
 
   if (event.type === "Notice") {
-    assistant.blocks = upsertNoticeBlock(assistant.blocks ?? [], {
-      type: "notice",
-      kind: String(event.kind ?? "notice"),
-      level:
-        event.level === "warning" || event.level === "error"
-          ? event.level
-          : "info",
-      title: String(event.title ?? "Notice"),
-      message: String(event.message ?? ""),
-      details: normalizeNoticeDetails(event.details),
-      status: undefined,
-      source: undefined,
-    });
+    const kind = String(event.kind ?? "notice");
+    if (kind !== "turn_status") {
+      assistant.blocks = upsertNoticeBlock(assistant.blocks ?? [], {
+        type: "notice",
+        kind,
+        level:
+          event.level === "warning" || event.level === "error"
+            ? event.level
+            : "info",
+        title: String(event.title ?? "Notice"),
+        message: String(event.message ?? ""),
+        details: normalizeNoticeDetails(event.details),
+      });
+    }
   }
 
   if (event.type === "Error") {
@@ -2835,17 +2705,6 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
       terminalState,
       source,
     ) ?? [];
-    const blockStats = collectTurnBlockStats(assistant.blocks ?? []);
-    const nextState = blockStats.approvalsPending > 0 ? "awaiting_approval" : terminalState;
-    assistant.blocks = upsertNoticeBlock(
-      assistant.blocks ?? [],
-      buildTurnStatusNotice(assistant.blocks ?? [], {
-        state: nextState,
-        source,
-        tokenUsage: event.token_usage ?? undefined,
-        durationMs: resolveTurnDurationMs(threadId, event),
-      }),
-    );
     if (status === "failed") {
       assistant.status = "error";
     } else if (status === "interrupted") {
@@ -2862,6 +2721,7 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
   const statusChanged = assistant.status !== currentAssistant.status;
   const metadataChanged =
     assistant.clientTurnId !== currentAssistant.clientTurnId ||
+    assistant.nativeTurnId !== currentAssistant.nativeTurnId ||
     assistant.turnEngineId !== currentAssistant.turnEngineId ||
     assistant.turnModelId !== currentAssistant.turnModelId ||
     assistant.turnReasoningEffort !== currentAssistant.turnReasoningEffort ||
@@ -2897,6 +2757,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return;
     }
 
+    const bindStartedAt = performance.now();
+    if (currentThreadId && currentThreadId !== threadId) {
+      cacheBoundThreadView(get());
+    }
+
     activeThreadBindSeq += 1;
     const bindSeq = activeThreadBindSeq;
     if (threadId) {
@@ -2920,18 +2785,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
       let backgroundTurnFinished = false;
       listenThreadEvents(currentThreadId, (event) => {
         if (event.type === "ApprovalRequested") {
+          updateCachedThreadRuntimeState(currentThreadId, "awaiting_approval", true);
           useThreadStore
             .getState()
             .setThreadStatusLocal(currentThreadId, "awaiting_approval");
           return;
         }
         if (event.type === "ApprovalResolved") {
+          updateCachedThreadRuntimeState(currentThreadId, "streaming", true);
           useThreadStore.getState().setThreadStatusLocal(currentThreadId, "streaming");
           return;
         }
         if (event.type === "Error" && !event.recoverable) {
           backgroundTurnFinished = true;
           pendingTurnMetaByThread.delete(currentThreadId);
+          updateCachedThreadRuntimeState(currentThreadId, "error", false);
           useThreadStore.getState().setThreadStatusLocal(currentThreadId, "error");
           cleanupBackgroundListener(currentThreadId);
           return;
@@ -2939,9 +2807,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
         if (event.type === "TurnCompleted") {
           backgroundTurnFinished = true;
           pendingTurnMetaByThread.delete(currentThreadId);
+          const completedStatus = threadStatusFromTurnCompletion(event);
+          updateCachedThreadRuntimeState(currentThreadId, completedStatus, false);
           useThreadStore
             .getState()
-            .setThreadStatusLocal(currentThreadId, threadStatusFromTurnCompletion(event));
+            .setThreadStatusLocal(currentThreadId, completedStatus);
           cleanupBackgroundListener(currentThreadId!);
         }
       }).then((unsub) => {
@@ -2984,32 +2854,122 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return;
     }
 
+    const cachedView = !options?.forceReload && currentThreadId !== threadId
+      ? readCachedThreadView(threadId)
+      : null;
+    if (cachedView) {
+      set({
+        threadId,
+        messages: cachedView.messages,
+        olderCursor: cachedView.olderCursor,
+        hasOlderMessages: cachedView.hasOlderMessages,
+        loadingOlderMessages: false,
+        olderLoadBlockedUntil: 0,
+        status: cachedView.status,
+        streaming: cachedView.streaming,
+        usageLimits: cachedView.usageLimits,
+        error: undefined,
+        unlisten: undefined,
+      });
+      recordPerfMetric("chat.thread.history_visible.ms", performance.now() - bindStartedAt, {
+        threadId,
+        source: "memory",
+      });
+    }
+
     try {
       // Clean up any background listener for this thread before re-subscribing
       cleanupBackgroundListener(threadId);
 
       const threadState = useThreadStore.getState();
       let activeThread = threadState.threads.find((thread) => thread.id === threadId);
-      if (isCodexThreadSyncRequired(activeThread)) {
-        try {
-          const syncedThread = await ipc.syncThreadFromEngine(threadId);
+      const syncPromise = isCodexThreadSyncRequired(activeThread)
+        ? ipc.syncThreadFromEngine(threadId).then((syncedThread) => {
           threadState.applyThreadUpdateLocal(syncedThread);
-          activeThread = syncedThread;
-        } catch (error) {
+          return syncedThread;
+        }).catch((error) => {
           console.warn(`Failed to sync Codex thread ${threadId}:`, error);
-        }
-      }
+          return null;
+        })
+        : null;
 
       const messageWindow = await ipc.getThreadMessagesWindow(
         threadId,
         null,
         MESSAGE_WINDOW_INITIAL_LIMIT,
       );
-      let messages = normalizeMessages(messageWindow.messages);
-      const olderCursor = messageWindow.nextCursor;
-      messages = applyHydrationWindow(messages);
+      const cachedHistoryMerge = cachedView
+        ? mergeLoadedWindowWithCachedOlderHistory(
+            normalizeMessages(messageWindow.messages),
+            cachedView.messages,
+          )
+        : {
+            messages: normalizeMessages(messageWindow.messages),
+            preservedOlderHistory: false,
+          };
+      let messages = applyHydrationWindow(cachedHistoryMerge.messages);
+      const olderCursor = cachedHistoryMerge.preservedOlderHistory
+        ? cachedView?.olderCursor ?? null
+        : messageWindow.nextCursor;
       if (bindSeq !== activeThreadBindSeq) {
         return;
+      }
+
+      // Publish durable local history as soon as it arrives. Listener setup and
+      // Codex rollout reconciliation both remain important, but neither belongs
+      // on the first-paint path when switching conversations.
+      messages = replayQueuedTurnFinishedEvents(threadId, messages);
+      const localState = get();
+      const locallyMergedMessages = localState.threadId === threadId
+        ? applyHydrationWindow(
+            mergeLoadedMessagesWithCurrentRuntimeMessages(
+              messages,
+              localState.messages,
+              threadId,
+            ),
+          )
+        : messages;
+      const localThread =
+        useThreadStore
+          .getState()
+          .threads.find((candidate) => candidate.id === threadId) ?? activeThread;
+      const localRuntimeState = resolveBoundThreadRuntimeState(
+        threadId,
+        localThread,
+        locallyMergedMessages,
+      );
+      const localUsageLimits = localThread?.engineId === "codex"
+        ? mergeUsageLimits(
+            contextUsageFromThreadMetadata(localThread.engineMetadata),
+            lastKnownCodexAccountUsageWindows,
+          )
+        : null;
+      set({
+        threadId,
+        messages: locallyMergedMessages,
+        olderCursor,
+        hasOlderMessages: olderCursor !== null,
+        loadingOlderMessages: false,
+        olderLoadBlockedUntil: 0,
+        unlisten: undefined,
+        error: undefined,
+        status: localRuntimeState.status,
+        streaming: localRuntimeState.streaming,
+        usageLimits: localUsageLimits,
+      });
+      writeCachedThreadView(threadId, {
+        messages: locallyMergedMessages,
+        olderCursor,
+        hasOlderMessages: olderCursor !== null,
+        status: localRuntimeState.status,
+        streaming: localRuntimeState.streaming,
+        usageLimits: localUsageLimits,
+      });
+      if (!cachedView) {
+        recordPerfMetric("chat.thread.history_visible.ms", performance.now() - bindStartedAt, {
+          threadId,
+          source: "local",
+        });
       }
 
       const queuedStreamEvents: StreamEvent[] = [];
@@ -3212,6 +3172,66 @@ export const useChatStore = create<ChatState>((set, get) => ({
         unlistenStream();
       };
 
+      const reconcileSyncedHistory = () => {
+        if (!syncPromise) return;
+        void syncPromise.then(async (syncedThread) => {
+          if (!syncedThread || bindSeq !== activeThreadBindSeq) return;
+          const syncedWindow = await ipc.getThreadMessagesWindow(
+            threadId,
+            null,
+            MESSAGE_WINDOW_INITIAL_LIMIT,
+          );
+          if (bindSeq !== activeThreadBindSeq) return;
+
+          const currentState = get();
+          if (currentState.threadId !== threadId) return;
+          const syncedHistoryMerge = mergeLoadedWindowWithCachedOlderHistory(
+            normalizeMessages(syncedWindow.messages),
+            currentState.messages,
+          );
+          const syncedMessages = applyHydrationWindow(
+            mergeLoadedMessagesWithCurrentRuntimeMessages(
+              applyHydrationWindow(syncedHistoryMerge.messages),
+              currentState.messages,
+              threadId,
+            ),
+          );
+          const syncedOlderCursor = syncedHistoryMerge.preservedOlderHistory
+            ? currentState.olderCursor
+            : syncedWindow.nextCursor;
+          const syncedRuntimeState = resolveBoundThreadRuntimeState(
+            threadId,
+            syncedThread,
+            syncedMessages,
+          );
+          const syncedUsageLimits = mergeUsageLimits(
+            contextUsageFromThreadMetadata(syncedThread.engineMetadata),
+            lastKnownCodexAccountUsageWindows,
+          );
+          set({
+            messages: syncedMessages,
+            olderCursor: syncedOlderCursor,
+            hasOlderMessages: syncedOlderCursor !== null,
+            status: syncedRuntimeState.status,
+            streaming: syncedRuntimeState.streaming,
+            usageLimits: syncedUsageLimits,
+          });
+          writeCachedThreadView(threadId, {
+            messages: syncedMessages,
+            olderCursor: syncedOlderCursor,
+            hasOlderMessages: syncedOlderCursor !== null,
+            status: syncedRuntimeState.status,
+            streaming: syncedRuntimeState.streaming,
+            usageLimits: syncedUsageLimits,
+          });
+          useThreadStore
+            .getState()
+            .setThreadStatusLocal(threadId, syncedRuntimeState.status);
+        }).catch((error) => {
+          console.warn(`Failed to reconcile synced Codex history ${threadId}:`, error);
+        });
+      };
+
       if (bindSeq !== activeThreadBindSeq) {
         unlisten();
         return;
@@ -3264,6 +3284,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           .getState()
           .setThreadStatusLocal(threadId, mergedRuntimeState.status);
         flushQueuedStreamEvents();
+        reconcileSyncedHistory();
         return;
       }
 
@@ -3300,20 +3321,29 @@ export const useChatStore = create<ChatState>((set, get) => ({
         .getState()
         .setThreadStatusLocal(threadId, boundRuntimeState.status);
       flushQueuedStreamEvents();
+      reconcileSyncedHistory();
     } catch (error) {
       if (bindSeq !== activeThreadBindSeq) {
         return;
       }
-      set({
-        threadId,
-        messages: [],
-        olderCursor: null,
-        hasOlderMessages: false,
-        loadingOlderMessages: false,
-        olderLoadBlockedUntil: 0,
-        usageLimits: null,
-        error: String(error),
-      });
+      set((current) => current.threadId === threadId
+        ? {
+            ...current,
+            loadingOlderMessages: false,
+            olderLoadBlockedUntil: 0,
+            error: String(error),
+          }
+        : {
+            ...current,
+            threadId,
+            messages: [],
+            olderCursor: null,
+            hasOlderMessages: false,
+            loadingOlderMessages: false,
+            olderLoadBlockedUntil: 0,
+            usageLimits: null,
+            error: String(error),
+          });
     } finally {
       if (bindingSeqByThread.get(threadId) === bindSeq) {
         bindingSeqByThread.delete(threadId);
@@ -3477,11 +3507,41 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const pendingTurn = pendingTurnMetaByThread.get(threadId);
       if (pendingTurn?.clientTurnId === clientTurnId) {
         pendingTurn.backendAccepted = true;
-        if (
-          typeof backendAssistantMessageId === "string" &&
-          backendAssistantMessageId.trim().length > 0
-        ) {
-          pendingTurn.assistantMessageId = backendAssistantMessageId;
+      }
+      if (
+        typeof backendAssistantMessageId === "string" &&
+        backendAssistantMessageId.trim().length > 0
+      ) {
+        const persistedAssistantMessageId = backendAssistantMessageId.trim();
+        if (pendingTurn?.clientTurnId === clientTurnId) {
+          pendingTurn.assistantMessageId = persistedAssistantMessageId;
+        }
+        set((current) => {
+          if (current.threadId !== threadId) return current;
+          const messages = reconcileAssistantMessageIdentity(
+            current.messages,
+            optimisticAssistantMessageId,
+            persistedAssistantMessageId,
+            clientTurnId,
+          );
+          return messages === current.messages
+            ? current
+            : { ...current, messages: applyHydrationWindow(messages) };
+        });
+        const cached = cachedThreadViews.get(threadId);
+        if (cached) {
+          const messages = reconcileAssistantMessageIdentity(
+            cached.messages,
+            optimisticAssistantMessageId,
+            persistedAssistantMessageId,
+            clientTurnId,
+          );
+          if (messages !== cached.messages) {
+            writeCachedThreadView(threadId, {
+              ...cached,
+              messages: applyHydrationWindow(messages),
+            });
+          }
         }
       }
       return true;
@@ -3538,13 +3598,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
     notifyTurnAccepted(options?.onAccepted);
 
     try {
-      await ipc.steerMessage(
+      const receipt = await ipc.steerMessage(
         threadId,
         message,
         attachments.length > 0 ? attachments : null,
         inputItems.length > 0 ? inputItems : null,
         planMode,
+        steerBlock.steerId,
       );
+      if (receipt) {
+        set((current) => ({
+          messages: applyHydrationWindow(
+            applySteerReceipt(current.messages, steerBlock.steerId, receipt),
+          ),
+        }));
+      }
       return true;
     } catch (error) {
       set((current) => ({

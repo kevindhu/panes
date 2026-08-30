@@ -20,14 +20,11 @@ pub struct NativeStrings {
     pub view_menu: &'static str,
     pub window_menu: &'static str,
     pub toggle_sidebar: &'static str,
-    pub toggle_git_panel: &'static str,
-    pub toggle_focus_mode: &'static str,
     pub zoom_in: &'static str,
     pub zoom_out: &'static str,
     pub reset_zoom: &'static str,
     pub toggle_fullscreen: &'static str,
     pub search: &'static str,
-    pub toggle_terminal: &'static str,
     pub close: &'static str,
 }
 
@@ -46,14 +43,11 @@ pub fn native_strings() -> NativeStrings {
         view_menu: "View",
         window_menu: "Window",
         toggle_sidebar: "Toggle Sidebar",
-        toggle_git_panel: "Toggle Git Panel",
-        toggle_focus_mode: "Toggle Focus Mode",
         zoom_in: "Zoom In",
         zoom_out: "Zoom Out",
         reset_zoom: "Reset Zoom",
         toggle_fullscreen: "Toggle Full Screen",
         search: "Search Workspace",
-        toggle_terminal: "Toggle Terminal",
         close: "Close",
     }
 }

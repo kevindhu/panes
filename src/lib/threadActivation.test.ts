@@ -84,8 +84,8 @@ describe("threadActivation", () => {
     expect(callOrder).toEqual([
       "workspace:ws-2",
       "thread:thread-1",
-      "repo:repo-2",
       "chat:thread-1",
+      "repo:repo-2",
     ]);
     expect(mockWorkspaceStoreState.activeWorkspaceId).toBe("ws-2");
     expect(mockWorkspaceStoreState.activeRepoId).toBe("repo-2");
@@ -118,8 +118,8 @@ describe("threadActivation", () => {
     expect(callOrder).toEqual([
       "workspace:ws-2",
       "thread:thread-startup",
-      "repo:repo-2",
       "chat:thread-startup",
+      "repo:repo-2",
     ]);
   });
 
@@ -142,6 +142,7 @@ describe("threadActivation", () => {
       buildThread({ id: "thread-a", workspaceId: "ws-a", repoId: "repo-a" }),
     );
     await Promise.resolve();
+    expect(mockChatStoreState.setActiveThread).toHaveBeenCalledWith("thread-a");
     const second = activateThreadContext(
       buildThread({ id: "thread-b", workspaceId: "ws-b", repoId: "repo-b" }),
     );
@@ -153,7 +154,7 @@ describe("threadActivation", () => {
     expect(mockWorkspaceStoreState.activeWorkspaceId).toBe("ws-b");
     expect(mockWorkspaceStoreState.setActiveRepo).toHaveBeenCalledTimes(1);
     expect(mockWorkspaceStoreState.setActiveRepo).toHaveBeenCalledWith("repo-b");
-    expect(mockChatStoreState.setActiveThread).toHaveBeenCalledTimes(1);
-    expect(mockChatStoreState.setActiveThread).toHaveBeenCalledWith("thread-b");
+    expect(mockChatStoreState.setActiveThread).toHaveBeenCalledTimes(2);
+    expect(mockChatStoreState.setActiveThread).toHaveBeenLastCalledWith("thread-b");
   });
 });

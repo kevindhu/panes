@@ -14,9 +14,8 @@ import {
   trimLinkText,
   tryParseUrl,
 } from "./localFileLinkPatterns";
-import { useFileStore } from "../stores/fileStore";
+import { ipc } from "./codexIpc";
 import { useWorkspaceStore } from "../stores/workspaceStore";
-import { showWorkspaceEditorForFileLink } from "./workspacePaneNavigation";
 import type { Repo } from "../types";
 
 const EXTERNAL_PROTOCOLS = new Set(["http:", "https:", "mailto:", "tel:"]);
@@ -44,7 +43,7 @@ export interface TextLinkMatch {
 }
 
 export type LinkTargetKind = "local" | "external" | "other";
-export type LinkNavigationResult = "internal" | "external" | "ignored";
+export type LinkNavigationResult = "internal" | "system" | "external" | "ignored";
 
 export function classifyLinkTarget(rawTarget: string): LinkTargetKind {
   if (isLocalFileLinkSyntax(rawTarget)) {
@@ -194,7 +193,13 @@ export async function navigateLinkTarget(
   rawTarget: string,
   options: LinkNavigationOptions,
 ): Promise<LinkNavigationResult> {
-  if (!options.shiftKey) {
+  const targetKind = classifyLinkTarget(rawTarget);
+  if (targetKind === "external") {
+    await openExternal(rawTarget);
+    return "external";
+  }
+
+  if (targetKind !== "local") {
     return "ignored";
   }
 
@@ -213,7 +218,7 @@ export async function navigateLinkTarget(
     activeRepoId: workspaceState.activeRepoId,
   });
 
-  if (localTarget) {
+  if (localTarget && options.shiftKey) {
     const reveal = localTarget.line
       ? {
           line: localTarget.line,
@@ -221,20 +226,26 @@ export async function navigateLinkTarget(
         }
       : null;
 
-    await useFileStore
-      .getState()
-      .openFileAtLocation(localTarget.rootPath, localTarget.filePath, reveal);
-
-    if (activeWorkspaceId) {
-      showWorkspaceEditorForFileLink(activeWorkspaceId, options.sourceLeafId ?? null);
-    }
+    window.dispatchEvent(
+      new CustomEvent("codex-open-file", {
+        detail: {
+          rootPath: localTarget.rootPath,
+          filePath: localTarget.filePath,
+          line: reveal?.line,
+          column: reveal?.column,
+        },
+      }),
+    );
 
     return "internal";
   }
 
-  if (classifyLinkTarget(rawTarget) === "external") {
-    await openExternal(rawTarget);
-    return "external";
+  const absoluteTarget =
+    localTarget?.absolutePath ??
+    (parseLocalAbsolutePathTarget(rawTarget) ?? parseLocalUrlTarget(rawTarget))?.path;
+  if (absoluteTarget) {
+    await ipc.openPathWithDefaultApp(normalizeAbsolutePath(absoluteTarget));
+    return "system";
   }
 
   return "ignored";

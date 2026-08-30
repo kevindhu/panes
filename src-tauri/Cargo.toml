@@ -13,10 +13,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri = { version = "2", features = ["tray-icon", "image-png", "protocol-asset"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
-tauri-plugin-fs = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
@@ -47,16 +46,18 @@ which = "6"
 flate2 = "1"
 tar = "0.4"
 
-git2 = { version = "0.19", features = ["vendored-openssl"] }
-notify = "6"
-portable-pty = "0.8"
-
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
+
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-single-instance = "2"
 
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+# Used by the cached development-executable helper so its debug binary behaves
+# like a normal windowed Windows app without hiding `tauri dev` diagnostics.
+windowed-dev-exe = []
 
 [profile.dev]
 # Keep local debug builds inspectable without letting `target/` explode as quickly.

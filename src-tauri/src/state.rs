@@ -1,26 +1,51 @@
 use std::{collections::HashMap, sync::Arc};
 
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, OnceCell, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::app_config::AppConfig, db::Database, engines::EngineManager, git::repo::FileTreeCache,
-    git::watcher::GitWatcherManager, power::KeepAwakeManager, terminal::TerminalManager,
-    terminal_notifications::TerminalNotificationManager,
+    config::app_config::AppConfig, db::Database, engines::EngineManager, file_tree::FileTreeCache,
+    models::ThreadDto, power::KeepAwakeManager,
 };
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Database,
     pub config: Arc<AppConfig>,
-    pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
     pub engines: Arc<EngineManager>,
-    pub git_watchers: Arc<GitWatcherManager>,
-    pub terminals: Arc<TerminalManager>,
-    pub notifications: Arc<TerminalNotificationManager>,
     pub keep_awake: Arc<KeepAwakeManager>,
     pub turns: Arc<TurnManager>,
     pub file_tree_cache: Arc<FileTreeCache>,
+    pub pending_forks: Arc<PendingThreadMutationManager>,
+    pub pending_rollbacks: Arc<PendingThreadMutationManager>,
+}
+
+/// Coordinates a deferred engine-level mutation for Codex threads.
+///
+/// Fork and rollback each own a manager instance. Their local projection is returned to
+/// the UI immediately, while a prefetch task and first use may race to materialize the
+/// native operation. The shared [`OnceCell`] guarantees one in-flight call per thread.
+///
+/// The cell stores successful results only, so a failed mutation remains retryable.
+#[derive(Default)]
+pub struct PendingThreadMutationManager {
+    cells: Mutex<HashMap<String, Arc<OnceCell<ThreadDto>>>>,
+}
+
+impl PendingThreadMutationManager {
+    /// Returns the shared once-cell for `thread_id`, creating it on first request.
+    pub async fn cell(&self, thread_id: &str) -> Arc<OnceCell<ThreadDto>> {
+        let mut cells = self.cells.lock().await;
+        cells
+            .entry(thread_id.to_string())
+            .or_insert_with(|| Arc::new(OnceCell::new()))
+            .clone()
+    }
+
+    /// Drops a coordination slot after the mutation has been durably persisted.
+    pub async fn forget(&self, thread_id: &str) {
+        self.cells.lock().await.remove(thread_id);
+    }
 }
 
 #[derive(Default)]

@@ -5,15 +5,12 @@ import {
   isCodexThreadSyncRequired,
 } from "./codexThreadRuntime";
 
-function makeThread(
-  engineMetadata: Record<string, unknown>,
-  engineId: Thread["engineId"] = "codex",
-): Thread {
+function makeThread(engineMetadata: Record<string, unknown>): Thread {
   return {
     id: "thread-1",
     workspaceId: "workspace-1",
     repoId: null,
-    engineId,
+    engineId: "codex",
     modelId: "gpt-5.4",
     engineThreadId: "engine-thread-1",
     engineMetadata,
@@ -30,9 +27,6 @@ describe("Codex thread runtime metadata", () => {
   it("recognizes only typed Codex sync state", () => {
     expect(isCodexThreadSyncRequired(makeThread({ codexSyncRequired: true }))).toBe(true);
     expect(isCodexThreadSyncRequired(makeThread({ codexSyncRequired: "true" }))).toBe(false);
-    expect(isCodexThreadSyncRequired(makeThread({ codexSyncRequired: true }, "claude"))).toBe(
-      false,
-    );
   });
 
   it("does not infer an active remote turn from a diagnostic reason", () => {

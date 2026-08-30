@@ -2,6 +2,7 @@ import {
   createElement,
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -10,9 +11,12 @@ import {
   type ReactNode,
   type SyntheticEvent,
 } from "react";
+import { Check, Copy } from "lucide-react";
 import {
-  getCachedAttachmentPreviewObjectUrl,
-  loadAttachmentPreviewObjectUrl,
+  getCachedAttachmentImageAssetUrl,
+  getCachedAttachmentImageFallbackUrl,
+  loadAttachmentImageAssetUrl,
+  loadAttachmentImageFallbackUrl,
 } from "../../lib/attachmentImages";
 import { recordPerfMetric } from "../../lib/perfTelemetry";
 import {
@@ -20,6 +24,10 @@ import {
   getWorkspacePaneLeafIdFromEventTarget,
   navigateLinkTarget,
 } from "../../lib/fileLinkNavigation";
+import {
+  recordTranscriptLinkPointerDown,
+  transcriptLinkShouldNavigate,
+} from "../../lib/transcriptSelection";
 import {
   MARKDOWN_LOCAL_IMAGE_MIME_ATTR,
   MARKDOWN_LOCAL_IMAGE_PATH_ATTR,
@@ -173,6 +181,7 @@ interface MarkdownContentProps {
   style?: CSSProperties;
   streaming?: boolean;
   workspaceRootPath?: string | null;
+  selectionScopeId?: string;
 }
 
 interface MarkdownWorkerPlaceholderOptions {
@@ -211,18 +220,19 @@ export function shouldRenderMarkdownWorkerPlaceholder({
   );
 }
 
+function getLinkAnchor(target: EventTarget | null): HTMLAnchorElement | null {
+  const element = getEventElement(target);
+  const anchor = element?.closest("a");
+  return anchor instanceof HTMLAnchorElement ? anchor : null;
+}
+
 function handleMarkdownLinkClick(event: ReactMouseEvent<HTMLDivElement>): void {
   if (event.defaultPrevented || event.button !== 0) {
     return;
   }
 
-  const element = getEventElement(event.target);
-  if (!element) {
-    return;
-  }
-
-  const anchor = element.closest("a");
-  if (!(anchor instanceof HTMLAnchorElement)) {
+  const anchor = getLinkAnchor(event.target);
+  if (!anchor) {
     return;
   }
 
@@ -231,8 +241,7 @@ function handleMarkdownLinkClick(event: ReactMouseEvent<HTMLDivElement>): void {
     return;
   }
 
-  const selection = globalThis.getSelection?.();
-  if (selection && !selection.isCollapsed && selection.toString().trim().length > 0) {
+  if (!transcriptLinkShouldNavigate(event, anchor)) {
     event.preventDefault();
     return;
   }
@@ -250,6 +259,11 @@ function handleMarkdownLinkClick(event: ReactMouseEvent<HTMLDivElement>): void {
     shiftKey: event.shiftKey,
     sourceLeafId: getWorkspacePaneLeafIdFromEventTarget(event.currentTarget),
   });
+}
+
+function handleMarkdownLinkMouseDown(event: ReactMouseEvent<HTMLDivElement>): void {
+  const anchor = getLinkAnchor(event.target);
+  if (anchor) recordTranscriptLinkPointerDown(event, anchor);
 }
 
 function getFileNameFromPath(filePath: string): string {
@@ -306,23 +320,25 @@ function MarkdownLocalImage({ filePath, mimeType, alt }: MarkdownLocalImageProps
   const thumbnailOptions = getThumbnailPreviewOptions();
   const frameCacheKey = getMarkdownLocalImageFrameCacheKey(filePath, mimeType);
   const [thumbnailSrc, setThumbnailSrc] = useState<string | null>(() => (
-    getCachedAttachmentPreviewObjectUrl(filePath, mimeType, thumbnailOptions) ?? null
+    getCachedAttachmentImageAssetUrl(filePath, mimeType, thumbnailOptions)
+      ?? getCachedAttachmentImageFallbackUrl(filePath, mimeType)
+      ?? null
+  ));
+  const [fullSrc, setFullSrc] = useState<string | null>(() => (
+    getCachedAttachmentImageAssetUrl(filePath, mimeType) ?? null
   ));
   const [thumbnailFrame, setThumbnailFrame] = useState<MarkdownLocalImageFrame | null>(() => (
     markdownLocalImageFrameCache.get(frameCacheKey) ?? null
   ));
   const [thumbnailFailed, setThumbnailFailed] = useState(false);
   const [viewerOpen, setViewerOpen] = useState(false);
-  const [viewerSrc, setViewerSrc] = useState<string | null>(() => (
-    getCachedAttachmentPreviewObjectUrl(filePath, mimeType) ?? null
-  ));
 
   useEffect(() => {
     let disposed = false;
     setThumbnailFailed(false);
     setThumbnailFrame(markdownLocalImageFrameCache.get(frameCacheKey) ?? null);
 
-    const cachedThumbnail = getCachedAttachmentPreviewObjectUrl(filePath, mimeType, thumbnailOptions);
+    const cachedThumbnail = getCachedAttachmentImageAssetUrl(filePath, mimeType, thumbnailOptions);
     if (cachedThumbnail !== undefined) {
       setThumbnailSrc(cachedThumbnail);
       setThumbnailFailed(!cachedThumbnail);
@@ -332,7 +348,7 @@ function MarkdownLocalImage({ filePath, mimeType, alt }: MarkdownLocalImageProps
     }
 
     setThumbnailSrc(null);
-    void loadAttachmentPreviewObjectUrl(filePath, mimeType, thumbnailOptions)
+    void loadAttachmentImageAssetUrl(filePath, mimeType, thumbnailOptions)
       .then((nextThumbnailSrc) => {
         if (disposed) {
           return;
@@ -343,7 +359,25 @@ function MarkdownLocalImage({ filePath, mimeType, alt }: MarkdownLocalImageProps
       .catch(() => {
         if (!disposed) {
           setThumbnailSrc(null);
-          setThumbnailFailed(true);
+          const cachedFallback = getCachedAttachmentImageFallbackUrl(filePath, mimeType);
+          if (cachedFallback) {
+            setThumbnailSrc(cachedFallback);
+            setFullSrc(null);
+            return;
+          }
+          void loadAttachmentImageFallbackUrl(filePath, mimeType)
+            .then((fallbackSrc) => {
+              if (!disposed) {
+                setThumbnailSrc(fallbackSrc);
+                setFullSrc(null);
+                setThumbnailFailed(!fallbackSrc);
+              }
+            })
+            .catch(() => {
+              if (!disposed) {
+                setThumbnailFailed(true);
+              }
+            });
         }
       });
 
@@ -353,24 +387,53 @@ function MarkdownLocalImage({ filePath, mimeType, alt }: MarkdownLocalImageProps
   }, [filePath, frameCacheKey, mimeType]);
 
   useEffect(() => {
-    setViewerSrc(getCachedAttachmentPreviewObjectUrl(filePath, mimeType) ?? null);
+    let disposed = false;
+    const cachedFullSrc = getCachedAttachmentImageAssetUrl(filePath, mimeType);
+    setFullSrc(cachedFullSrc ?? null);
+    if (cachedFullSrc === undefined) {
+      void loadAttachmentImageAssetUrl(filePath, mimeType)
+        .then((nextFullSrc) => {
+          if (!disposed) {
+            setFullSrc(nextFullSrc);
+          }
+        })
+        .catch(() => {
+          if (!disposed) {
+            setFullSrc(null);
+          }
+        });
+    }
+    return () => {
+      disposed = true;
+    };
   }, [filePath, mimeType]);
 
-  const requestViewerPreview = useCallback(async (): Promise<string | null> => {
-    const cachedPreview = getCachedAttachmentPreviewObjectUrl(filePath, mimeType);
-    if (cachedPreview !== undefined) {
-      setViewerSrc(cachedPreview);
-      return cachedPreview;
+  const requestViewerFallback = useCallback(async (): Promise<string | null> => {
+    const cachedFallback = getCachedAttachmentImageFallbackUrl(filePath, mimeType);
+    if (cachedFallback !== undefined) {
+      if (cachedFallback) {
+        setThumbnailSrc(cachedFallback);
+        setFullSrc(null);
+      }
+      return cachedFallback;
     }
-
-    const previewSrc = await loadAttachmentPreviewObjectUrl(filePath, mimeType);
-    setViewerSrc(previewSrc);
-    return previewSrc;
+    const fallbackSrc = await loadAttachmentImageFallbackUrl(filePath, mimeType);
+    if (fallbackSrc) {
+      setThumbnailSrc(fallbackSrc);
+      setFullSrc(null);
+    }
+    return fallbackSrc;
   }, [filePath, mimeType]);
 
   function openViewer() {
     setViewerOpen(true);
-    void requestViewerPreview().catch(() => {});
+  }
+
+  function handleThumbnailError() {
+    setFullSrc(null);
+    void requestViewerFallback()
+      .then((fallbackSrc) => setThumbnailFailed(!fallbackSrc))
+      .catch(() => setThumbnailFailed(true));
   }
 
   function handleThumbnailLoad(event: SyntheticEvent<HTMLImageElement>) {
@@ -413,7 +476,7 @@ function MarkdownLocalImage({ filePath, mimeType, alt }: MarkdownLocalImageProps
             draggable={false}
             decoding="async"
             onLoad={handleThumbnailLoad}
-            onError={() => setThumbnailFailed(true)}
+            onError={handleThumbnailError}
           />
         ) : (
           <span className="markdown-local-image-placeholder">
@@ -427,9 +490,9 @@ function MarkdownLocalImage({ filePath, mimeType, alt }: MarkdownLocalImageProps
           filePath={filePath}
           fileName={fileName}
           mimeType={mimeType}
-          originalSrc={null}
-          previewSrc={viewerSrc ?? thumbnailSrc}
-          requestPreview={requestViewerPreview}
+          originalSrc={fullSrc}
+          previewSrc={thumbnailSrc}
+          requestPreview={requestViewerFallback}
           onClose={() => setViewerOpen(false)}
         />
       )}
@@ -467,6 +530,56 @@ function getReactAttributeValue(attributeName: string, value: string): string | 
   return value;
 }
 
+interface MarkdownCodeBlockProps {
+  content: string;
+  preProps: Record<string, unknown>;
+  children: ReactNode[];
+}
+
+function MarkdownCodeBlock({ content, preProps, children }: MarkdownCodeBlockProps) {
+  const [copied, setCopied] = useState(false);
+  const resetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => {
+    if (resetTimerRef.current !== null) {
+      clearTimeout(resetTimerRef.current);
+    }
+  }, []);
+
+  const handleCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopied(true);
+      if (resetTimerRef.current !== null) {
+        clearTimeout(resetTimerRef.current);
+      }
+      resetTimerRef.current = setTimeout(() => {
+        setCopied(false);
+        resetTimerRef.current = null;
+      }, 1500);
+    } catch {
+      setCopied(false);
+    }
+  }, [content]);
+
+  const copyLabel = copied ? "Code copied" : "Copy code";
+
+  return (
+    <div className="markdown-code-block">
+      {createElement("pre", preProps, ...children)}
+      <button
+        type="button"
+        className={`markdown-code-copy${copied ? " copied" : ""}`}
+        onClick={() => void handleCopy()}
+        aria-label={copyLabel}
+        title={copyLabel}
+      >
+        {copied ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
+      </button>
+    </div>
+  );
+}
+
 function convertHtmlNodeToReact(node: ChildNode, key: string): ReactNode {
   if (node.nodeType === Node.TEXT_NODE) {
     return node.textContent;
@@ -491,7 +604,7 @@ function convertHtmlNodeToReact(node: ChildNode, key: string): ReactNode {
     }
   }
 
-  const props: Record<string, unknown> = { key };
+  const props: Record<string, unknown> = {};
   for (const attribute of Array.from(node.attributes)) {
     if (attribute.name === "style") {
       continue;
@@ -501,16 +614,32 @@ function convertHtmlNodeToReact(node: ChildNode, key: string): ReactNode {
   }
 
   if (isVoidElement(tagName)) {
-    return createElement(tagName, props);
+    return createElement(tagName, { ...props, key });
   }
 
   const children = Array.from(node.childNodes).map((childNode, childIndex) =>
     convertHtmlNodeToReact(childNode, `${key}.${childIndex}`),
   );
-  return createElement(tagName, props, ...children);
+
+  if (
+    tagName === "pre" &&
+    node.childElementCount === 1 &&
+    node.firstElementChild?.tagName.toLowerCase() === "code"
+  ) {
+    return (
+      <MarkdownCodeBlock
+        key={key}
+        content={node.textContent ?? ""}
+        preProps={props}
+        children={children}
+      />
+    );
+  }
+
+  return createElement(tagName, { ...props, key }, ...children);
 }
 
-function renderMarkdownHtmlAsReact(html: string): ReactNode[] | null {
+function renderMarkdownHtmlAsReact(html: string, forceReactTree = false): ReactNode[] | null {
   if (typeof document === "undefined") {
     return null;
   }
@@ -518,7 +647,10 @@ function renderMarkdownHtmlAsReact(html: string): ReactNode[] | null {
   const template = document.createElement("template");
   template.innerHTML = html;
 
-  if (!template.content.querySelector(`img[${MARKDOWN_LOCAL_IMAGE_PATH_ATTR}]`)) {
+  const containsInteractiveContent =
+    template.content.querySelector(`img[${MARKDOWN_LOCAL_IMAGE_PATH_ATTR}]`) !== null ||
+    template.content.querySelector("pre > code") !== null;
+  if (!forceReactTree && !containsInteractiveContent) {
     return null;
   }
 
@@ -533,11 +665,16 @@ export default function MarkdownContent({
   style,
   streaming = false,
   workspaceRootPath,
+  selectionScopeId,
 }: MarkdownContentProps) {
   const [workerHtml, setWorkerHtml] = useState<string | null>(null);
   const [workerError, setWorkerError] = useState(false);
   const parseStartedAtRef = useRef(0);
   const hasStreamedRef = useRef(streaming);
+  const generatedSelectionScopeId = useId();
+  const resolvedSelectionScopeId = selectionScopeId ?? `markdown:${generatedSelectionScopeId}`;
+  const handleLinkClick = useCallback(handleMarkdownLinkClick, []);
+  const handleLinkMouseDown = useCallback(handleMarkdownLinkMouseDown, []);
 
   const workerEligible = content.length >= MARKDOWN_WORKER_THRESHOLD_CHARS;
   const deferStreamingMarkdown =
@@ -631,13 +768,17 @@ export default function MarkdownContent({
     [html, workspaceRootPath],
   );
   const renderedReactNodes = useMemo(
-    () => (renderedHtml === null ? null : renderMarkdownHtmlAsReact(renderedHtml)),
-    [renderedHtml],
+    () => (renderedHtml === null ? null : renderMarkdownHtmlAsReact(renderedHtml, hasStreamed)),
+    [hasStreamed, renderedHtml],
   );
 
   if (showWorkerPlaceholder) {
     return (
-      <div className={className} style={style}>
+      <div
+        className={className}
+        style={style}
+        data-transcript-selection-scope={resolvedSelectionScopeId}
+      >
         <pre
           style={{
             margin: 0,
@@ -654,7 +795,11 @@ export default function MarkdownContent({
 
   if (renderedHtml === null) {
     return (
-      <div className={className} style={style}>
+      <div
+        className={className}
+        style={style}
+        data-transcript-selection-scope={resolvedSelectionScopeId}
+      >
         <pre
           style={{
             margin: 0,
@@ -674,7 +819,9 @@ export default function MarkdownContent({
       <div
         className={className}
         style={style}
-        onClickCapture={handleMarkdownLinkClick}
+        data-transcript-selection-scope={resolvedSelectionScopeId}
+        onMouseDownCapture={handleLinkMouseDown}
+        onClickCapture={handleLinkClick}
       >
         {renderedReactNodes}
       </div>
@@ -685,7 +832,9 @@ export default function MarkdownContent({
     <div
       className={className}
       style={style}
-      onClickCapture={handleMarkdownLinkClick}
+      data-transcript-selection-scope={resolvedSelectionScopeId}
+      onMouseDownCapture={handleLinkMouseDown}
+      onClickCapture={handleLinkClick}
       dangerouslySetInnerHTML={{ __html: renderedHtml }}
     />
   );

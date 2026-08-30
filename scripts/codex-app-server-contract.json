@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "threadItemTypes": {
+    "userMessage": "raw",
+    "hookPrompt": "raw",
+    "agentMessage": "specialized",
+    "plan": "specialized",
+    "reasoning": "specialized",
+    "commandExecution": "specialized",
+    "fileChange": "specialized",
+    "mcpToolCall": "specialized",
+    "dynamicToolCall": "raw",
+    "collabAgentToolCall": "specialized",
+    "subAgentActivity": "raw",
+    "webSearch": "specialized",
+    "imageView": "raw",
+    "sleep": "raw",
+    "imageGeneration": "raw",
+    "enteredReviewMode": "raw",
+    "exitedReviewMode": "raw",
+    "contextCompaction": "raw"
+  },
+  "requiredNotifications": [
+    "turn/started",
+    "turn/completed",
+    "turn/diff/updated",
+    "turn/plan/updated",
+    "thread/tokenUsage/updated",
+    "item/started",
+    "item/completed",
+    "item/agentMessage/delta",
+    "item/plan/delta",
+    "item/reasoning/summaryPartAdded",
+    "item/reasoning/summaryTextDelta",
+    "item/reasoning/textDelta",
+    "item/commandExecution/outputDelta",
+    "item/commandExecution/terminalInteraction",
+    "item/fileChange/patchUpdated",
+    "item/mcpToolCall/progress",
+    "hook/started",
+    "hook/completed",
+    "model/rerouted",
+    "model/safetyBuffering/updated",
+    "model/verification"
+  ],
+  "requiredServerRequests": [
+    "account/chatgptAuthTokens/refresh",
+    "item/permissions/requestApproval",
+    "item/tool/call",
+    "item/tool/requestUserInput",
+    "mcpServer/elicitation/request"
+  ]
+}

@@ -1,11 +1,5 @@
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
-use serde_json::{value::RawValue, Map, Value};
-
-use super::{
-    trim_action_output_delta_json_string, trim_json_string_to_chars, STREAMED_DIFF_MAX_CHARS,
-};
+use serde_json::{value::RawValue, Value};
 
 #[derive(Debug, Clone)]
 pub enum IncomingMessage {
@@ -22,9 +16,12 @@ pub enum IncomingMessage {
     },
 }
 
-fn raw_value_from_value(value: &Value) -> Box<RawValue> {
-    serde_json::value::to_raw_value(value)
-        .unwrap_or_else(|_| RawValue::from_string("null".to_string()).expect("null is valid JSON"))
+fn own_raw_params(raw: Option<&RawValue>) -> anyhow::Result<Box<RawValue>> {
+    RawValue::from_string(
+        raw.map(|value| value.get().to_owned())
+            .unwrap_or_else(|| "{}".to_owned()),
+    )
+    .map_err(Into::into)
 }
 
 pub fn raw_value_to_value(raw: &RawValue) -> Value {
@@ -67,7 +64,9 @@ pub fn parse_incoming(line: &str) -> anyhow::Result<IncomingMessage> {
     if let Some(method) = method {
         let raw_id_value = envelope.id.map(parse_raw_value).transpose()?;
         let id = raw_id_value.as_ref().and_then(normalize_id);
-        let params = raw_value_from_value(&parse_params_for_method(&method, envelope.params)?);
+        // Preserve the app-server payload exactly. Any presentation-specific truncation belongs
+        // downstream of the durable transcript boundary, never in protocol ingestion.
+        let params = own_raw_params(envelope.params)?;
 
         if let Some(id) = id {
             let raw_id = raw_id_value.unwrap_or_else(|| Value::String(id.clone()));
@@ -115,171 +114,6 @@ struct RawIncomingEnvelope<'a> {
     result: Option<&'a RawValue>,
     #[serde(default, borrow)]
     error: Option<&'a RawValue>,
-}
-
-fn parse_params_for_method(method: &str, raw: Option<&RawValue>) -> anyhow::Result<Value> {
-    let Some(raw) = raw else {
-        return Ok(Value::Object(Map::new()));
-    };
-
-    if is_large_output_event(method) {
-        return parse_large_output_params(method, raw);
-    }
-
-    parse_raw_value(raw)
-}
-
-fn parse_large_output_params(method: &str, raw: &RawValue) -> anyhow::Result<Value> {
-    if !raw.get().trim_start().starts_with('{') {
-        return parse_raw_value(raw);
-    }
-
-    if method_signature(method) == "itemcompleted" {
-        return parse_item_completed_params(raw);
-    }
-
-    let raw_fields: BTreeMap<String, &RawValue> = serde_json::from_str(raw.get())
-        .map_err(|error| anyhow::anyhow!("invalid large output params: {error}"))?;
-    let trim_kind = large_output_param_trim_kind(method);
-    let mut params = Map::new();
-
-    for (key, raw_field) in raw_fields {
-        match trim_kind {
-            LargeOutputParamTrimKind::ActionOutput(keys) if keys.contains(&key.as_str()) => {
-                if let Some(trimmed) = trim_action_output_delta_json_string(raw_field.get()) {
-                    params.insert(key, Value::String(trimmed));
-                    continue;
-                }
-            }
-            LargeOutputParamTrimKind::Diff if key == "diff" => {
-                if let Some(trimmed) =
-                    trim_json_string_to_chars(raw_field.get(), STREAMED_DIFF_MAX_CHARS)
-                {
-                    params.insert(key, Value::String(trimmed));
-                    continue;
-                }
-            }
-            _ => {}
-        }
-
-        params.insert(key, parse_raw_value(raw_field)?);
-    }
-
-    Ok(Value::Object(params))
-}
-
-enum LargeOutputParamTrimKind {
-    ActionOutput(&'static [&'static str]),
-    Diff,
-}
-
-fn large_output_param_trim_kind(method: &str) -> LargeOutputParamTrimKind {
-    let signature = method_signature(method);
-    if signature.contains("terminalinteraction") {
-        LargeOutputParamTrimKind::ActionOutput(&["stdin"])
-    } else if signature == "turndiffupdated" {
-        LargeOutputParamTrimKind::Diff
-    } else {
-        LargeOutputParamTrimKind::ActionOutput(&["delta", "output", "text", "content"])
-    }
-}
-
-fn parse_item_completed_params(raw: &RawValue) -> anyhow::Result<Value> {
-    let raw_fields: BTreeMap<String, &RawValue> = serde_json::from_str(raw.get())
-        .map_err(|error| anyhow::anyhow!("invalid item completed params: {error}"))?;
-    let mut params = Map::new();
-
-    for (key, raw_field) in raw_fields {
-        if key == "item" {
-            params.insert(key, parse_completed_item(raw_field)?);
-        } else {
-            params.insert(key, parse_raw_value(raw_field)?);
-        }
-    }
-
-    Ok(Value::Object(params))
-}
-
-fn parse_completed_item(raw: &RawValue) -> anyhow::Result<Value> {
-    if !raw.get().trim_start().starts_with('{') {
-        return parse_raw_value(raw);
-    }
-
-    let raw_fields: BTreeMap<String, &RawValue> = serde_json::from_str(raw.get())
-        .map_err(|error| anyhow::anyhow!("invalid completed item: {error}"))?;
-    let mut item = Map::new();
-
-    for (key, raw_field) in raw_fields {
-        let value = match key.as_str() {
-            "aggregatedOutput" | "output" | "text" => parse_trimmed_json_string(raw_field)?,
-            "changes" => parse_changes_with_trimmed_diffs(raw_field)?,
-            "error" => parse_error_with_trimmed_strings(raw_field)?,
-            _ => parse_raw_value(raw_field)?,
-        };
-        item.insert(key, value);
-    }
-
-    Ok(Value::Object(item))
-}
-
-fn parse_trimmed_json_string(raw: &RawValue) -> anyhow::Result<Value> {
-    if let Some(trimmed) = trim_action_output_delta_json_string(raw.get()) {
-        Ok(Value::String(trimmed))
-    } else {
-        parse_raw_value(raw)
-    }
-}
-
-fn parse_changes_with_trimmed_diffs(raw: &RawValue) -> anyhow::Result<Value> {
-    if !raw.get().trim_start().starts_with('[') {
-        return parse_raw_value(raw);
-    }
-
-    let raw_changes: Vec<&RawValue> = serde_json::from_str(raw.get())
-        .map_err(|error| anyhow::anyhow!("invalid completed item changes: {error}"))?;
-    let mut changes = Vec::with_capacity(raw_changes.len());
-
-    for raw_change in raw_changes {
-        if !raw_change.get().trim_start().starts_with('{') {
-            changes.push(parse_raw_value(raw_change)?);
-            continue;
-        }
-
-        let raw_fields: BTreeMap<String, &RawValue> = serde_json::from_str(raw_change.get())
-            .map_err(|error| anyhow::anyhow!("invalid completed item change: {error}"))?;
-        let mut change = Map::new();
-        for (key, raw_field) in raw_fields {
-            let value = if key == "diff" {
-                parse_trimmed_json_string(raw_field)?
-            } else {
-                parse_raw_value(raw_field)?
-            };
-            change.insert(key, value);
-        }
-        changes.push(Value::Object(change));
-    }
-
-    Ok(Value::Array(changes))
-}
-
-fn parse_error_with_trimmed_strings(raw: &RawValue) -> anyhow::Result<Value> {
-    if !raw.get().trim_start().starts_with('{') {
-        return parse_trimmed_json_string(raw);
-    }
-
-    let raw_fields: BTreeMap<String, &RawValue> = serde_json::from_str(raw.get())
-        .map_err(|error| anyhow::anyhow!("invalid completed item error: {error}"))?;
-    let mut error = Map::new();
-
-    for (key, raw_field) in raw_fields {
-        let value = match key.as_str() {
-            "stdout" | "stderr" | "details" => parse_trimmed_json_string(raw_field)?,
-            _ => parse_raw_value(raw_field)?,
-        };
-        error.insert(key, value);
-    }
-
-    Ok(Value::Object(error))
 }
 
 fn parse_raw_value(raw: &RawValue) -> anyhow::Result<Value> {
@@ -344,30 +178,9 @@ fn value_into_string(value: Value) -> Option<String> {
     }
 }
 
-fn is_large_output_event(method: &str) -> bool {
-    matches!(
-        method_signature(method).as_str(),
-        "itemcommandexecutionoutputdelta"
-            | "itemfilechangeoutputdelta"
-            | "itemcommandexecutionterminalinteraction"
-            | "terminalinteraction"
-            | "turndiffupdated"
-            | "itemcompleted"
-    )
-}
-
-fn method_signature(method: &str) -> String {
-    method
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(|ch| ch.to_lowercase())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::{ACTION_OUTPUT_DELTA_MAX_CHARS, STREAMED_DIFF_MAX_CHARS};
     use serde_json::json;
 
     #[test]
@@ -471,11 +284,8 @@ mod tests {
     }
 
     #[test]
-    fn trims_large_output_delta_while_parsing_params() {
-        let output = format!(
-            "prefix:{}:tail",
-            "x".repeat(ACTION_OUTPUT_DELTA_MAX_CHARS + 4096)
-        );
+    fn preserves_large_output_delta_while_parsing_params() {
+        let output = format!("prefix:{}:tail", "x".repeat(2 * 1024 * 1024));
         let line = json!({
             "method": "item/command_execution/output_delta",
             "params": {
@@ -497,9 +307,7 @@ mod tests {
             .get("delta")
             .and_then(Value::as_str)
             .expect("delta should be a string");
-        assert_eq!(delta.chars().count(), ACTION_OUTPUT_DELTA_MAX_CHARS);
-        assert!(delta.starts_with("... [output truncated; showing tail]\n"));
-        assert!(delta.ends_with(":tail"));
+        assert_eq!(delta, output);
         assert_eq!(params["metadata"], json!({ "preserved": true }));
     }
 
@@ -519,15 +327,10 @@ mod tests {
     }
 
     #[test]
-    fn trims_completed_item_large_output_fields_while_parsing_params() {
-        let output = format!(
-            "head:{}:tail",
-            "x".repeat(ACTION_OUTPUT_DELTA_MAX_CHARS + 4096)
-        );
-        let diff = format!(
-            "diff --git a/a b/a\n{}",
-            "y".repeat(ACTION_OUTPUT_DELTA_MAX_CHARS)
-        );
+    fn preserves_completed_item_large_output_fields_while_parsing_params() {
+        let expected_output = format!("head:{}:tail", "x".repeat(1024 * 1024));
+        let expected_diff = format!("diff --git a/a b/a\n{}", "y".repeat(1024 * 1024));
+        let expected_stderr = format!("err:{}", "z".repeat(1024 * 1024));
         let line = json!({
             "method": "item/completed",
             "params": {
@@ -537,9 +340,9 @@ mod tests {
                     "id": "cmd-1",
                     "type": "commandExecution",
                     "status": "completed",
-                    "aggregatedOutput": output,
-                    "changes": [{ "path": "src/main.rs", "diff": diff }],
-                    "error": { "stderr": format!("err:{}", "z".repeat(ACTION_OUTPUT_DELTA_MAX_CHARS + 1)) }
+                    "aggregatedOutput": expected_output,
+                    "changes": [{ "path": "src/main.rs", "diff": expected_diff }],
+                    "error": { "stderr": expected_stderr }
                 }
             }
         })
@@ -569,26 +372,22 @@ mod tests {
             .and_then(Value::as_str)
             .expect("stderr should be a string");
 
-        assert_eq!(output.chars().count(), ACTION_OUTPUT_DELTA_MAX_CHARS);
-        assert!(output.ends_with(":tail"));
-        assert_eq!(diff.chars().count(), ACTION_OUTPUT_DELTA_MAX_CHARS);
-        assert_eq!(stderr.chars().count(), ACTION_OUTPUT_DELTA_MAX_CHARS);
+        assert_eq!(output, expected_output);
+        assert_eq!(diff, expected_diff);
+        assert_eq!(stderr, expected_stderr);
         assert_eq!(params["threadId"], json!("thread-1"));
         assert_eq!(item["id"], json!("cmd-1"));
     }
 
     #[test]
-    fn trims_turn_diff_while_parsing_params() {
-        let diff = format!(
-            "diff --git a/a b/a\n{}",
-            "x".repeat(STREAMED_DIFF_MAX_CHARS + 4096)
-        );
+    fn preserves_turn_diff_while_parsing_params() {
+        let expected_diff = format!("diff --git a/a b/a\n{}", "x".repeat(1024 * 1024));
         let line = json!({
             "method": "turn/diff/updated",
             "params": {
                 "threadId": "thread-1",
                 "turnId": "turn-1",
-                "diff": diff
+                "diff": expected_diff
             }
         })
         .to_string();
@@ -603,8 +402,21 @@ mod tests {
             .and_then(Value::as_str)
             .expect("diff should be a string");
 
-        assert_eq!(diff.chars().count(), STREAMED_DIFF_MAX_CHARS);
-        assert!(diff.starts_with("... [output truncated; showing tail]\n"));
+        assert_eq!(diff, expected_diff);
         assert_eq!(params["threadId"], json!("thread-1"));
+    }
+
+    #[test]
+    fn preserves_raw_params_bytes_including_escapes_and_spacing() {
+        let line = r#"{"method":"item/agentMessage/delta","params": { "threadId" : "t1", "delta":"line\u003a one\nline two" }}"#;
+        let message = parse_incoming(line).expect("notification should parse");
+        let IncomingMessage::Notification { params, .. } = message else {
+            panic!("expected notification");
+        };
+
+        assert_eq!(
+            params.get(),
+            r#"{ "threadId" : "t1", "delta":"line\u003a one\nline two" }"#
+        );
     }
 }

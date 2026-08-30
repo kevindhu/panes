@@ -5,7 +5,7 @@ const mockIpc = vi.hoisted(() => ({
   engineHealth: vi.fn(),
 }));
 
-vi.mock("../lib/ipc", () => ({
+vi.mock("../lib/codexIpc", () => ({
   ipc: mockIpc,
 }));
 

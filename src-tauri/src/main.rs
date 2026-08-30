@@ -1,4 +1,7 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(
+    any(not(debug_assertions), feature = "windowed-dev-exe"),
+    windows_subsystem = "windows"
+)]
 
 fn main() {
     match agent_workspace_lib::maybe_handle_cli_subcommand() {

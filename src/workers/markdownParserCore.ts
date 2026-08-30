@@ -29,6 +29,49 @@ const SAFE_HTML_TAG_RE = /<(br|hr)\s*\/?>/gi;
 const RAW_HTML_FRAGMENT_RE =
   /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<![a-z][^>]*>|<\?[\s\S]*?\?>|<\/[a-z][a-z0-9-]*\s*>|<[a-z][a-z0-9-]*(?:\s+(?:"[^"]*"|'[^']*'|[^"'<>])*)?\s*\/?>/gi;
 const MARKDOWN_IMAGE_UNC_PREFIX_RE = /(!\[(?:\\.|[^\]\\\r\n])*\]\(\s*<?)\\{2,}/g;
+const OPENAI_ANNOTATION_START = "\uE200";
+const OPENAI_ANNOTATION_END = "\uE201";
+const OPENAI_ANNOTATION_SEPARATOR = "\uE202";
+
+function stripOpenAiCitationAnnotations(input: string): string {
+  let result = "";
+  let cursor = 0;
+
+  while (cursor < input.length) {
+    const start = input.indexOf(OPENAI_ANNOTATION_START, cursor);
+    if (start < 0) {
+      result += input.slice(cursor);
+      break;
+    }
+
+    result += input.slice(cursor, start);
+    const end = input.indexOf(OPENAI_ANNOTATION_END, start + 1);
+    if (end < 0) {
+      const trailingPayload = input.slice(start + 1);
+      const isStreamingCitation =
+        "cite".startsWith(trailingPayload) ||
+        trailingPayload.startsWith(`cite${OPENAI_ANNOTATION_SEPARATOR}`);
+      if (isStreamingCitation) {
+        break;
+      }
+
+      result += OPENAI_ANNOTATION_START;
+      cursor = start + 1;
+      continue;
+    }
+
+    const payload = input.slice(start + 1, end);
+    const isCitation =
+      payload === "cite" ||
+      payload.startsWith(`cite${OPENAI_ANNOTATION_SEPARATOR}`);
+    if (!isCitation) {
+      result += input.slice(start, end + 1);
+    }
+    cursor = end + 1;
+  }
+
+  return result;
+}
 
 function escapeHtmlFragment(input: string): string {
   return input
@@ -38,11 +81,12 @@ function escapeHtmlFragment(input: string): string {
 }
 
 function escapeNonFenceHtml(input: string): string {
+  const withoutCitationAnnotations = stripOpenAiCitationAnnotations(input);
   // Preserve known safe self-closing HTML tags (<br>, <hr>) by replacing them
   // with placeholders before escaping, then restoring after.
   const placeholders: { placeholder: string; tag: string }[] = [];
   let idx = 0;
-  const withPlaceholders = input.replace(SAFE_HTML_TAG_RE, (match) => {
+  const withPlaceholders = withoutCitationAnnotations.replace(SAFE_HTML_TAG_RE, (match) => {
     const placeholder = `\x00SAFE_TAG_${idx++}\x00`;
     placeholders.push({ placeholder, tag: match });
     return placeholder;
@@ -381,5 +425,6 @@ export const markdownParserCoreInternals = {
   parseFenceOpening,
   isFenceClosing,
   splitLinesWithEndings,
+  stripOpenAiCitationAnnotations,
   tokenizeFences,
 };

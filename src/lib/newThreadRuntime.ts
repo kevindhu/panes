@@ -1,5 +1,4 @@
 import type { EngineInfo, Thread } from "../types";
-import type { OnboardingPreferredChatSelection } from "./onboarding";
 
 export type NewThreadServiceTier = "fast" | "flex";
 
@@ -23,7 +22,6 @@ interface ResolveNewThreadRuntimeInput {
   engines: ReadonlyArray<EngineInfo>;
   composerRuntime?: ComposerRuntimeSnapshot | null;
   activeThread?: Thread | null;
-  onboardingSelection?: OnboardingPreferredChatSelection | null;
 }
 
 function normalizeString(value: string | null | undefined): string | null {
@@ -147,19 +145,10 @@ export function resolveNewThreadRuntime({
   engines,
   composerRuntime,
   activeThread,
-  onboardingSelection,
 }: ResolveNewThreadRuntimeInput): NewThreadRuntimeSelection {
   const candidates: Array<NewThreadRuntimeSelection | null> = [
     composerRuntime ?? null,
     activeThread ? runtimeFromThread(activeThread) : null,
-    onboardingSelection
-      ? {
-          engineId: onboardingSelection.engineId,
-          modelId: onboardingSelection.modelId,
-          reasoningEffort: null,
-          serviceTier: null,
-        }
-      : null,
     NEW_THREAD_FALLBACK_RUNTIME,
   ];
 
