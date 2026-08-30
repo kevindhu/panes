@@ -143,10 +143,30 @@ button { color: inherit; }
 .codex-usage-trigger.danger .codex-usage-wheel { --codex-usage-wheel-color: var(--danger); }
 .codex-usage-trigger.refreshing .codex-usage-wheel { animation: codex-spin .8s linear infinite; }
 .codex-usage-popover { position: fixed; z-index: 1200; max-width: calc(100vw - 20px); max-height: calc(100vh - 20px); overflow: auto; border: 1px solid var(--border-strong); border-radius: 12px; background: var(--surface-raised); box-shadow: var(--shadow-lg); color: var(--text-1); }
-.codex-context-window { --codex-usage-window-color: var(--accent); display: grid; gap: 8px; padding: 13px 14px 15px; border-bottom: 1px solid var(--border); }
-.codex-context-window-copy { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; font-size: 11.5px; }
-.codex-context-window-copy > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-3); }
-.codex-context-window-copy > strong { flex: 0 0 auto; color: var(--text-2); font-size: 11.5px; font-weight: 550; font-variant-numeric: tabular-nums; }
+.codex-context-window { border-bottom: 1px solid var(--border); }
+.codex-context-window-toggle { width: 100%; min-height: 41px; display: grid; grid-template-columns: minmax(0, 1fr) auto 13px; align-items: center; gap: 8px; border: 0; padding: 0 12px 0 14px; background: transparent; color: var(--text-3); text-align: left; }
+.codex-context-window-toggle:hover { background: var(--surface-hover); }
+.codex-context-window-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.codex-context-window-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; }
+.codex-context-window-toggle > strong { color: var(--text-2); font-size: 11.5px; font-weight: 550; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.codex-context-window-toggle > svg { transition: transform 160ms var(--ease-out); }
+.codex-context-window.expanded .codex-context-window-toggle > svg { transform: rotate(180deg); }
+.codex-context-progress { height: 5px; display: flex; overflow: hidden; margin: 0 14px 14px; border-radius: 999px; background: var(--bg-3); }
+.codex-context-segment { min-width: 2px; height: 100%; flex: 0 0 auto; box-sizing: border-box; border-right: 2px solid var(--surface-raised); transition: width 180ms var(--ease-out); }
+.codex-context-segment.input, .codex-context-swatch.input, .codex-context-segment.used, .codex-context-swatch.used { background: #2f76d2; }
+.codex-context-segment.cache-write, .codex-context-swatch.cache-write { background: #ed6a35; }
+.codex-context-segment.cached, .codex-context-swatch.cached { background: #1eaa74; }
+.codex-context-segment.output, .codex-context-swatch.output { background: #e6a000; }
+.codex-context-segment.reasoning, .codex-context-swatch.reasoning { background: #dd70a0; }
+.codex-context-segment.other, .codex-context-swatch.other { background: var(--text-3); }
+.codex-context-swatch.free { background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--border-strong); }
+.codex-context-breakdown { display: grid; gap: 7px; padding: 0 14px 13px; }
+.codex-context-breakdown-row { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto 35px; align-items: baseline; gap: 7px; font-size: 10.5px; }
+.codex-context-swatch { width: 8px; height: 8px; align-self: center; border-radius: 2px; }
+.codex-context-breakdown-row > span:nth-child(2) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.codex-context-breakdown-row > small { color: var(--text-3); font-size: 10px; font-variant-numeric: tabular-nums; }
+.codex-context-breakdown-row > strong { color: var(--text-2); font-size: 10px; font-weight: 500; font-variant-numeric: tabular-nums; text-align: right; }
+.codex-context-breakdown > p { margin: 3px 0 0; padding-top: 9px; border-top: 1px solid var(--border); color: var(--text-3); font-size: 9px; line-height: 1.4; }
 .codex-usage-popover > header { min-height: 42px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 14px; border-bottom: 1px solid var(--border); color: var(--text-3); font-size: 11px; }
 .codex-usage-popover > header > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .codex-usage-popover > header > small { flex: 0 0 auto; color: var(--accent); font-size: 9.5px; }

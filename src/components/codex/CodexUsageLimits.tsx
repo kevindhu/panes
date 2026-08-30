@@ -1,4 +1,4 @@
-import { RefreshCw } from "lucide-react";
+import { ChevronDown, RefreshCw } from "lucide-react";
 import {
   useCallback,
   useEffect,
@@ -69,6 +69,105 @@ export function formatTokenCount(value: number | null | undefined): string | nul
   return String(tokens);
 }
 
+type ContextWindowSegmentKey =
+  | "input"
+  | "cache-write"
+  | "cached"
+  | "output"
+  | "reasoning"
+  | "other"
+  | "used"
+  | "free";
+
+export interface ContextWindowSegment {
+  key: ContextWindowSegmentKey;
+  label: string;
+  tokens: number;
+  percent: number | null;
+}
+
+function finiteTokens(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0, Math.round(value))
+    : null;
+}
+
+function formatSegmentPercent(value: number | null): string {
+  if (value === null) return "\u2014";
+  return `${value.toFixed(1).replace(/\.0$/, "")}%`;
+}
+
+export function contextWindowSegments(
+  usage: ContextUsage | null | undefined,
+): ContextWindowSegment[] {
+  const currentTokens = finiteTokens(usage?.currentTokens);
+  const maxContextTokens = finiteTokens(usage?.maxContextTokens);
+  if (currentTokens === null) return [];
+
+  const usedTokens = maxContextTokens === null
+    ? currentTokens
+    : Math.min(currentTokens, maxContextTokens);
+  const toSegment = (
+    key: ContextWindowSegmentKey,
+    label: string,
+    tokens: number,
+  ): ContextWindowSegment => ({
+    key,
+    label,
+    tokens,
+    percent: maxContextTokens !== null && maxContextTokens > 0
+      ? (tokens / maxContextTokens) * 100
+      : null,
+  });
+
+  const breakdown = usage?.breakdown;
+  const occupied: ContextWindowSegment[] = [];
+  if (breakdown) {
+    const inputTokens = Math.min(finiteTokens(breakdown.inputTokens) ?? 0, usedTokens);
+    const outputTokens = Math.min(
+      finiteTokens(breakdown.outputTokens) ?? 0,
+      Math.max(0, usedTokens - inputTokens),
+    );
+    const cachedInputTokens = Math.min(
+      finiteTokens(breakdown.cachedInputTokens) ?? 0,
+      inputTokens,
+    );
+    const cacheWriteInputTokens = Math.min(
+      finiteTokens(breakdown.cacheWriteInputTokens) ?? 0,
+      Math.max(0, inputTokens - cachedInputTokens),
+    );
+    const uncachedInputTokens = Math.max(
+      0,
+      inputTokens - cachedInputTokens - cacheWriteInputTokens,
+    );
+    const reasoningOutputTokens = Math.min(
+      finiteTokens(breakdown.reasoningOutputTokens) ?? 0,
+      outputTokens,
+    );
+    const regularOutputTokens = Math.max(0, outputTokens - reasoningOutputTokens);
+    const otherTokens = Math.max(0, usedTokens - inputTokens - outputTokens);
+
+    for (const [key, label, tokens] of [
+      ["input", "Input context", uncachedInputTokens],
+      ["cache-write", "Cache-write input", cacheWriteInputTokens],
+      ["cached", "Cached input", cachedInputTokens],
+      ["output", "Output", regularOutputTokens],
+      ["reasoning", "Reasoning output", reasoningOutputTokens],
+      ["other", "Other context", otherTokens],
+    ] as const) {
+      if (tokens > 0) occupied.push(toSegment(key, label, tokens));
+    }
+  } else if (usedTokens > 0) {
+    occupied.push(toSegment("used", "Used context", usedTokens));
+  }
+
+  if (maxContextTokens !== null && maxContextTokens > 0) {
+    occupied.push(toSegment("free", "Free space", Math.max(0, maxContextTokens - usedTokens)));
+  }
+
+  return occupied;
+}
+
 function usageTone(usedPercent: number | null): "normal" | "warning" | "danger" {
   if (usedPercent !== null && usedPercent >= 90) return "danger";
   if (usedPercent !== null && usedPercent >= 75) return "warning";
@@ -135,9 +234,13 @@ function UsageWindowRow({ label, remainingPercent, resetsAt }: UsageWindowRowPro
 }
 
 function ContextWindowRow({ usage }: { usage: ContextUsage | null }) {
+  const breakdownId = useId();
+  const [expanded, setExpanded] = useState(false);
   const usedPercent = contextWindowUsedPercent(usage);
   const currentTokens = formatTokenCount(usage?.currentTokens);
   const maxContextTokens = formatTokenCount(usage?.maxContextTokens);
+  const segments = contextWindowSegments(usage);
+  const occupiedSegments = segments.filter((segment) => segment.key !== "free");
   const summary = currentTokens !== null && maxContextTokens !== null && usedPercent !== null
     ? `${currentTokens} / ${maxContextTokens} (${usedPercent}%)`
     : usedPercent !== null
@@ -145,13 +248,20 @@ function ContextWindowRow({ usage }: { usage: ContextUsage | null }) {
       : "\u2014";
 
   return (
-    <section className="codex-context-window">
-      <div className="codex-context-window-copy">
-        <span>Context window</span>
+    <section className={`codex-context-window ${expanded ? "expanded" : ""}`}>
+      <button
+        className="codex-context-window-toggle"
+        type="button"
+        aria-expanded={expanded}
+        aria-controls={breakdownId}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <span className="codex-context-window-label">Context window</span>
         <strong>{summary}</strong>
-      </div>
+        <ChevronDown size={13} aria-hidden="true" />
+      </button>
       <div
-        className="codex-usage-progress"
+        className="codex-context-progress"
         role="progressbar"
         aria-label="Context window usage"
         aria-valuemin={0}
@@ -159,8 +269,33 @@ function ContextWindowRow({ usage }: { usage: ContextUsage | null }) {
         aria-valuenow={usedPercent ?? undefined}
         aria-valuetext={usedPercent === null ? undefined : summary}
       >
-        <span style={{ width: `${usedPercent ?? 0}%` }} />
+        {occupiedSegments.map((segment) => (
+          <span
+            key={segment.key}
+            className={`codex-context-segment ${segment.key}`}
+            data-context-segment={segment.key}
+            style={{ width: `${segment.percent ?? 0}%` }}
+            title={`${segment.label}: ${formatTokenCount(segment.tokens) ?? "0"} (${formatSegmentPercent(segment.percent)})`}
+          />
+        ))}
       </div>
+      {expanded && (
+        <div id={breakdownId} className="codex-context-breakdown">
+          {segments.map((segment) => (
+            <div className="codex-context-breakdown-row" key={segment.key}>
+              <span className={`codex-context-swatch ${segment.key}`} aria-hidden="true" />
+              <span>{segment.label}</span>
+              <small>{formatTokenCount(segment.tokens) ?? "0"}</small>
+              <strong>{formatSegmentPercent(segment.percent)}</strong>
+            </div>
+          ))}
+          {usage?.breakdown && (
+            <p>
+              Codex groups system prompts, tools, skills, and messages inside input context.
+            </p>
+          )}
+        </div>
+      )}
     </section>
   );
 }

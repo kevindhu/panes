@@ -7,6 +7,7 @@ import type { ContextUsage } from "../../types";
 import {
   CodexUsageLimits,
   contextWindowUsedPercent,
+  contextWindowSegments,
   formatTokenCount,
   remainingToUsedPercent,
 } from "./CodexUsageLimits";
@@ -63,6 +64,18 @@ describe("CodexUsageLimits", () => {
     expect(formatTokenCount(42_000)).toBe("42k");
     expect(formatTokenCount(747_600)).toBe("747.6k");
     expect(formatTokenCount(1_000_000)).toBe("1M");
+    expect(contextWindowSegments(usage)).toEqual([
+      { key: "input", label: "Input context", tokens: 20_000, percent: 10 },
+      { key: "cache-write", label: "Cache-write input", tokens: 2_000, percent: 1 },
+      { key: "cached", label: "Cached input", tokens: 12_000, percent: 6 },
+      { key: "output", label: "Output", tokens: 5_000, percent: 2.5 },
+      { key: "reasoning", label: "Reasoning output", tokens: 3_000, percent: 1.5 },
+      { key: "free", label: "Free space", tokens: 158_000, percent: 79 },
+    ]);
+    expect(contextWindowSegments({ ...usage, breakdown: null })).toEqual([
+      { key: "used", label: "Used context", tokens: 42_000, percent: 21 },
+      { key: "free", label: "Free space", tokens: 158_000, percent: 79 },
+    ]);
   });
 
   it("opens the plan-limit popover and refreshes the current thread", async () => {
@@ -98,7 +111,21 @@ describe("CodexUsageLimits", () => {
       '[role="progressbar"][aria-label="Context window usage"]',
     );
     expect(contextProgress?.getAttribute("aria-valuenow")).toBe("21");
-    expect(contextProgress?.querySelector<HTMLSpanElement>("span")?.style.width).toBe("21%");
+    expect(
+      Array.from(contextProgress?.querySelectorAll<HTMLElement>("[data-context-segment]") ?? [])
+        .map((segment) => segment.dataset.contextSegment),
+    ).toEqual(["input", "cache-write", "cached", "output", "reasoning"]);
+
+    await act(async () => {
+      popover?.querySelector<HTMLButtonElement>(".codex-context-window-toggle")?.click();
+    });
+    expect(popover?.textContent).toContain("Input context");
+    expect(popover?.textContent).toContain("Cache-write input");
+    expect(popover?.textContent).toContain("Cached input");
+    expect(popover?.textContent).toContain("Reasoning output");
+    expect(popover?.textContent).toContain("Free space");
+    expect(popover?.textContent).toContain("158k");
+    expect(popover?.textContent).toContain("79%");
     expect(onRefresh).toHaveBeenCalledWith("thread-1");
   });
 
