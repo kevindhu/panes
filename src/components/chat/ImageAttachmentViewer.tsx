@@ -73,6 +73,7 @@ export function ImageAttachmentViewer({
   const firstPixelRecordedRef = useRef(false);
   const fitScaleRef = useRef(FIT_SCALE_FALLBACK);
   const userAdjustedScaleRef = useRef(false);
+  const transitionFrameRef = useRef<number | null>(null);
   const [fitScale, setFitScale] = useState(FIT_SCALE_FALLBACK);
   const [scale, setScale] = useState(FIT_SCALE_FALLBACK);
   const [offset, setOffset] = useState(DEFAULT_OFFSET);
@@ -81,6 +82,8 @@ export function ImageAttachmentViewer({
   const [dragging, setDragging] = useState(false);
   const [failed, setFailed] = useState(false);
   const [naturalSize, setNaturalSize] = useState<Point | null>(null);
+  const [imageFitReady, setImageFitReady] = useState(false);
+  const [imageTransitionsEnabled, setImageTransitionsEnabled] = useState(false);
   const currentSrc = [displaySrc, previewSrc, originalSrc].find(
     (source): source is string => Boolean(
       source && !failedSourcesRef.current.has(source),
@@ -103,21 +106,32 @@ export function ImageAttachmentViewer({
     return requestedSourcePromiseRef.current;
   }, [requestPreview]);
 
-  const fitCurrentImage = useCallback((force = false) => {
+  const enableImageTransitionsAfterFirstPaint = useCallback(() => {
+    setImageFitReady(true);
+    if (transitionFrameRef.current !== null) {
+      window.cancelAnimationFrame(transitionFrameRef.current);
+    }
+    transitionFrameRef.current = window.requestAnimationFrame(() => {
+      transitionFrameRef.current = null;
+      setImageTransitionsEnabled(true);
+    });
+  }, []);
+
+  const fitCurrentImage = useCallback((force = false): boolean => {
     const nextFitScale = calculateFitScale(
       stageRef.current,
       imageRef.current,
       VIEWER_IMAGE_INSET,
     );
     if (nextFitScale === null) {
-      return;
+      return false;
     }
     fitScaleRef.current = nextFitScale;
     setFitScale(nextFitScale);
     if (force || !userAdjustedScaleRef.current) {
       setScale(nextFitScale);
       setOffset(DEFAULT_OFFSET);
-      return;
+      return true;
     }
     setScale((currentScale) => {
       const nextScale = clampScale(currentScale, nextFitScale);
@@ -129,11 +143,16 @@ export function ImageAttachmentViewer({
       ));
       return nextScale;
     });
+    return true;
   }, []);
 
   useLayoutEffect(() => {
     if (!open) {
       return;
+    }
+    if (transitionFrameRef.current !== null) {
+      window.cancelAnimationFrame(transitionFrameRef.current);
+      transitionFrameRef.current = null;
     }
     openStartedAtRef.current = performance.now();
     firstPixelRecordedRef.current = false;
@@ -149,8 +168,28 @@ export function ImageAttachmentViewer({
     setDragging(false);
     setFailed(false);
     setNaturalSize(null);
+    setImageFitReady(false);
+    setImageTransitionsEnabled(false);
     dragStateRef.current = null;
   }, [fileName, filePath, mimeType, open, requestPreview]);
+
+  useLayoutEffect(() => {
+    if (!open) {
+      return;
+    }
+    if (transitionFrameRef.current !== null) {
+      window.cancelAnimationFrame(transitionFrameRef.current);
+      transitionFrameRef.current = null;
+    }
+    setImageFitReady(false);
+    setImageTransitionsEnabled(false);
+  }, [currentSrc, open]);
+
+  useEffect(() => () => {
+    if (transitionFrameRef.current !== null) {
+      window.cancelAnimationFrame(transitionFrameRef.current);
+    }
+  }, []);
 
   useEffect(() => {
     if (!open || displaySrc) {
@@ -458,7 +497,9 @@ export function ImageAttachmentViewer({
       y: event.currentTarget.naturalHeight,
     };
     setNaturalSize(nextNaturalSize);
-    fitCurrentImage();
+    if (fitCurrentImage(true)) {
+      enableImageTransitionsAfterFirstPaint();
+    }
     if (!firstPixelRecordedRef.current) {
       firstPixelRecordedRef.current = true;
       recordPerfMetric(
@@ -601,7 +642,7 @@ export function ImageAttachmentViewer({
               ref={imageRef}
               src={currentSrc}
               alt={fileName}
-              className="chat-image-viewer-image"
+              className={`chat-image-viewer-image${imageFitReady ? " is-fit-ready" : ""}${imageTransitionsEnabled ? " can-transition" : ""}`}
               style={{
                 transform: `translate3d(calc(-50% + ${offset.x}px), calc(-50% + ${offset.y}px), 0) scale(${scale})`,
               }}

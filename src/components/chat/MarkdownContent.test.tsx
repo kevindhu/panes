@@ -447,8 +447,8 @@ describe("MarkdownContent", () => {
     expect(mockPrepareAttachmentImageAsset).toHaveBeenCalledWith(
       "C:\\repo\\screenshots\\page.png",
       "image/png",
-      720,
-      440,
+      1120,
+      840,
     );
     expect(image?.getAttribute("src")).toBe(
       "asset://C:/repo/screenshots/page.png.thumb.png?v=thumb",
@@ -481,8 +481,8 @@ describe("MarkdownContent", () => {
     expect(mockPrepareAttachmentImageAsset).toHaveBeenCalledWith(
       absolutePath,
       "image/png",
-      720,
-      440,
+      1120,
+      840,
     );
   });
 
@@ -516,8 +516,8 @@ describe("MarkdownContent", () => {
     expect(mockPrepareAttachmentImageAsset).toHaveBeenCalledWith(
       windowsPath,
       "image/png",
-      720,
-      440,
+      1120,
+      840,
     );
   });
 
@@ -547,8 +547,8 @@ describe("MarkdownContent", () => {
     expect(mockPrepareAttachmentImageAsset).toHaveBeenCalledWith(
       uncPath,
       "image/webp",
-      720,
-      440,
+      1120,
+      840,
     );
   });
 

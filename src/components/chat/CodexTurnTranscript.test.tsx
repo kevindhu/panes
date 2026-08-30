@@ -542,6 +542,8 @@ describe("CodexTranscriptRenderer", () => {
       "https://cdn.example.com/mcp.jpg",
     ]);
     expect(container.querySelector('[data-item-type="imageView"] .chat-image-gallery-card')).not.toBeNull();
+    expect(container.querySelector('[data-item-type="imageView"] .chat-image-figure-viewed')).not.toBeNull();
+    expect(container.querySelector('[data-item-type="imageGeneration"] .chat-image-figure-viewed')).toBeNull();
 
     const imageViewHeader = container.querySelector<HTMLButtonElement>(
       '[data-item-type="imageView"] .codex-native-activity-header',

@@ -244,6 +244,57 @@ describe("ImageAttachmentViewer", () => {
     expect(document.body.querySelector(".chat-image-viewer-zoom-label")?.textContent).toBe("23%");
   });
 
+  it("reveals the first viewer frame at fit scale before enabling zoom transitions", async () => {
+    let pendingAnimationFrame: FrameRequestCallback | null = null;
+    const requestAnimationFrameSpy = vi
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation((callback) => {
+        pendingAnimationFrame = callback;
+        return 1;
+      });
+    const cancelAnimationFrameSpy = vi
+      .spyOn(window, "cancelAnimationFrame")
+      .mockImplementation(() => undefined);
+
+    await renderViewer({
+      originalSrc: "asset://large-portrait",
+      previewSrc: "asset://large-portrait",
+    });
+
+    const stage = document.body.querySelector(".chat-image-viewer-stage") as HTMLDivElement;
+    const image = document.body.querySelector(".chat-image-viewer-image") as HTMLImageElement;
+    Object.defineProperties(stage, {
+      clientWidth: { configurable: true, value: 1_000 },
+      clientHeight: { configurable: true, value: 700 },
+    });
+    Object.defineProperties(image, {
+      naturalWidth: { configurable: true, value: 2_000 },
+      naturalHeight: { configurable: true, value: 3_000 },
+    });
+
+    expect(image.className).not.toContain("is-fit-ready");
+
+    await act(async () => {
+      image.dispatchEvent(new Event("load"));
+    });
+
+    expect(document.body.querySelector(".chat-image-viewer-zoom-label")?.textContent).toBe("23%");
+    expect(image.style.transform).toContain("scale(0.22533333333333333)");
+    expect(image.className).toContain("is-fit-ready");
+    expect(image.className).not.toContain("can-transition");
+
+    const animationFrame = pendingAnimationFrame;
+    expect(animationFrame).not.toBeNull();
+    await act(async () => {
+      animationFrame?.(performance.now());
+    });
+
+    expect(image.className).toContain("can-transition");
+
+    requestAnimationFrameSpy.mockRestore();
+    cancelAnimationFrameSpy.mockRestore();
+  });
+
   it("closes only when the backdrop itself is clicked", async () => {
     const onClose = vi.fn();
     await renderViewer({

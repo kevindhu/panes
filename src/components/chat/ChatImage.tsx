@@ -21,7 +21,7 @@ import {
 } from "../../lib/chatImageSources";
 import { ImageAttachmentViewer } from "./ImageAttachmentViewer";
 
-const DEFAULT_THUMBNAIL_OPTIONS = { maxWidth: 720, maxHeight: 440 };
+const DEFAULT_THUMBNAIL_OPTIONS = { maxWidth: 1120, maxHeight: 840 };
 const INLINE_MAX_WIDTH = 560;
 const INLINE_MAX_HEIGHT = 420;
 const IMAGE_FRAME_CACHE_LIMIT = 256;
@@ -334,19 +334,26 @@ export function ChatImagePreview({
   const [viewerOpen, setViewerOpen] = useState(false);
   const frameKey = chatImageKey(image);
   const [frame, setFrame] = useState<ImageFrame | null>(() => imageFrameCache.get(frameKey) ?? null);
+  const isViewedGalleryImage = variant === "gallery" && image.origin === "image-view";
 
   useEffect(() => {
     setFrame(imageFrameCache.get(frameKey) ?? null);
   }, [frameKey]);
 
-  const frameStyle = frame && variant === "markdown"
-    ? ({
-        "--markdown-local-image-frame-width": `${frame.width}px`,
-      } as CSSProperties)
+  const frameStyle = frame
+    ? variant === "markdown"
+      ? ({
+          "--markdown-local-image-frame-width": `${frame.width}px`,
+        } as CSSProperties)
+      : isViewedGalleryImage
+        ? ({
+            "--chat-image-view-frame-width": `${frame.width}px`,
+          } as CSSProperties)
+        : undefined
     : undefined;
 
   function handleImageLoad(event: SyntheticEvent<HTMLImageElement>) {
-    if (variant !== "markdown") {
+    if (variant !== "markdown" && !isViewedGalleryImage) {
       return;
     }
     const nextFrame = fitInlineFrame(
@@ -368,10 +375,10 @@ export function ChatImagePreview({
 
   const buttonClass = variant === "markdown"
     ? "chat-image-preview markdown-local-image-button"
-    : "chat-image-preview chat-image-gallery-card";
+    : `chat-image-preview chat-image-gallery-card${isViewedGalleryImage ? " chat-image-gallery-card-viewed" : ""}`;
   const imageClass = variant === "markdown"
     ? "chat-image-preview-thumbnail markdown-local-image-thumbnail"
-    : "chat-image-preview-thumbnail chat-image-gallery-thumbnail";
+    : `chat-image-preview-thumbnail chat-image-gallery-thumbnail${isViewedGalleryImage ? " chat-image-gallery-thumbnail-viewed" : ""}`;
 
   const previewButton = (
     <button
@@ -425,7 +432,10 @@ export function ChatImagePreview({
   }
 
   return (
-    <figure className="chat-image-figure chat-image-figure-gallery">
+    <figure
+      className={`chat-image-figure chat-image-figure-gallery${isViewedGalleryImage ? " chat-image-figure-viewed" : ""}`}
+      style={isViewedGalleryImage ? frameStyle : undefined}
+    >
       {previewButton}
       {image.caption && <figcaption title={image.caption}>{image.caption}</figcaption>}
       {viewer}

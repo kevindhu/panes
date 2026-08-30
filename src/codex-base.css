@@ -293,6 +293,9 @@ button:disabled { cursor: default; }
 .chat-image-figure-gallery { overflow: hidden; border: 1px solid var(--border); border-radius: 9px; background: var(--bg-2); }
 .chat-image-gallery-card { width: 100%; height: clamp(160px, 30vw, 360px); border: 0; border-radius: 0; background-image: linear-gradient(45deg, rgba(127,127,127,.055) 25%, transparent 25%), linear-gradient(-45deg, rgba(127,127,127,.055) 25%, transparent 25%), linear-gradient(45deg, transparent 75%, rgba(127,127,127,.055) 75%), linear-gradient(-45deg, transparent 75%, rgba(127,127,127,.055) 75%); background-size: 18px 18px; background-position: 0 0, 0 9px, 9px -9px, -9px 0; }
 .chat-image-gallery-thumbnail { max-width: 100%; max-height: 100%; padding: 6px; }
+.chat-image-figure-viewed { width: min(var(--chat-image-view-frame-width, 560px), 100%); justify-self: start; }
+.chat-image-gallery-card-viewed { height: auto; min-height: 0; }
+.chat-image-gallery-thumbnail-viewed { height: auto; max-height: none; }
 .chat-image-figure-gallery figcaption { overflow: hidden; border-top: 1px solid var(--border); padding: 6px 9px; text-overflow: ellipsis; white-space: nowrap; color: var(--text-3); font-size: 9.5px; }
 .codex-native-activity-images { border-top: 1px solid var(--border); padding: 10px 13px 12px 40px; background: color-mix(in srgb, var(--bg-2) 35%, transparent); }
 .legacy-action-images { border-top: 1px solid var(--border); padding: 9px 12px 11px 30px; }
@@ -315,7 +318,9 @@ button:disabled { cursor: default; }
 .chat-image-viewer-stage { position: relative; min-height: 0; flex: 1; display: grid; place-items: center; overflow: hidden; touch-action: none; background-color: #0a0c10; background-image: radial-gradient(circle at center, rgba(255,255,255,.045), transparent 62%); }
 .chat-image-viewer-stage.is-zoomed { cursor: grab; }
 .chat-image-viewer-stage.is-dragging { cursor: grabbing; }
-.chat-image-viewer-image { position: absolute; top: 50%; left: 50%; width: auto; height: auto; max-width: none; max-height: none; user-select: none; will-change: transform; transform-origin: center; transition: transform 90ms ease-out; }
+.chat-image-viewer-image { position: absolute; top: 50%; left: 50%; width: auto; height: auto; max-width: none; max-height: none; user-select: none; visibility: hidden; will-change: transform; transform-origin: center; }
+.chat-image-viewer-image.is-fit-ready { visibility: visible; }
+.chat-image-viewer-image.can-transition { transition: transform 90ms ease-out; }
 .chat-image-viewer-stage.is-dragging .chat-image-viewer-image { transition: none; }
 .chat-image-viewer-status { color: #aeb6c0; font-size: 11px; }
 @keyframes chat-image-viewer-fade-in { from { opacity: 0; } to { opacity: 1; } }

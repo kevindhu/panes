@@ -156,4 +156,55 @@ describe("ChatImagePreview", () => {
       expect.anything(),
     );
   });
+
+  it("uses a natural-aspect frame only for viewed activity images", async () => {
+    await act(async () => {
+      root.render(
+        <>
+          <ChatImagePreview image={{
+            id: "viewed-portrait",
+            origin: "image-view",
+            fileName: "portrait.png",
+            alt: "Viewed portrait",
+            mimeType: "image/png",
+            sourceUrl: "https://cdn.example.com/portrait.png",
+          }} />
+          <ChatImagePreview image={{
+            id: "generated-portrait",
+            origin: "generated",
+            fileName: "generated.png",
+            alt: "Generated portrait",
+            mimeType: "image/png",
+            sourceUrl: "https://cdn.example.com/generated.png",
+          }} />
+        </>,
+      );
+      await Promise.resolve();
+    });
+
+    const viewedButton = container.querySelector<HTMLButtonElement>(
+      '[data-panes-chat-image-id="viewed-portrait"]',
+    );
+    const viewedImage = viewedButton?.querySelector("img");
+    expect(viewedImage).not.toBeNull();
+    Object.defineProperties(viewedImage!, {
+      naturalWidth: { configurable: true, value: 1_400 },
+      naturalHeight: { configurable: true, value: 2_000 },
+    });
+    await act(async () => {
+      viewedImage?.dispatchEvent(new Event("load", { bubbles: true }));
+    });
+
+    const viewedFigure = viewedButton?.closest<HTMLElement>("figure");
+    expect(viewedFigure?.classList.contains("chat-image-figure-viewed")).toBe(true);
+    expect(viewedButton?.classList.contains("chat-image-gallery-card-viewed")).toBe(true);
+    expect(viewedImage?.classList.contains("chat-image-gallery-thumbnail-viewed")).toBe(true);
+    expect(viewedFigure?.style.getPropertyValue("--chat-image-view-frame-width")).toBe("294px");
+
+    const generatedButton = container.querySelector<HTMLButtonElement>(
+      '[data-panes-chat-image-id="generated-portrait"]',
+    );
+    expect(generatedButton?.closest("figure")?.classList.contains("chat-image-figure-viewed")).toBe(false);
+    expect(generatedButton?.classList.contains("chat-image-gallery-card-viewed")).toBe(false);
+  });
 });
