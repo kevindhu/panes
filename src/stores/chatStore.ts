@@ -82,7 +82,7 @@ interface ChatState {
     },
   ) => Promise<boolean>;
   cancel: () => Promise<void>;
-  respondApproval: (approvalId: string, response: ApprovalResponse) => Promise<void>;
+  respondApproval: (approvalId: string, response: ApprovalResponse) => Promise<boolean>;
   hydrateActionOutput: (messageId: string, actionId: string) => Promise<void>;
 }
 
@@ -187,6 +187,28 @@ function updateCachedThreadRuntimeState(
   const cached = cachedThreadViews.get(threadId);
   if (!cached) return;
   writeCachedThreadView(threadId, { ...cached, status, streaming });
+}
+
+function applyApprovalEventToCachedThreadView(
+  threadId: string,
+  event: Extract<StreamEvent, { type: "ApprovalRequested" | "ApprovalResolved" }>,
+): Pick<ChatState, "status" | "streaming"> | null {
+  const cached = cachedThreadViews.get(threadId);
+  if (!cached) return null;
+
+  const messages = applyStreamEvent(cached.messages, event, threadId);
+  const runtimeState = applyRuntimeStateFromEvent(
+    cached.status,
+    cached.streaming,
+    event,
+    messages,
+  );
+  writeCachedThreadView(threadId, {
+    ...cached,
+    messages,
+    ...runtimeState,
+  });
+  return runtimeState;
 }
 
 function cacheBoundThreadView(state: ChatState): void {
@@ -2771,8 +2793,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
 
     // Tear down the current listener. If the thread was still streaming,
-    // install a lightweight background listener that watches for TurnCompleted
-    // so the thread status updates correctly when the user switches back.
+    // install a lightweight background listener that preserves approvals and
+    // watches for TurnCompleted so switching back cannot hide pending input.
     if (currentUnlisten) {
       currentUnlisten();
     }
@@ -2781,15 +2803,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
       let backgroundTurnFinished = false;
       listenThreadEvents(currentThreadId, (event) => {
         if (event.type === "ApprovalRequested") {
-          updateCachedThreadRuntimeState(currentThreadId, "awaiting_approval", true);
+          const runtimeState = applyApprovalEventToCachedThreadView(currentThreadId, event)
+            ?? { status: "awaiting_approval" as const, streaming: true };
           useThreadStore
             .getState()
-            .setThreadStatusLocal(currentThreadId, "awaiting_approval");
+            .setThreadStatusLocal(currentThreadId, runtimeState.status);
           return;
         }
         if (event.type === "ApprovalResolved") {
-          updateCachedThreadRuntimeState(currentThreadId, "streaming", true);
-          useThreadStore.getState().setThreadStatusLocal(currentThreadId, "streaming");
+          const runtimeState = applyApprovalEventToCachedThreadView(currentThreadId, event)
+            ?? { status: "streaming" as const, streaming: true };
+          useThreadStore.getState().setThreadStatusLocal(currentThreadId, runtimeState.status);
           return;
         }
         if (event.type === "Error" && !event.recoverable) {
@@ -2871,11 +2895,52 @@ export const useChatStore = create<ChatState>((set, get) => ({
         threadId,
         source: "memory",
       });
+    } else if (currentThreadId !== threadId) {
+      const targetThread = useThreadStore
+        .getState()
+        .threads.find((candidate) => candidate.id === threadId);
+      const targetStatus = targetThread?.status ?? "idle";
+      set({
+        threadId,
+        messages: [],
+        olderCursor: null,
+        hasOlderMessages: false,
+        loadingOlderMessages: false,
+        olderLoadBlockedUntil: 0,
+        status: targetStatus,
+        streaming: isThreadStatusStreaming(targetStatus),
+        usageLimits:
+          targetThread?.engineId === "codex"
+            ? mergeUsageLimits(
+                contextUsageFromThreadMetadata(targetThread.engineMetadata),
+                lastKnownCodexAccountUsageWindows,
+              )
+            : null,
+        error: undefined,
+        unlisten: undefined,
+      });
     }
 
+    let bindingUnlisten: (() => void) | undefined;
     try {
       // Clean up any background listener for this thread before re-subscribing
       cleanupBackgroundListener(threadId);
+
+      // Subscribe before reading history. Codex emits a user-input request just
+      // before persisting it, so loading first creates a gap in which both the
+      // snapshot and the live listener can miss the questionnaire.
+      const queuedStreamEvents: StreamEvent[] = [];
+      let handleBoundStreamEvent = (event: StreamEvent) => {
+        enqueueStreamEvent(queuedStreamEvents, event);
+      };
+      const unlistenStream = await listenThreadEvents(threadId, (event) => {
+        handleBoundStreamEvent(event);
+      });
+      bindingUnlisten = unlistenStream;
+      if (bindSeq !== activeThreadBindSeq) {
+        unlistenStream();
+        return;
+      }
 
       const threadState = useThreadStore.getState();
       let activeThread = threadState.threads.find((thread) => thread.id === threadId);
@@ -2908,6 +2973,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         ? cachedView?.olderCursor ?? null
         : messageWindow.nextCursor;
       if (bindSeq !== activeThreadBindSeq) {
+        unlistenStream();
         return;
       }
 
@@ -2916,6 +2982,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // on the first-paint path when switching conversations.
       messages = replayQueuedTurnFinishedEvents(threadId, messages);
       const localState = get();
+      const supersedingLocalUnlisten =
+        localState.threadId === threadId &&
+        localState.unlisten &&
+        localState.unlisten !== currentUnlisten
+          ? localState.unlisten
+          : undefined;
       const locallyMergedMessages = localState.threadId === threadId
         ? applyHydrationWindow(
             mergeLoadedMessagesWithCurrentRuntimeMessages(
@@ -2947,7 +3019,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         hasOlderMessages: olderCursor !== null,
         loadingOlderMessages: false,
         olderLoadBlockedUntil: 0,
-        unlisten: undefined,
+        unlisten: supersedingLocalUnlisten,
         error: undefined,
         status: localRuntimeState.status,
         streaming: localRuntimeState.streaming,
@@ -2968,7 +3040,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
         });
       }
 
-      const queuedStreamEvents: StreamEvent[] = [];
       let streamFlushTimer: ReturnType<typeof setTimeout> | null = null;
       let streamFlushInProgress = false;
       let eventRateWindowStartedAt = performance.now();
@@ -3116,7 +3187,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         }, STREAM_EVENT_BATCH_WINDOW_MS);
       };
 
-      const unlistenStream = await listenThreadEvents(threadId, (event) => {
+      handleBoundStreamEvent = (event) => {
         if (bindSeq !== activeThreadBindSeq) {
           return;
         }
@@ -3156,7 +3227,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           return;
         }
         scheduleStreamFlush();
-      });
+      };
 
       const unlisten = () => {
         if (streamFlushTimer !== null) {
@@ -3319,6 +3390,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       flushQueuedStreamEvents();
       reconcileSyncedHistory();
     } catch (error) {
+      bindingUnlisten?.();
       if (bindSeq !== activeThreadBindSeq) {
         return;
       }
@@ -3642,7 +3714,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const threadId = get().threadId;
     if (!threadId) {
       set({ error: "No active thread selected" });
-      return;
+      return false;
     }
 
     // Apply optimistic update BEFORE the IPC call
@@ -3674,6 +3746,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     try {
       await ipc.respondApproval(threadId, approvalId, response);
+      return true;
     } catch (error) {
       // Roll back the optimistic update on failure
       set({
@@ -3685,6 +3758,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       useThreadStore
         .getState()
         .setThreadStatusLocal(threadId, previousState.status);
+      return false;
     }
   },
   hydrateActionOutput: async (messageId, actionId) => {

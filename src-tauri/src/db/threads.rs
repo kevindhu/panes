@@ -442,6 +442,26 @@ pub fn reconcile_runtime_state(db: &Database) -> anyhow::Result<RuntimeRecoveryR
         .transaction()
         .context("failed to start runtime recovery transaction")?;
 
+    // Live approval request IDs belong to the engine process that issued them.
+    // Once that runtime is gone, a pending request on a terminalized
+    // assistant message cannot be answered and must be recorded as canceled.
+    tx.execute(
+        "UPDATE approvals
+         SET status = 'answered',
+             decision = COALESCE(decision, 'cancel'),
+             answered_at = COALESCE(answered_at, datetime('now'))
+         WHERE status = 'pending'
+           AND EXISTS (
+             SELECT 1
+             FROM messages m
+             WHERE m.id = approvals.message_id
+               AND m.role = 'assistant'
+               AND m.status IN ('streaming', 'completed', 'error', 'interrupted')
+           )",
+        [],
+    )
+    .context("failed to cancel stale approvals during runtime recovery")?;
+
     let messages_marked_interrupted = tx
         .execute(
             "UPDATE messages
@@ -723,6 +743,87 @@ mod tests {
         assert_eq!(
             derive_thread_status_for_recovery(&conn, &thread.id).unwrap(),
             ThreadStatusDto::Completed
+        );
+    }
+
+    #[test]
+    fn runtime_recovery_cancels_approval_before_interrupting_its_message() {
+        let db = test_db();
+        let thread = test_thread(&db, "Questionnaire recovery");
+        let assistant = messages::insert_assistant_placeholder(
+            &db,
+            &thread.id,
+            Some("codex"),
+            Some("gpt-5.3-codex"),
+            Some("low"),
+        )
+        .unwrap();
+        let approval_id = "questionnaire-pending-at-restart";
+        let details = json!({
+            "_serverMethod": "item/tool/requestUserInput",
+            "questions": [{ "id": "scope", "question": "Which scope?" }],
+        });
+        let blocks = json!([{
+            "type": "approval",
+            "approvalId": approval_id,
+            "actionType": "other",
+            "summary": "Codex requested input",
+            "details": details,
+            "status": "pending",
+        }]);
+        messages::update_assistant_blocks_json(
+            &db,
+            &assistant.id,
+            &blocks.to_string(),
+            crate::models::MessageStatusDto::Streaming,
+            None,
+        )
+        .unwrap();
+        actions::insert_approval(
+            &db,
+            approval_id,
+            &thread.id,
+            &assistant.id,
+            &ActionType::Other,
+            "Codex requested input",
+            &details,
+        )
+        .unwrap();
+        update_thread_status(&db, &thread.id, ThreadStatusDto::AwaitingApproval).unwrap();
+
+        let report = reconcile_runtime_state(&db).unwrap();
+
+        assert_eq!(report.messages_marked_interrupted, 1);
+        let conn = db.connect().unwrap();
+        let approval: (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, decision FROM approvals WHERE id = ?1",
+                params![approval_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            approval,
+            ("answered".to_string(), Some("cancel".to_string()))
+        );
+        drop(conn);
+
+        let recovered = messages::get_thread_messages(&db, &thread.id).unwrap();
+        assert_eq!(
+            recovered[0].status,
+            crate::models::MessageStatusDto::Interrupted
+        );
+        let approval_block = recovered[0]
+            .blocks
+            .as_ref()
+            .and_then(serde_json::Value::as_array)
+            .and_then(|items| items.first())
+            .unwrap();
+        assert_eq!(approval_block.get("status"), Some(&json!("answered")));
+        assert_eq!(approval_block.get("decision"), Some(&json!("cancel")));
+        assert_eq!(
+            get_thread(&db, &thread.id).unwrap().unwrap().status,
+            ThreadStatusDto::Idle
         );
     }
 

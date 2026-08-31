@@ -1225,11 +1225,7 @@ function ToolInputApprovalCard({
 
   const answers = extractApprovalAnswerMap(block.responseData);
   const isAnswered = block.status === "answered";
-  const hasAnswers = Boolean(
-    isAnswered &&
-    answers &&
-    questions.some((question) => extractAnswerText(answers[question.id] ?? answers[question.question])),
-  );
+  const wasCanceled = isAnswered && block.decision === "cancel";
   const [expanded, setExpanded] = useState(false);
   const toggleExpanded = useCallback(() => setExpanded((v) => !v), []);
 
@@ -1237,7 +1233,7 @@ function ToolInputApprovalCard({
     <div>
       <div
         className="msg-block-header"
-        {...(hasAnswers ? {
+        {...(isAnswered ? {
           role: "button" as const,
           tabIndex: 0,
           "aria-expanded": expanded,
@@ -1245,24 +1241,27 @@ function ToolInputApprovalCard({
           onKeyDown: (e: React.KeyboardEvent) => handleToggleKeyDown(e, toggleExpanded),
         } : { style: { cursor: "default" } })}
       >
-        {hasAnswers && (
+        {isAnswered && (
           <ChevronRight size={11} className={`msg-block-chevron${expanded ? " msg-block-chevron-open" : ""}`} />
         )}
         <MessageSquare size={12} style={{ color: isPending ? "var(--info)" : "var(--text-3)", flexShrink: 0, opacity: 0.7 }} />
         <span style={{ fontSize: 11.5, color: "var(--text-2)", flex: 1 }}>
           {isPending
             ? t("messageBlocks.approval.pendingQuestions", { count: questions.length })
-            : t("messageBlocks.approval.answeredQuestions", { count: questions.length })}
+            : wasCanceled
+              ? t("messageBlocks.approval.unsubmittedQuestions", { count: questions.length })
+              : t("messageBlocks.approval.answeredQuestions", { count: questions.length })}
         </span>
       </div>
-      {hasAnswers && expanded && (
+      {isAnswered && expanded && (
         <div className="tool-input-qa-body">
           {questions.map((q) => {
             const text = extractAnswerText(answers?.[q.id] ?? answers?.[q.question]);
-            if (!text) return null;
             return (
               <div key={q.id} className="tool-input-qa-row">
-                {q.question} → <strong>{q.secret ? "••••••" : text}</strong>
+                {q.question}{text
+                  ? <> → <strong>{q.secret ? "••••••" : text}</strong></>
+                  : <> — {t("messageBlocks.approval.answerNotSubmitted")}</>}
               </div>
             );
           })}

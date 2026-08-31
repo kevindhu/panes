@@ -10,9 +10,43 @@ import {
 
 interface Props {
   details: Record<string, unknown>;
-  onSubmit: (response: ApprovalResponse) => void | Promise<void>;
+  onSubmit: (response: ApprovalResponse) => boolean | void | Promise<boolean | void>;
   onStop?: () => void | Promise<void>;
   submitLabel?: string;
+  draftKey?: string;
+}
+
+interface QuestionnaireDraft {
+  signature: string;
+  selectedByQuestion: ToolInputSelections;
+  customByQuestion: Record<string, string>;
+  currentQuestionIndex: number;
+}
+
+const MAX_LIVE_QUESTIONNAIRE_DRAFTS = 64;
+const liveQuestionnaireDrafts = new Map<string, QuestionnaireDraft>();
+
+function readLiveQuestionnaireDraft(
+  draftKey: string | undefined,
+  signature: string,
+): QuestionnaireDraft | null {
+  if (!draftKey) return null;
+  const draft = liveQuestionnaireDrafts.get(draftKey);
+  return draft?.signature === signature ? draft : null;
+}
+
+function writeLiveQuestionnaireDraft(draftKey: string, draft: QuestionnaireDraft): void {
+  liveQuestionnaireDrafts.delete(draftKey);
+  liveQuestionnaireDrafts.set(draftKey, draft);
+  while (liveQuestionnaireDrafts.size > MAX_LIVE_QUESTIONNAIRE_DRAFTS) {
+    const oldestKey = liveQuestionnaireDrafts.keys().next().value as string | undefined;
+    if (!oldestKey) break;
+    liveQuestionnaireDrafts.delete(oldestKey);
+  }
+}
+
+export function resetLiveQuestionnaireDraftsForTests(): void {
+  liveQuestionnaireDrafts.clear();
 }
 
 function questionSignature(questions: ReturnType<typeof parseToolInputQuestions>): string {
@@ -35,22 +69,39 @@ export function ToolInputQuestionnaire({
   onSubmit,
   onStop,
   submitLabel = "Send answers",
+  draftKey,
 }: Props) {
   const questions = useMemo(() => parseToolInputQuestions(details), [details]);
   const signature = useMemo(() => questionSignature(questions), [questions]);
+  const initialDraft = readLiveQuestionnaireDraft(draftKey, signature);
   const [selectedByQuestion, setSelectedByQuestion] = useState<ToolInputSelections>(() =>
-    defaultToolInputSelections(questions),
+    initialDraft?.selectedByQuestion ?? defaultToolInputSelections(questions),
   );
-  const [customByQuestion, setCustomByQuestion] = useState<Record<string, string>>({});
-  const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+  const [customByQuestion, setCustomByQuestion] = useState<Record<string, string>>(
+    () => initialDraft?.customByQuestion ?? {},
+  );
+  const [currentQuestionIndex, setCurrentQuestionIndex] = useState(
+    () => initialDraft?.currentQuestionIndex ?? 0,
+  );
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
-    setSelectedByQuestion(defaultToolInputSelections(questions));
-    setCustomByQuestion({});
-    setCurrentQuestionIndex(0);
+    const draft = readLiveQuestionnaireDraft(draftKey, signature);
+    setSelectedByQuestion(draft?.selectedByQuestion ?? defaultToolInputSelections(questions));
+    setCustomByQuestion(draft?.customByQuestion ?? {});
+    setCurrentQuestionIndex(draft?.currentQuestionIndex ?? 0);
     setSubmitting(false);
-  }, [signature]); // eslint-disable-line react-hooks/exhaustive-deps -- signature is the stable request identity
+  }, [draftKey, signature]); // eslint-disable-line react-hooks/exhaustive-deps -- signature is the stable request identity
+
+  useEffect(() => {
+    if (!draftKey) return;
+    writeLiveQuestionnaireDraft(draftKey, {
+      signature,
+      selectedByQuestion,
+      customByQuestion,
+      currentQuestionIndex,
+    });
+  }, [currentQuestionIndex, customByQuestion, draftKey, selectedByQuestion, signature]);
 
   if (questions.length === 0) return null;
 
@@ -84,13 +135,24 @@ export function ToolInputQuestionnaire({
 
     setSubmitting(true);
     try {
-      await onSubmit(buildToolInputResponseFromSelections(
+      const accepted = await onSubmit(buildToolInputResponseFromSelections(
         questions,
         selectedByQuestion,
         customByQuestion,
       ));
+      if (accepted !== false && draftKey) {
+        liveQuestionnaireDrafts.delete(draftKey);
+      }
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  async function stop() {
+    try {
+      await onStop?.();
+    } finally {
+      if (draftKey) liveQuestionnaireDrafts.delete(draftKey);
     }
   }
 
@@ -170,7 +232,7 @@ export function ToolInputQuestionnaire({
       <div className="codex-questionnaire-actions">
         <div>
           {onStop && (
-            <button type="button" className="secondary danger" disabled={submitting} onClick={() => void onStop()}>
+            <button type="button" className="secondary danger" disabled={submitting} onClick={() => void stop()}>
               Stop turn
             </button>
           )}

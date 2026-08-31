@@ -21,6 +21,7 @@ import {
   type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
+  type ReactNode,
 } from "react";
 import { createPortal, flushSync } from "react-dom";
 import { canForkCodexMessageHistory } from "../../lib/codexThreadCapabilities";
@@ -35,7 +36,7 @@ import {
 } from "../../stores/threadStore";
 import { toast } from "../../stores/toastStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
-import type { Thread } from "../../types";
+import type { Thread, Workspace } from "../../types";
 
 const EMPTY_THREADS: Thread[] = [];
 const SIDEBAR_WIDTH_KEY = "panes:sidebar-width";
@@ -56,6 +57,11 @@ type SidebarView = "workspaces" | "archived";
 
 interface SessionMenuState {
   thread: Thread;
+  anchor: HTMLButtonElement;
+}
+
+interface WorkspaceMenuState {
+  workspace: Workspace;
   anchor: HTMLButtonElement;
 }
 
@@ -195,19 +201,17 @@ function SessionRenameInput({
   );
 }
 
-function SessionActionsMenu({
-  state,
-  forkUnavailableReason,
-  onRename,
-  onFork,
-  onArchive,
+function AnchoredActionsMenu({
+  anchor,
+  ariaLabel,
+  className,
+  children,
   onClose,
 }: {
-  state: SessionMenuState;
-  forkUnavailableReason: string | null;
-  onRename: () => void;
-  onFork: () => void;
-  onArchive: () => void;
+  anchor: HTMLButtonElement;
+  ariaLabel: string;
+  className?: string;
+  children: ReactNode;
   onClose: () => void;
 }) {
   const menuRef = useRef<HTMLDivElement>(null);
@@ -218,12 +222,12 @@ function SessionActionsMenu({
 
   const placeMenu = useCallback(() => {
     const menu = menuRef.current;
-    if (!menu || !state.anchor.isConnected) {
+    if (!menu || !anchor.isConnected) {
       onClose();
       return;
     }
 
-    const anchorRect = state.anchor.getBoundingClientRect();
+    const anchorRect = anchor.getBoundingClientRect();
     const menuRect = menu.getBoundingClientRect();
     const maxLeft = Math.max(
       MENU_EDGE_GAP,
@@ -238,7 +242,7 @@ function SessionActionsMenu({
       ? belowTop
       : Math.max(MENU_EDGE_GAP, anchorRect.top - menuRect.height - MENU_ANCHOR_GAP);
     setPosition({ left, top });
-  }, [onClose, state.anchor]);
+  }, [anchor, onClose]);
 
   useLayoutEffect(() => {
     placeMenu();
@@ -258,12 +262,12 @@ function SessionActionsMenu({
     const closeFromOutside = (event: PointerEvent) => {
       const target = event.target;
       if (!(target instanceof Node)) return;
-      if (menuRef.current?.contains(target) || state.anchor.contains(target)) return;
+      if (menuRef.current?.contains(target) || anchor.contains(target)) return;
       onClose();
     };
     document.addEventListener("pointerdown", closeFromOutside, true);
     return () => document.removeEventListener("pointerdown", closeFromOutside, true);
-  }, [onClose, state.anchor]);
+  }, [anchor, onClose]);
 
   function focusRelativeItem(direction: 1 | -1) {
     const items = Array.from(
@@ -283,7 +287,7 @@ function SessionActionsMenu({
     if (event.key === "Escape") {
       event.preventDefault();
       onClose();
-      state.anchor.focus();
+      anchor.focus();
       return;
     }
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -316,11 +320,38 @@ function SessionActionsMenu({
   return createPortal(
     <div
       ref={menuRef}
-      className="codex-session-actions-menu"
+      className={`codex-session-actions-menu${className ? ` ${className}` : ""}`}
       role="menu"
-      aria-label={`Actions for ${state.thread.title || "Untitled"}`}
+      aria-label={ariaLabel}
       style={position}
       onKeyDown={handleKeyDown}
+    >
+      {children}
+    </div>,
+    document.body,
+  );
+}
+
+function SessionActionsMenu({
+  state,
+  forkUnavailableReason,
+  onRename,
+  onFork,
+  onArchive,
+  onClose,
+}: {
+  state: SessionMenuState;
+  forkUnavailableReason: string | null;
+  onRename: () => void;
+  onFork: () => void;
+  onArchive: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <AnchoredActionsMenu
+      anchor={state.anchor}
+      ariaLabel={`Actions for ${state.thread.title || "Untitled"}`}
+      onClose={onClose}
     >
       <button type="button" role="menuitem" data-shortcut="r" onClick={onRename}>
         <span>Rename</span><kbd>R</kbd>
@@ -339,6 +370,106 @@ function SessionActionsMenu({
       <button type="button" role="menuitem" data-shortcut="a" onClick={onArchive}>
         <span>Archive</span><kbd>A</kbd>
       </button>
+    </AnchoredActionsMenu>
+  );
+}
+
+function WorkspaceActionsMenu({
+  state,
+  onRemove,
+  onClose,
+}: {
+  state: WorkspaceMenuState;
+  onRemove: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <AnchoredActionsMenu
+      anchor={state.anchor}
+      ariaLabel={`Actions for ${state.workspace.name}`}
+      className="codex-workspace-actions-menu"
+      onClose={onClose}
+    >
+      <button type="button" role="menuitem" onClick={onRemove}>
+        <span>Remove workspace</span>
+      </button>
+    </AnchoredActionsMenu>
+  );
+}
+
+function RemoveWorkspaceDialog({
+  workspace,
+  busy,
+  onConfirm,
+  onCancel,
+}: {
+  workspace: Workspace;
+  busy: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const cancelRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    cancelRef.current?.focus();
+  }, []);
+
+  function handleKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (event.key === "Escape" && !busy) {
+      event.preventDefault();
+      onCancel();
+      return;
+    }
+    if (event.key !== "Tab") return;
+
+    const buttons = Array.from(
+      event.currentTarget.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"),
+    );
+    if (!buttons.length) return;
+    const currentIndex = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    const nextIndex = event.shiftKey
+      ? (currentIndex <= 0 ? buttons.length - 1 : currentIndex - 1)
+      : (currentIndex === buttons.length - 1 ? 0 : currentIndex + 1);
+    event.preventDefault();
+    buttons[nextIndex]?.focus();
+  }
+
+  return createPortal(
+    <div
+      className="codex-workspace-remove-overlay"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget && !busy) onCancel();
+      }}
+    >
+      <div
+        className="codex-workspace-remove-dialog"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="codex-remove-workspace-title"
+        aria-describedby="codex-remove-workspace-description"
+        onKeyDown={handleKeyDown}
+      >
+        <h2 id="codex-remove-workspace-title">Remove {workspace.name}?</h2>
+        <p id="codex-remove-workspace-description">
+          This only removes the workspace from the sidebar. Its files and conversations stay
+          untouched, and opening the folder again restores it.
+        </p>
+        <div className="codex-workspace-remove-actions">
+          <button ref={cancelRef} type="button" disabled={busy} onClick={onCancel}>
+            Cancel
+          </button>
+          <button
+            className="danger"
+            type="button"
+            disabled={busy}
+            onClick={onConfirm}
+          >
+            {busy ? (
+              <><LoaderCircle size={13} className="codex-spin" /> Removing...</>
+            ) : "Remove workspace"}
+          </button>
+        </div>
+      </div>
     </div>,
     document.body,
   );
@@ -444,6 +575,9 @@ function SessionRow({
 export function CodexSidebar() {
   const [sidebarView, setSidebarView] = useState<SidebarView>("workspaces");
   const [sessionMenu, setSessionMenu] = useState<SessionMenuState | null>(null);
+  const [workspaceMenu, setWorkspaceMenu] = useState<WorkspaceMenuState | null>(null);
+  const [workspaceRemovalPrompt, setWorkspaceRemovalPrompt] = useState<Workspace | null>(null);
+  const [removingWorkspaceId, setRemovingWorkspaceId] = useState<string | null>(null);
   const [editingThreadId, setEditingThreadId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [busyThreadId, setBusyThreadId] = useState<string | null>(null);
@@ -480,6 +614,7 @@ export function CodexSidebar() {
   const archivedWorkspaces = useWorkspaceStore((state) => state.archivedWorkspaces);
   const activeWorkspaceId = useWorkspaceStore((state) => state.activeWorkspaceId);
   const openWorkspace = useWorkspaceStore((state) => state.openWorkspace);
+  const removeWorkspace = useWorkspaceStore((state) => state.removeWorkspace);
   const restoreWorkspace = useWorkspaceStore((state) => state.restoreWorkspace);
   const reorderWorkspaces = useWorkspaceStore((state) => state.reorderWorkspaces);
   const threadsByWorkspace = useThreadStore((state) => state.threadsByWorkspace);
@@ -698,21 +833,42 @@ export function CodexSidebar() {
 
   async function chooseWorkspace() {
     if (openingWorkspace) return;
+    setWorkspaceMenu(null);
     setOpeningWorkspace(true);
     try {
       const path = await open({ directory: true, multiple: false, title: "Open a workspace" });
       if (typeof path !== "string") return;
+      const archivedWorkspaceIds = new Set(
+        useWorkspaceStore.getState().archivedWorkspaces.map((workspace) => workspace.id),
+      );
       const workspace = await openWorkspace(path, 0);
       if (!workspace) {
         toast.error(useWorkspaceStore.getState().error ?? "Could not open the workspace.");
         return;
       }
       expandWorkspace(workspace.id);
+      setSidebarView("workspaces");
+
+      if (archivedWorkspaceIds.has(workspace.id)) {
+        await useThreadStore.getState().refreshThreads(workspace.id);
+        const threadState = useThreadStore.getState();
+        const restoredThreads = orderedThreads(
+          threadState.threadsByWorkspace[workspace.id] ?? EMPTY_THREADS,
+        );
+        await activateThreadContext(restoredThreads[0] ?? null);
+        if (threadState.error) {
+          toast.error(
+            `Workspace restored, but its conversations could not be loaded: ${threadState.error}`,
+          );
+        } else {
+          toast.success(`Restored "${workspace.name}".`);
+        }
+        return;
+      }
+
       const threadId = await createAndActivateWorkspaceThread(workspace.id);
       if (!threadId) {
         toast.error(useThreadStore.getState().error ?? "Could not create a conversation.");
-      } else {
-        setSidebarView("workspaces");
       }
     } catch (error) {
       toast.error(`Could not open the workspace: ${errorMessage(error, "Unknown error")}`);
@@ -738,13 +894,61 @@ export function CodexSidebar() {
   async function selectThread(thread: Thread) {
     expandWorkspace(thread.workspaceId);
     setSessionMenu(null);
+    setWorkspaceMenu(null);
     await activateThreadContext(thread);
   }
 
   function openSessionMenu(thread: Thread, anchor: HTMLButtonElement) {
+    setWorkspaceMenu(null);
     setEditingThreadId(null);
     setRenameValue("");
     setSessionMenu((current) => current?.thread.id === thread.id ? null : { thread, anchor });
+  }
+
+  function openWorkspaceMenu(workspace: Workspace, anchor: HTMLButtonElement) {
+    setSessionMenu(null);
+    setEditingThreadId(null);
+    setRenameValue("");
+    setWorkspaceMenu((current) => (
+      current?.workspace.id === workspace.id ? null : { workspace, anchor }
+    ));
+  }
+
+  function requestWorkspaceRemoval(workspace: Workspace) {
+    setWorkspaceMenu(null);
+    setWorkspaceRemovalPrompt(workspace);
+  }
+
+  async function confirmWorkspaceRemoval(workspace: Workspace) {
+    if (removingWorkspaceId) return;
+    setRemovingWorkspaceId(workspace.id);
+    const wasActive = activeWorkspaceId === workspace.id;
+    try {
+      await removeWorkspace(workspace.id);
+      const workspaceState = useWorkspaceStore.getState();
+      if (workspaceState.workspaces.some((item) => item.id === workspace.id)) {
+        toast.error(workspaceState.error ?? "Could not remove the workspace.");
+        return;
+      }
+
+      if (wasActive) {
+        const nextWorkspaceId = workspaceState.activeWorkspaceId;
+        const nextThread = nextWorkspaceId
+          ? orderedThreads(
+            useThreadStore.getState().threadsByWorkspace[nextWorkspaceId] ?? EMPTY_THREADS,
+          )[0] ?? null
+          : null;
+        if (nextThread) expandWorkspace(nextThread.workspaceId);
+        await activateThreadContext(nextThread);
+      }
+
+      setWorkspaceRemovalPrompt(null);
+      toast.success("Workspace removed from the sidebar. Open its folder again to restore it.");
+    } catch (error) {
+      toast.error(`Could not remove the workspace: ${errorMessage(error, "Unknown error")}`);
+    } finally {
+      setRemovingWorkspaceId(null);
+    }
   }
 
   function beginRename(thread: Thread) {
@@ -820,6 +1024,7 @@ export function CodexSidebar() {
 
   async function showArchivedSessions() {
     setSessionMenu(null);
+    setWorkspaceMenu(null);
     setEditingThreadId(null);
     setSidebarView("archived");
     await loadArchivedSessions();
@@ -897,7 +1102,7 @@ export function CodexSidebar() {
       reorderingWorkspaces
       || event.button !== 0
       || event.isPrimary === false
-      || pointerTarget?.closest(".codex-workspace-add")
+      || pointerTarget?.closest(".codex-workspace-add, .codex-workspace-menu-button")
     ) {
       return;
     }
@@ -1145,6 +1350,7 @@ export function CodexSidebar() {
               const workspaceClassName = [
                 "codex-workspace-group",
                 activeWorkspaceId === workspace.id ? "active-workspace" : "",
+                workspaceMenu?.workspace.id === workspace.id ? "menu-open" : "",
                 dragPlaceholder ? "dragging drag-placeholder" : "",
               ].filter(Boolean).join(" ");
               const sessionListId = `workspace-sessions-${workspace.id}`;
@@ -1216,6 +1422,19 @@ export function CodexSidebar() {
                       {creatingWorkspaceId === workspace.id
                         ? <LoaderCircle size={14} className="codex-spin" />
                         : <Plus size={15} />}
+                    </button>
+                    <button
+                      className="codex-workspace-menu-button"
+                      type="button"
+                      draggable={false}
+                      disabled={removingWorkspaceId !== null || reorderingWorkspaces}
+                      title={`Workspace actions for ${workspace.name}`}
+                      aria-label={`Workspace actions for ${workspace.name}`}
+                      aria-haspopup="menu"
+                      aria-expanded={workspaceMenu?.workspace.id === workspace.id}
+                      onClick={(event) => openWorkspaceMenu(workspace, event.currentTarget)}
+                    >
+                      <MoreVertical size={14} />
                     </button>
                   </div>
                   <div
@@ -1345,6 +1564,25 @@ export function CodexSidebar() {
           onFork={() => void forkThread(sessionMenu.thread)}
           onArchive={() => void archiveThread(sessionMenu.thread)}
           onClose={() => setSessionMenu(null)}
+        />
+      )}
+
+      {workspaceMenu && (
+        <WorkspaceActionsMenu
+          state={workspaceMenu}
+          onRemove={() => requestWorkspaceRemoval(workspaceMenu.workspace)}
+          onClose={() => setWorkspaceMenu(null)}
+        />
+      )}
+
+      {workspaceRemovalPrompt && (
+        <RemoveWorkspaceDialog
+          workspace={workspaceRemovalPrompt}
+          busy={removingWorkspaceId === workspaceRemovalPrompt.id}
+          onConfirm={() => void confirmWorkspaceRemoval(workspaceRemovalPrompt)}
+          onCancel={() => {
+            if (!removingWorkspaceId) setWorkspaceRemovalPrompt(null);
+          }}
         />
       )}
 

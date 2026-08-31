@@ -55,7 +55,8 @@ button { color: inherit; }
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--border) 72%, transparent);
 }
 .codex-workspace-group.drag-placeholder .codex-workspace-toggle,
-.codex-workspace-group.drag-placeholder .codex-workspace-add { color: var(--text-3); }
+.codex-workspace-group.drag-placeholder .codex-workspace-add,
+.codex-workspace-group.drag-placeholder .codex-workspace-menu-button { color: var(--text-3); }
 .codex-workspace-drag-overlay {
   position: fixed; z-index: 1600; top: 0; left: 0; height: 40px; box-sizing: border-box;
   border: 1px solid var(--border); border-radius: 10px; padding: 0 13px;
@@ -80,6 +81,7 @@ button { color: inherit; }
 .codex-workspace-group.active-workspace .codex-workspace-toggle { color: var(--text-1); }
 .codex-workspace-toggle:focus-visible,
 .codex-workspace-add:focus-visible,
+.codex-workspace-menu-button:focus-visible,
 .codex-session-main:focus-visible,
 .codex-session-menu-button:focus-visible,
 .codex-archived-session-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
@@ -89,6 +91,15 @@ button { color: inherit; }
 }
 .codex-workspace-add:hover:not(:disabled) { background: var(--surface-hover); color: var(--text-1); opacity: 1; }
 .codex-workspace-add:disabled { opacity: .42; }
+.codex-workspace-menu-button {
+  width: 25px; height: 28px; flex: 0 0 25px; border: 0; border-radius: 6px; padding: 0; background: transparent;
+  display: grid; place-items: center; color: var(--text-2); opacity: 0; transition: opacity var(--duration-fast) var(--ease-out);
+}
+.codex-workspace-header:hover .codex-workspace-menu-button:not(:disabled),
+.codex-workspace-header:focus-within .codex-workspace-menu-button:not(:disabled),
+.codex-workspace-group.menu-open .codex-workspace-menu-button { opacity: .76; }
+.codex-workspace-menu-button:hover:not(:disabled) { background: var(--surface-hover); color: var(--text-1); opacity: 1 !important; }
+.codex-workspace-menu-button:disabled { opacity: 0; }
 .codex-workspace-notification {
   width: 7px; height: 7px; flex: 0 0 7px; margin: 0 7px; border-radius: 50%;
   background: var(--success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 14%, transparent);
@@ -163,6 +174,28 @@ button { color: inherit; }
 .codex-session-actions-menu button:disabled { color: var(--text-3); opacity: .48; }
 .codex-session-actions-menu kbd { color: var(--text-3); font: inherit; font-size: 10.5px; }
 .codex-session-menu-separator { height: 1px; margin: 4px 5px; background: var(--border); }
+.codex-workspace-actions-menu { width: 160px; }
+.codex-workspace-remove-overlay {
+  position: fixed; inset: 0; z-index: 1500; padding: 18px; display: grid; place-items: center;
+  background: rgba(0, 0, 0, .4); backdrop-filter: blur(2px);
+}
+.codex-workspace-remove-dialog {
+  width: min(390px, 100%); border: 1px solid var(--border-strong); border-radius: 11px; padding: 17px;
+  background: var(--surface-raised); color: var(--text-1); box-shadow: var(--shadow-lg);
+}
+.codex-workspace-remove-dialog h2 { margin: 0 0 7px; font-size: 14px; font-weight: 620; letter-spacing: -.01em; }
+.codex-workspace-remove-dialog p { margin: 0; color: var(--text-2); font-size: 11.5px; line-height: 1.55; }
+.codex-workspace-remove-actions { margin-top: 17px; display: flex; justify-content: flex-end; gap: 7px; }
+.codex-workspace-remove-actions button {
+  min-width: 72px; height: 31px; border: 1px solid var(--border); border-radius: 7px; padding: 0 11px;
+  background: transparent; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  color: var(--text-1); font-size: 11.5px;
+}
+.codex-workspace-remove-actions button:hover:not(:disabled) { background: var(--surface-hover); }
+.codex-workspace-remove-actions button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.codex-workspace-remove-actions button.danger { border-color: color-mix(in srgb, var(--danger) 52%, var(--border)); background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); }
+.codex-workspace-remove-actions button.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--danger) 18%, transparent); }
+.codex-workspace-remove-actions button:disabled { opacity: .55; }
 .codex-sidebar-empty,
 .codex-sidebar-loading { padding: 14px 9px; color: var(--text-3); font-size: 11px; line-height: 1.5; }
 .codex-sidebar-loading { display: flex; align-items: center; gap: 7px; }

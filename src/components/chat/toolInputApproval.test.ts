@@ -119,4 +119,14 @@ describe("Codex request-user-input helpers", () => {
       .toBe("approval-pending");
     expect(findLatestPendingToolInputApproval([answered, malformed])).toBeNull();
   });
+
+  it("recognizes the legacy tool/request_user_input app-server alias", () => {
+    const alias = assistantMessage("alias", {
+      ...nativeDetails,
+      _serverMethod: "tool/request_user_input",
+    });
+
+    expect(findLatestPendingToolInputApproval([alias])?.approvalId)
+      .toBe("approval-alias");
+  });
 });

@@ -708,8 +708,8 @@ export function CodexChat() {
   }
 
   async function submitPendingToolInput(response: ApprovalResponse) {
-    if (!pendingToolInputApproval) return;
-    await respondApproval(pendingToolInputApproval.approvalId, response);
+    if (!pendingToolInputApproval) return false;
+    return respondApproval(pendingToolInputApproval.approvalId, response);
   }
 
   async function executePlanImplementation() {
@@ -1001,9 +1001,13 @@ export function CodexChat() {
           )}
           {pendingToolInputApproval ? (
             <ToolInputQuestionnaire
+              key={pendingToolInputApproval.approvalId}
               details={pendingToolInputApproval.details}
               onSubmit={submitPendingToolInput}
               onStop={cancel}
+              draftKey={planMode
+                ? `${activeThreadId}:${pendingToolInputApproval.approvalId}`
+                : undefined}
             />
           ) : showPlanImplementationPrompt ? (
             <ToolInputQuestionnaire

@@ -702,6 +702,124 @@ describe("chatStore send", () => {
     expect(useChatStore.getState().messages[0]?.id).toBe("message-2");
   });
 
+  it("captures a plan-mode questionnaire while initial history is still loading", async () => {
+    vi.useFakeTimers();
+
+    const history = deferred<{ messages: Message[]; nextCursor: null }>();
+    let streamHandler: ((event: StreamEvent) => void) | null = null;
+    mockIpc.getThreadMessagesWindow.mockReturnValueOnce(history.promise);
+    mockListenThreadEvents.mockImplementationOnce(async (_threadId, onEvent) => {
+      streamHandler = onEvent;
+      return () => {};
+    });
+    useChatStore.setState({ threadId: null, unlisten: undefined });
+
+    const binding = useChatStore.getState().setActiveThread("thread-1");
+    await Promise.resolve();
+
+    expect(streamHandler).not.toBeNull();
+    expect(mockListenThreadEvents.mock.invocationCallOrder[0])
+      .toBeLessThan(mockIpc.getThreadMessagesWindow.mock.invocationCallOrder[0]);
+    streamHandler!({
+      type: "ApprovalRequested",
+      approval_id: "question-during-bind",
+      action_type: "other",
+      summary: "Which scope?",
+      details: {
+        _serverMethod: "item/tool/requestUserInput",
+        questions: [{ id: "scope", question: "Which scope?", options: null }],
+      },
+    });
+
+    history.resolve({
+      messages: [{
+        id: "assistant-during-bind",
+        threadId: "thread-1",
+        role: "assistant",
+        status: "streaming",
+        schemaVersion: 1,
+        blocks: [],
+        createdAt: new Date().toISOString(),
+      }],
+      nextCursor: null,
+    });
+    await binding;
+    await vi.advanceTimersByTimeAsync(20);
+
+    expect(useChatStore.getState().messages[0]?.blocks).toEqual([
+      expect.objectContaining({
+        type: "approval",
+        approvalId: "question-during-bind",
+        status: "pending",
+        details: expect.objectContaining({
+          _serverMethod: "item/tool/requestUserInput",
+        }),
+      }),
+    ]);
+    expect(useChatStore.getState()).toMatchObject({
+      status: "awaiting_approval",
+      streaming: true,
+    });
+
+    vi.useRealTimers();
+  });
+
+  it("preserves a background plan-mode questionnaire when switching back", async () => {
+    const handlers = new Map<string, (event: StreamEvent) => void>();
+    const threadOne = makeThread("thread-1", "streaming");
+    const threadTwo = makeThread("thread-2", "completed");
+    seedThreads(threadOne, threadTwo);
+    mockListenThreadEvents.mockImplementation(async (threadId, onEvent) => {
+      handlers.set(threadId, onEvent);
+      return () => {};
+    });
+    useChatStore.setState({
+      threadId: "thread-1",
+      messages: [{
+        id: "assistant-background-question",
+        threadId: "thread-1",
+        role: "assistant",
+        status: "streaming",
+        schemaVersion: 1,
+        blocks: [],
+        createdAt: new Date().toISOString(),
+      }],
+      status: "streaming",
+      streaming: true,
+      unlisten: vi.fn(),
+    });
+
+    await useChatStore.getState().setActiveThread("thread-2");
+    handlers.get("thread-1")?.({
+      type: "ApprovalRequested",
+      approval_id: "question-in-background",
+      action_type: "other",
+      summary: "Choose a target",
+      details: {
+        _serverMethod: "item/tool/requestUserInput",
+        questions: [{ id: "target", question: "Choose a target", options: null }],
+      },
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    const approval = useChatStore.getState().messages
+      .flatMap((message) => message.blocks ?? [])
+      .find((block) => block.type === "approval");
+    expect(approval).toMatchObject({
+      type: "approval",
+      approvalId: "question-in-background",
+      status: "pending",
+      details: expect.objectContaining({
+        _serverMethod: "item/tool/requestUserInput",
+      }),
+    });
+    expect(useChatStore.getState()).toMatchObject({
+      status: "awaiting_approval",
+      streaming: true,
+    });
+  });
+
   it("routes streamed content to the matching optimistic assistant via clientTurnId", async () => {
     vi.useFakeTimers();
 

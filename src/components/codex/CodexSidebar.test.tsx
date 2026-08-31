@@ -15,7 +15,11 @@ const mocks = vi.hoisted(() => ({
   activateThreadContext: vi.fn(async (_thread: Thread | null) => {}),
   createAndActivateWorkspaceThread: vi.fn(async (_workspaceId: string) => "new-thread" as string | null),
   forkThread: vi.fn(async (_threadId: string) => null as Thread | null),
+  openDialog: vi.fn(async () => null as string | null),
+  openWorkspace: vi.fn(async (_path: string, _scanDepth?: number) => null as Workspace | null),
   refreshArchived: vi.fn(async (_workspaceIds: string[]) => {}),
+  refreshThreads: vi.fn(async (_workspaceId: string) => {}),
+  removeWorkspace: vi.fn(async (_workspaceId: string) => {}),
   removeThread: vi.fn(async (_threadId: string) => true),
   renameThread: vi.fn(async (_threadId: string, _title: string) => null as Thread | null),
   reorderWorkspaces: vi.fn(async (_workspaceIds: string[]) => {}),
@@ -25,6 +29,10 @@ const mocks = vi.hoisted(() => ({
     success: vi.fn(),
     error: vi.fn(),
   },
+}));
+
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: mocks.openDialog,
 }));
 
 vi.mock("../../lib/threadActivation", () => ({
@@ -86,6 +94,8 @@ function setWorkspaceState(
     reposLoading: false,
     loading: false,
     error: undefined,
+    openWorkspace: mocks.openWorkspace,
+    removeWorkspace: mocks.removeWorkspace,
     reorderWorkspaces: mocks.reorderWorkspaces,
     restoreWorkspace: mocks.restoreWorkspace,
   });
@@ -107,6 +117,7 @@ function setThreadState(
     error: undefined,
     forkCodexThread: mocks.forkThread,
     refreshAllArchivedThreads: mocks.refreshArchived,
+    refreshThreads: mocks.refreshThreads,
     removeThread: mocks.removeThread,
     renameThread: mocks.renameThread,
     restoreThread: mocks.restoreThread,
@@ -171,8 +182,25 @@ beforeEach(() => {
   vi.clearAllMocks();
 
   mocks.createAndActivateWorkspaceThread.mockResolvedValue("new-thread");
+  mocks.openDialog.mockResolvedValue(null);
+  mocks.openWorkspace.mockResolvedValue(null);
   mocks.refreshArchived.mockResolvedValue(undefined);
+  mocks.refreshThreads.mockResolvedValue(undefined);
   mocks.removeThread.mockResolvedValue(true);
+  mocks.removeWorkspace.mockImplementation(async (workspaceId) => {
+    const state = useWorkspaceStore.getState();
+    const removed = state.workspaces.find((workspace) => workspace.id === workspaceId);
+    const remaining = state.workspaces.filter((workspace) => workspace.id !== workspaceId);
+    useWorkspaceStore.setState({
+      workspaces: remaining,
+      archivedWorkspaces: removed
+        ? [removed, ...state.archivedWorkspaces.filter((workspace) => workspace.id !== workspaceId)]
+        : state.archivedWorkspaces,
+      activeWorkspaceId: state.activeWorkspaceId === workspaceId
+        ? remaining[0]?.id ?? null
+        : state.activeWorkspaceId,
+    });
+  });
   mocks.reorderWorkspaces.mockResolvedValue(undefined);
   mocks.restoreThread.mockResolvedValue(null);
   mocks.restoreWorkspace.mockImplementation(async (workspaceId) => {
@@ -448,6 +476,103 @@ describe("CodexSidebar", () => {
     expect(JSON.parse(
       localStorage.getItem("panes:sidebar-collapsed-workspace-ids") ?? "[]",
     )).toEqual([]);
+  });
+
+  it("removes a workspace through a minimal menu without removing its conversations", async () => {
+    const workspaceA = makeWorkspace("workspace-a", "Alpha");
+    const workspaceB = makeWorkspace("workspace-b", "Beta");
+    const active = makeThread({
+      id: "active-thread",
+      workspaceId: workspaceA.id,
+      title: "Alpha work",
+    });
+    const next = makeThread({
+      id: "next-thread",
+      workspaceId: workspaceB.id,
+      title: "Beta work",
+    });
+    setWorkspaceState([workspaceA, workspaceB], workspaceA.id);
+    setThreadState({
+      [workspaceA.id]: [active],
+      [workspaceB.id]: [next],
+    }, active.id);
+    await renderSidebar();
+
+    const actions = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Workspace actions for Alpha"]',
+    );
+    expect(actions?.classList.contains("codex-workspace-menu-button")).toBe(true);
+
+    await act(async () => actions?.click());
+    const menu = document.body.querySelector<HTMLElement>(
+      '[role="menu"][aria-label="Actions for Alpha"]',
+    );
+    expect(menu?.textContent?.trim()).toBe("Remove workspace");
+
+    await act(async () => buttonWithText(menu ?? document.body, "Remove workspace").click());
+    const dialog = document.body.querySelector<HTMLElement>('[role="alertdialog"]');
+    expect(dialog?.textContent).toContain("Remove Alpha?");
+    expect(dialog?.textContent).toContain("files and conversations stay untouched");
+
+    await act(async () => {
+      buttonWithText(dialog ?? document.body, "Remove workspace").click();
+      await Promise.resolve();
+    });
+
+    expect(mocks.removeWorkspace).toHaveBeenCalledWith(workspaceA.id);
+    expect(mocks.removeThread).not.toHaveBeenCalled();
+    expect(useThreadStore.getState().threadsByWorkspace[workspaceA.id]).toEqual([active]);
+    expect(useWorkspaceStore.getState().archivedWorkspaces).toContainEqual(workspaceA);
+    expect(container.textContent).not.toContain("Alpha work");
+    expect(mocks.activateThreadContext).toHaveBeenCalledWith(next);
+    expect(mocks.toast.success).toHaveBeenCalledWith(
+      "Workspace removed from the sidebar. Open its folder again to restore it.",
+    );
+  });
+
+  it("reopens a removed workspace with its existing conversations and no extra blank one", async () => {
+    const workspace = makeWorkspace("workspace-a", "Alpha");
+    const existing = makeThread({
+      id: "existing-thread",
+      workspaceId: workspace.id,
+      title: "Existing work",
+    });
+    setWorkspaceState([], null, [workspace]);
+    setThreadState({});
+    mocks.openDialog.mockResolvedValue(workspace.rootPath);
+    mocks.openWorkspace.mockImplementation(async () => {
+      useWorkspaceStore.setState({
+        workspaces: [workspace],
+        archivedWorkspaces: [],
+        activeWorkspaceId: workspace.id,
+      });
+      return workspace;
+    });
+    mocks.refreshThreads.mockImplementation(async (workspaceId) => {
+      const threadState = useThreadStore.getState();
+      useThreadStore.setState({
+        threads: [existing],
+        threadsByWorkspace: {
+          ...threadState.threadsByWorkspace,
+          [workspaceId]: [existing],
+        },
+        activeThreadId: existing.id,
+        error: undefined,
+      });
+    });
+    await renderSidebar();
+
+    await act(async () => {
+      buttonWithText(container, "Open workspace").click();
+      await Promise.resolve();
+    });
+
+    expect(mocks.openWorkspace).toHaveBeenCalledWith(workspace.rootPath, 0);
+    expect(mocks.refreshThreads).toHaveBeenCalledWith(workspace.id);
+    expect(mocks.createAndActivateWorkspaceThread).not.toHaveBeenCalled();
+    expect(mocks.activateThreadContext).toHaveBeenCalledWith(existing);
+    expect(container.textContent).toContain("Existing work");
+    expect(mocks.toast.success).toHaveBeenCalledWith('Restored "Alpha".');
   });
 
   it("exposes exactly Rename, Fork, and Archive and disables an unsafe full fork", async () => {

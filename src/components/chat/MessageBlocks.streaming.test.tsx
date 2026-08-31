@@ -250,6 +250,48 @@ describe("MessageBlocks streaming text", () => {
     expect(container.textContent).not.toContain("super-secret");
   });
 
+  it("keeps an interrupted questionnaire inspectable without calling it answered", async () => {
+    const blocks: ContentBlock[] = [{
+      type: "approval",
+      approvalId: "interrupted-input",
+      actionType: "other",
+      summary: "Codex requested input",
+      details: {
+        _serverMethod: "item/tool/requestUserInput",
+        questions: [{
+          id: "scope",
+          question: "Which scope should the plan cover?",
+          options: null,
+        }],
+      },
+      status: "answered",
+      decision: "cancel",
+    }];
+
+    await act(async () => {
+      root.render(
+        <MessageBlocks
+          blocks={blocks}
+          status="interrupted"
+          onApproval={vi.fn()}
+          onLoadActionOutput={vi.fn(async () => undefined)}
+        />,
+      );
+    });
+
+    expect(container.textContent).toContain("messageBlocks.approval.unsubmittedQuestions");
+    expect(container.textContent).not.toContain("messageBlocks.approval.answeredQuestions");
+    const header = container.querySelector('[role="button"]');
+    expect(header).not.toBeNull();
+
+    await act(async () => {
+      header?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(container.textContent).toContain("Which scope should the plan cover?");
+    expect(container.textContent).toContain("messageBlocks.approval.answerNotSubmitted");
+  });
+
   it("does not render a removed status notice from persisted blocks", async () => {
     const blocks: ContentBlock[] = [
       { type: "text", content: "This is only the user prompt" },
