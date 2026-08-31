@@ -16,6 +16,7 @@ import {
 } from "./localFileLinkPatterns";
 import { ipc } from "./codexIpc";
 import { useWorkspaceStore } from "../stores/workspaceStore";
+import { toast } from "../stores/toastStore";
 import type { Repo } from "../types";
 
 const EXTERNAL_PROTOCOLS = new Set(["http:", "https:", "mailto:", "tel:"]);
@@ -156,36 +157,44 @@ export function resolveLocalFileLinkPath(
 
 export async function navigateLinkTarget(rawTarget: string): Promise<LinkNavigationResult> {
   const targetKind = classifyLinkTarget(rawTarget);
-  if (targetKind === "external") {
-    await openExternal(rawTarget);
-    return "external";
-  }
+  try {
+    if (targetKind === "external") {
+      await openExternal(rawTarget);
+      return "external";
+    }
 
-  if (targetKind !== "local") {
-    return "ignored";
-  }
+    if (targetKind !== "local") {
+      return "ignored";
+    }
 
-  const workspaceState = useWorkspaceStore.getState();
-  const activeWorkspaceId = workspaceState.activeWorkspaceId;
-  const activeWorkspace = activeWorkspaceId
-    ? workspaceState.workspaces.find((workspace) => workspace.id === activeWorkspaceId) ?? null
-    : null;
-  const repos = activeWorkspaceId
-    ? workspaceState.repos.filter((repo) => repo.workspaceId === activeWorkspaceId)
-    : workspaceState.repos;
+    const workspaceState = useWorkspaceStore.getState();
+    const activeWorkspaceId = workspaceState.activeWorkspaceId;
+    const activeWorkspace = activeWorkspaceId
+      ? workspaceState.workspaces.find((workspace) => workspace.id === activeWorkspaceId) ?? null
+      : null;
+    const repos = activeWorkspaceId
+      ? workspaceState.repos.filter((repo) => repo.workspaceId === activeWorkspaceId)
+      : workspaceState.repos;
 
-  const localPath = resolveLocalFileLinkPath(rawTarget, {
-    workspaceRoot: activeWorkspace?.rootPath ?? null,
-    repos,
-    activeRepoId: workspaceState.activeRepoId,
-  });
+    const localPath = resolveLocalFileLinkPath(rawTarget, {
+      workspaceRoot: activeWorkspace?.rootPath ?? null,
+      repos,
+      activeRepoId: workspaceState.activeRepoId,
+    });
 
-  const absoluteTarget =
-    localPath ??
-    (parseLocalAbsolutePathTarget(rawTarget) ?? parseLocalUrlTarget(rawTarget))?.path;
-  if (absoluteTarget) {
-    await ipc.openPathWithDefaultApp(normalizeAbsolutePath(absoluteTarget));
-    return "system";
+    const absoluteTarget =
+      localPath ??
+      (parseLocalAbsolutePathTarget(rawTarget) ?? parseLocalUrlTarget(rawTarget))?.path;
+    if (absoluteTarget) {
+      await ipc.openPathWithDefaultApp(normalizeAbsolutePath(absoluteTarget));
+      return "system";
+    }
+  } catch {
+    toast.error(
+      targetKind === "local"
+        ? "That file or folder no longer exists."
+        : "Could not open link.",
+    );
   }
 
   return "ignored";

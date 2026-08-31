@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockOpenExternal = vi.hoisted(() => vi.fn());
 const mockOpenPathWithDefaultApp = vi.hoisted(() => vi.fn());
+const mockToastError = vi.hoisted(() => vi.fn());
 const mockWorkspaceState = vi.hoisted(() => ({
   activeWorkspaceId: "ws-1",
   activeRepoId: "repo-1",
@@ -50,6 +51,12 @@ vi.mock("./codexIpc", () => ({
 vi.mock("../stores/workspaceStore", () => ({
   useWorkspaceStore: {
     getState: () => mockWorkspaceState,
+  },
+}));
+
+vi.mock("../stores/toastStore", () => ({
+  toast: {
+    error: mockToastError,
   },
 }));
 
@@ -320,5 +327,13 @@ describe("fileLinkNavigation", () => {
     expect(mockOpenPathWithDefaultApp).toHaveBeenCalledWith(
       "C:/Users/lemondoo/Documents/Panes Memory Leak Investigation 2026-08-29",
     );
+  });
+
+  it("shows a short error toast when a local link no longer exists", async () => {
+    mockOpenPathWithDefaultApp.mockRejectedValue(new Error("path does not exist"));
+
+    await expect(navigateLinkTarget("C:/Users/dev/old-folder")).resolves.toBe("ignored");
+
+    expect(mockToastError).toHaveBeenCalledWith("That file or folder no longer exists.");
   });
 });
