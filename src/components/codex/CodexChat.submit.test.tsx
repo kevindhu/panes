@@ -183,6 +183,17 @@ describe("CodexChat submission", () => {
     expect(container.querySelector('[role="status"]')?.textContent)
       .toContain("Confirming compatibility rollback in Codex");
     expect(container.querySelector<HTMLTextAreaElement>("textarea")?.disabled).toBe(false);
+    expect(container.querySelector<HTMLButtonElement>("button.send")?.disabled).toBe(true);
+    const textarea = container.querySelector("textarea");
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set?.call(textarea, "Keep this draft");
+      textarea?.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => {
+      textarea?.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter" }));
+    });
+    expect(mockIpc.sendMessage).not.toHaveBeenCalled();
+    expect(textarea?.value).toBe("Keep this draft");
   });
 
   it("shows a persisted background rollback failure without waiting for send", async () => {
@@ -202,7 +213,9 @@ describe("CodexChat submission", () => {
     await act(async () => root.render(<CodexChat />));
 
     expect(container.querySelector('[role="alert"]')?.textContent)
-      .toContain("Rollback preparation failed");
+      .toContain("History edit needs recovery");
+    expect(container.querySelector<HTMLButtonElement>("button.send")?.disabled).toBe(true);
+    expect(container.textContent).toContain("Recover history");
   });
 
   it("toggles Fast mode from the composer toolbar", async () => {

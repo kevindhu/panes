@@ -28,6 +28,17 @@ function makeThread(overrides: Partial<Thread> = {}): Thread {
 }
 
 describe("codexThreadCapabilities", () => {
+  it("blocks fork and edit while a history mutation is unresolved, including permanent rejection", () => {
+    for (const engineRollbackError of [undefined, "paginated threads do not support thread/rollback"]) {
+      const pending = makeThread({ engineMetadata: {
+        codexTranscriptImported: true, engineRollbackPending: true, engineRollbackError,
+      } });
+      expect(canForkCodexMessageHistory(pending)).toBe(false);
+      expect(canEditCodexMessageHistory(pending)).toBe(false);
+      expect(canUseNativeCodexHistoryTools(pending)).toBe(false);
+    }
+  });
+
   it("treats codex threads as transcript-ready when the import flag is not explicitly false", () => {
     expect(
       hasCodexTranscriptForNativeTools(

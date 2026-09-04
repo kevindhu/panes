@@ -328,7 +328,7 @@ impl CodexTransport {
         };
 
         if let Some(error) = response.error {
-            anyhow::bail!("{}", error);
+            return Err(error.into());
         }
 
         Ok(response.result.unwrap_or(serde_json::Value::Null))

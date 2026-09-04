@@ -268,6 +268,15 @@ pub fn replace_thread_messages(
     thread_id: &str,
     messages: &[ImportedMessageRecord],
 ) -> anyhow::Result<usize> {
+    replace_thread_messages_and_metadata(db, thread_id, messages, None)
+}
+
+pub fn replace_thread_messages_and_metadata(
+    db: &Database,
+    thread_id: &str,
+    messages: &[ImportedMessageRecord],
+    metadata: Option<&Value>,
+) -> anyhow::Result<usize> {
     let mut conn = db.connect()?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -370,6 +379,13 @@ pub fn replace_thread_messages(
         anyhow::bail!("thread not found while importing messages: {thread_id}");
     }
 
+    if let Some(metadata) = metadata {
+        tx.execute(
+            "UPDATE threads SET engine_metadata_json = ?1 WHERE id = ?2",
+            params![metadata.to_string(), thread_id],
+        )?;
+    }
+
     tx.commit()
         .context("failed to commit thread message import transaction")?;
     Ok(messages.len())
@@ -401,9 +417,31 @@ pub fn thread_turn_count(db: &Database, thread_id: &str) -> anyhow::Result<u32> 
     u32::try_from(count).context("thread turn count exceeds u32")
 }
 
-/// Atomically records a deferred rollback intent and projects the retained local
-/// transcript. The projection remains authoritative locally after Codex confirms
-/// the native rollback reached the expected turn count.
+pub fn thread_native_turn_ids(db: &Database, thread_id: &str) -> anyhow::Result<Vec<String>> {
+    let messages = get_thread_messages(db, thread_id)?;
+    let mut ids: Vec<Option<String>> = Vec::new();
+    for message in messages {
+        if message.role == "user" && !message_has_steer_marker(&message) {
+            ids.push(None);
+        }
+        if let (Some(slot), Some(id)) = (ids.last_mut(), message.native_turn_id) {
+            if slot.as_ref().is_some_and(|existing| existing != &id) {
+                anyhow::bail!("local turn contains conflicting native turn IDs");
+            }
+            *slot = Some(id);
+        }
+    }
+    ids.into_iter()
+        .map(|id| {
+            id.filter(|id| !id.is_empty()).ok_or_else(|| {
+                anyhow::anyhow!("local turn has no native boundary; refresh the thread first")
+            })
+        })
+        .collect()
+}
+
+/// Records a history intent. New callers retain the transcript until remote
+/// confirmation; the projection branch supports old-format records/tests.
 pub fn prepare_pending_thread_rollback(
     db: &Database,
     thread_id: &str,
@@ -433,7 +471,14 @@ pub fn prepare_pending_thread_rollback(
         anyhow::bail!("thread not found or another rollback is already pending: {thread_id}");
     }
 
-    delete_rollback_messages(&tx, thread_id, &message_ids)?;
+    if pending_metadata
+        .get("engineRollbackRemoteFirst")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        // Compatibility with older callers/records which already projected locally.
+        delete_rollback_messages(&tx, thread_id, &message_ids)?;
+    }
     tx.execute(
         "UPDATE threads
          SET message_count = (
@@ -487,6 +532,28 @@ fn rollback_message_ids(messages: &[MessageDto], num_turns: u32) -> anyhow::Resu
         .skip(cutoff_index)
         .map(|message| message.id.clone())
         .collect())
+}
+
+/// Commit the local suffix deletion and pending-marker removal together, after
+/// the remote target has been verified. Retained messages keep their identities.
+pub fn finish_pending_thread_rollback(
+    db: &Database,
+    thread_id: &str,
+    num_turns: u32,
+    metadata: &Value,
+) -> anyhow::Result<()> {
+    let messages = get_thread_messages(db, thread_id)?;
+    let ids = rollback_message_ids(&messages, num_turns)?;
+    let mut conn = db.connect()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let marked = tx.execute("UPDATE threads SET engine_metadata_json = ?1 WHERE id = ?2 AND json_extract(engine_metadata_json, '$.engineRollbackPending') = 1", params![metadata.to_string(), thread_id])?;
+    if marked != 1 {
+        anyhow::bail!("pending history mutation changed before commit");
+    }
+    delete_rollback_messages(&tx, thread_id, &ids)?;
+    tx.execute("UPDATE threads SET message_count = (SELECT COUNT(*) FROM messages WHERE thread_id = ?1), total_tokens = (SELECT COALESCE(SUM(COALESCE(token_input, 0) + COALESCE(token_output, 0)), 0) FROM messages WHERE thread_id = ?1), last_activity_at = COALESCE((SELECT MAX(created_at) FROM messages WHERE thread_id = ?1), datetime('now')) WHERE id = ?1", params![thread_id])?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn delete_rollback_messages(

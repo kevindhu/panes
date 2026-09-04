@@ -429,6 +429,57 @@ async fn handle_codex_runtime_event(
                 );
             }
         }
+        CodexRuntimeEvent::ThreadReverted { engine_thread_id } => {
+            let thread = run_db(state.db.clone(), {
+                let id = engine_thread_id.clone();
+                move |db| db::threads::find_thread_by_engine_thread_id(db, "codex", &id)
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(thread) = thread {
+                let _guard = state.pending_rollbacks.lock_history(&thread.id).await;
+                let local_ids = run_db(state.db.clone(), {
+                    let id = thread.id.clone();
+                    move |db| db::messages::thread_native_turn_ids(db, &id)
+                })
+                .await;
+                let remote = state.engines.read_thread_sync_snapshot(&thread).await;
+                // Our own revert has already committed under the same lock. Only
+                // invalidate the transcript if it actually differs (or cannot be read).
+                let matches = match (local_ids, remote) {
+                    (Ok(local), Ok(Some(remote))) => local == remote.native_turn_ids,
+                    _ => false,
+                };
+                if !matches {
+                    if let Some(updated) = apply_codex_runtime_thread_update(
+                        state,
+                        &engine_thread_id,
+                        None,
+                        None,
+                        &[],
+                        None,
+                        Some(true),
+                        Some("thread_reverted"),
+                    )
+                    .await
+                    {
+                        let _ = app.emit(
+                            "thread-updated",
+                            ThreadUpdatedEvent {
+                                thread_id: updated.id.clone(),
+                                workspace_id: updated.workspace_id.clone(),
+                                thread: Some(updated),
+                            },
+                        );
+                        let _ = app.emit(
+                            "codex-rollback-materialized",
+                            serde_json::json!({"threadId": thread.id}),
+                        );
+                    }
+                }
+            }
+        }
         CodexRuntimeEvent::ThreadCompacted { engine_thread_id } => {
             if let Some(updated_thread) = apply_codex_runtime_thread_update(
                 state,

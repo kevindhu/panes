@@ -29,9 +29,26 @@ pub struct AppState {
 #[derive(Default)]
 pub struct PendingThreadMutationManager {
     cells: Mutex<HashMap<String, Arc<OnceCell<ThreadDto>>>>,
+    history_locks: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
 }
 
 impl PendingThreadMutationManager {
+    /// Serialize history preparation with send/fork/sync, before any caller reads
+    /// thread metadata. Weak entries avoid retaining one mutex per historical thread.
+    pub async fn lock_history(&self, thread_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.history_locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            let lock = locks
+                .get(thread_id)
+                .and_then(std::sync::Weak::upgrade)
+                .unwrap_or_else(|| Arc::new(Mutex::new(())));
+            locks.insert(thread_id.to_owned(), Arc::downgrade(&lock));
+            lock
+        };
+        lock.lock_owned().await
+    }
+
     /// Returns the shared once-cell for `thread_id`, creating it on first request.
     pub async fn cell(&self, thread_id: &str) -> Arc<OnceCell<ThreadDto>> {
         let mut cells = self.cells.lock().await;

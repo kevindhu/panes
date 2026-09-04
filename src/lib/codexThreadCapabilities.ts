@@ -43,6 +43,7 @@ export function canForkCodexMessageHistory(
   return (
     thread?.engineId === "codex" &&
     !!thread.engineThreadId &&
+    thread.engineMetadata?.engineRollbackPending !== true &&
     hasVerifiedCodexCompatibilityHistory(thread) &&
     hasCodexTranscriptForNativeTools(thread)
   );

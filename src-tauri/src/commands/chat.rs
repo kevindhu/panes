@@ -1031,6 +1031,7 @@ pub async fn send_message(
     plan_mode: Option<bool>,
     client_turn_id: Option<String>,
 ) -> Result<String, String> {
+    let _history_guard = state.pending_rollbacks.lock_history(&thread_id).await;
     let already_running = state.turns.get(&thread_id).await.is_some();
     if already_running {
         return Err(
@@ -1302,11 +1303,23 @@ pub async fn send_message(
         output_schema: thread_output_schema(thread.engine_metadata.as_ref()),
     };
 
-    let engine_thread_id = state
+    let initialized_thread = state
         .engines
         .ensure_engine_thread(&thread, Some(effective_model_id.as_str()), scope, sandbox)
         .await
         .map_err(err_to_string)?;
+    let engine_thread_id = initialized_thread.engine_thread_id;
+    if let Some(mode) = initialized_thread.history_mode {
+        let mut metadata = thread.engine_metadata.clone().unwrap_or_else(|| json!({}));
+        metadata["codexHistoryMode"] = json!(mode);
+        run_db(db.clone(), {
+            let id = thread.id.clone();
+            let metadata = metadata.clone();
+            move |db| db::threads::update_engine_metadata(db, &id, &metadata)
+        })
+        .await?;
+        thread.engine_metadata = Some(metadata);
+    }
 
     if thread.engine_thread_id.as_deref() != Some(&engine_thread_id) {
         run_db(db.clone(), {
@@ -1409,6 +1422,7 @@ pub async fn send_message(
         .await;
     });
 
+    crate::commands::threads::backfill_codex_history_mode(app, state.inner().clone(), thread_id);
     Ok(assistant_message.id)
 }
 
@@ -1420,6 +1434,7 @@ pub async fn start_codex_review(
     target: CodexReviewTargetPayload,
     delivery: Option<CodexReviewDeliveryPayload>,
 ) -> Result<ThreadDto, String> {
+    let _history_guard = state.pending_rollbacks.lock_history(&thread_id).await;
     if state.turns.get(&thread_id).await.is_some() {
         return Err(
             "A turn is already running for this thread. Cancel it before starting a review."
@@ -2253,11 +2268,19 @@ pub async fn get_thread_messages(
 
 #[tauri::command]
 pub async fn get_thread_messages_window(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     thread_id: String,
     cursor: Option<MessageWindowCursorDto>,
     limit: Option<usize>,
 ) -> Result<MessageWindowDto, String> {
+    if cursor.is_none() {
+        crate::commands::threads::backfill_codex_history_mode(
+            app,
+            state.inner().clone(),
+            thread_id.clone(),
+        );
+    }
     let requested_limit = limit.unwrap_or(MESSAGE_WINDOW_DEFAULT_LIMIT);
     let clamped_limit = requested_limit.clamp(1, MESSAGE_WINDOW_MAX_LIMIT);
 

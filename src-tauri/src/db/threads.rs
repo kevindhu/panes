@@ -227,6 +227,27 @@ pub fn update_engine_metadata(
     Ok(())
 }
 
+pub fn backfill_codex_history_mode(
+    db: &Database,
+    thread_id: &str,
+    engine_thread_id: &str,
+    mode: &str,
+) -> anyhow::Result<Option<ThreadDto>> {
+    if !matches!(mode, "legacy" | "paginated") {
+        return Ok(None);
+    }
+    let changed = db.connect()?.execute(
+        "UPDATE threads SET engine_metadata_json = json_set(COALESCE(engine_metadata_json, '{}'), '$.codexHistoryMode', ?1)
+         WHERE id = ?2 AND engine_id = 'codex' AND engine_thread_id = ?3
+           AND COALESCE(json_extract(engine_metadata_json, '$.codexHistoryMode'), '') NOT IN ('legacy', 'paginated')",
+        params![mode, thread_id, engine_thread_id],
+    )?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    get_thread(db, thread_id)
+}
+
 pub fn mark_pending_rollback_started(db: &Database, thread_id: &str) -> anyhow::Result<ThreadDto> {
     let conn = db.connect()?;
     let affected = conn
@@ -616,6 +637,70 @@ mod tests {
         let workspace =
             workspaces::upsert_workspace(db, root.to_string_lossy().as_ref(), Some(1)).unwrap();
         create_thread(db, &workspace.id, None, "codex", "gpt-5.3-codex", title).unwrap()
+    }
+
+    #[test]
+    fn history_mode_backfill_changes_only_missing_metadata_and_rejects_stale_results() {
+        let db = test_db();
+        let thread = test_thread(&db, "Old thread");
+        set_engine_thread_id(&db, &thread.id, "native-thread").unwrap();
+        let message =
+            messages::insert_assistant_placeholder(&db, &thread.id, Some("codex"), None, None)
+                .unwrap();
+        for mode in ["legacy", "paginated"] {
+            update_engine_metadata(
+                &db,
+                &thread.id,
+                &json!({"manualTitle": true, "codexSyncRequired": false}),
+            )
+            .unwrap();
+            let before = get_thread(&db, &thread.id).unwrap().unwrap();
+            let updated = backfill_codex_history_mode(&db, &thread.id, "native-thread", mode)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                updated.engine_metadata,
+                Some(
+                    json!({"manualTitle": true, "codexSyncRequired": false, "codexHistoryMode": mode})
+                )
+            );
+            assert_eq!(updated.title, before.title);
+            assert_eq!(updated.status, before.status);
+            assert_eq!(updated.message_count, before.message_count);
+            assert_eq!(updated.last_activity_at, before.last_activity_at);
+            assert_eq!(
+                messages::get_thread_messages(&db, &thread.id).unwrap()[0].id,
+                message.id
+            );
+            assert!(backfill_codex_history_mode(
+                &db,
+                &thread.id,
+                "native-thread",
+                if mode == "legacy" {
+                    "paginated"
+                } else {
+                    "legacy"
+                }
+            )
+            .unwrap()
+            .is_none());
+        }
+        update_engine_metadata(&db, &thread.id, &json!({"codexHistoryMode": null})).unwrap();
+        assert!(
+            backfill_codex_history_mode(&db, &thread.id, "old-native-id", "legacy")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backfill_codex_history_mode(&db, &thread.id, "native-thread", "unknown")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backfill_codex_history_mode(&db, &thread.id, "native-thread", "legacy")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

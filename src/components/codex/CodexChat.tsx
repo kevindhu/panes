@@ -637,7 +637,7 @@ export function CodexChat() {
   async function submit() {
     const submittedInput = input;
     const text = input.trim();
-    if (rollingBackMessageId || (!text && !attachments.length) || !activeWorkspaceId || !composerModeScopeReady) return;
+    if (rollingBackMessageId || engineRollbackPending || (!text && !attachments.length) || !activeWorkspaceId || !composerModeScopeReady) return;
     let targetThreadId = activeThreadId;
     const creatingThread = !targetThreadId;
     if (creatingThread) {
@@ -979,9 +979,19 @@ export function CodexChat() {
             {!engineMutationError && <LoaderCircle size={13} className="codex-spin" />}
             <span>
               {engineMutationError
-                ? `${engineForkPending ? "Fork" : "Rollback"} preparation failed. Sending will retry automatically.`
+                ? engineForkPending ? "Fork preparation failed. Sending will retry automatically." : "History edit needs recovery. Refresh the thread before continuing."
                 : engineMutationStatus}
             </span>
+            {engineRollbackPending && engineMutationError && activeThreadId && (
+              <button type="button" onClick={() => void ipc.syncThreadFromEngine(activeThreadId)
+                .then(applyThreadUpdateLocal)
+                .catch((error) => toast.error(String(error)))
+                .finally(() => {
+                  if (useThreadStore.getState().activeThreadId === activeThreadId) {
+                    return useChatStore.getState().setActiveThread(activeThreadId, { forceReload: true });
+                  }
+                })}>Recover history</button>
+            )}
           </div>
         )}
         {hasUnseenOutput && (
@@ -1074,7 +1084,7 @@ export function CodexChat() {
                 />
                 <span className="spacer" />
                 {streaming && <button type="button" onClick={() => void cancel()} title="Stop"><Square size={13} /></button>}
-                <button className="send" type="button" disabled={rollingBackMessageId !== null || (!input.trim() && !attachments.length) || !selectedModel || !composerModeScopeReady} onClick={() => void submit()} title={rollingBackMessageId ? "Finishing rollback" : streaming ? "Steer" : "Send"}><Send size={14} /></button>
+                <button className="send" type="button" disabled={engineRollbackPending || rollingBackMessageId !== null || (!input.trim() && !attachments.length) || !selectedModel || !composerModeScopeReady} onClick={() => void submit()} title={engineRollbackPending || rollingBackMessageId ? "Finishing history edit" : streaming ? "Steer" : "Send"}><Send size={14} /></button>
               </div>
             </>
           )}

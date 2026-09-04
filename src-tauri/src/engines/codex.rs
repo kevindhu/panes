@@ -140,6 +140,7 @@ struct CodexState {
     approval_requests: HashMap<String, PendingApproval>,
     active_turn_ids: HashMap<String, String>,
     thread_runtimes: HashMap<String, ThreadRuntime>,
+    history_mode_reads: HashMap<String, Arc<tokio::sync::OnceCell<Option<String>>>>,
     fork_compatibility_cache: HashMap<String, bool>,
     runtime_model_cache: Option<Vec<ModelInfo>>,
     sandbox_probe_completed: bool,
@@ -215,10 +216,14 @@ pub enum CodexRuntimeEvent {
     ThreadCompacted {
         engine_thread_id: String,
     },
+    ThreadReverted {
+        engine_thread_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub struct CodexForkedThread {
+    pub history_mode: Option<String>,
     pub engine_thread_id: String,
     pub model_id: String,
     pub title: Option<String>,
@@ -673,6 +678,7 @@ impl Engine for CodexEngine {
                     .await;
                 return Ok(EngineThread {
                     engine_thread_id: existing_thread_id.to_string(),
+                    history_mode: None,
                 });
             }
         }
@@ -704,7 +710,10 @@ impl Engine for CodexEngine {
                     let runtime = thread_runtime_from_resume_response(&result, &requested_runtime);
                     self.store_thread_runtime(&engine_thread_id, runtime).await;
 
-                    return Ok(EngineThread { engine_thread_id });
+                    return Ok(EngineThread {
+                        engine_thread_id,
+                        history_mode: extract_history_mode(&result),
+                    });
                 }
                 Err(error) => {
                     return Err(error).with_context(|| {
@@ -757,7 +766,10 @@ impl Engine for CodexEngine {
         );
         self.store_thread_runtime(&engine_thread_id, runtime).await;
 
-        Ok(EngineThread { engine_thread_id })
+        Ok(EngineThread {
+            engine_thread_id,
+            history_mode: extract_history_mode(&result),
+        })
     }
 
     async fn send_message(
@@ -1696,6 +1708,7 @@ impl CodexEngine {
             .insert(new_engine_thread_id.clone(), false);
 
         let forked_thread = CodexForkedThread {
+            history_mode: extract_history_mode(&response),
             engine_thread_id: new_engine_thread_id.clone(),
             model_id: extract_any_string(&response, &["model"])
                 .unwrap_or_else(|| model.to_string()),
@@ -1806,6 +1819,7 @@ impl CodexEngine {
             .fork_compatibility_cache
             .insert(new_engine_thread_id.clone(), false);
         let forked_thread = CodexForkedThread {
+            history_mode: extract_history_mode(&response),
             engine_thread_id: new_engine_thread_id.clone(),
             model_id: extract_any_string(&response, &["model"])
                 .unwrap_or_else(|| model.to_string()),
@@ -1974,12 +1988,47 @@ impl CodexEngine {
         let turns = extract_turns_from_thread_read_response(&response);
 
         Ok(ThreadSyncSnapshot {
+            history_mode: extract_history_mode(&response),
+            native_turn_ids: turns
+                .iter()
+                .filter_map(|turn| {
+                    turn.get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect(),
             title: extract_thread_title(&response),
             preview: extract_thread_preview(&response),
             raw_status: extract_thread_runtime_status_type(&response),
             active_flags: extract_thread_runtime_active_flags(&response),
             imported_messages: extract_imported_messages_from_turns(&turns),
         })
+    }
+
+    pub async fn revert_thread(
+        &self,
+        engine_thread_id: &str,
+        before_turn_id: &str,
+    ) -> anyhow::Result<ThreadSyncSnapshot> {
+        let transport = self.ensure_ready_transport().await?;
+        // Revert requires a loaded thread. Resume without hydrating its history.
+        request_with_fallback(
+            transport.as_ref(),
+            THREAD_RESUME_METHODS,
+            serde_json::json!({"threadId": engine_thread_id, "excludeTurns": true}),
+            DEFAULT_TIMEOUT,
+        )
+        .await?;
+        request_with_fallback(
+            transport.as_ref(),
+            &["thread/revert"],
+            serde_json::json!({"threadId": engine_thread_id, "beforeTurnId": before_turn_id}),
+            DEFAULT_TIMEOUT,
+        )
+        .await?;
+        // Revert responses deliberately omit turns; an empty payload is not an empty history.
+        self.read_thread_sync_snapshot(engine_thread_id, false)
+            .await
     }
 
     pub async fn compact_thread(&self, engine_thread_id: &str) -> anyhow::Result<()> {
@@ -2723,6 +2772,52 @@ impl CodexEngine {
             .ok_or_else(|| anyhow::anyhow!("codex thread response missing remote thread summary"))
     }
 
+    /// Metadata only. Concurrent backfills share the same request; failures are
+    /// not cached, so opening or sending later can try again.
+    pub async fn read_history_mode(&self, engine_thread_id: &str) -> Option<String> {
+        let cell = self
+            .state
+            .lock()
+            .await
+            .history_mode_reads
+            .entry(engine_thread_id.to_owned())
+            .or_default()
+            .clone();
+        let result = cell
+            .get_or_init(|| async {
+                let result: anyhow::Result<Option<String>> = async {
+                    let transport = self.ensure_ready_transport().await?;
+                    let response = request_with_fallback(
+                        transport.as_ref(),
+                        THREAD_READ_METHODS,
+                        serde_json::json!({"threadId": engine_thread_id, "includeTurns": false}),
+                        DEFAULT_TIMEOUT,
+                    )
+                    .await?;
+                    Ok::<_, anyhow::Error>(extract_history_mode(&response))
+                }
+                .await;
+                match result {
+                    Ok(mode) => mode,
+                    Err(error) => {
+                        log::debug!("history mode read for {engine_thread_id} deferred: {error:#}");
+                        None
+                    }
+                }
+            })
+            .await
+            .clone();
+        let mut state = self.state.lock().await;
+        if state
+            .history_mode_reads
+            .get(engine_thread_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &cell))
+        {
+            state.history_mode_reads.remove(engine_thread_id);
+        }
+        result
+    }
+
     pub async fn unarchive_remote_thread(&self, engine_thread_id: &str) -> anyhow::Result<()> {
         self.unarchive_thread(engine_thread_id).await
     }
@@ -2747,10 +2842,18 @@ impl CodexEngine {
         .await
         .context("failed to read codex thread metadata")?;
 
-        let mut imported_messages = self
-            .list_thread_import_messages(transport.as_ref(), engine_thread_id)
+        let turns = self
+            .list_thread_turns(transport.as_ref(), engine_thread_id)
             .await?;
-        if compatibility_fork {
+        let mut imported_messages = extract_imported_messages_from_turns(&turns);
+        if compatibility_fork && extract_history_mode(&result).as_deref() == Some("paginated") {
+            // Injected history need not appear in the ordinary turns projection.
+            // Read the item stream as well before treating a recovery as complete.
+            let entries = fetch_paginated_data(transport.as_ref(), &["thread/items/list"], |cursor| {
+                serde_json::json!({"threadId": engine_thread_id, "cursor": cursor, "limit": 100, "sortDirection": "asc"})
+            }).await.context("failed to hydrate paginated compatibility history")?;
+            imported_messages = extract_paginated_compatibility_messages(&turns, &entries)?;
+        } else if compatibility_fork {
             let thread = result.get("thread").unwrap_or(&result);
             let rollout_path = extract_any_string(thread, &["path"])
                 .filter(|path| !path.trim().is_empty())
@@ -2768,25 +2871,21 @@ impl CodexEngine {
         }
 
         Ok(ThreadSyncSnapshot {
+            history_mode: extract_history_mode(&result),
+            native_turn_ids: turns
+                .iter()
+                .filter_map(|turn| {
+                    turn.get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect(),
             title: extract_thread_title(&result),
             preview: extract_thread_preview(&result),
             raw_status: extract_thread_runtime_status_type(&result),
             active_flags: extract_thread_runtime_active_flags(&result),
             imported_messages,
         })
-    }
-
-    async fn list_thread_import_messages(
-        &self,
-        transport: &CodexTransport,
-        engine_thread_id: &str,
-    ) -> anyhow::Result<Vec<ImportedThreadMessage>> {
-        let turns = self
-            .list_thread_turns(transport, engine_thread_id)
-            .await
-            .context("failed to list Codex thread turns for transcript import")?;
-
-        Ok(extract_imported_messages_from_turns(&turns))
     }
 
     async fn list_thread_turns(
@@ -3469,6 +3568,16 @@ impl CodexEngine {
                                             preview: None,
                                         },
                                     );
+                                }
+                            }
+                            "thread/reverted" => {
+                                if let Some(engine_thread_id) =
+                                    extract_any_string(&params, &["threadId", "thread_id"])
+                                {
+                                    let _ =
+                                        runtime_events.send(CodexRuntimeEvent::ThreadReverted {
+                                            engine_thread_id,
+                                        });
                                 }
                             }
                             "thread/name/updated" => {
@@ -5255,6 +5364,15 @@ async fn request_with_fallback(
     params: serde_json::Value,
     timeout: Duration,
 ) -> anyhow::Result<serde_json::Value> {
+    if let [method] = methods {
+        return transport
+            .request(method, params, timeout)
+            .await
+            .map_err(|error| {
+                let message = format!("{method}: {error:#}");
+                error.context(message)
+            });
+    }
     let mut errors = Vec::new();
 
     for method in methods {
@@ -5272,6 +5390,22 @@ async fn request_with_fallback(
 fn is_thread_not_loaded_rpc_error(error: &anyhow::Error) -> bool {
     let normalized = format!("{error:#}").to_ascii_lowercase();
     normalized.contains("thread not found:") || normalized.contains("thread not loaded:")
+}
+
+fn extract_history_mode(response: &serde_json::Value) -> Option<String> {
+    response
+        .get("thread")
+        .unwrap_or(response)
+        .get("historyMode")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+pub fn is_history_mutation_rejected(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<super::codex_protocol::RpcError>()
+        .is_some_and(|rpc| matches!(rpc.code, Some(-32600 | -32601 | -32602)))
+        && !is_thread_not_loaded_rpc_error(error)
 }
 
 fn scope_cwd(scope: &ThreadScope) -> String {
@@ -5436,9 +5570,8 @@ fn build_thread_fork_params(thread_id: &str, last_turn_id: Option<&str>) -> serd
     // forks exist only in the current app-server process and cannot be resumed
     // after that process restarts.
     params.insert("ephemeral".to_string(), serde_json::Value::Bool(false));
-    // Fork-time runtime overrides and `excludeTurns` both force slower setup paths
-    // in current Codex releases. The child inherits the source runtime here; Panes
-    // applies the selected model, permissions, and cwd on the next turn instead.
+    // Panes does not consume the deprecated eager history in fork responses.
+    params.insert("excludeTurns".to_string(), serde_json::Value::Bool(true));
     serde_json::Value::Object(params)
 }
 
@@ -6101,6 +6234,49 @@ fn extract_turns_from_thread_read_response(response: &serde_json::Value) -> Vec<
     }
 
     Vec::new()
+}
+
+fn extract_paginated_compatibility_messages(
+    turns: &[serde_json::Value],
+    entries: &[serde_json::Value],
+) -> anyhow::Result<Vec<ImportedThreadMessage>> {
+    let native_turns: HashMap<_, _> = turns
+        .iter()
+        .filter_map(|turn| {
+            turn.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(|id| (id, turn))
+        })
+        .collect();
+    let mut groups: Vec<serde_json::Value> = Vec::new();
+    let mut last_id: Option<&str> = None;
+    let mut has_user = false;
+    for entry in entries {
+        let id = entry
+            .get("turnId")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("paginated history item has no turnId"))?;
+        let item = entry
+            .get("item")
+            .ok_or_else(|| anyhow::anyhow!("paginated history entry has no item"))?;
+        let native = native_turns.get(id).copied();
+        let user = item.get("type").and_then(serde_json::Value::as_str) == Some("userMessage");
+        if last_id != Some(id) || (native.is_none() && user && has_user) {
+            let mut group = native
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({"status": "completed"}));
+            group["items"] = serde_json::json!([]);
+            groups.push(group);
+            last_id = Some(id);
+            has_user = false;
+        }
+        has_user |= user;
+        groups.last_mut().unwrap()["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(item.clone());
+    }
+    Ok(extract_imported_messages_from_turns(&groups))
 }
 
 fn extract_imported_messages_from_turns(turns: &[serde_json::Value]) -> Vec<ImportedThreadMessage> {
@@ -8467,6 +8643,7 @@ fn is_known_codex_notification_method(normalized_method: &str) -> bool {
             | "turn/plan/updated"
             | "thread/started"
             | "thread/compacted"
+            | "thread/reverted"
             | "contextcompacted"
             | "thread/status/changed"
             | "thread/name/updated"
@@ -8788,7 +8965,82 @@ mod tests {
 
         assert_eq!(params.get("lastTurnId"), Some(&json!("turn-2")));
         assert_eq!(params.get("ephemeral"), Some(&json!(false)));
-        assert_eq!(params.as_object().map(serde_json::Map::len), Some(3));
+        assert_eq!(params.get("excludeTurns"), Some(&json!(true)));
+        assert_eq!(params.as_object().map(serde_json::Map::len), Some(4));
+    }
+
+    #[test]
+    fn history_mutation_errors_preserve_protocol_rejections_but_not_transient_failures() {
+        use crate::engines::codex_protocol::RpcError;
+        for code in [-32600, -32601, -32602] {
+            let error = anyhow::Error::new(RpcError {
+                code: Some(code),
+                message: "unsupported history operation".into(),
+                data: None,
+            })
+            .context("RPC failed");
+            assert!(is_history_mutation_rejected(&error));
+        }
+        let unloaded = anyhow::Error::new(RpcError {
+            code: Some(-32600),
+            message: "thread not loaded: thread-1".into(),
+            data: None,
+        });
+        assert!(!is_history_mutation_rejected(&unloaded));
+        assert!(!is_history_mutation_rejected(&anyhow::anyhow!(
+            "request timeout"
+        )));
+        assert!(!is_history_mutation_rejected(&anyhow::Error::new(
+            RpcError {
+                code: Some(-32603),
+                message: "temporary server failure".into(),
+                data: None
+            }
+        )));
+        assert_eq!(
+            extract_history_mode(&json!({"thread": {"historyMode": "paginated"}})).as_deref(),
+            Some("paginated")
+        );
+        assert_eq!(
+            extract_history_mode(&json!({"historyMode": "legacy"})).as_deref(),
+            Some("legacy")
+        );
+        assert!(extract_history_mode(&json!({"thread": {}})).is_none());
+        assert!(is_known_codex_notification_method("thread/reverted"));
+    }
+
+    #[test]
+    fn paginated_compatibility_recovery_preserves_injected_prefix_without_inventing_turn_boundaries(
+    ) {
+        let turns = vec![json!({"id": "native-1", "status": "completed", "items": []})];
+        let entries = vec![
+            json!({"turnId": "injected", "item": {"type": "userMessage", "content": [{"type": "text", "text": "First"}]}}),
+            json!({"turnId": "injected", "item": {"type": "agentMessage", "text": "First reply"}}),
+            json!({"turnId": "injected", "item": {"type": "userMessage", "content": [{"type": "text", "text": "Second"}]}}),
+            json!({"turnId": "injected", "item": {"type": "agentMessage", "text": "Second reply"}}),
+            json!({"turnId": "native-1", "item": {"type": "userMessage", "content": [{"type": "text", "text": "Third"}]}}),
+            json!({"turnId": "native-1", "item": {"type": "agentMessage", "text": "Third reply"}}),
+        ];
+        let imported = extract_paginated_compatibility_messages(&turns, &entries).unwrap();
+        assert_eq!(
+            imported
+                .iter()
+                .filter_map(|m| m.content.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                "First",
+                "First reply",
+                "Second",
+                "Second reply",
+                "Third",
+                "Third reply"
+            ]
+        );
+        assert!(imported[..4].iter().all(|m| m.native_turn_id.is_none()));
+        assert!(imported[4..]
+            .iter()
+            .all(|m| m.native_turn_id.as_deref() == Some("native-1")));
+        assert!(extract_paginated_compatibility_messages(&turns, &[json!({"item": {}})]).is_err());
     }
 
     #[test]

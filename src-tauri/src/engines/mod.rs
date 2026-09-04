@@ -194,10 +194,13 @@ fn map_engine_capabilities(capabilities: EngineCapabilities) -> EngineCapabiliti
 #[derive(Debug, Clone)]
 pub struct EngineThread {
     pub engine_thread_id: String,
+    pub history_mode: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ThreadSyncSnapshot {
+    pub history_mode: Option<String>,
+    pub native_turn_ids: Vec<String>,
     pub title: Option<String>,
     pub preview: Option<String>,
     pub raw_status: Option<String>,
@@ -484,6 +487,16 @@ impl EngineManager {
             .await
     }
 
+    pub async fn revert_codex_thread(
+        &self,
+        engine_thread_id: &str,
+        before_turn_id: &str,
+    ) -> anyhow::Result<ThreadSyncSnapshot> {
+        self.codex
+            .revert_thread(engine_thread_id, before_turn_id)
+            .await
+    }
+
     pub async fn compact_codex_thread(&self, engine_thread_id: &str) -> anyhow::Result<()> {
         self.codex.compact_thread(engine_thread_id).await
     }
@@ -501,6 +514,10 @@ impl EngineManager {
         engine_thread_id: &str,
     ) -> anyhow::Result<CodexRemoteThreadSummary> {
         self.codex.read_remote_thread(engine_thread_id).await
+    }
+
+    pub async fn read_codex_history_mode(&self, engine_thread_id: &str) -> Option<String> {
+        self.codex.read_history_mode(engine_thread_id).await
     }
 
     pub async fn unarchive_codex_remote_thread(
@@ -537,7 +554,7 @@ impl EngineManager {
         model_id: Option<&str>,
         scope: ThreadScope,
         sandbox: SandboxPolicy,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<EngineThread> {
         let resume_id = thread.engine_thread_id.as_deref();
         let effective_model_id = model_id.unwrap_or(thread.model_id.as_str());
 
@@ -550,7 +567,7 @@ impl EngineManager {
             _ => anyhow::bail!("unsupported engine_id {}", thread.engine_id),
         };
 
-        Ok(result.engine_thread_id)
+        Ok(result)
     }
 
     pub async fn send_message(
