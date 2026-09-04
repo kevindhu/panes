@@ -262,7 +262,7 @@ enum ThreadUnsubscribeOutcome {
     TransportUnavailable,
 }
 
-fn gpt56_reasoning_efforts(include_ultra: bool) -> Vec<ReasoningEffortOption> {
+fn frontier_reasoning_efforts(include_ultra: bool) -> Vec<ReasoningEffortOption> {
     let mut efforts = vec![
         ReasoningEffortOption {
             reasoning_effort: "low".to_string(),
@@ -309,6 +309,23 @@ impl Engine for CodexEngine {
     fn models(&self) -> Vec<ModelInfo> {
         vec![
             ModelInfo {
+                id: "gpt-6-astra".to_string(),
+                display_name: "GPT-6-Astra".to_string(),
+                description: "Our most capable model, built for the hardest end-to-end work."
+                    .to_string(),
+                hidden: false,
+                is_default: false,
+                upgrade: None,
+                availability_nux: None,
+                upgrade_info: None,
+                input_modalities: vec!["text".to_string(), "image".to_string()],
+                attachment_modalities: vec!["text".to_string(), "image".to_string()],
+                limits: None,
+                supports_personality: false,
+                default_reasoning_effort: "medium".to_string(),
+                supported_reasoning_efforts: frontier_reasoning_efforts(false),
+            },
+            ModelInfo {
                 id: "gpt-5.6-sol".to_string(),
                 display_name: "GPT-5.6-Sol".to_string(),
                 description: "Latest frontier agentic coding model.".to_string(),
@@ -322,7 +339,7 @@ impl Engine for CodexEngine {
                 limits: None,
                 supports_personality: true,
                 default_reasoning_effort: "low".to_string(),
-                supported_reasoning_efforts: gpt56_reasoning_efforts(true),
+                supported_reasoning_efforts: frontier_reasoning_efforts(true),
             },
             ModelInfo {
                 id: "gpt-5.6-terra".to_string(),
@@ -338,7 +355,7 @@ impl Engine for CodexEngine {
                 limits: None,
                 supports_personality: true,
                 default_reasoning_effort: "medium".to_string(),
-                supported_reasoning_efforts: gpt56_reasoning_efforts(true),
+                supported_reasoning_efforts: frontier_reasoning_efforts(true),
             },
             ModelInfo {
                 id: "gpt-5.6-luna".to_string(),
@@ -354,7 +371,7 @@ impl Engine for CodexEngine {
                 limits: None,
                 supports_personality: true,
                 default_reasoning_effort: "medium".to_string(),
-                supported_reasoning_efforts: gpt56_reasoning_efforts(false),
+                supported_reasoning_efforts: frontier_reasoning_efforts(false),
             },
             ModelInfo {
                 id: "gpt-5.6".to_string(),
@@ -370,7 +387,7 @@ impl Engine for CodexEngine {
                 limits: None,
                 supports_personality: true,
                 default_reasoning_effort: "low".to_string(),
-                supported_reasoning_efforts: gpt56_reasoning_efforts(true),
+                supported_reasoning_efforts: frontier_reasoning_efforts(true),
             },
             ModelInfo {
                 id: "gpt-5.5".to_string(),
@@ -10016,6 +10033,23 @@ mod tests {
     fn static_model_fallback_includes_current_codex_models() {
         let engine = CodexEngine::default();
         let models = engine.models();
+
+        let astra = models
+            .iter()
+            .find(|model| model.id == "gpt-6-astra")
+            .expect("static fallback should include gpt-6-astra");
+        assert_eq!(astra.display_name, "GPT-6-Astra");
+        assert!(!astra.hidden);
+        assert!(!astra.is_default);
+        assert_eq!(astra.default_reasoning_effort, "medium");
+        assert_eq!(
+            astra
+                .supported_reasoning_efforts
+                .iter()
+                .map(|option| option.reasoning_effort.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
 
         let gpt56_sol = models
             .iter()
