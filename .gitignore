@@ -21,7 +21,6 @@ app-icon.png
 app-icon-1024.png
 
 # Local docs that should not be versioned
-AGENTS.md
 CLAUDE.md
 PERFORMANCE_PLANO.md
 
