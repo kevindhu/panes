@@ -255,6 +255,53 @@ fn merge_context_usage_cache_into_metadata(
     metadata
 }
 
+fn checkpoint_context_usage(
+    db: &crate::db::Database,
+    thread_id: &str,
+    metadata: Option<&Value>,
+    engine_thread_id: Option<&str>,
+) -> Option<crate::engines::UsageLimitsSnapshot> {
+    let native_thread_id = if is_codex_compatibility_fork(metadata) {
+        // The copied ledger describes the original full native context, not the
+        // sanitized text injected into a compatibility fork.
+        Some(engine_thread_id?)
+    } else {
+        None
+    };
+    match db::codex_transcript::load_latest_context_usage(db, thread_id, native_thread_id) {
+        Ok(Some(usage)) => {
+            let mut mapper = crate::engines::codex_event_mapper::TurnEventMapper::default();
+            let payload = if usage.get("tokenUsage").is_some() {
+                usage
+            } else {
+                json!({ "tokenUsage": usage })
+            };
+            mapper.merge_usage_snapshot_payload(&payload);
+            mapper.latest_usage_limits_snapshot()
+        }
+        Ok(None) => None,
+        Err(error) => {
+            log::warn!("failed to restore checkpoint context usage for {thread_id}: {error}");
+            None
+        }
+    }
+}
+
+fn restore_checkpoint_context_usage(
+    db: &crate::db::Database,
+    thread_id: &str,
+    mut metadata: Value,
+    engine_thread_id: Option<&str>,
+) -> Value {
+    if let Some(object) = metadata.as_object_mut() {
+        object.remove(CONTEXT_USAGE_CACHE_METADATA_KEY);
+    }
+    match checkpoint_context_usage(db, thread_id, Some(&metadata), engine_thread_id) {
+        Some(usage) => merge_context_usage_cache_into_metadata(Some(metadata), &usage),
+        None => metadata,
+    }
+}
+
 #[tauri::command]
 pub async fn append_branch_profile_log(
     operation_id: String,
@@ -3445,6 +3492,12 @@ async fn create_pending_codex_branch_thread(
                 !clone_local_history,
                 (!clone_local_history).then_some("branch_thread_requires_sync"),
             );
+            let metadata = restore_checkpoint_context_usage(
+                db,
+                &created.id,
+                metadata,
+                source_thread.engine_thread_id.as_deref(),
+            );
             let metadata = mark_engine_fork_pending(metadata, &intent);
             let next_status = map_codex_thread_status_to_local(None, &[], false);
             let update_snapshot_started_at = Instant::now();
@@ -3500,6 +3553,7 @@ async fn attach_forked_engine_to_branch(
                 object.insert("lastModelId".to_string(), json!(forked_model_id));
                 object.insert("codexTranscriptImported".to_string(), json!(true));
                 if compatibility_fork {
+                    object.remove(CONTEXT_USAGE_CACHE_METADATA_KEY);
                     object.insert(CODEX_COMPATIBILITY_FORK_KEY.to_string(), json!(true));
                     object.insert(
                         CODEX_COMPATIBILITY_HISTORY_COMPLETE_KEY.to_string(),
@@ -3627,6 +3681,14 @@ fn persist_codex_in_place_rollback(
         }
         db::messages::finish_pending_thread_rollback(db, &thread.id, intent.num_turns, &metadata)?;
     }
+    // Both native rollback and paginated revert commit through this path. Read
+    // the retained ledger only after the discarded local turns have been removed.
+    let metadata = restore_checkpoint_context_usage(
+        db,
+        &thread.id,
+        metadata,
+        thread.engine_thread_id.as_deref(),
+    );
     db::threads::update_thread_runtime_snapshot(
         db,
         &thread.id,
@@ -3653,6 +3715,7 @@ fn clone_codex_branch_metadata(
     if let Some(object) = metadata.as_object_mut() {
         object.remove("manualTitle");
         object.remove("manualTitleUpdatedAt");
+        object.remove(CONTEXT_USAGE_CACHE_METADATA_KEY);
         object.insert("lastModelId".to_string(), json!(model_id));
         object.insert("codexTranscriptImported".to_string(), json!(true));
     }
@@ -4390,6 +4453,122 @@ mod tests {
         .expect("failed to create thread")
     }
 
+    fn record_checkpoint_usage(
+        state: &AppState,
+        thread_id: &str,
+        message: &MessageDto,
+        tokens: u64,
+    ) {
+        db::codex_transcript::record_native_event_batch(
+            &state.db,
+            thread_id,
+            &message.id,
+            &[crate::engines::events::CodexNativeEvent {
+                source_sequence: 1,
+                observed_at_ms: 1,
+                event_kind: crate::engines::events::CodexNativeEventKind::Notification,
+                method: "thread/tokenUsage/updated".into(),
+                request_id: None,
+                native_thread_id: "engine-source".into(),
+                native_turn_id: message.native_turn_id.clone(),
+                params_json: json!({
+                    "tokenUsage": {
+                        "last": { "totalTokens": tokens, "inputTokens": tokens - 1000, "outputTokens": 1000 },
+                        "total": { "totalTokens": 999999 },
+                        "modelContextWindow": 112000
+                    }
+                })
+                .to_string(),
+            }],
+        )
+        .expect("record checkpoint usage");
+    }
+
+    #[test]
+    fn checkpoint_usage_requires_the_retained_turn_and_matching_compatibility_engine() {
+        let state = test_app_state();
+        let (thread, _) = history_fixture(&state, true);
+        let messages = db::messages::get_thread_messages(&state.db, &thread.id).unwrap();
+        record_checkpoint_usage(&state, &thread.id, &messages[1], 32000);
+        let stale_metadata = json!({ "contextUsageCache": { "currentTokens": 92000 } });
+        let restored =
+            restore_checkpoint_context_usage(&state.db, &thread.id, stale_metadata, None);
+        assert!(
+            restored.get(CONTEXT_USAGE_CACHE_METADATA_KEY).is_none(),
+            "a missing final measurement must not reuse an older turn or the latest cache"
+        );
+
+        record_checkpoint_usage(&state, &thread.id, &messages[5], 92000);
+        let compatibility = json!({ "codexCompatibilityFork": true });
+        assert!(
+            checkpoint_context_usage(
+                &state.db,
+                &thread.id,
+                Some(&compatibility),
+                Some("new-engine")
+            )
+            .is_none(),
+            "injected history must not inherit the original context size"
+        );
+        let measured = checkpoint_context_usage(
+            &state.db,
+            &thread.id,
+            Some(&compatibility),
+            Some("engine-source"),
+        )
+        .unwrap();
+        assert_eq!(measured.current_tokens, Some(92000));
+    }
+
+    #[test]
+    fn rollback_clears_stale_usage_for_unmeasured_or_empty_history() {
+        for retained_turns in [0, 1] {
+            let state = test_app_state();
+            let (thread, mut snapshot) = history_fixture(&state, true);
+            let messages = db::messages::get_thread_messages(&state.db, &thread.id).unwrap();
+            record_checkpoint_usage(&state, &thread.id, &messages[5], 92000);
+            let mut metadata = thread.engine_metadata.clone().unwrap();
+            metadata[CONTEXT_USAGE_CACHE_METADATA_KEY] = json!({ "currentTokens": 92000 });
+            metadata[ENGINE_ROLLBACK_NUM_TURNS_KEY] = json!(3 - retained_turns);
+            metadata[ENGINE_ROLLBACK_TARGET_TURN_COUNT_KEY] = json!(retained_turns);
+            db::threads::update_engine_metadata(&state.db, &thread.id, &metadata).unwrap();
+            snapshot.native_turn_ids.truncate(retained_turns);
+            snapshot.imported_messages.truncate(retained_turns * 2);
+
+            let updated = persist_codex_in_place_rollback(&state.db, &thread, &snapshot).unwrap();
+            assert!(cached_context_usage_from_metadata(updated.engine_metadata.as_ref()).is_none());
+            assert_eq!(updated.message_count, (retained_turns * 2) as i64);
+        }
+    }
+
+    #[test]
+    fn rollback_and_revert_restore_usage_after_committing_the_retained_prefix() {
+        for history_mode in ["legacy", "paginated"] {
+            let state = test_app_state();
+            let (thread, mut snapshot) = history_fixture(&state, true);
+            let messages = db::messages::get_thread_messages(&state.db, &thread.id).unwrap();
+            record_checkpoint_usage(&state, &thread.id, &messages[1], 32000);
+            record_checkpoint_usage(&state, &thread.id, &messages[5], 92000);
+            let mut metadata = thread.engine_metadata.clone().unwrap();
+            metadata[CONTEXT_USAGE_CACHE_METADATA_KEY] = json!({ "currentTokens": 92000 });
+            db::threads::update_engine_metadata(&state.db, &thread.id, &metadata).unwrap();
+            snapshot.history_mode = Some(history_mode.into());
+            snapshot.native_turn_ids.truncate(1);
+            snapshot.imported_messages.truncate(2);
+
+            let updated = persist_codex_in_place_rollback(&state.db, &thread, &snapshot).unwrap();
+            let usage =
+                cached_context_usage_from_metadata(updated.engine_metadata.as_ref()).unwrap();
+            assert_eq!(usage.current_tokens, Some(32000), "{history_mode}");
+            assert_eq!(
+                usage.context_window_percent,
+                Some(80),
+                "20% used, not 80% used"
+            );
+            assert_eq!(updated.message_count, 2);
+        }
+    }
+
     fn history_fixture(state: &AppState, remote_first: bool) -> (ThreadDto, ThreadSyncSnapshot) {
         let thread = test_thread(state, "codex", "gpt-5.4");
         let messages = (0..6)
@@ -5008,6 +5187,7 @@ mod tests {
             Some(&json!({
                 "codexTranscriptImported": false,
                 "manualTitle": true,
+                "contextUsageCache": { "currentTokens": 92000 },
             })),
             "gpt-5.4",
             Some("idle"),
@@ -5020,6 +5200,7 @@ mod tests {
         assert_eq!(metadata.get("codexTranscriptImported"), Some(&json!(true)));
         assert_eq!(metadata.get("lastModelId"), Some(&json!("gpt-5.4")));
         assert_eq!(metadata.get("manualTitle"), None);
+        assert_eq!(metadata.get(CONTEXT_USAGE_CACHE_METADATA_KEY), None);
     }
 
     #[test]
@@ -5426,6 +5607,14 @@ mod tests {
         let source_messages =
             db::messages::get_thread_messages(&state.db, &source.id).expect("load source messages");
         let completed_assistant_id = source_messages[1].id.clone();
+        record_checkpoint_usage(&state, &source.id, &source_messages[1], 32000);
+        record_checkpoint_usage(&state, &source.id, &source_messages[3], 92000);
+        db::threads::update_engine_metadata(
+            &state.db,
+            &source.id,
+            &json!({ "contextUsageCache": { "currentTokens": 92000 } }),
+        )
+        .unwrap();
         let source = db::threads::get_thread(&state.db, &source.id)
             .expect("get source thread")
             .expect("source thread exists");
@@ -5447,6 +5636,13 @@ mod tests {
         .expect("expected exact pending branch creation to succeed");
 
         assert_eq!(branch.message_count, 2);
+        let usage = cached_context_usage_from_metadata(branch.engine_metadata.as_ref()).unwrap();
+        assert_eq!(usage.current_tokens, Some(32000));
+        assert_eq!(
+            usage.context_window_percent,
+            Some(80),
+            "20% used, not the parent's 80%"
+        );
         let branch_messages =
             db::messages::get_thread_messages(&state.db, &branch.id).expect("load branch messages");
         assert_eq!(branch_messages.len(), 2);

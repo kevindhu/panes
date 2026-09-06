@@ -9,6 +9,36 @@ use super::Database;
 
 const PENDING_ITEM_TYPE: &str = "__pending__";
 
+/// Read only the final assistant message's measurement. Falling back to an older
+/// measured turn would misrepresent a checkpoint whose usage was never recorded.
+/// Compatibility history can require a measurement from the new engine thread,
+/// since its injected text has a different context size from the original turn.
+pub fn load_latest_context_usage(
+    db: &Database,
+    thread_id: &str,
+    native_thread_id: Option<&str>,
+) -> anyhow::Result<Option<Value>> {
+    let conn = db.connect()?;
+    let usage_json: Option<String> = conn
+        .query_row(
+            "SELECT turns.usage_json
+             FROM messages
+             LEFT JOIN codex_turns AS turns ON turns.message_id = messages.id
+               AND (?2 IS NULL OR turns.native_thread_id = ?2)
+             WHERE messages.thread_id = ?1 AND messages.role = 'assistant'
+             ORDER BY messages.created_at DESC, messages.rowid DESC
+             LIMIT 1",
+            params![thread_id, native_thread_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to load checkpoint context usage")?
+        .flatten();
+    usage_json
+        .map(|usage| serde_json::from_str(&usage).context("invalid checkpoint context usage"))
+        .transpose()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexTurnRecord {
