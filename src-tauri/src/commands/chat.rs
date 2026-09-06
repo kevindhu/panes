@@ -50,8 +50,8 @@ const ENGINE_EVENT_LOG_ACTION_OUTPUT_MAX_CHARS: usize = 4_096;
 const TRUNCATED_SUFFIX: &str = "\n... [truncated]";
 const MAX_ATTACHMENTS_PER_TURN: usize = 10;
 const MAX_PASTED_IMAGE_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
-const MAX_EMBEDDED_CHAT_IMAGE_CACHE_FILES: usize = 192;
-const MAX_EMBEDDED_CHAT_IMAGE_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_EMBEDDED_CHAT_IMAGE_CACHE_FILES: usize = 5_000;
+const MAX_EMBEDDED_CHAT_IMAGE_CACHE_BYTES: u64 = 10_000_000_000;
 const TEXT_ATTACHMENT_EXTENSIONS: &[&str] = &[
     "txt", "md", "json", "js", "ts", "tsx", "jsx", "py", "rs", "go", "css", "html", "yaml", "yml",
     "toml", "xml", "sql", "sh", "csv",
