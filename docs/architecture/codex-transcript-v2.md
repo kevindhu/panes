@@ -125,7 +125,13 @@ event listener is temporarily unavailable. History reload and live streaming the
 same projector and ordering rules.
 
 The semantic timeline renders agent messages in source order and groups adjacent native
-activities. Every activity row is independently expandable, including successful commands and
+activities. Each `fileChange` item renders as a separate, initially expanded diff block at its
+first source sequence, including repeated edits to the same file. Its stable item identity keeps
+its position and expansion state as later items arrive. The latest `turn/diff/updated` snapshot
+renders separately as **All changes this turn** below the timeline, after the final response when
+present. This cumulative summary has a stable turn identity and updates in place; it never
+replaces or reorders individual edit blocks. Live updates and history reload use this same rule.
+Every activity row is independently expandable, including successful commands and
 web searches that emitted no output. Specialized bodies cover commands, stdout/stderr/stdin,
 file diffs, MCP/dynamic/collaboration tools, web-search queries and actions, plans, reasoning,
 images, review events, compaction, and unknown future item types. Started and completed item

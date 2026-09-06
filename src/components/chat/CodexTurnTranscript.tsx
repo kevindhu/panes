@@ -544,7 +544,11 @@ function ActivityDetails({
       {activity.activityKind === "mcp" && <ToolDetails activity={activity} />}
       {activity.activityKind === "search" && <WebSearchDetails activity={activity} turnStatus={turnStatus} />}
       {(activity.activityKind === "reasoning" || activity.activityKind === "plan") && <ReasoningDetails activity={activity} />}
-      {activity.activityKind === "diff" && <DiffText diff={recordString(activity.payload, "diff") ?? ""} />}
+      {activity.activityKind === "diff" && (
+        recordString(activity.payload, "diff")?.trim()
+          ? <DiffText diff={recordString(activity.payload, "diff")!} />
+          : <div className="codex-native-empty-output">No net changes this turn.</div>
+      )}
       {!["command", "file", "mcp", "search", "reasoning", "plan", "diff"].includes(activity.activityKind) && (
         <JsonSection label="Details" value={activity.payload} />
       )}
@@ -609,7 +613,7 @@ function ActivityRow({
     }),
     [activity.id, activity.itemId, activity.itemType, activity.payload, activity.title, workspaceRootPath],
   );
-  const [expanded, setExpanded] = useState(() => images.length > 0);
+  const [expanded, setExpanded] = useState(() => activity.activityKind === "file" || images.length > 0);
   const previousImageCountRef = useRef(images.length);
   useEffect(() => {
     if (previousImageCountRef.current === 0 && images.length > 0) {
@@ -621,6 +625,7 @@ function ActivityRow({
     <div
       className={`codex-native-activity-row ${expanded ? "expanded" : ""}`}
       data-item-type={activity.itemType}
+      data-source-sequence={activity.sequence}
       data-transcript-selection-scope={`${selectionNamespace}:activity:${activity.id}`}
     >
       <button
@@ -844,6 +849,7 @@ function ActivityGroup({
 type TranscriptSegment =
   | { kind: "message"; entry: Extract<CodexTranscriptEntry, { kind: "message" }> }
   | { kind: "activities"; entries: CodexTranscriptActivity[] }
+  | { kind: "file"; entry: CodexTranscriptActivity }
   | { kind: "plan"; entry: CodexTranscriptActivity }
   | { kind: "planProgress"; entry: Extract<CodexTranscriptEntry, { kind: "planProgress" }> }
   | { kind: "steer"; entry: Extract<CodexTranscriptEntry, { kind: "steer" }> }
@@ -859,7 +865,10 @@ function buildSegments(entries: CodexTranscriptEntry[]): TranscriptSegment[] {
     activities = [];
   };
   for (const entry of entries) {
-    if (entry.kind === "activity" && entry.activityKind === "plan") {
+    if (entry.kind === "activity" && entry.activityKind === "file") {
+      flushActivities();
+      segments.push({ kind: "file", entry });
+    } else if (entry.kind === "activity" && entry.activityKind === "plan") {
       flushActivities();
       segments.push({ kind: "plan", entry });
     } else if (entry.kind === "activity") {
@@ -1186,6 +1195,18 @@ export function CodexTranscriptRenderer({
       data-transcript-selection-scope={`${selectionNamespace}:native`}
     >
       {segments.map((segment) => {
+        if (segment.kind === "file") {
+          return (
+            <section className="codex-native-group codex-native-file-block" key={segment.entry.id}>
+              <ActivityRow
+                activity={segment.entry}
+                selectionNamespace={selectionNamespace}
+                turnStatus={turnStatus}
+                workspaceRootPath={workspaceRootPath}
+              />
+            </section>
+          );
+        }
         if (segment.kind === "activities") {
           return (
             <ActivityGroup
@@ -1280,6 +1301,17 @@ export function CodexTranscriptRenderer({
           selectionScopeId={`${selectionNamespace}:plan-progress`}
           turnStatus={turnStatus}
         />
+      )}
+      {projection.turnDiff && (
+        <section className="codex-native-group codex-native-turn-diff" aria-label="All changes this turn">
+          <ActivityRow
+            key={projection.turnDiff.id}
+            activity={projection.turnDiff}
+            selectionNamespace={selectionNamespace}
+            turnStatus={turnStatus}
+            workspaceRootPath={workspaceRootPath}
+          />
+        </section>
       )}
       {loadError && <div className="codex-native-sync-warning"><AlertTriangle size={12} /> Transcript refresh failed: {loadError}</div>}
       <NativeEventsDrawer events={projection.events} />

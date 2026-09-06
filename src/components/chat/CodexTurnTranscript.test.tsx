@@ -163,6 +163,131 @@ describe("CodexTranscriptRenderer", () => {
     container.remove();
   });
 
+  it("keeps individual diff blocks and their expansion state in place as a turn streams", async () => {
+    const firstPatch = "@@ -1 +1 @@\n-original\n+intermediate\n";
+    const secondPatch = "@@ -1 +1 @@\n-intermediate\n+final\n";
+    const aggregate = "--- a/main.ts\n+++ b/main.ts\n@@ -1 +1 @@\n-original\n+final\n";
+    const initial = snapshot();
+    initial.turn = { ...initial.turn, status: "inProgress", completedAtMs: null, planJson: null, lastSourceSequence: 4 };
+    const firstEdit = {
+      ...initial.items[0]!,
+      itemId: "edit-1",
+      itemType: "fileChange",
+      firstSourceSequence: 2,
+      lastSourceSequence: 3,
+      completedJson: JSON.stringify({
+        type: "fileChange", status: "completed",
+        changes: [{ path: "main.ts", kind: "update", diff: firstPatch }],
+      }),
+    };
+    initial.items = [firstEdit];
+    const firstDiff = {
+      ...initial.events[0]!,
+      id: 4,
+      sourceSequence: 4,
+      method: "turn/diff/updated",
+      paramsJson: JSON.stringify({ diff: firstPatch }),
+    };
+    initial.events = [firstDiff];
+    await act(async () => root.render(
+      <CodexTranscriptRenderer snapshot={initial} status="streaming" onApproval={vi.fn()} />,
+    ));
+
+    const firstBlock = container.querySelector(".codex-native-file-block");
+    const firstToggle = firstBlock!.querySelector<HTMLButtonElement>(".codex-native-activity-header")!;
+    expect(firstToggle.getAttribute("aria-expanded")).toBe("true");
+    expect(firstBlock?.querySelector(".codex-native-diff")?.textContent).toContain("+intermediate");
+    const summary = container.querySelector(".codex-native-turn-diff")!;
+    const summaryToggle = summary.querySelector<HTMLButtonElement>(".codex-native-activity-header")!;
+    await act(async () => {
+      firstToggle.click();
+      summaryToggle.click();
+    });
+
+    const next: CodexTurnSnapshot = {
+      ...initial,
+      turn: { ...initial.turn, lastSourceSequence: 8 },
+      items: [
+        firstEdit,
+        {
+          ...firstEdit, itemId: "commentary", itemType: "agentMessage", firstSourceSequence: 5, lastSourceSequence: 5,
+          completedJson: JSON.stringify({ text: "Making a second edit.", phase: "commentary" }),
+        },
+        {
+          ...firstEdit, itemId: "edit-2", firstSourceSequence: 6, lastSourceSequence: 7,
+          completedJson: JSON.stringify({
+            type: "fileChange", status: "completed",
+            changes: [{ path: "main.ts", kind: "update", diff: secondPatch }],
+          }),
+        },
+      ],
+      events: [firstDiff, { ...firstDiff, id: 8, sourceSequence: 8, paramsJson: JSON.stringify({ diff: aggregate }) }],
+    };
+    await act(async () => root.render(
+      <CodexTranscriptRenderer snapshot={next} status="streaming" onApproval={vi.fn()} />,
+    ));
+
+    const timelineSelector = ".codex-native-file-block, .codex-native-message, .codex-native-turn-diff";
+    const timeline = Array.from(container.querySelectorAll(timelineSelector));
+    expect(timeline).toHaveLength(4);
+    expect(timeline[0]).toBe(firstBlock);
+    expect(firstToggle.getAttribute("aria-expanded")).toBe("false");
+    expect(timeline[1]?.textContent).toBe("Making a second edit.");
+    expect(timeline[2]?.querySelector(".codex-native-diff")?.textContent).toContain("-intermediate+final");
+    expect(timeline[3]).toBe(summary);
+    expect(summaryToggle.getAttribute("aria-expanded")).toBe("true");
+    expect(summary.querySelector(".codex-native-diff")?.textContent).toContain("-original+final");
+    expect(summary.querySelector(".codex-native-diff")?.textContent).not.toContain("intermediate");
+    expect(container.querySelectorAll('[data-item-type="turnDiff"]')).toHaveLength(1);
+
+    const completed: CodexTurnSnapshot = {
+      ...next,
+      turn: { ...next.turn, status: "completed", completedAtMs: 4_000, lastSourceSequence: 11 },
+      items: [...next.items, {
+        ...firstEdit, itemId: "answer", itemType: "agentMessage", firstSourceSequence: 9, lastSourceSequence: 10,
+        completedJson: JSON.stringify({ text: "Finished editing.", phase: "final_answer" }),
+      }],
+    };
+    await act(async () => root.render(
+      <CodexTranscriptRenderer snapshot={completed} status="completed" onApproval={vi.fn()} />,
+    ));
+    const completedTimeline = Array.from(container.querySelectorAll(timelineSelector));
+    expect(completedTimeline).toHaveLength(5);
+    expect(completedTimeline[0]).toBe(firstBlock);
+    expect(completedTimeline[2]).toBe(timeline[2]);
+    expect(completedTimeline[3]?.textContent).toBe("Finished editing.");
+    expect(completedTimeline[4]).toBe(summary);
+    expect(firstToggle.getAttribute("aria-expanded")).toBe("false");
+    await act(async () => firstToggle.click());
+    expect(firstBlock?.querySelector(".codex-native-diff")?.textContent).toContain("-original+intermediate");
+
+    // Reopening history preserves the same order and per-edit patches.
+    await act(async () => root.render(null));
+    await act(async () => root.render(
+      <CodexTranscriptRenderer snapshot={completed} status="completed" onApproval={vi.fn()} />,
+    ));
+    const reloadedTimeline = Array.from(container.querySelectorAll(timelineSelector));
+    expect(reloadedTimeline.map((entry) => entry.className)).toEqual(completedTimeline.map((entry) => entry.className));
+    expect(reloadedTimeline[0]?.querySelector(".codex-native-diff")?.textContent).toContain("-original+intermediate");
+    expect(reloadedTimeline[2]?.querySelector(".codex-native-diff")?.textContent).toContain("-intermediate+final");
+  });
+
+  it.each(["completed", "interrupted", "error"] as const)("shows an empty aggregate without a stale diff when the turn is %s", async (status) => {
+    const reverted = snapshot();
+    reverted.events = [{
+      ...reverted.events[0]!,
+      method: "turn/diff/updated",
+      paramsJson: JSON.stringify({ diff: "" }),
+    }];
+    await act(async () => root.render(
+      <CodexTranscriptRenderer snapshot={reverted} status={status} onApproval={vi.fn()} />,
+    ));
+    const summary = container.querySelector(".codex-native-turn-diff")!;
+    await act(async () => summary.querySelector<HTMLButtonElement>(".codex-native-activity-header")!.click());
+    expect(summary.textContent).toContain("No net changes this turn.");
+    expect(summary.querySelector(".codex-native-diff")).toBeNull();
+  });
+
   it("always expands a zero-output command and exposes its complete invocation", async () => {
     await act(async () => {
       root.render(

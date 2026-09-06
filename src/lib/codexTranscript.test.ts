@@ -107,6 +107,80 @@ function chunk(
 }
 
 describe("Codex transcript projection", () => {
+  it("keeps repeated edits in source order and projects the latest cumulative diff separately", () => {
+    const firstPatch = "@@ -1 +1 @@\n-original\n+intermediate\n";
+    const secondPatch = "@@ -1 +1 @@\n-intermediate\n+final\n";
+    const combinedDiff = "--- a/src/main.ts\n+++ b/src/main.ts\n@@ -1 +1 @@\n-original\n+final\n";
+    const firstEdit = item("edit-1", "fileChange", 2, {
+      changes: [{ path: "src/main.ts", kind: "update", diff: firstPatch }],
+    });
+    const firstDiffEvent = event(4, 4, "turn/diff/updated", { diff: firstPatch });
+    const initial: CodexTurnSnapshot = {
+      turn: turn(4),
+      items: [firstEdit],
+      events: [firstDiffEvent],
+      chunks: [],
+    };
+    const initialProjection = projectCodexTranscript(initial);
+    const tail: CodexTurnSnapshot = {
+      turn: turn(11),
+      items: [
+        item("commentary", "agentMessage", 5, { text: "One more edit.", phase: "commentary" }),
+        item("edit-2", "fileChange", 6, {
+          changes: [{ path: "src/main.ts", kind: "update", diff: secondPatch }],
+        }),
+        item("answer", "agentMessage", 9, { text: "Finished.", phase: "final_answer" }),
+      ],
+      events: [event(8, 8, "turn/diff/updated", { diff: combinedDiff })],
+      chunks: [],
+    };
+    const merged = mergeCodexTurnSnapshot(initial, tail);
+    const projection = projectCodexTranscript(merged);
+
+    expect(projection.entries.map((entry) => [entry.id, entry.sequence])).toEqual([
+      ["item:edit-1", 2],
+      ["item:commentary", 5],
+      ["item:edit-2", 6],
+      ["item:answer", 9],
+    ]);
+    expect(projection.entries[0]).toEqual(initialProjection.entries[0]);
+    expect(projection.entries[2]).toMatchObject({ payload: { changes: [{ diff: secondPatch }] } });
+    expect(projection.turnDiff).toMatchObject({
+      id: initialProjection.turnDiff?.id,
+      sequence: 8,
+      title: "All changes this turn +1 -1",
+      payload: { diff: combinedDiff },
+    });
+    expect(projection.turnDiff?.payload.diff).not.toContain("intermediate");
+    // A full history load uses the same projection, even if input events are unordered.
+    expect(projectCodexTranscript({
+      ...tail,
+      items: [...tail.items, firstEdit],
+      events: [...tail.events, firstDiffEvent],
+    })).toEqual(projection);
+    expect(projectCodexTranscript(mergeCodexTurnSnapshot(merged, tail))).toEqual(projection);
+  });
+
+  it("retains an empty latest turn diff after a revert without erasing the individual edit", () => {
+    const snapshot: CodexTurnSnapshot = {
+      turn: turn(6),
+      items: [item("edit-1", "fileChange", 2, {
+        changes: [{ path: "main.ts", kind: "update", diff: "-old\n+new\n" }],
+      })],
+      events: [],
+      chunks: [],
+    };
+    expect(projectCodexTranscript(snapshot).turnDiff).toBeNull();
+    snapshot.events = [
+      event(4, 4, "turn/diff/updated", { diff: "-old\n+new\n" }),
+      event(6, 6, "turn/diff/updated", { diff: "" }),
+    ];
+    const projection = projectCodexTranscript(snapshot);
+    expect(projection.entries).toHaveLength(1);
+    expect(projection.entries[0]).toMatchObject({ itemType: "fileChange", sequence: 2 });
+    expect(projection.turnDiff).toMatchObject({ sequence: 6, payload: { diff: "" } });
+  });
+
   it("keeps zero-output commands and web searches explicit and expandable", () => {
     const fullCommand = '"C:\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe" -Command \'New-Item -ItemType Directory -Force scripts | Out-Null\'';
     const snapshot: CodexTurnSnapshot = {

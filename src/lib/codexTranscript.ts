@@ -165,6 +165,7 @@ export interface CodexWebSearchDetails {
 
 export interface CodexTranscriptProjection {
   entries: CodexTranscriptEntry[];
+  turnDiff: CodexTranscriptActivity | null;
   events: CodexTurnEventRecord[];
   usage: CodexTranscriptUsage | null;
   plan: CodexPlanProgress | null;
@@ -564,21 +565,21 @@ function buildActivity(
   return activity;
 }
 
-function buildTurnDiffActivity(event: CodexTurnEventRecord): CodexTranscriptActivity | null {
+function buildTurnDiffActivity(event: CodexTurnEventRecord, turnId: string): CodexTranscriptActivity | null {
   const params = parseCodexJsonRecord(event.paramsJson);
   const diff = readString(params, "diff");
   if (diff === null) return null;
   const counts = diffCounts(diff);
   return {
     kind: "activity",
-    id: `event:${event.id}`,
+    id: `turn-diff:${turnId}`,
     itemId: null,
     itemType: "turnDiff",
     activityKind: "diff",
     sequence: event.sourceSequence,
     status: "done",
     phase: null,
-    title: `Diff (turn) +${counts.additions} -${counts.deletions}`,
+    title: `All changes this turn +${counts.additions} -${counts.deletions}`,
     subtitle: null,
     durationMs: null,
     payload: params,
@@ -885,6 +886,7 @@ export function interleaveLegacyTranscriptBlocks(
 }
 
 export function projectCodexTranscript(snapshot: CodexTurnSnapshot): CodexTranscriptProjection {
+  const events = [...snapshot.events].sort((left, right) => left.sourceSequence - right.sourceSequence);
   const chunksByItem = new Map<string, CodexItemStreamChunkRecord[]>();
   for (const chunk of snapshot.chunks) {
     if (!chunk.itemId) continue;
@@ -918,17 +920,16 @@ export function projectCodexTranscript(snapshot: CodexTurnSnapshot): CodexTransc
     entries.push(buildActivity(item, chunks));
   }
 
-  const latestTurnDiff = [...snapshot.events]
+  // Turn diffs are cumulative snapshots, not individual edits. Keep the latest
+  // snapshot outside the timeline so updates cannot move or replace edit blocks.
+  const latestTurnDiff = [...events]
     .reverse()
     .find((event) => methodSignature(event.method) === "turndiffupdated");
-  if (latestTurnDiff) {
-    const diff = buildTurnDiffActivity(latestTurnDiff);
-    if (diff) entries.push(diff);
-  }
+  const turnDiff = latestTurnDiff ? buildTurnDiffActivity(latestTurnDiff, snapshot.turn.id) : null;
 
   const plan = parseCodexPlanProgress(snapshot.turn.planJson);
   if (plan) {
-    const latestPlanEvent = [...snapshot.events]
+    const latestPlanEvent = [...events]
       .reverse()
       .find((event) => methodSignature(event.method) === "turnplanupdated");
     if (latestPlanEvent) {
@@ -944,7 +945,8 @@ export function projectCodexTranscript(snapshot: CodexTurnSnapshot): CodexTransc
   entries.sort((left, right) => left.sequence - right.sequence || left.id.localeCompare(right.id));
   return {
     entries,
-    events: [...snapshot.events].sort((left, right) => left.sourceSequence - right.sourceSequence),
+    turnDiff,
+    events,
     usage: parseCodexTranscriptUsage(snapshot.turn.usageJson),
     plan,
   };
