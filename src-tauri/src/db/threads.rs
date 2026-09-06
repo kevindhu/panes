@@ -536,21 +536,23 @@ pub(crate) fn derive_thread_status_for_recovery(
     conn: &rusqlite::Connection,
     thread_id: &str,
 ) -> anyhow::Result<ThreadStatusDto> {
-    let has_pending_approval = conn
-        .query_row(
-            "SELECT 1
+    let mut pending = conn.prepare(
+        "SELECT a.details_json
        FROM approvals a
        JOIN messages m ON m.id = a.message_id
        WHERE a.thread_id = ?1
          AND a.status = 'pending'
-         AND m.status = 'streaming'
-       LIMIT 1",
-            params![thread_id],
-            |_| Ok(()),
-        )
-        .optional()
-        .context("failed to inspect pending approvals during runtime recovery")?
-        .is_some();
+         AND m.status = 'streaming'",
+    )?;
+    let details = pending.query_map(params![thread_id], |row| row.get::<_, String>(0))?;
+    let mut has_pending_approval = false;
+    for detail in details {
+        let value = serde_json::from_str(&detail?).unwrap_or(serde_json::Value::Null);
+        if crate::engines::is_blocking_approval(&value) {
+            has_pending_approval = true;
+            break;
+        }
+    }
 
     if has_pending_approval {
         return Ok(ThreadStatusDto::AwaitingApproval);
@@ -828,6 +830,42 @@ mod tests {
         assert_eq!(
             derive_thread_status_for_recovery(&conn, &thread.id).unwrap(),
             ThreadStatusDto::Completed
+        );
+    }
+
+    #[test]
+    fn recovery_only_waits_for_blocking_questions() {
+        let db = test_db();
+        let thread = test_thread(&db, "Async questions");
+        let assistant =
+            messages::insert_assistant_placeholder(&db, &thread.id, Some("codex"), None, None)
+                .unwrap();
+        let conn = db.connect().unwrap();
+        for (id, blocking) in [("async", false), ("blocking", true)] {
+            actions::insert_approval(
+                &db,
+                id,
+                &thread.id,
+                &assistant.id,
+                &ActionType::Other,
+                "Scope?",
+                &json!({"_serverMethod": "item/tool/requestUserInput", "isBlocking": blocking}),
+            )
+            .unwrap();
+            assert_eq!(
+                derive_thread_status_for_recovery(&conn, &thread.id).unwrap(),
+                if blocking {
+                    ThreadStatusDto::AwaitingApproval
+                } else {
+                    ThreadStatusDto::Idle
+                }
+            );
+        }
+        actions::answer_approval(&db, "blocking", "accept").unwrap();
+        // Recovery does not invent a live turn from a persisted placeholder.
+        assert_eq!(
+            derive_thread_status_for_recovery(&conn, &thread.id).unwrap(),
+            ThreadStatusDto::Idle
         );
     }
 

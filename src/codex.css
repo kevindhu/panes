@@ -354,6 +354,11 @@ button { color: inherit; }
 .codex-questionnaire-actions button.danger { color: var(--danger); }
 .codex-questionnaire-actions button.primary { border: 1px solid var(--accent); background: var(--accent); color: var(--accent-contrast, #fff); font-weight: 600; }
 .codex-questionnaire-actions button:disabled { opacity: .42; cursor: default; }
+.codex-pending-questions { max-height: min(45vh, 380px); overflow-y: auto; margin-bottom: 8px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.codex-pending-questions-label { padding: 8px 12px; color: var(--text-3); font-size: 11px; }
+.codex-pending-questions details { border-top: 1px solid var(--border); padding: 10px 12px; }
+.codex-pending-questions summary { cursor: pointer; color: var(--text-2); font-size: 12px; }
+.codex-pending-questions .codex-questionnaire { margin-top: 10px; }
 .codex-empty { min-width: 0; flex: 1; display: grid; place-content: center; text-align: center; }
 .codex-empty h1 { margin: 0; font-size: 22px; }.codex-empty p { color: var(--text-3); font-size: 12px; }
 

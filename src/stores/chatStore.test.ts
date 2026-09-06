@@ -764,7 +764,7 @@ describe("chatStore send", () => {
     vi.useRealTimers();
   });
 
-  it("preserves a background plan-mode questionnaire when switching back", async () => {
+  it.each([true, false])("preserves background questions when switching back (blocking=%s)", async (isBlocking) => {
     const handlers = new Map<string, (event: StreamEvent) => void>();
     const threadOne = makeThread("thread-1", "streaming");
     const threadTwo = makeThread("thread-2", "completed");
@@ -796,6 +796,7 @@ describe("chatStore send", () => {
       action_type: "other",
       summary: "Choose a target",
       details: {
+        isBlocking,
         _serverMethod: "item/tool/requestUserInput",
         questions: [{ id: "target", question: "Choose a target", options: null }],
       },
@@ -815,7 +816,7 @@ describe("chatStore send", () => {
       }),
     });
     expect(useChatStore.getState()).toMatchObject({
-      status: "awaiting_approval",
+      status: isBlocking ? "awaiting_approval" : "streaming",
       streaming: true,
     });
   });
@@ -3339,6 +3340,71 @@ describe("chatStore send", () => {
       streaming: true,
     });
 
+    vi.useRealTimers();
+  });
+
+  it("keeps async questions pending during output, respects blocking requests, and cleans up on completion", async () => {
+    vi.useFakeTimers();
+    let handler!: (event: StreamEvent) => void;
+    mockListenThreadEvents.mockImplementationOnce(async (_threadId, onEvent) => {
+      handler = onEvent;
+      return () => {};
+    });
+    await useChatStore.getState().setActiveThread("thread-1");
+    const ask = (id: string, isBlocking: boolean) => handler({
+      type: "ApprovalRequested", approval_id: id, action_type: "other", summary: "Scope?",
+      details: { _serverMethod: "item/tool/requestUserInput", isBlocking,
+        questions: [{ id: "scope", header: "Scope", question: "Which scope?", options: null }] },
+    });
+    ask("async-1", false);
+    ask("async-2", false);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(useChatStore.getState()).toMatchObject({ status: "streaming", streaming: true });
+    expect(useChatStore.getState().messages.flatMap((m) => m.blocks ?? []).filter((b) => b.type === "approval" && b.status === "pending")).toHaveLength(2);
+    ask("blocking", true);
+    ask("async-3", false);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(useChatStore.getState().status).toBe("awaiting_approval");
+    handler({ type: "ApprovalResolved", approval_id: "blocking" });
+    await vi.advanceTimersByTimeAsync(20);
+    expect(useChatStore.getState().status).toBe("streaming");
+    handler({ type: "TurnCompleted", status: "completed", diagnostics: { source: "engine" } });
+    await vi.advanceTimersByTimeAsync(20);
+    expect(useChatStore.getState()).toMatchObject({ status: "completed", streaming: false });
+    expect(useChatStore.getState().messages.flatMap((m) => m.blocks ?? []).filter((b) => b.type === "approval" && b.status === "pending")).toHaveLength(0);
+    vi.useRealTimers();
+  });
+
+  it.each(["pending", "resolved", "completed", "switched"])("preserves streamed output when an async answer fails (%s)", async (outcome) => {
+    vi.useFakeTimers();
+    const answer = deferred<void>();
+    mockIpc.respondApproval.mockReturnValueOnce(answer.promise);
+    let handler!: (event: StreamEvent) => void;
+    mockListenThreadEvents.mockImplementationOnce(async (_threadId, onEvent) => {
+      handler = onEvent;
+      return () => {};
+    });
+    await useChatStore.getState().setActiveThread("thread-1");
+    handler({ type: "ApprovalRequested", approval_id: "async", action_type: "other", summary: "Scope?",
+      details: { _serverMethod: "item/tool/requestUserInput", isBlocking: false } });
+    await vi.advanceTimersByTimeAsync(20);
+    const submission = useChatStore.getState().respondApproval("async", { answers: {} });
+    handler({ type: "TextDelta", content: "New output during submission" });
+    if (outcome === "resolved") handler({ type: "ApprovalResolved", approval_id: "async" });
+    if (outcome === "completed") handler({ type: "TurnCompleted", status: "completed" });
+    await vi.advanceTimersByTimeAsync(20);
+    if (outcome === "switched") await useChatStore.getState().setActiveThread("thread-2");
+    answer.reject(new Error("Connection lost"));
+    await expect(submission).resolves.toBe(false);
+    if (outcome === "switched") {
+      expect(useChatStore.getState().threadId).toBe("thread-2");
+      await useChatStore.getState().setActiveThread("thread-1");
+    }
+    const state = useChatStore.getState();
+    const blocks = state.messages.flatMap((message) => message.blocks ?? []);
+    expect(blocks).toContainEqual(expect.objectContaining({ type: "text", content: "New output during submission" }));
+    expect(blocks.find((block) => block.type === "approval")?.status).toBe(["pending", "switched"].includes(outcome) ? "pending" : "answered");
+    expect(state.status).toBe(outcome === "completed" ? "completed" : "streaming");
     vi.useRealTimers();
   });
 

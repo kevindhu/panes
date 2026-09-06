@@ -1064,7 +1064,13 @@ function liveActivityLabel(
   }
   const latestMethod = events.at(-1)?.method.toLowerCase() ?? "";
   if (latestMethod.includes("requestapproval")) return "Waiting for approval…";
-  if (latestMethod.includes("requestuserinput") || latestMethod.includes("elicitation")) return "Waiting for input…";
+  if (latestMethod.includes("requestuserinput")) {
+    try {
+      if (JSON.parse(events.at(-1)?.paramsJson ?? "{}").isBlocking === false) return "Working · question pending…";
+    } catch { /* Older or malformed payloads keep the conservative waiting label. */ }
+    return "Waiting for input…";
+  }
+  if (latestMethod.includes("elicitation")) return "Waiting for input…";
   if (latestMethod === "hook/started") return "Running hook…";
   if (latestMethod === "model/rerouted") return "Switching models…";
   if (latestMethod === "model/safetybuffering/updated") return "Verifying response…";

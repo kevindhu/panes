@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { isBlockingApproval } from "../lib/pendingQuestions";
 import {
   ipc,
   listenThreadEvents,
@@ -664,7 +665,10 @@ function applyRuntimeStateFromEvent(
   }
 
   if (event.type === "ApprovalRequested") {
-    return { status: "awaiting_approval", streaming: true };
+    return {
+      status: messagesHavePendingApprovals(messages) ? "awaiting_approval" : "streaming",
+      streaming: true,
+    };
   }
 
   if (event.type === "ApprovalResolved") {
@@ -691,7 +695,10 @@ function applyRuntimeStateFromEvent(
   }
 
   if (event.type === "TurnStarted" || eventHasVisibleAssistantContent(event)) {
-    return { status: "streaming", streaming: true };
+    return {
+      status: messagesHavePendingApprovals(messages) ? "awaiting_approval" : "streaming",
+      streaming: true,
+    };
   }
 
   return { status, streaming };
@@ -943,7 +950,8 @@ function resolveApprovalInMessages(
     const approvalBlock = blocks[approvalIndex] as ApprovalBlock;
     if (
       approvalBlock.status === "answered" &&
-      (decision === undefined || approvalBlock.decision === decision)
+      decision !== undefined &&
+      approvalBlock.decision === decision
     ) {
       return messages;
     }
@@ -1824,7 +1832,9 @@ type TerminalTurnState = "completed" | "interrupted" | "failed";
 function messagesHavePendingApprovals(messages: Message[]): boolean {
   return messages.some((message) =>
     message.role === "assistant" &&
-    (message.blocks ?? []).some((block) => block.type === "approval" && block.status === "pending"),
+    (message.blocks ?? []).some((block) =>
+      block.type === "approval" && block.status === "pending" && isBlockingApproval(block.details),
+    ),
   );
 }
 
@@ -2804,7 +2814,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       listenThreadEvents(currentThreadId, (event) => {
         if (event.type === "ApprovalRequested") {
           const runtimeState = applyApprovalEventToCachedThreadView(currentThreadId, event)
-            ?? { status: "awaiting_approval" as const, streaming: true };
+            ?? {
+              status: isBlockingApproval(event.details) ? "awaiting_approval" as const : "streaming" as const,
+              streaming: true,
+            };
           useThreadStore
             .getState()
             .setThreadStatusLocal(currentThreadId, runtimeState.status);
@@ -3722,11 +3735,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const responseData = typeof response === "object" && response !== null && !Array.isArray(response)
       ? response as Record<string, unknown>
       : undefined;
-    const previousState = {
-      messages: get().messages,
-      status: get().status,
-      streaming: get().streaming,
-    };
+    const previousBlock = get().messages.flatMap((message) => message.blocks ?? [])
+      .find((block) => block.type === "approval" && block.approvalId === approvalId);
     set((state) => {
       const nextMessages = resolveApprovalInMessages(state.messages, approvalId, decision, responseData);
       if (nextMessages === state.messages) {
@@ -3744,20 +3754,36 @@ export const useChatStore = create<ChatState>((set, get) => ({
       .getState()
       .setThreadStatusLocal(threadId, get().status);
 
+    const optimisticBlock = get().messages.flatMap((message) => message.blocks ?? [])
+      .find((block) => block.type === "approval" && block.approvalId === approvalId);
     try {
       await ipc.respondApproval(threadId, approvalId, response);
       return true;
     } catch (error) {
-      // Roll back the optimistic update on failure
-      set({
-        messages: previousState.messages,
-        status: previousState.status,
-        streaming: previousState.streaming,
-        error: String(error),
-      });
-      useThreadStore
-        .getState()
-        .setThreadStatusLocal(threadId, previousState.status);
+      // Output, other answers, resolution events, or a thread switch may arrive
+      // while an async answer is in flight. Never restore an entire stale view.
+      const restore = (view: CachedThreadView): CachedThreadView => {
+        const messages = view.messages.map((message) => ({
+          ...message,
+          blocks: message.blocks?.map((block) =>
+            message.status === "streaming" && block === optimisticBlock && previousBlock
+              ? previousBlock
+              : block,
+          ),
+        }));
+        return { ...view, messages, ...(deriveRuntimeStateFromMessages(messages) ?? {}) };
+      };
+      if (get().threadId === threadId) {
+        set((state) => ({ ...restore(state), error: String(error) }));
+        useThreadStore.getState().setThreadStatusLocal(threadId, get().status);
+      } else {
+        const cached = cachedThreadViews.get(threadId);
+        if (cached) {
+          const restored = restore(cached);
+          writeCachedThreadView(threadId, restored);
+          useThreadStore.getState().setThreadStatusLocal(threadId, restored.status);
+        }
+      }
       return false;
     }
   },

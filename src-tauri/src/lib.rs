@@ -612,11 +612,13 @@ async fn resolve_codex_runtime_approval(
                 }
             }
 
-            let next_thread_status = if has_local_turn {
-                ThreadStatusDto::Streaming
-            } else {
-                db::threads::derive_thread_status_for_recovery(&tx, &thread_id)?
-            };
+            let recovered_status = db::threads::derive_thread_status_for_recovery(&tx, &thread_id)?;
+            let next_thread_status =
+                if has_local_turn && recovered_status != ThreadStatusDto::AwaitingApproval {
+                    ThreadStatusDto::Streaming
+                } else {
+                    recovered_status
+                };
             tx.execute(
                 "UPDATE threads
                  SET status = ?1, last_activity_at = datetime('now')

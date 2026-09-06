@@ -10,6 +10,7 @@ const mockIpc = vi.hoisted(() => ({
   savePastedImageAttachment: vi.fn(),
   forkCodexThreadAtTurn: vi.fn(),
   setThreadCodexConfig: vi.fn(),
+  respondApproval: vi.fn(),
 }));
 const mockListeners = vi.hoisted(() => ({
   transcriptUpdated: null as null | ((event: {
@@ -54,6 +55,7 @@ import { useThreadStore } from "../../stores/threadStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
 import { initializeCodexI18n } from "../../i18n/codex";
 import { CodexChat } from "./CodexChat";
+import { resetLiveQuestionnaireDraftsForTests } from "../chat/ToolInputQuestionnaire";
 
 const thread: Thread = {
   id: "thread-1",
@@ -80,10 +82,12 @@ beforeAll(async () => {
 beforeEach(() => {
   vi.clearAllMocks();
   mockIpc.setThreadCodexConfig.mockResolvedValue(thread);
+  mockIpc.respondApproval.mockResolvedValue(undefined);
   mockListeners.transcriptUpdated = null;
   mockListeners.assistantTurnRenderCount = 0;
   localStorage.clear();
   sessionStorage.clear();
+  resetLiveQuestionnaireDraftsForTests();
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
@@ -155,6 +159,47 @@ beforeEach(() => {
   container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
+});
+
+it("shows multiple async questions alongside steering and submits only the selected request", async () => {
+  useChatStore.setState({
+    streaming: true, status: "streaming",
+    messages: [{ id: "assistant-questions", schemaVersion: 1, threadId: thread.id, role: "assistant", content: "", status: "streaming", createdAt: thread.createdAt,
+      blocks: ["one", "two"].map((id) => ({ type: "approval", approvalId: id, actionType: "other", summary: `Question ${id}`, status: "pending",
+        details: { _serverMethod: "item/tool/requestUserInput", isBlocking: false,
+          questions: [{ id: "scope", header: "Scope", question: `Choose ${id}`, options: [{ label: "Small", description: "Focused" }] }] } })) }],
+  });
+  await act(async () => root.render(<CodexChat />));
+  expect(container.querySelector('textarea[placeholder="Steer the current turn…"]')).not.toBeNull();
+  expect(container.querySelectorAll('.codex-pending-questions details')).toHaveLength(2);
+  expect(mockIpc.respondApproval).not.toHaveBeenCalled();
+  const send = [...container.querySelectorAll('.codex-pending-questions button')].find((button) => button.textContent === "Send answers");
+  await act(async () => (send as HTMLButtonElement)?.click());
+  expect(mockIpc.respondApproval).toHaveBeenCalledWith(thread.id, "one", { answers: { scope: { answers: ["Small"] } } });
+  expect(container.querySelectorAll('.codex-pending-questions details')).toHaveLength(1);
+  expect(useChatStore.getState().status).toBe("streaming");
+  expect(useThreadPlanModeStore.getState().threadModes[thread.id]).toBeUndefined();
+});
+
+it("retains blocking composer takeover in default mode", async () => {
+  useChatStore.setState({ streaming: true, status: "awaiting_approval",
+    messages: [{ id: "assistant-blocking", schemaVersion: 1, threadId: thread.id, role: "assistant", content: "", status: "streaming", createdAt: thread.createdAt,
+      blocks: [{ type: "approval", approvalId: "blocking", actionType: "other", summary: "Required", status: "pending",
+        details: { _serverMethod: "item/tool/requestUserInput", isBlocking: true,
+          questions: [{ id: "scope", header: "Scope", question: "Required scope?", options: null }] } }] }],
+  });
+  await act(async () => root.render(<CodexChat />));
+  expect(container.querySelector('textarea[placeholder="Steer the current turn…"]')).toBeNull();
+  expect(container.textContent).toContain("Required scope?");
+  expect(container.querySelector('.codex-pending-questions')).toBeNull();
+  const answer = container.querySelector<HTMLTextAreaElement>('.codex-questionnaire-answer');
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set?.call(answer, "Keep this draft");
+    answer?.dispatchEvent(new Event("input", { bubbles: true }));
+    root.render(<div>Another thread</div>);
+  });
+  await act(async () => root.render(<CodexChat />));
+  expect(container.querySelector<HTMLTextAreaElement>('.codex-questionnaire-answer')?.value).toBe("Keep this draft");
 });
 
 afterEach(async () => {

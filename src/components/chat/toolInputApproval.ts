@@ -7,6 +7,7 @@ import type {
   NetworkPolicyAmendment,
   PermissionsApprovalResponse,
 } from "../../types";
+import { isUserInputRequest } from "../../lib/pendingQuestions";
 
 export interface ToolInputOption {
   label: string;
@@ -26,10 +27,6 @@ export interface ToolInputQuestion {
 
 export type ToolInputSelections = Record<string, string[]>;
 
-const REQUEST_USER_INPUT_METHODS = new Set([
-  "item/tool/requestuserinput",
-  "tool/requestuserinput",
-]);
 const DYNAMIC_TOOL_CALL_METHOD = "item/tool/call";
 const PERMISSIONS_REQUEST_METHOD = "item/permissions/requestapproval";
 const MCP_ELICITATION_REQUEST_METHOD = "mcpserver/elicitation/request";
@@ -50,7 +47,7 @@ export function getApprovalServerMethod(details?: Record<string, unknown>): stri
 }
 
 export function isRequestUserInputApproval(details?: Record<string, unknown>): boolean {
-  return REQUEST_USER_INPUT_METHODS.has(getApprovalServerMethod(details));
+  return isUserInputRequest(details);
 }
 
 export function isDynamicToolCallApproval(details?: Record<string, unknown>): boolean {

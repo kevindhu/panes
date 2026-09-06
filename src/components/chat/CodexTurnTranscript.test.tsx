@@ -163,6 +163,16 @@ describe("CodexTranscriptRenderer", () => {
     container.remove();
   });
 
+  it.each([true, false])("labels a question without inventing a blocking wait (blocking=%s)", async (isBlocking) => {
+    const current = snapshot();
+    current.turn = { ...current.turn, status: "inProgress", completedAtMs: null, planJson: null };
+    current.items = [];
+    current.events = [{ ...current.events[0]!, eventKind: "request", method: "item/tool/requestUserInput",
+      paramsJson: JSON.stringify({ isBlocking, itemId: "question", questions: [] }) }];
+    await act(async () => root.render(<CodexTranscriptRenderer snapshot={current} status="streaming" onApproval={vi.fn()} />));
+    expect(container.textContent).toContain(isBlocking ? "Waiting for input" : "Working · question pending");
+  });
+
   it("keeps individual diff blocks and their expansion state in place as a turn streams", async () => {
     const firstPatch = "@@ -1 +1 @@\n-original\n+intermediate\n";
     const secondPatch = "@@ -1 +1 @@\n-intermediate\n+final\n";

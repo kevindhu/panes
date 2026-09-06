@@ -2169,12 +2169,16 @@ async fn respond_to_approval_inner(
                     Some(&normalized_response),
                 );
             }
-            let next_thread_status = if has_local_turn {
-                ThreadStatusDto::Streaming
-            } else {
+            let recovered_status = {
                 let conn = db.connect()?;
                 db::threads::derive_thread_status_for_recovery(&conn, &thread_id)?
             };
+            let next_thread_status =
+                if has_local_turn && recovered_status != ThreadStatusDto::AwaitingApproval {
+                    ThreadStatusDto::Streaming
+                } else {
+                    recovered_status
+                };
             db::threads::update_thread_status(db, &thread_id, next_thread_status)?;
             Ok(())
         }
@@ -4030,7 +4034,7 @@ async fn process_stream_event(
         _ => {}
     }
 
-    let progress = apply_event_to_blocks(
+    let mut progress = apply_event_to_blocks(
         blocks,
         action_index,
         approval_index,
@@ -4038,6 +4042,30 @@ async fn process_stream_event(
         max_output_chars,
         turn_duration_ms,
     );
+
+    if matches!(&normalized_event, EngineEvent::ApprovalRequested { .. }) {
+        // Answers are persisted outside the streaming loop. Its block snapshot
+        // may still contain an older pending request, so use persisted request
+        // state when a new question arrives.
+        match run_db(state.db.clone(), {
+            let thread_id = thread.id.clone();
+            move |db| {
+                let conn = db.connect()?;
+                db::threads::derive_thread_status_for_recovery(&conn, &thread_id)
+            }
+        })
+        .await
+        {
+            Ok(status) => {
+                progress.thread_status = Some(if status == ThreadStatusDto::AwaitingApproval {
+                    status
+                } else {
+                    ThreadStatusDto::Streaming
+                });
+            }
+            Err(error) => log::warn!("failed to reconcile question waiting state: {error}"),
+        }
+    }
 
     if matches!(&normalized_event, EngineEvent::TurnCompleted { .. }) {
         resolve_pending_approvals_for_terminal_message(state, assistant_message_id).await;
@@ -4842,7 +4870,20 @@ fn apply_event_to_blocks(
             };
             progress.blocks_changed =
                 upsert_approval_block(blocks, approval_index, approval_id, block);
-            progress.thread_status = Some(ThreadStatusDto::AwaitingApproval);
+            let has_blocking_request = blocks.iter().any(|block| match block {
+                ContentBlock::Approval {
+                    details, status, ..
+                } if status == "pending" => {
+                    let details = serde_json::from_str(details.get()).unwrap_or(Value::Null);
+                    crate::engines::is_blocking_approval(&details)
+                }
+                _ => false,
+            });
+            progress.thread_status = Some(if has_blocking_request {
+                ThreadStatusDto::AwaitingApproval
+            } else {
+                ThreadStatusDto::Streaming
+            });
             progress.force_persist = true;
         }
         EngineEvent::Error {
@@ -6889,6 +6930,34 @@ mod tests {
             } if status == "answered" && decision == "cancel"
         ));
         assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn async_questions_preserve_other_blocking_requests() {
+        let mut blocks = Vec::new();
+        let mut actions = HashMap::new();
+        let mut approvals = HashMap::new();
+        for (id, blocking, expected) in [
+            ("async-1", false, ThreadStatusDto::Streaming),
+            ("blocking", true, ThreadStatusDto::AwaitingApproval),
+            ("async-2", false, ThreadStatusDto::AwaitingApproval),
+        ] {
+            let progress = apply_event_to_blocks(
+                &mut blocks,
+                &mut actions,
+                &mut approvals,
+                &EngineEvent::ApprovalRequested {
+                    approval_id: id.to_string(),
+                    action_type: crate::engines::ActionType::Other,
+                    summary: "Scope?".to_string(),
+                    details: json!({"_serverMethod": "item/tool/requestUserInput", "isBlocking": blocking}),
+                },
+                1000,
+                None,
+            );
+            assert_eq!(progress.thread_status, Some(expected));
+        }
+        assert_eq!(blocks.len(), 3);
     }
 
     #[test]

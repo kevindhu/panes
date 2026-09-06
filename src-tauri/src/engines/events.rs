@@ -1,5 +1,24 @@
 use serde::{Deserialize, Serialize};
 
+pub fn is_blocking_approval(details: &serde_json::Value) -> bool {
+    let method: String = details
+        .get("_serverMethod")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    // Other approvals and older runtimes remain blocking.
+    !(matches!(
+        method.as_str(),
+        "itemtoolrequestuserinput" | "toolrequestuserinput"
+    ) && details
+        .get("isBlocking")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false))
+}
+
 pub const ACTION_OUTPUT_DELTA_MAX_CHARS: usize = 16 * 1024;
 pub const STREAMED_DIFF_MAX_CHARS: usize = 128 * 1024;
 const ACTION_OUTPUT_DELTA_TRUNCATED_PREFIX: &str = "... [output truncated; showing tail]\n";

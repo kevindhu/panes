@@ -34,7 +34,8 @@ import {
   VirtualMessageTranscript,
   type VirtualMessageTranscriptHandle,
 } from "./VirtualMessageTranscript";
-import { findLatestPendingToolInputApproval } from "../chat/toolInputApproval";
+import { parseToolInputQuestions } from "../chat/toolInputApproval";
+import { isBlockingApproval, pendingQuestions } from "../../lib/pendingQuestions";
 import {
   canForkFromAssistantMessage,
   computeDroppedTurnsForEditedMessage,
@@ -265,12 +266,14 @@ export function CodexChat() {
       .join("|"),
     [displayedMessages, transcriptSequences],
   );
-  const pendingToolInputApproval = useMemo(
+  const toolInputRequests = useMemo(
     () => activeThreadId && boundThreadId === activeThreadId
-      ? findLatestPendingToolInputApproval(messages)
-      : null,
+      ? pendingQuestions(messages).filter((request) => parseToolInputQuestions(request.details).length > 0)
+      : [],
     [activeThreadId, boundThreadId, messages],
   );
+  const pendingToolInputApproval = toolInputRequests.find((request) => isBlockingApproval(request.details)) ?? null;
+  const nonblockingQuestions = toolInputRequests.filter((request) => !isBlockingApproval(request.details));
   const nativePlanText = useMemo(() => {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
@@ -286,7 +289,7 @@ export function CodexChat() {
   const showPlanImplementationPrompt = Boolean(
     planMode &&
     planModeThreadIsBound &&
-    !pendingToolInputApproval &&
+    toolInputRequests.length === 0 &&
     shouldPromptToImplementPlan({
       streaming,
       status,
@@ -1005,6 +1008,21 @@ export function CodexChat() {
             Jump to latest
           </button>
         )}
+        {nonblockingQuestions.length > 0 && (
+          <section className="codex-pending-questions" aria-label="Pending questions">
+            <div className="codex-pending-questions-label">Questions · Codex can keep working</div>
+            {nonblockingQuestions.map((request) => (
+              <details key={request.approvalId} open>
+                <summary>{request.summary || "Question from Codex"}</summary>
+                <ToolInputQuestionnaire
+                  details={request.details}
+                  onSubmit={(response) => respondApproval(request.approvalId, response)}
+                  draftKey={`${activeThreadId}:${request.approvalId}`}
+                />
+              </details>
+            ))}
+          </section>
+        )}
         <div className="codex-composer">
           {showSpecialComposer && planMode && (
             <div className="codex-composer-mode"><ListChecks size={12} /> Plan mode</div>
@@ -1015,9 +1033,7 @@ export function CodexChat() {
               details={pendingToolInputApproval.details}
               onSubmit={submitPendingToolInput}
               onStop={cancel}
-              draftKey={planMode
-                ? `${activeThreadId}:${pendingToolInputApproval.approvalId}`
-                : undefined}
+              draftKey={`${activeThreadId}:${pendingToolInputApproval.approvalId}`}
             />
           ) : showPlanImplementationPrompt ? (
             <ToolInputQuestionnaire
