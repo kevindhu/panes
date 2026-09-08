@@ -1,0 +1,26 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Panes</title>
+  <desc>Two interlocking panes with precision-cut corners in electric green on graphite.</desc>
+  <defs>
+    <linearGradient id="tile" x1="96" y1="32" x2="416" y2="480" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#161B18"/>
+      <stop offset="1" stop-color="#070A08"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="96" y1="32" x2="384" y2="480" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#39443B"/>
+      <stop offset="1" stop-color="#161D18"/>
+    </linearGradient>
+    <linearGradient id="green" x1="192" y1="128" x2="384" y2="320" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7CFF5B"/>
+      <stop offset="1" stop-color="#39FF14"/>
+    </linearGradient>
+    <linearGradient id="rear" x1="128" y1="192" x2="320" y2="384" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#BDD0BF"/>
+      <stop offset="1" stop-color="#6D8973"/>
+    </linearGradient>
+  </defs>
+  <rect x="32" y="32" width="448" height="448" rx="100" fill="url(#tile)"/>
+  <rect x="33" y="33" width="446" height="446" rx="99" stroke="url(#edge)" stroke-width="2"/>
+  <path d="M160 192H128V352L160 384H320V352" stroke="url(#rear)" stroke-width="20"/>
+  <path d="M192 288V128H352L384 160V320H224L192 288Z" stroke="url(#green)" stroke-width="20"/>
+</svg>

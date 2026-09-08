@@ -282,18 +282,55 @@ pub fn replace_thread_messages_and_metadata(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("failed to start thread message import transaction")?;
 
+    // Engine history is a compatibility projection, not a replacement for the
+    // captured native ledger. Keep retained assistant messages (and their FK
+    // dependants) by native turn identity. Turns absent from the authoritative
+    // history are still removed, as required by rollback.
+    tx.execute_batch(
+        "CREATE TEMP TABLE retained_import_messages (
+            native_turn_id TEXT PRIMARY KEY, message_id TEXT NOT NULL UNIQUE
+         );",
+    )?;
+    let mut retained = HashMap::new();
+    for message in messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+    {
+        let Some(native_turn_id) = message.native_turn_id.as_deref() else {
+            continue;
+        };
+        let message_id: Option<String> = tx
+            .query_row(
+                "SELECT m.id FROM messages m JOIN codex_turns t ON t.message_id = m.id
+                 WHERE m.thread_id = ?1 AND m.role = 'assistant' AND t.native_turn_id = ?2",
+                params![thread_id, native_turn_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(message_id) = message_id {
+            tx.execute(
+                "INSERT INTO retained_import_messages VALUES (?1, ?2)",
+                params![native_turn_id, message_id],
+            )?;
+            retained.insert(native_turn_id.to_string(), message_id);
+        }
+    }
+
     tx.execute(
-        "DELETE FROM actions WHERE thread_id = ?1",
+        "DELETE FROM actions WHERE thread_id = ?1 AND
+         (message_id IS NULL OR message_id NOT IN (SELECT message_id FROM retained_import_messages))",
         params![thread_id],
     )
     .context("failed to clear imported thread actions")?;
     tx.execute(
-        "DELETE FROM approvals WHERE thread_id = ?1",
+        "DELETE FROM approvals WHERE thread_id = ?1 AND
+         (message_id IS NULL OR message_id NOT IN (SELECT message_id FROM retained_import_messages))",
         params![thread_id],
     )
     .context("failed to clear imported thread approvals")?;
     tx.execute(
-        "DELETE FROM messages WHERE thread_id = ?1",
+        "DELETE FROM messages WHERE thread_id = ?1
+         AND id NOT IN (SELECT message_id FROM retained_import_messages)",
         params![thread_id],
     )
     .context("failed to clear imported thread messages")?;
@@ -327,6 +364,19 @@ pub fn replace_thread_messages_and_metadata(
         let created_at = ordered_created_at
             .format("%Y-%m-%d %H:%M:%S%.3f")
             .to_string();
+
+        if let Some(message_id) = message
+            .native_turn_id
+            .as_ref()
+            .filter(|_| message.role == "assistant")
+            .and_then(|turn_id| retained.get(turn_id))
+        {
+            tx.execute(
+                "UPDATE messages SET created_at = ?2, status = ?3 WHERE id = ?1",
+                params![message_id, created_at, message.status.as_str()],
+            )?;
+            continue;
+        }
 
         tx.execute(
             "INSERT INTO messages (
@@ -386,6 +436,7 @@ pub fn replace_thread_messages_and_metadata(
         )?;
     }
 
+    tx.execute_batch("DROP TABLE retained_import_messages;")?;
     tx.commit()
         .context("failed to commit thread message import transaction")?;
     Ok(messages.len())
@@ -2373,6 +2424,18 @@ mod tests {
                 ),
                 native_event(
                     5,
+                    "item/completed",
+                    json!({ "item": { "id": "command-1", "type": "commandExecution",
+                        "command": "run investigation", "aggregatedOutput": "evidence", "status": "completed" } }),
+                ),
+                native_event(
+                    6,
+                    "item/completed",
+                    json!({ "item": { "id": "edit-1", "type": "fileChange",
+                        "changes": [{ "path": "server.lua", "diff": "-old\n+fixed" }], "status": "completed" } }),
+                ),
+                native_event(
+                    7,
                     "turn/completed",
                     json!({ "turn": { "id": native_turn_id, "status": "completed" } }),
                 ),
@@ -2518,6 +2581,86 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn engine_sync_preserves_retained_native_history_and_removes_rolled_back_turns() {
+        let db = test_db();
+        let source = test_thread(&db);
+        let target = test_thread(&db);
+        let assistant = insert_message(
+            &db,
+            &source,
+            "assistant",
+            Some("Full investigation".into()),
+            Some(json!([{ "type": "text", "content": "Full investigation" }])),
+            MessageStatusDto::Completed,
+            Some("codex"),
+            None,
+            None,
+        )
+        .unwrap();
+        let event = |sequence, method: &str, payload: Value| CodexNativeEvent {
+            source_sequence: sequence,
+            observed_at_ms: 1000 + sequence as i64,
+            event_kind: CodexNativeEventKind::Notification,
+            method: method.into(),
+            request_id: None,
+            native_thread_id: "native-source".into(),
+            native_turn_id: Some("retained-turn".into()),
+            params_json: payload.to_string(),
+        };
+        codex_transcript::record_native_event_batch(&db, &source, &assistant.id, &[
+            event(1, "turn/started", json!({ "turn": { "id": "retained-turn" } })),
+            event(2, "item/agentMessage/delta", json!({ "itemId": "text", "delta": "Working" })),
+            event(3, "item/completed", json!({ "item": { "id": "edit", "type": "fileChange", "changes": [{ "diff": "-old\n+fixed" }] } })),
+            event(4, "turn/completed", json!({ "turn": { "id": "retained-turn", "status": "completed" } })),
+        ]).unwrap();
+        clone_thread_messages_for_branch(&db, &source, &target, None).unwrap();
+        let cloned = get_thread_messages(&db, &target).unwrap().remove(0);
+        let before = codex_transcript::load_turn_snapshot(&db, &cloned.id)
+            .unwrap()
+            .unwrap();
+        let imported = ImportedMessageRecord {
+            role: "assistant".into(),
+            content: Some("Only final response".into()),
+            blocks: json!([{ "type": "text", "content": "Only final response" }]),
+            status: MessageStatusDto::Completed,
+            native_turn_id: Some("retained-turn".into()),
+            turn_engine_id: Some("codex".into()),
+            turn_model_id: None,
+            turn_reasoning_effort: None,
+            token_input: 0,
+            token_output: 0,
+            created_at: None,
+        };
+        // An invalid duplicate identity aborts atomically, including temporary
+        // import state on the pooled connection.
+        assert!(
+            replace_thread_messages(&db, &target, &[imported.clone(), imported.clone()]).is_err()
+        );
+        assert_eq!(get_thread_messages(&db, &target).unwrap()[0].id, cloned.id);
+        for _ in 0..2 {
+            replace_thread_messages(&db, &target, &[imported.clone()]).unwrap();
+            let messages = get_thread_messages(&db, &target).unwrap();
+            assert_eq!(messages[0].id, cloned.id);
+            assert_eq!(messages[0].blocks, cloned.blocks);
+            let after = codex_transcript::load_turn_snapshot(&db, &cloned.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.items, before.items);
+            assert_eq!(after.events, before.events);
+            assert_eq!(after.chunks, before.chunks);
+        }
+        // Remote rollback is still authoritative about which turns exist.
+        replace_thread_messages(&db, &target, &[]).unwrap();
+        assert!(get_thread_messages(&db, &target).unwrap().is_empty());
+        assert!(codex_transcript::load_turn_snapshot(&db, &cloned.id)
+            .unwrap()
+            .is_none());
+        assert!(codex_transcript::load_turn_snapshot(&db, &assistant.id)
+            .unwrap()
+            .is_some());
     }
 
     #[test]

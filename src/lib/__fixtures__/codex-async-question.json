@@ -1,0 +1,19 @@
+{
+  "type": "agentMessage",
+  "id": "call_NN2CpNit4E2t8nnFHXWuLuDe",
+  "text": "When it sends you back to a stage after claiming, where do you land? This will help distinguish the teleport paths I found.\n- In the safe room near its starting point\n- On a mini-treadmill\n- Inside the keyboard arena\n- I’m not sure",
+  "phase": "final_answer",
+  "memoryCitation": null,
+  "delivery": "async",
+  "questions": [
+    {
+      "title": "When it sends you back to a stage after claiming, where do you land? This will help distinguish the teleport paths I found.",
+      "options": [
+        "In the safe room near its starting point",
+        "On a mini-treadmill",
+        "Inside the keyboard arena",
+        "I’m not sure"
+      ]
+    }
+  ]
+}

@@ -26,6 +26,7 @@ import {
   type ReactNode,
 } from "react";
 import { ipc } from "../../lib/codexIpc";
+import { AsyncQuestionMessage } from "./AsyncQuestionMessage";
 import {
   extractChatImagesFromPayload,
   redactChatImagePayload,
@@ -1278,6 +1279,18 @@ export function CodexTranscriptRenderer({
               selectionNamespace={selectionNamespace}
             />
           );
+        }
+        if (segment.entry.questions?.length) {
+          return <AsyncQuestionMessage
+            key={segment.entry.id}
+            threadId={snapshot.turn.threadId}
+            itemId={segment.entry.id.slice("item:".length)}
+            messageId={snapshot.turn.messageId}
+            acceptedReplies={interleaved.entries.flatMap((entry) =>
+              entry.kind === "steer" && entry.block.status === "accepted" ? [entry.block.content] : [],
+            )}
+            questions={segment.entry.questions}
+          />;
         }
         return (
           <MarkdownContent

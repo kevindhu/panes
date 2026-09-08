@@ -1123,6 +1123,7 @@ function createOptimisticUserMessage(
     threadId,
     role: "user",
     content: message,
+    pendingDelivery: true,
     blocks: userBlocks,
     status: "completed",
     schemaVersion: 1,
@@ -3588,6 +3589,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const pendingTurn = pendingTurnMetaByThread.get(threadId);
       if (pendingTurn?.clientTurnId === clientTurnId) {
         pendingTurn.backendAccepted = true;
+      }
+      const acceptUserMessage = (messages: Message[]) => messages.map((item) =>
+        item.id === userMessage.id ? { ...item, pendingDelivery: false } : item,
+      );
+      set((current) => current.threadId === threadId
+        ? { messages: acceptUserMessage(current.messages) }
+        : current);
+      const acceptedCachedView = cachedThreadViews.get(threadId);
+      if (acceptedCachedView) {
+        writeCachedThreadView(threadId, {
+          ...acceptedCachedView,
+          messages: acceptUserMessage(acceptedCachedView.messages),
+        });
       }
       if (
         typeof backendAssistantMessageId === "string" &&

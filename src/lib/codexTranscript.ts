@@ -1,3 +1,4 @@
+import { parseAsyncQuestions, type AsyncQuestion } from "./asyncQuestionMessages";
 import type {
   ApprovalBlock,
   AttachmentBlock,
@@ -36,6 +37,7 @@ export interface CodexTranscriptMessageEntry {
   phase: string | null;
   text: string;
   streaming: boolean;
+  questions?: AsyncQuestion[];
 }
 
 export interface CodexTranscriptActivity {
@@ -904,7 +906,8 @@ export function projectCodexTranscript(snapshot: CodexTurnSnapshot): CodexTransc
     const chunks = chunksByItem.get(item.itemId) ?? [];
     if (item.itemType === "agentMessage") {
       const text = itemText(item, payload, chunks);
-      if (text) {
+      const questions = parseAsyncQuestions(payload);
+      if (text || questions.length > 0) {
         entries.push({
           kind: "message",
           id: `item:${item.itemId}`,
@@ -912,6 +915,7 @@ export function projectCodexTranscript(snapshot: CodexTurnSnapshot): CodexTransc
           phase: item.phase ?? readString(payload, "phase"),
           text,
           streaming: item.completedJson === null,
+          ...(questions.length > 0 ? { questions } : {}),
         });
       }
       continue;

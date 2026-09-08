@@ -73,6 +73,7 @@ import {
   useParsedDiff,
 } from "../shared/DiffViewer";
 import MarkdownContent from "./MarkdownContent";
+import { displayAsyncQuestionReply } from "../../lib/asyncQuestionMessages";
 import { AttachmentChip } from "./AttachmentChip";
 import {
   extractTextLinkMatches,
@@ -620,7 +621,7 @@ function SteerBlockView({ block }: { block: SteerBlock }) {
               wordBreak: "break-word",
             }}
           >
-            {block.content}
+            {displayAsyncQuestionReply(block.content)}
           </div>
         )}
 
@@ -1587,7 +1588,7 @@ function renderSingleBlock(
 
   /* ── Text ── */
   if (block.type === "text") {
-    const textContent = String(block.content ?? "");
+    const textContent = displayAsyncQuestionReply(String(block.content ?? ""));
     const isLastBlock = index === sourceBlocks.length - 1;
     const isStreamingText = status === "streaming" && isLastBlock;
 

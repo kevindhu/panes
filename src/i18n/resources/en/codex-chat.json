@@ -1,4 +1,9 @@
 {
+  "asyncQuestions": {
+    "label": "Question from Codex",
+    "sent": "Answer sent",
+    "failed": "Your answer was not sent. Please try again."
+  },
   "attachments": {
     "viewer": {
       "open": "Open image",

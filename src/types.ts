@@ -51,6 +51,8 @@ export interface Message {
   threadId: string;
   role: "user" | "assistant";
   content?: string;
+  /** Client-only: optimistic user input has not been accepted by the backend. */
+  pendingDelivery?: boolean;
   blocks?: ContentBlock[];
   clientTurnId?: string | null;
   nativeTurnId?: string | null;

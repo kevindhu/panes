@@ -2843,7 +2843,7 @@ impl CodexEngine {
         .context("failed to read codex thread metadata")?;
 
         let turns = self
-            .list_thread_turns(transport.as_ref(), engine_thread_id)
+            .list_thread_turns(transport.as_ref(), engine_thread_id, true)
             .await?;
         let mut imported_messages = extract_imported_messages_from_turns(&turns);
         if compatibility_fork && extract_history_mode(&result).as_deref() == Some("paginated") {
@@ -2892,6 +2892,7 @@ impl CodexEngine {
         &self,
         transport: &CodexTransport,
         engine_thread_id: &str,
+        full_items: bool,
     ) -> anyhow::Result<Vec<serde_json::Value>> {
         match fetch_paginated_data(transport, THREAD_TURNS_LIST_METHODS, |cursor| {
             serde_json::json!({
@@ -2899,7 +2900,7 @@ impl CodexEngine {
               "cursor": cursor,
               "limit": 100,
               "sortDirection": "asc",
-              "itemsView": "summary",
+              "itemsView": if full_items { "full" } else { "summary" },
             })
         })
         .await
@@ -2923,7 +2924,7 @@ impl CodexEngine {
     ) -> anyhow::Result<String> {
         let transport = self.ensure_ready_transport().await?;
         let turns = self
-            .list_thread_turns(transport.as_ref(), engine_thread_id)
+            .list_thread_turns(transport.as_ref(), engine_thread_id, false)
             .await
             .context("failed to list Codex turns while resolving fork point")?;
         resolve_fork_turn_id_from_turns(&turns, turns_after)
@@ -2956,7 +2957,7 @@ impl CodexEngine {
     ) -> anyhow::Result<Option<ReconciledTurnCompletion>> {
         let transport = self.ensure_ready_transport().await?;
         let turns = self
-            .list_thread_turns(transport.as_ref(), engine_thread_id)
+            .list_thread_turns(transport.as_ref(), engine_thread_id, false)
             .await
             .context("failed to list Codex thread turns for reconciliation")?;
 
@@ -7019,17 +7020,23 @@ async fn fetch_paginated_data(
         )
         .await?;
         let Some(data) = response.get("data").and_then(serde_json::Value::as_array) else {
-            break;
+            anyhow::bail!(
+                "paginated Codex response missing data array: {}",
+                methods[0]
+            );
         };
         out.extend(data.iter().cloned());
         let next_cursor = extract_any_string(&response, &["nextCursor", "next_cursor"]);
         if next_cursor.is_none() {
-            break;
+            return Ok(out);
         }
         cursor = next_cursor;
     }
 
-    Ok(out)
+    anyhow::bail!(
+        "Codex pagination exceeded {PAGINATION_MAX_PAGES} pages: {}",
+        methods[0]
+    )
 }
 
 fn method_call_outcome_from_error<T>(error: anyhow::Error) -> MethodCallOutcome<T> {

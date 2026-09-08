@@ -4,6 +4,7 @@
     "userMessage": "raw",
     "hookPrompt": "raw",
     "agentMessage": "specialized",
+    "functionCallOutput": "raw",
     "plan": "specialized",
     "reasoning": "specialized",
     "commandExecution": "specialized",

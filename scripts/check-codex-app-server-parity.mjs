@@ -119,6 +119,13 @@ if (!schemaRoot) {
 
 try {
   const threadRead = loadJson(requireFile(schemaRoot, join("v2", "ThreadReadResponse.json")));
+  const turnsList = loadJson(requireFile(schemaRoot, join("v2", "ThreadTurnsListParams.json")));
+  assert(turnsList.properties?.itemsView, "Thread turns must support an explicit items view");
+  assertContainsAll(
+    (turnsList.definitions?.TurnItemsView?.oneOf ?? []).flatMap((view) => view.enum ?? []),
+    ["full", "summary"],
+    "Thread turn item views",
+  );
   const turnStart = loadJson(requireFile(schemaRoot, join("v2", "TurnStartParams.json")));
   const turnPlanUpdated = loadJson(requireFile(schemaRoot, join("v2", "TurnPlanUpdatedNotification.json")));
   const threadTokenUsageUpdated = loadJson(
@@ -128,6 +135,12 @@ try {
   const toolRequestUserInputResponse = loadJson(requireFile(schemaRoot, "ToolRequestUserInputResponse.json"));
   const serverNotifications = loadJson(requireFile(schemaRoot, "ServerNotification.json"));
   const serverRequests = loadJson(requireFile(schemaRoot, "ServerRequest.json"));
+  const agentMessage = threadRead.definitions?.ThreadItem?.oneOf?.find(
+    (variant) => variant.properties?.type?.enum?.includes("agentMessage"),
+  );
+  assertContainsAll(Object.keys(agentMessage?.properties ?? {}), ["delivery", "questions"], "AgentMessage async fields");
+  assertContainsAll(threadRead.definitions?.AgentMessageDelivery?.enum ?? [], ["async"], "AgentMessage delivery");
+  assertContainsAll(Object.keys(threadRead.definitions?.AsyncUserInputQuestion?.properties ?? {}), ["title", "options"], "AsyncUserInputQuestion");
 
   assert(turnStart.properties?.collaborationMode, "TurnStartParams has no collaborationMode");
   assertContainsAll(

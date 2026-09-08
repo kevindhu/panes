@@ -105,6 +105,16 @@ function makeTurnFinishedEvent(
 }
 
 describe("chatStore send", () => {
+  it("marks optimistic user input accepted only after the send receipt", async () => {
+    const receipt = deferred<string>();
+    mockIpc.sendMessage.mockReturnValueOnce(receipt.promise);
+    const sending = useChatStore.getState().send("answer");
+    expect(useChatStore.getState().messages.find((message) => message.role === "user")?.pendingDelivery).toBe(true);
+    receipt.resolve("assistant-persisted");
+    expect(await sending).toBe(true);
+    expect(useChatStore.getState().messages.find((message) => message.role === "user")?.pendingDelivery).toBe(false);
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     resetUsageLimitCachesForTests();

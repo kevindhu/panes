@@ -115,6 +115,19 @@ messages. Phase 2 selects the native renderer whenever a v2 ledger exists. The l
 remains the compatibility path for pre-v2 history. Conversation forks copy the retained v2
 ledger alongside their messages so renderer selection remains stable after branching.
 
+Engine sync requests `itemsView: "full"`; summary views are used only for
+lightweight turn lookup/reconciliation. Pagination must finish successfully
+before a snapshot can replace local history. A malformed page or exhausted
+page limit fails the import rather than treating a partial list as complete.
+
+Within the import transaction, retained assistant messages with a captured
+ledger are matched by native turn ID in the target thread. Their local message
+IDs, content, native ledger, and linked actions/approvals are preserved. Engine
+history remains authoritative about ordering, status, and removed turns, so
+rollback can remove a suffix without replacing the retained prefix with a
+lossy compatibility projection. Repeated sync must preserve the same ledger
+bytes and local identity after a fork.
+
 ## Phase 2 presentation contract
 
 The Codex chat renderer loads an initial native snapshot for each assistant message and merges

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import asyncQuestion from "./__fixtures__/codex-async-question.json";
 import type {
   CodexItemStreamChunkRecord,
   CodexTurnEventRecord,
@@ -44,6 +45,20 @@ function turn(lastSourceSequence: number): CodexTurnSnapshot["turn"] {
     }),
   };
 }
+
+it("preserves the real async question message on live and reloaded projections", () => {
+  const completed = item(asyncQuestion.id, "agentMessage", 1, asyncQuestion);
+  const live = { ...completed, startedJson: completed.completedJson, completedJson: null };
+  for (const record of [live, completed]) {
+    const projection = projectCodexTranscript({ turn: turn(2), items: [record], events: [], chunks: [] });
+    expect(projection.entries).toContainEqual(expect.objectContaining({
+      kind: "message", questions: asyncQuestion.questions,
+    }));
+  }
+  const malformed = item("invalid", "agentMessage", 1, { text: "Fallback retained", delivery: "async", questions: [{ title: null }] });
+  expect(projectCodexTranscript({ turn: turn(2), items: [malformed], events: [], chunks: [] }).entries)
+    .toContainEqual(expect.objectContaining({ kind: "message", text: "Fallback retained" }));
+});
 
 function item(
   itemId: string,

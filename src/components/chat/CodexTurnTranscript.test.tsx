@@ -4,6 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CodexTurnSnapshot } from "../../types";
+import capturedQuestion from "../../lib/__fixtures__/codex-async-question.json";
 
 const mockGetCodexTurnSnapshot = vi.hoisted(() => vi.fn());
 
@@ -161,6 +162,16 @@ describe("CodexTranscriptRenderer", () => {
   afterEach(async () => {
     await act(async () => root.unmount());
     container.remove();
+  });
+
+  it("renders the captured delivered async message as an interactive questionnaire after reload", async () => {
+    const current = snapshot();
+    current.items = [{ ...current.items[0]!, itemId: capturedQuestion.id, itemType: "agentMessage",
+      completedJson: JSON.stringify(capturedQuestion), startedJson: null, phase: "final_answer" }];
+    current.chunks = [];
+    await act(async () => root.render(<CodexTranscriptRenderer snapshot={current} status="completed" onApproval={vi.fn()} />));
+    expect(container.querySelectorAll('.codex-async-question-message [role="radio"]')).toHaveLength(4);
+    expect(container.textContent).toContain(capturedQuestion.questions[0]!.title);
   });
 
   it.each([true, false])("labels a question without inventing a blocking wait (blocking=%s)", async (isBlocking) => {
