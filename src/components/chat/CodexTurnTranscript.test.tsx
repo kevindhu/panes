@@ -309,6 +309,27 @@ describe("CodexTranscriptRenderer", () => {
     expect(summary.querySelector(".codex-native-diff")).toBeNull();
   });
 
+  it("shows shell edits from the persisted workspace diff after completion and reload", async () => {
+    const current = snapshot();
+    current.turn.planJson = null;
+    current.events.push({ ...current.events[0]!, id: 7, sourceSequence: 7,
+      eventKind: "local", method: "panes/turnDiff/completed",
+      paramsJson: JSON.stringify({ diff: "--- a/main.ts\n+++ b/main.ts\n@@ -1 +1 @@\n-old\n+shell edit\n" }),
+    });
+    current.turn.lastSourceSequence = 7;
+    for (const reload of [false, true]) {
+      if (reload) await act(async () => root.render(null));
+      await act(async () => root.render(
+        <CodexTranscriptRenderer snapshot={current} status="completed" onApproval={vi.fn()} />,
+      ));
+      const summary = container.querySelector(".codex-native-turn-diff")!;
+      expect(summary.textContent).toContain("All changes this turn +1 -1");
+      await act(async () => summary.querySelector<HTMLButtonElement>(".codex-native-activity-header")!.click());
+      expect(summary.querySelector(".codex-native-diff")?.textContent).toContain("-old+shell edit");
+      expect(container.querySelectorAll('[data-item-type="turnDiff"]')).toHaveLength(1);
+    }
+  });
+
   it("always expands a zero-output command and exposes its complete invocation", async () => {
     await act(async () => {
       root.render(

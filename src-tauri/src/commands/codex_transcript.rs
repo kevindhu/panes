@@ -32,7 +32,8 @@ type CodexTranscriptUpdateTarget = ();
 /// commits the final batch, and joins the worker before the assistant turn is finalized.
 pub(super) struct CodexTranscriptRecorder {
     sender: Option<mpsc::Sender<CodexNativeEvent>>,
-    worker: JoinHandle<anyhow::Result<()>>,
+    worker: Option<JoinHandle<anyhow::Result<()>>>,
+    worker_error: Option<String>,
 }
 
 #[cfg(not(test))]
@@ -114,7 +115,8 @@ impl CodexTranscriptRecorder {
         ));
         Self {
             sender: Some(sender),
-            worker,
+            worker: Some(worker),
+            worker_error: None,
         }
     }
 
@@ -123,20 +125,42 @@ impl CodexTranscriptRecorder {
         Self::start_with_target(db, local_thread_id, assistant_message_id, None)
     }
 
-    pub(super) async fn record(&self, event: CodexNativeEvent) -> anyhow::Result<()> {
-        self.sender
+    pub(super) async fn record(&mut self, event: CodexNativeEvent) -> anyhow::Result<()> {
+        if self
+            .sender
             .as_ref()
             .context("Codex transcript recorder is already closed")?
             .send(event)
             .await
-            .map_err(|_| anyhow::anyhow!("Codex transcript recorder worker stopped"))
+            .is_err()
+        {
+            // A closed channel only describes the symptom. Join the failed worker to
+            // preserve the database error (including its SQLite cause) for the UI.
+            self.join_worker().await?;
+            anyhow::bail!("Codex transcript recorder worker stopped unexpectedly");
+        }
+        Ok(())
     }
 
     pub(super) async fn finish(mut self) -> anyhow::Result<()> {
         self.sender.take();
-        self.worker
-            .await
-            .context("Codex transcript recorder task failed to join")?
+        self.join_worker().await
+    }
+
+    async fn join_worker(&mut self) -> anyhow::Result<()> {
+        if let Some(worker) = self.worker.take() {
+            let result = worker
+                .await
+                .context("Codex transcript recorder task failed to join")
+                .and_then(|result| result);
+            if let Err(error) = result {
+                self.worker_error = Some(format!("{error:#}"));
+            }
+        }
+        match self.worker_error.as_ref() {
+            Some(error) => Err(anyhow::anyhow!("{error}")),
+            None => Ok(()),
+        }
     }
 }
 
@@ -248,6 +272,48 @@ mod tests {
     use crate::engines::CodexNativeEventKind;
 
     #[tokio::test]
+    async fn recorder_reports_database_cause_after_worker_stops_and_on_finish() {
+        let path =
+            std::env::temp_dir().join(format!("panes-recorder-error-{}.sqlite", Uuid::new_v4()));
+        let database = Database::open(path.clone()).unwrap();
+        // A missing message owner forces a real SQLite foreign-key error in the worker.
+        let mut recorder = CodexTranscriptRecorder::start_for_test(
+            database.clone(),
+            "missing-thread".into(),
+            "missing-message".into(),
+        );
+        let event = CodexNativeEvent {
+            source_sequence: 1,
+            observed_at_ms: 1,
+            event_kind: CodexNativeEventKind::Notification,
+            method: "turn/started".into(),
+            request_id: None,
+            native_thread_id: "native-thread".into(),
+            native_turn_id: Some("native-turn".into()),
+            params_json: r#"{"threadId":"native-thread","turn":{"id":"native-turn"}}"#.into(),
+        };
+        recorder.record(event.clone()).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            recorder.sender.as_ref().unwrap().closed(),
+        )
+        .await
+        .unwrap();
+        let error = recorder.record(event).await.unwrap_err().to_string();
+        assert!(
+            error.contains("failed to create Codex turn ledger row"),
+            "{error}"
+        );
+        assert!(error.contains("FOREIGN KEY constraint failed"), "{error}");
+        assert_eq!(recorder.finish().await.unwrap_err().to_string(), error);
+
+        drop(database);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = fs::remove_file(PathBuf::from(format!("{}{suffix}", path.display())));
+        }
+    }
+
+    #[tokio::test]
     async fn finish_flushes_the_final_partial_batch() {
         let path =
             std::env::temp_dir().join(format!("panes-codex-recorder-{}.sqlite", Uuid::new_v4()));
@@ -276,7 +342,7 @@ mod tests {
             .expect("message fixture");
         drop(connection);
 
-        let recorder = CodexTranscriptRecorder::start_for_test(
+        let mut recorder = CodexTranscriptRecorder::start_for_test(
             database.clone(),
             "thread".into(),
             "message".into(),

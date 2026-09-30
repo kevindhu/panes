@@ -149,6 +149,7 @@ pub struct CodexNativeEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CodexNativeEventKind {
+    Local,
     ClientRequest,
     ClientResponse,
     Request,
@@ -159,6 +160,7 @@ pub enum CodexNativeEventKind {
 impl CodexNativeEventKind {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Local => "local",
             Self::ClientRequest => "client_request",
             Self::ClientResponse => "client_response",
             Self::Request => "request",

@@ -144,6 +144,18 @@ its position and expansion state as later items arrive. The latest `turn/diff/up
 renders separately as **All changes this turn** below the timeline, after the final response when
 present. This cumulative summary has a stable turn identity and updates in place; it never
 replaces or reorders individual edit blocks. Live updates and history reload use this same rule.
+For local Git workspaces, Panes also captures the working tree before a normal turn starts and
+compares it after the engine stream drains. This includes shell and MCP file writes, which do
+not necessarily produce native diff notifications. A temporary index and object directory
+isolate capture from the user's staging area, refs, and object database. The final aggregate is
+stored without truncation as a `local` event named `panes/turnDiff/completed`, after all native
+events, and takes precedence over the patch-tool-only summary. An empty aggregate clears a
+stale native diff after a revert. Turns with no changes and no native diff omit the summary.
+If Git capture is unavailable, the native summary remains the fallback. The comparison covers
+workspace changes during the turn, so concurrent writers in the same working tree are included;
+it does not claim to attribute changes to an individual tool. Ignored untracked files, nested
+repository contents, and edits outside the configured repositories are not captured. Old turns
+without native diffs or a captured baseline cannot be reconstructed from current working files.
 Every activity row is independently expandable, including successful commands and
 web searches that emitted no output. Specialized bodies cover commands, stdout/stderr/stdin,
 file diffs, MCP/dynamic/collaboration tools, web-search queries and actions, plans, reasoning,

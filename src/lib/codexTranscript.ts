@@ -928,7 +928,8 @@ export function projectCodexTranscript(snapshot: CodexTurnSnapshot): CodexTransc
   // snapshot outside the timeline so updates cannot move or replace edit blocks.
   const latestTurnDiff = [...events]
     .reverse()
-    .find((event) => methodSignature(event.method) === "turndiffupdated");
+    .find((event) => methodSignature(event.method) === "turndiffupdated"
+      || event.method === "panes/turnDiff/completed");
   const turnDiff = latestTurnDiff ? buildTurnDiffActivity(latestTurnDiff, snapshot.turn.id) : null;
 
   const plan = parseCodexPlanProgress(snapshot.turn.planJson);

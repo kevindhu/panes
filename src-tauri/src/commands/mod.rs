@@ -5,4 +5,5 @@ pub mod engines;
 pub mod files;
 pub mod power;
 pub mod threads;
+mod turn_diff;
 pub mod workspace;

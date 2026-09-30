@@ -176,6 +176,21 @@ describe("Codex transcript projection", () => {
     expect(projectCodexTranscript(mergeCodexTurnSnapshot(merged, tail))).toEqual(projection);
   });
 
+  it.each(["--- a/main.ts\n+++ b/main.ts\n@@ -1 +1 @@\n-old\n+shell edit\n", ""])("replays the local workspace aggregate after native patches (%s)", (diff) => {
+    const native = event(4, 4, "turn/diff/updated", { diff: "-old\n+patch tool\n" });
+    const initial: CodexTurnSnapshot = { turn: turn(8), items: [], chunks: [], events: [native] };
+    const local = { ...event(9, 9, "panes/turnDiff/completed", { diff }), eventKind: "local" as const };
+    const completed: CodexTurnSnapshot = { ...initial, turn: turn(9), events: [native, local] };
+    const live = mergeCodexTurnSnapshot(initial, { ...completed, events: [local] });
+    expect(projectCodexTranscript(live)).toEqual(projectCodexTranscript(completed));
+    expect(projectCodexTranscript(completed).turnDiff).toMatchObject({
+      id: projectCodexTranscript(initial).turnDiff?.id,
+      sequence: 9,
+      payload: { diff },
+    });
+    expect(projectCodexTranscript({ ...completed, events: [local] }).turnDiff?.payload.diff).toBe(diff);
+  });
+
   it("retains an empty latest turn diff after a revert without erasing the individual edit", () => {
     const snapshot: CodexTurnSnapshot = {
       turn: turn(6),

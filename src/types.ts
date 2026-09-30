@@ -164,7 +164,7 @@ export interface CodexTurnRecord {
 export interface CodexTurnEventRecord {
   id: number;
   sourceSequence: number;
-  eventKind: "client_request" | "client_response" | "request" | "notification" | "response";
+  eventKind: "local" | "client_request" | "client_response" | "request" | "notification" | "response";
   method: string;
   requestId: string | null;
   nativeThreadId: string;

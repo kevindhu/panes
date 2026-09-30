@@ -952,6 +952,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn local_turn_diff_survives_reload_incremental_reads_and_forks() {
+        let (db, path) = create_test_database("local-diff");
+        let completed = event(
+            1,
+            "turn/completed",
+            json!({ "turn": { "status": "completed" } }),
+        );
+        let mut aggregate = event(
+            2,
+            "panes/turnDiff/completed",
+            json!({
+                "diff": format!("--- a/main.txt\n+++ b/main.txt\n{}", "+shell edit\n".repeat(STREAMED_DIFF_MAX_CHARS)),
+                "roots": ["C:/workspace"],
+            }),
+        );
+        aggregate.event_kind = CodexNativeEventKind::Local;
+        record_native_event_batch(
+            &db,
+            LOCAL_THREAD_ID,
+            ASSISTANT_MESSAGE_ID,
+            &[completed, aggregate.clone()],
+        )
+        .unwrap();
+        drop(db);
+        let db = Database::open(path.clone()).unwrap();
+        let slice = load_turn_snapshot_after(&db, ASSISTANT_MESSAGE_ID, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(slice.turn.status, "completed");
+        assert_eq!(slice.events.len(), 1);
+        assert_eq!(slice.events[0].event_kind, "local");
+        assert_eq!(slice.events[0].params_json, aggregate.params_json);
+
+        let mut connection = db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction.execute("INSERT INTO threads (id, workspace_id, engine_id, model_id) VALUES ('fork', 'workspace-1', 'codex', 'gpt-test')", []).unwrap();
+        transaction.execute("INSERT INTO messages (id, thread_id, role, status) VALUES ('fork-message', 'fork', 'assistant', 'completed')", []).unwrap();
+        assert!(clone_turn_snapshot_for_message(
+            &transaction,
+            ASSISTANT_MESSAGE_ID,
+            "fork",
+            "fork-message"
+        )
+        .unwrap());
+        transaction.commit().unwrap();
+        drop(connection);
+        let fork = load_turn_snapshot(&db, "fork-message").unwrap().unwrap();
+        assert_eq!(fork.events[1].params_json, aggregate.params_json);
+        assert_eq!(fork.events[1].event_kind, "local");
+        drop(db);
+        remove_test_database(&path);
+    }
+
     fn event(source_sequence: u64, method: &str, params_value: Value) -> CodexNativeEvent {
         CodexNativeEvent {
             source_sequence,

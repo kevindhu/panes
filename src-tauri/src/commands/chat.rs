@@ -38,6 +38,7 @@ use crate::{
 };
 
 use super::codex_transcript::CodexTranscriptRecorder;
+use super::turn_diff::TurnDiffCapture;
 
 const MAX_THREAD_TITLE_CHARS: usize = 72;
 const STREAM_EVENT_COALESCE_MAX_CHARS: usize = 8_192;
@@ -1281,6 +1282,7 @@ pub async fn send_message(
         thread.engine_metadata.as_ref(),
     )?;
 
+    let diff_roots = writable_roots.clone();
     let sandbox = SandboxPolicy {
         writable_roots,
         allow_network,
@@ -1460,6 +1462,7 @@ pub async fn send_message(
             assistant_message_id,
             initial_turn_model_id,
             turn_input_for_task,
+            diff_roots,
             client_turn_id,
             cancellation,
         )
@@ -2487,6 +2490,7 @@ async fn run_turn(
     assistant_message_id: String,
     initial_turn_model_id: String,
     turn_input: TurnInput,
+    diff_roots: Vec<String>,
     client_turn_id: Option<String>,
     cancellation: CancellationToken,
 ) {
@@ -2502,6 +2506,20 @@ async fn run_turn(
         )
     });
     let mut transcript_recording_error: Option<String> = None;
+    let mut last_native_event: Option<(u64, String, Option<String>)> = None;
+    // Capture before the engine can execute any tools. Comparing against HEAD would
+    // incorrectly include pre-existing edits and lose changes committed during a turn.
+    let diff_capture = if thread.engine_id == "codex" {
+        match TurnDiffCapture::start(&diff_roots).await {
+            Ok(capture) => Some(capture),
+            Err(error) => {
+                log::warn!("turn diff baseline unavailable: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     if thread.engine_id == "codex" && turn_input.plan_mode {
         let message = format!(
@@ -2679,8 +2697,13 @@ async fn run_turn(
         };
 
         if let EngineEvent::CodexNativeEvent { event } = incoming_event {
+            last_native_event = Some((
+                event.source_sequence,
+                event.native_thread_id.clone(),
+                event.native_turn_id.clone(),
+            ));
             if transcript_recording_error.is_none() {
-                let record_result = match transcript_recorder.as_ref() {
+                let record_result = match transcript_recorder.as_mut() {
                     Some(recorder) => recorder.record(event).await,
                     None => Err(anyhow::anyhow!(
                         "received a Codex native event without a transcript recorder"
@@ -2904,6 +2927,40 @@ async fn run_turn(
             force_persist,
         )
         .await;
+    }
+
+    // Native diff notifications only cover Codex's patch tool. Persist an explicitly
+    // local aggregate after the native stream drains, so shell/MCP edits also replay.
+    if let (Some(capture), Some((sequence, native_thread_id, native_turn_id))) =
+        (diff_capture, last_native_event)
+    {
+        match capture.finish().await {
+            Ok(diff)
+                if !diff.is_empty()
+                    || blocks
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::Diff { .. })) =>
+            {
+                if let Some(recorder) = transcript_recorder.as_mut() {
+                    let event = crate::engines::CodexNativeEvent {
+                        source_sequence: sequence + 1,
+                        observed_at_ms: chrono::Utc::now().timestamp_millis(),
+                        event_kind: crate::engines::CodexNativeEventKind::Local,
+                        method: "panes/turnDiff/completed".into(),
+                        request_id: None,
+                        native_thread_id,
+                        native_turn_id,
+                        params_json: json!({ "diff": diff, "roots": diff_roots }).to_string(),
+                    };
+                    if let Err(error) = recorder.record(event).await {
+                        transcript_recording_error
+                            .get_or_insert_with(|| format!("Turn diff recording failed: {error}"));
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => log::warn!("turn diff comparison unavailable: {error}"),
+        }
     }
 
     if let Some(recorder) = transcript_recorder.take() {
@@ -3332,7 +3389,7 @@ async fn run_codex_review_turn(
 
         if let EngineEvent::CodexNativeEvent { event } = incoming_event {
             if transcript_recording_error.is_none() {
-                let record_result = match transcript_recorder.as_ref() {
+                let record_result = match transcript_recorder.as_mut() {
                     Some(recorder) => recorder.record(event).await,
                     None => Err(anyhow::anyhow!(
                         "received a Codex review event without a transcript recorder"
