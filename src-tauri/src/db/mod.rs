@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::Context;
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 
 use crate::{path_utils, runtime_env};
 
@@ -16,11 +16,14 @@ pub mod actions;
 pub mod codex_transcript;
 pub mod messages;
 pub mod repos;
+#[cfg(test)]
+mod startup_tests;
 pub mod threads;
 pub mod workspaces;
 
 const SQLITE_POOL_MAX_IDLE: usize = 8;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Clone)]
 pub struct Database {
@@ -122,22 +125,53 @@ impl Database {
     }
 
     fn run_migrations(&self) -> anyhow::Result<()> {
+        let started = std::time::Instant::now();
         let mut conn = self.connect()?;
         enable_wal_mode(&conn)?;
-        conn.execute_batch(include_str!("migrations/001_initial.sql"))
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version == SCHEMA_VERSION {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            version < SCHEMA_VERSION,
+            "database schema {version} is newer than supported schema {SCHEMA_VERSION}"
+        );
+
+        // Older releases did not record migrations and re-read all message bodies
+        // on every launch. Commit the schema, backfills and version together so
+        // both a failed upgrade and concurrent opens remain safe to retry.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version == SCHEMA_VERSION {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            version < SCHEMA_VERSION,
+            "database schema is newer than this app"
+        );
+        tx.execute_batch(include_str!("migrations/001_initial.sql"))
             .context("failed to apply migrations")?;
-        conn.execute_batch(include_str!("migrations/002_codex_transcript.sql"))
+        tx.execute_batch(include_str!("migrations/002_codex_transcript.sql"))
             .context("failed to apply Codex transcript migration")?;
-        ensure_archived_columns(&conn)?;
-        ensure_workspace_sort_order_column(&conn)?;
-        ensure_workspace_git_columns(&conn)?;
-        ensure_repo_columns(&conn)?;
-        ensure_workspace_startup_columns(&conn)?;
-        ensure_runtime_columns(&conn)?;
-        migrate_codex_remote_turn_metadata(&conn)?;
-        ensure_messages_audit_columns(&conn)?;
-        ensure_approval_response_columns(&conn)?;
-        repair_normalized_workspace_and_repo_paths(&mut conn)?;
+        ensure_archived_columns(&tx)?;
+        ensure_workspace_sort_order_column(&tx)?;
+        ensure_workspace_git_columns(&tx)?;
+        ensure_repo_columns(&tx)?;
+        ensure_workspace_startup_columns(&tx)?;
+        ensure_runtime_columns(&tx)?;
+        tx.execute_batch(include_str!("migrations/003_startup.sql"))
+            .context("failed to apply startup indexes and search trigger migration")?;
+        migrate_codex_remote_turn_metadata(&tx)?;
+        ensure_messages_audit_columns(&tx)?;
+        ensure_approval_response_columns(&tx)?;
+        repair_normalized_workspace_and_repo_paths(&tx)?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.commit()
+            .context("failed to commit database migrations")?;
+        log::info!(
+            "startup database migration to {SCHEMA_VERSION}: {:?}",
+            started.elapsed()
+        );
         Ok(())
     }
 }
@@ -363,14 +397,9 @@ struct RepoPathRow {
     trust_level: String,
 }
 
-fn repair_normalized_workspace_and_repo_paths(conn: &mut Connection) -> anyhow::Result<()> {
-    let tx = conn
-        .transaction()
-        .context("failed to start path normalization transaction")?;
-    merge_duplicate_workspaces(&tx)?;
-    merge_duplicate_repos(&tx)?;
-    tx.commit()
-        .context("failed to commit path normalization transaction")?;
+fn repair_normalized_workspace_and_repo_paths(tx: &Transaction<'_>) -> anyhow::Result<()> {
+    merge_duplicate_workspaces(tx)?;
+    merge_duplicate_repos(tx)?;
     Ok(())
 }
 
@@ -840,6 +869,50 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual startup profile; requires an isolated database snapshot"]
+    fn profile_startup_snapshot() {
+        let _ = env_logger::try_init();
+        let path = PathBuf::from(
+            std::env::var_os("PANES_STARTUP_PROFILE_DB")
+                .expect("set PANES_STARTUP_PROFILE_DB to a disposable snapshot"),
+        );
+        assert!(path.is_file());
+        let live_path = runtime_env::app_data_dir().join("workspaces.db");
+        if live_path.exists() {
+            assert_ne!(
+                path.canonicalize().unwrap(),
+                live_path.canonicalize().unwrap()
+            );
+        }
+        let started = std::time::Instant::now();
+        let db = Database::open(path).unwrap();
+        eprintln!(
+            "PROFILE database_open_ms={:.1}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        let started = std::time::Instant::now();
+        threads::reconcile_runtime_state(&db).unwrap();
+        eprintln!(
+            "PROFILE runtime_recovery_ms={:.1}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        let started = std::time::Instant::now();
+        let _power = crate::power::KeepAwakeManager::new();
+        eprintln!(
+            "PROFILE power_init_ms={:.1}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        let started = std::time::Instant::now();
+        for workspace in workspaces::list_workspaces(&db).unwrap() {
+            threads::list_threads_for_workspace(&db, &workspace.id).unwrap();
+        }
+        eprintln!(
+            "PROFILE list_all_threads_ms={:.1}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    #[test]
     fn pooled_connections_use_wal_and_extended_busy_timeout() {
         let db = test_db();
         let conn = db.connect().expect("failed to open configured connection");
@@ -887,6 +960,10 @@ mod tests {
         .expect("failed to insert migration test threads");
         drop(conn);
 
+        db.connect()
+            .unwrap()
+            .pragma_update(None, "user_version", 0)
+            .unwrap();
         db.run_migrations()
             .expect("failed to migrate legacy Codex metadata");
         db.run_migrations()
@@ -990,6 +1067,10 @@ mod tests {
         .expect("failed to insert thread");
         drop(conn);
 
+        db.connect()
+            .unwrap()
+            .pragma_update(None, "user_version", 0)
+            .unwrap();
         db.run_migrations()
             .expect("failed to rerun migrations with duplicate windows paths");
 
@@ -1056,6 +1137,10 @@ mod tests {
         .expect("failed to insert thread");
         drop(conn);
 
+        db.connect()
+            .unwrap()
+            .pragma_update(None, "user_version", 0)
+            .unwrap();
         db.run_migrations()
             .expect("failed to rerun migrations for duplicate repo paths");
 
@@ -1129,6 +1214,10 @@ mod tests {
         .expect("failed to insert thread");
         drop(conn);
 
+        db.connect()
+            .unwrap()
+            .pragma_update(None, "user_version", 0)
+            .unwrap();
         db.run_migrations()
             .expect("failed to rerun migrations for duplicate workspace repos");
 
@@ -1205,6 +1294,10 @@ mod tests {
         .expect("failed to insert second duplicate repo");
         drop(conn);
 
+        db.connect()
+            .unwrap()
+            .pragma_update(None, "user_version", 0)
+            .unwrap();
         db.run_migrations()
             .expect("failed to rerun migrations for cumulative repo merge");
 

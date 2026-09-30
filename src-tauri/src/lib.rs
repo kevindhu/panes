@@ -47,7 +47,10 @@ pub fn maybe_handle_cli_subcommand() -> anyhow::Result<bool> {
 }
 
 fn initialize_app_state() -> anyhow::Result<AppState> {
+    let started = std::time::Instant::now();
     let db = Database::init().context("failed to initialize database")?;
+    log::info!("startup database ready: {:?}", started.elapsed());
+    let started = std::time::Instant::now();
     match db::threads::reconcile_runtime_state(&db) {
         Ok(report) => {
             if report.messages_marked_interrupted > 0 || report.thread_status_updates > 0 {
@@ -63,6 +66,8 @@ fn initialize_app_state() -> anyhow::Result<AppState> {
         }
     }
 
+    log::info!("startup runtime recovery: {:?}", started.elapsed());
+    let started = std::time::Instant::now();
     let app_config = AppConfig::load_or_create().context("failed to load config")?;
     let keep_awake = Arc::new(KeepAwakeManager::new());
     if let Err(error) = keep_awake.reclaim_stale_helpers() {
@@ -78,6 +83,10 @@ fn initialize_app_state() -> anyhow::Result<AppState> {
 
     let _ = db::workspaces::ensure_default_workspace(&db)
         .context("failed to ensure default workspace")?;
+    log::info!(
+        "startup config, power and workspace: {:?}",
+        started.elapsed()
+    );
 
     Ok(AppState {
         db,
@@ -93,6 +102,7 @@ fn initialize_app_state() -> anyhow::Result<AppState> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::init();
+    let started = std::time::Instant::now();
     linux_webkit::apply_webkit_display_workarounds();
 
     let builder = tauri::Builder::default();
@@ -112,7 +122,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .menu(build_app_menu)
-        .setup(|app| {
+        .setup(move |app| {
             // The single-instance plugin is registered before this setup
             // callback, so a duplicate launch exits before touching SQLite.
             let _ = app.manage(initialize_app_state()?);
@@ -137,6 +147,7 @@ pub fn run() {
             let main_window = WebviewWindowBuilder::from_config(app.handle(), &main_window_config)?
                 .enable_clipboard_access()
                 .build()?;
+            log::info!("startup window created: {:?}", started.elapsed());
             #[cfg(not(target_os = "linux"))]
             let _ = &main_window;
 

@@ -1,4 +1,6 @@
 type PerfMetricName =
+  | "startup.local_workspace.ms"
+  | "startup.engine_catalog.ms"
   | "chat.turn.first_shell.ms"
   | "chat.turn.first_content.ms"
   | "chat.turn.first_text.ms"
@@ -30,6 +32,8 @@ interface PerfMetricSummary {
 const MAX_STORED_METRICS = 4_000;
 const WARN_COOLDOWN_MS = 8_000;
 const PERF_BUDGETS: Record<PerfMetricName, number> = {
+  "startup.local_workspace.ms": 1_000,
+  "startup.engine_catalog.ms": 4_000,
   "chat.turn.first_shell.ms": 48,
   "chat.turn.first_content.ms": 1_400,
   "chat.turn.first_text.ms": 1_800,

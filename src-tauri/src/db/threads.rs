@@ -407,6 +407,22 @@ fn reconcile_stale_running_thread_statuses(
     workspace_id: Option<&str>,
 ) -> anyhow::Result<usize> {
     let conn = db.connect()?;
+    // Sidebar startup lists workspaces concurrently. Even a no-op UPDATE
+    // acquires SQLite's single writer lock, causing dozens of readers to queue
+    // behind busy-handler retries. Most workspaces have no running threads.
+    let has_running_threads: bool = conn.query_row(
+        "SELECT EXISTS (
+           SELECT 1 FROM threads
+           WHERE (?1 IS NULL OR id = ?1)
+             AND (?2 IS NULL OR workspace_id = ?2)
+             AND status IN ('streaming', 'awaiting_approval')
+         )",
+        params![thread_id, workspace_id],
+        |row| row.get(0),
+    )?;
+    if !has_running_threads {
+        return Ok(0);
+    }
     let changed = conn
         .execute(
             "UPDATE threads
@@ -416,7 +432,7 @@ fn reconcile_stale_running_thread_statuses(
                  WHEN 'error' THEN 'error'
                  WHEN 'interrupted' THEN 'idle'
                END
-               FROM messages m
+               FROM messages m INDEXED BY idx_messages_runtime
                WHERE m.thread_id = threads.id
                  AND m.role = 'assistant'
                ORDER BY m.created_at DESC, m.rowid DESC
@@ -440,7 +456,7 @@ fn reconcile_stale_running_thread_statuses(
                )
                AND (
                  SELECT m.status
-                 FROM messages m
+                 FROM messages m INDEXED BY idx_messages_runtime
                  WHERE m.thread_id = threads.id
                    AND m.role = 'assistant'
                  ORDER BY m.created_at DESC, m.rowid DESC
@@ -456,6 +472,20 @@ fn reconcile_stale_running_thread_statuses(
 
     Ok(changed)
 }
+
+const RECOVER_STREAMING_MESSAGES_SQL: &str = "UPDATE messages
+    SET status = 'interrupted'
+    WHERE rowid IN (
+      SELECT rowid FROM messages
+      WHERE role = 'assistant' AND status = 'streaming'
+    )";
+
+// Without this index hint SQLite prefers idx_messages_thread to avoid sorting
+// timestamp ties, at the cost of reading huge transcript overflow pages.
+const LATEST_ASSISTANT_STATUS_SQL: &str = "SELECT status
+    FROM messages INDEXED BY idx_messages_runtime
+    WHERE thread_id = ?1 AND role = 'assistant'
+    ORDER BY created_at DESC, rowid DESC LIMIT 1";
 
 pub fn reconcile_runtime_state(db: &Database) -> anyhow::Result<RuntimeRecoveryReport> {
     let mut conn = db.connect()?;
@@ -484,13 +514,7 @@ pub fn reconcile_runtime_state(db: &Database) -> anyhow::Result<RuntimeRecoveryR
     .context("failed to cancel stale approvals during runtime recovery")?;
 
     let messages_marked_interrupted = tx
-        .execute(
-            "UPDATE messages
-       SET status = 'interrupted'
-       WHERE role = 'assistant'
-         AND status = 'streaming'",
-            [],
-        )
+        .execute(RECOVER_STREAMING_MESSAGES_SQL, [])
         .context("failed to normalize stale streaming assistant messages")?;
 
     let thread_ids = {
@@ -559,16 +583,9 @@ pub(crate) fn derive_thread_status_for_recovery(
     }
 
     let last_assistant_status = conn
-        .query_row(
-            "SELECT status
-       FROM messages
-       WHERE thread_id = ?1
-         AND role = 'assistant'
-       ORDER BY created_at DESC, rowid DESC
-       LIMIT 1",
-            params![thread_id],
-            |row| row.get::<_, String>(0),
-        )
+        .query_row(LATEST_ASSISTANT_STATUS_SQL, params![thread_id], |row| {
+            row.get::<_, String>(0)
+        })
         .optional()
         .context("failed to inspect latest assistant message during runtime recovery")?;
 
@@ -605,6 +622,97 @@ fn map_thread_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadDto> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn startup_thread_listing_does_not_wait_for_an_unrelated_writer() {
+        let db = test_db();
+        let workspace = workspaces::upsert_workspace(&db, "/startup-listing", None).unwrap();
+        let thread = create_thread(&db, &workspace.id, None, "codex", "model", "Saved").unwrap();
+        set_engine_thread_id(&db, &thread.id, "native").unwrap();
+        let conn = db.connect().unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        drop(conn);
+        let mut writer = rusqlite::Connection::open(&db.path).unwrap();
+        let _transaction = writer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let listed = list_threads_for_workspace(&db, &workspace.id)
+            .expect("WAL readers must not need the writer lock");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, thread.id);
+    }
+
+    #[test]
+    fn startup_recovery_queries_use_covering_metadata_index() {
+        let db = test_db();
+        let conn = db.connect().unwrap();
+        for (query, args) in [
+            (super::LATEST_ASSISTANT_STATUS_SQL, vec!["thread"]),
+            (super::RECOVER_STREAMING_MESSAGES_SQL, vec![]),
+        ] {
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .unwrap();
+            let plan = stmt
+                .query_map(rusqlite::params_from_iter(args), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("COVERING INDEX idx_messages_runtime")),
+                "{plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|step| step.contains("SCAN messages")),
+                "{plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_recovery_preserves_rowid_ties_and_ignores_newer_user_messages() {
+        let db = test_db();
+        let workspace = workspaces::upsert_workspace(&db, "/startup-recovery", None).unwrap();
+        let thread = create_thread(&db, &workspace.id, None, "codex", "model", "Recovery").unwrap();
+        let conn = db.connect().unwrap();
+        for (id, role, status, created) in [
+            ("z", "assistant", "error", "2026-01-01 00:00:00"),
+            ("a", "assistant", "completed", "2026-01-01 00:00:00"),
+            ("user", "user", "streaming", "2026-01-02 00:00:00"),
+        ] {
+            conn.execute(
+                "INSERT INTO messages(id,thread_id,role,status,created_at) VALUES(?1,?2,?3,?4,?5)",
+                params![id, thread.id, role, status, created],
+            )
+            .unwrap();
+        }
+        let first = reconcile_runtime_state(&db).unwrap();
+        assert_eq!(first.messages_marked_interrupted, 0);
+        assert_eq!(
+            get_thread(&db, &thread.id).unwrap().unwrap().status,
+            ThreadStatusDto::Completed
+        );
+        conn.execute("UPDATE messages SET status='streaming' WHERE id='a'", [])
+            .unwrap();
+        let next = reconcile_runtime_state(&db).unwrap();
+        assert_eq!(next.messages_marked_interrupted, 1);
+        assert_eq!(
+            get_thread(&db, &thread.id).unwrap().unwrap().status,
+            ThreadStatusDto::Idle
+        );
+        assert_eq!(
+            conn.query_row("SELECT status FROM messages WHERE id='user'", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "streaming"
+        );
+        let again = reconcile_runtime_state(&db).unwrap();
+        assert_eq!(again.messages_marked_interrupted, 0);
+        assert_eq!(again.thread_status_updates, 0);
+    }
+
     use std::{
         fs,
         sync::{Arc, Mutex},

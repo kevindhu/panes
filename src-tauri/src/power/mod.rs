@@ -19,6 +19,8 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_helper;
 pub mod monitor;
+#[cfg(target_os = "windows")]
+mod windows;
 
 use crate::config::app_config::{AppConfig, PowerConfig};
 #[cfg(not(target_os = "macos"))]
@@ -753,7 +755,9 @@ impl KeepAwakeManager {
                 })?;
         if let Some(current_start_marker) = current_start_marker {
             return Ok(match owner.start_marker.as_deref() {
-                Some(saved_start_marker) => saved_start_marker == current_start_marker,
+                Some(saved_start_marker) => {
+                    start_markers_match(saved_start_marker, &current_start_marker)
+                }
                 None => true,
             });
         }
@@ -800,7 +804,9 @@ impl KeepAwakeManager {
 
         match persisted.helper.start_marker.as_deref() {
             Some(saved_start_marker) => match start_marker.as_deref() {
-                Some(current_start_marker) if current_start_marker == saved_start_marker => {
+                Some(current_start_marker)
+                    if start_markers_match(current_start_marker, saved_start_marker) =>
+                {
                     self.process_ops
                         .terminate(persisted.helper.pid)
                         .map_err(|error| {
@@ -1186,7 +1192,7 @@ fn read_process_start_marker(pid: u32) -> io::Result<Option<String>> {
 
     #[cfg(target_os = "windows")]
     {
-        return read_windows_process_property(pid, "CreationDate", true);
+        return windows::read_process_start_marker(pid);
     }
 
     #[allow(unreachable_code)]
@@ -1207,6 +1213,22 @@ fn read_process_start_marker(pid: u32) -> io::Result<Option<String>> {
             Ok(Some(start_marker))
         }
     }
+}
+
+fn start_markers_match(saved: &str, current: &str) -> bool {
+    if saved == current {
+        return true;
+    }
+    // Older Windows builds persisted CIM's local RFC3339 timestamp. Native
+    // process times use UTC; compare instants at CIM's microsecond precision.
+    #[cfg(target_os = "windows")]
+    if let (Ok(saved), Ok(current)) = (
+        chrono::DateTime::parse_from_rfc3339(saved),
+        chrono::DateTime::parse_from_rfc3339(current),
+    ) {
+        return saved.timestamp_micros() == current.timestamp_micros();
+    }
+    false
 }
 
 fn read_process_command_line(pid: u32) -> io::Result<Option<String>> {

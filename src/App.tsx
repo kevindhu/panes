@@ -24,7 +24,7 @@ import {
   listenThreadUpdated,
 } from "./lib/codexIpc";
 import { createAndActivateWorkspaceThread } from "./lib/newThreadActions";
-import { activateThreadContext } from "./lib/threadActivation";
+import { initializeCodexWorkspace } from "./lib/workspaceStartup";
 import {
   isCodexZoomAvailable,
   resolveCodexZoomShortcut,
@@ -42,25 +42,6 @@ function fireZoomShortcut(action: CodexZoomAction) {
   if (now - lastFired < ZOOM_SHORTCUT_DEBOUNCE_MS) return;
   zoomShortcutLastFired.set(action, now);
   runCodexZoomAction(action);
-}
-
-async function initializeCodexWorkspace() {
-  await Promise.all([
-    useWorkspaceStore.getState().loadWorkspaces(),
-    useEngineStore.getState().load(),
-  ]);
-  const workspaceState = useWorkspaceStore.getState();
-  const workspaceId = workspaceState.activeWorkspaceId;
-  const workspaceIds = workspaceState.workspaces.map((workspace) => workspace.id);
-  await useThreadStore.getState().refreshAllThreads(workspaceIds);
-  const state = useThreadStore.getState();
-  const selected = state.threads.find((thread) => thread.id === state.activeThreadId)
-    ?? (workspaceId ? state.threadsByWorkspace[workspaceId]?.[0] : null)
-    ?? null;
-  await activateThreadContext(selected);
-  if (workspaceIds.length) {
-    void useEngineStore.getState().ensureHealth("codex");
-  }
 }
 
 function handleShortcut(action: string) {
