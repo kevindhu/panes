@@ -3676,10 +3676,27 @@ fn persist_codex_in_place_rollback(
     {
         let intent = engine_rollback_intent(current_thread.engine_metadata.as_ref())
             .ok_or_else(|| anyhow::anyhow!("invalid pending history mutation"))?;
-        if db::messages::thread_turn_count(db, &thread.id)? != intent.source_turn_count {
+        let local_turn_count = db::messages::thread_turn_count(db, &thread.id)?;
+        if local_turn_count == intent.source_turn_count {
+            db::messages::finish_pending_thread_rollback(
+                db,
+                &thread.id,
+                intent.num_turns,
+                &metadata,
+            )?;
+        } else if local_turn_count == intent.target_turn_count {
+            // A completed remote revert can be imported before rollback recovery
+            // resumes (for example after a restart). Accept that idempotent state
+            // only when the exact native boundary matches the verified snapshot.
+            let local_ids = db::messages::thread_native_turn_ids(db, &thread.id)?;
+            if local_ids != rollback_snapshot.native_turn_ids {
+                anyhow::bail!(
+                    "local history differs from the completed edit; reconcile before continuing"
+                );
+            }
+        } else {
             anyhow::bail!("local history changed during the edit; reconcile before continuing");
         }
-        db::messages::finish_pending_thread_rollback(db, &thread.id, intent.num_turns, &metadata)?;
     }
     // Both native rollback and paginated revert commit through this path. Read
     // the retained ledger only after the discarded local turns have been removed.
@@ -4679,6 +4696,53 @@ mod tests {
         assert_eq!(
             db::messages::thread_turn_count(&state.db, &thread.id).unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn remote_first_history_recovery_accepts_an_already_imported_target() {
+        let state = test_app_state();
+        let (thread, mut snapshot) = history_fixture(&state, true);
+        snapshot.native_turn_ids.truncate(1);
+        snapshot.imported_messages.truncate(2);
+
+        // Simulate authoritative history reconciliation winning the race with
+        // rollback recovery while leaving the durable intent in place.
+        db::messages::replace_thread_messages(
+            &state.db,
+            &thread.id,
+            &snapshot
+                .imported_messages
+                .iter()
+                .map(|message| db::messages::ImportedMessageRecord {
+                    role: message.role.clone(),
+                    content: message.content.clone(),
+                    blocks: message.blocks.clone(),
+                    status: MessageStatusDto::Completed,
+                    native_turn_id: message.native_turn_id.clone(),
+                    turn_engine_id: message.turn_engine_id.clone(),
+                    turn_model_id: message.turn_model_id.clone(),
+                    turn_reasoning_effort: message.turn_reasoning_effort.clone(),
+                    token_input: message.token_input,
+                    token_output: message.token_output,
+                    created_at: message.created_at.clone(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        let recovered = persist_codex_in_place_rollback(&state.db, &thread, &snapshot).unwrap();
+        assert!(!is_engine_rollback_pending(
+            recovered.engine_metadata.as_ref()
+        ));
+        assert_eq!(recovered.message_count, 2);
+        assert_eq!(
+            db::messages::thread_native_turn_ids(&state.db, &thread.id).unwrap(),
+            snapshot.native_turn_ids
+        );
+        assert_eq!(
+            recovered.engine_metadata.as_ref().unwrap()["manualTitle"],
+            "Keep me"
         );
     }
 
