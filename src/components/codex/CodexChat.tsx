@@ -348,7 +348,8 @@ export function CodexChat() {
 
   useEffect(() => {
     nearBottomRef.current = savedScrollPosition?.nearBottom ?? true;
-  }, [boundThreadId, savedScrollPosition]);
+    setHasUnseenOutput(boundThreadId === activeThreadId && !nearBottomRef.current);
+  }, [activeThreadId, boundThreadId, savedScrollPosition]);
 
   useEffect(() => {
     const preferredModel = readMetadataString(activeThread, "lastModelId")
@@ -370,7 +371,6 @@ export function CodexChat() {
     setTranscriptSequences({});
     setNativePlanTextByMessageId({});
     setImplementingPlan(false);
-    setHasUnseenOutput(false);
     selectionPausedFollowRef.current = false;
     previousStreamingRef.current = false;
   }, [activeThreadId]);

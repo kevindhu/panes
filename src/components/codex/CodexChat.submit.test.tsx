@@ -64,6 +64,7 @@ import { useThreadStore } from "../../stores/threadStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
 import { initializeCodexI18n } from "../../i18n/codex";
 import { CodexChat } from "./CodexChat";
+import { readChatScrollPosition, resetChatScrollPositionsForTests, saveChatScrollPosition } from "../../lib/chatScrollPosition";
 import { resetLiveQuestionnaireDraftsForTests } from "../chat/ToolInputQuestionnaire";
 
 const thread: Thread = {
@@ -100,6 +101,7 @@ beforeEach(() => {
   localStorage.clear();
   sessionStorage.clear();
   resetLiveQuestionnaireDraftsForTests();
+  resetChatScrollPositionsForTests();
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
@@ -560,6 +562,35 @@ describe("CodexChat submission", () => {
       await Promise.resolve();
     });
     expect(turn()?.getAttribute("data-refresh-sequence")).toBe("51");
+  });
+
+  it.each([false, true])("restores Jump to latest with a saved history position (staged switch: %s)", async (staged) => {
+    const other = { ...thread, id: "thread-2", title: "Other session" };
+    useThreadStore.setState({ threads: [thread, other], threadsByWorkspace: { "workspace-1": [thread, other] } });
+    const position = { scrollTop: 12000, distanceFromBottom: 80000, nearBottom: false,
+      anchorMessageId: "history-message", anchorRowId: "history-message/item:command", anchorOffset: -12 };
+    saveChatScrollPosition(thread.id, position);
+    await act(async () => root.render(<CodexChat />));
+    expect(container.querySelector(".codex-jump-latest")).not.toBeNull();
+
+    const switchTo = async (id: string) => {
+      await act(async () => {
+        useThreadStore.setState({ activeThreadId: id });
+        if (!staged) useChatStore.setState({ threadId: id });
+      });
+      if (staged) {
+        expect(container.querySelector(".codex-jump-latest")).toBeNull();
+        await act(async () => useChatStore.setState({ threadId: id }));
+      }
+    };
+    await switchTo(other.id);
+    expect(container.querySelector(".codex-jump-latest")).toBeNull();
+    await switchTo(thread.id);
+    const button = container.querySelector<HTMLButtonElement>(".codex-jump-latest");
+    expect(button).not.toBeNull();
+    expect(readChatScrollPosition(thread.id)).toEqual(position);
+    await act(async () => button!.click());
+    expect(container.querySelector(".codex-jump-latest")).toBeNull();
   });
 
   it("pauses live auto-follow for a selection until Jump to latest is used", async () => {

@@ -27,6 +27,7 @@ interface Props {
 interface Anchor { key: string; messageId: string; offset: number }
 const heights = new Map<string, number>();
 const MAX_HEIGHTS = 8_000;
+const BOTTOM_TOLERANCE_PX = 8;
 const measurementKey = (width: number, row: TranscriptRow) => `${width}:${row.key}:${row.revision ?? ""}`;
 export function virtualRangeWithPinnedInterval(range: Range, interval: readonly [number, number] | null) {
   const selected = new Set(defaultRangeExtractor(range));
@@ -157,7 +158,14 @@ export const VirtualMessageTranscript = forwardRef<VirtualMessageTranscriptHandl
   }, [capture, setFollowing]);
   useImperativeHandle(forwardedRef, () => ({
     cancelRestore: pause,
-    scrollToEnd: () => { restoring.current = false; setFollowing(true); anchor.current = null; redraw(n => n + 1); },
+    scrollToEnd: () => {
+      restoring.current = false;
+      // An explicit jump ends the old gesture. Its later scroll/layout events
+      // must not be interpreted as the reader moving away from the bottom.
+      userScrolling.current = false;
+      pointerActive.current = false;
+      setFollowing(true); anchor.current = null; redraw(n => n + 1);
+    },
   }), [pause, setFollowing]);
 
   useLayoutEffect(() => {
@@ -206,8 +214,8 @@ export const VirtualMessageTranscript = forwardRef<VirtualMessageTranscriptHandl
       }
       if ((!presented || restoring.current) && !pointerActive.current && !userScrolling.current) return;
       if (pointerActive.current || userScrolling.current) {
-        if (offset < previousScrollTop.current - 1) setFollowing(false);
-        const atEnd = viewport.scrollHeight - viewport.clientHeight - offset <= 2;
+        const atEnd = viewport.scrollHeight - viewport.clientHeight - offset <= BOTTOM_TOLERANCE_PX;
+        if (!atEnd && offset < previousScrollTop.current - 1) setFollowing(false);
         if (atEnd && offset > previousScrollTop.current + 1 && !window.getSelection()?.toString()) setFollowing(true);
       }
       previousScrollTop.current = offset;

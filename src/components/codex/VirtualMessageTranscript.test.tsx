@@ -2,11 +2,12 @@
 
 import { act, createRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Message } from "../../types";
 import {
   CHAT_TRANSCRIPT_VIRTUALIZATION_ENABLED,
   VirtualMessageTranscript,
+  type VirtualMessageTranscriptHandle,
   virtualRangeWithPinnedInterval,
 } from "./VirtualMessageTranscript";
 import {
@@ -147,6 +148,54 @@ describe("VirtualMessageTranscript", () => {
       10, 11, 12,
       38, 39, 40, 41, 42, 43, 44, 45, 46,
     ]);
+  });
+
+  it.each(["content shrink", "small offset correction"])("keeps following after Jump to latest and %s", async (change) => {
+    const viewport = document.createElement("div");
+    let height = 1000;
+    Object.defineProperties(viewport, { clientHeight: { value: 100 }, scrollHeight: { get: () => height } });
+    const viewportRef = createRef<HTMLDivElement>(); viewportRef.current = viewport;
+    const handle = createRef<VirtualMessageTranscriptHandle>();
+    const following = vi.fn();
+    await act(async () => root.render(<VirtualMessageTranscript ref={handle} messages={[message(0)]}
+      viewportRef={viewportRef} restorePosition={null} selectedMessageRange={null} layoutRevision="test"
+      virtualizationEnabled={false} renderMessage={() => null} onFollowChange={following} />));
+    await act(async () => {
+      viewport.dispatchEvent(new Event("scroll"));
+      viewport.dispatchEvent(new WheelEvent("wheel", { deltaY: -100 }));
+      viewport.scrollTop = 700; viewport.dispatchEvent(new Event("scroll"));
+    });
+    expect(following).toHaveBeenLastCalledWith(false);
+    await act(async () => handle.current!.scrollToEnd());
+    expect(viewport.scrollTop).toBe(900);
+    expect(following).toHaveBeenLastCalledWith(true);
+    following.mockClear();
+    await act(async () => {
+      viewport.dispatchEvent(new Event("scroll")); // Read-back of our own jump.
+      if (change === "content shrink") height = 995;
+      viewport.scrollTop = 895; viewport.dispatchEvent(new Event("scroll"));
+    });
+    expect(following).not.toHaveBeenCalledWith(false);
+    await act(async () => viewport.dispatchEvent(new WheelEvent("wheel", { deltaY: -20 })));
+    expect(following).toHaveBeenLastCalledWith(false); // Fresh upward intent still pauses immediately.
+  });
+
+  it("resumes following when downward scrolling ends a few pixels from the bottom", async () => {
+    const viewport = document.createElement("div");
+    Object.defineProperties(viewport, { clientHeight: { value: 100 }, scrollHeight: { value: 1000 } });
+    const viewportRef = createRef<HTMLDivElement>(); viewportRef.current = viewport;
+    const following = vi.fn();
+    await act(async () => root.render(<VirtualMessageTranscript messages={[message(0)]}
+      viewportRef={viewportRef} restorePosition={null} selectedMessageRange={null} layoutRevision="test"
+      virtualizationEnabled={false} renderMessage={() => null} onFollowChange={following} />));
+    await act(async () => {
+      viewport.dispatchEvent(new Event("scroll"));
+      viewport.dispatchEvent(new WheelEvent("wheel", { deltaY: -100 }));
+      viewport.scrollTop = 700; viewport.dispatchEvent(new Event("scroll"));
+      viewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 100 }));
+      viewport.scrollTop = 895; viewport.dispatchEvent(new Event("scroll"));
+    });
+    expect(following).toHaveBeenLastCalledWith(true);
   });
 
   it("estimates short user rows near their compact rendered height", () => {
