@@ -21,6 +21,7 @@ use crate::{
 
 pub mod codex;
 pub mod codex_event_mapper;
+mod codex_idle;
 pub mod codex_protocol;
 pub mod codex_transport;
 pub mod events;
