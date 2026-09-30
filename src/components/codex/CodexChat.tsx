@@ -1,4 +1,3 @@
-import { open } from "@tauri-apps/plugin-dialog";
 import {
   ArrowDown,
   Brain,
@@ -7,11 +6,8 @@ import {
   GitBranch,
   ListChecks,
   LoaderCircle,
-  Paperclip,
   RotateCcw,
-  Send,
   Settings2,
-  Square,
   Zap,
 } from "lucide-react";
 import {
@@ -22,13 +18,11 @@ import {
   useRef,
   useState,
   Suspense,
-  type ClipboardEvent,
-  type KeyboardEvent,
 } from "react";
-import { buildCodexInputItems } from "../chat/codexInputItems";
-import { AttachmentChip } from "../chat/AttachmentChip";
+import { MessageTimestamp } from "../chat/MessageTimestamp";
 import { ToolInputQuestionnaire } from "../chat/ToolInputQuestionnaire";
 import { CodexUsageLimits } from "./CodexUsageLimits";
+import { CodexComposer, type CodexComposerHandle, type CodexComposerSubmission } from "./CodexComposer";
 import {
   CHAT_TRANSCRIPT_VIRTUALIZATION_ENABLED,
   VirtualMessageTranscript,
@@ -42,7 +36,6 @@ import {
   computeTurnsAfterAssistantMessage,
   extractEditableMessageContext,
   isEditableUserTurn,
-  mergeUniqueChatAttachments,
   messagesBeforeEditableUserTurn,
 } from "../chat/messageEditBranching";
 import {
@@ -63,6 +56,7 @@ import {
 } from "../../lib/chatScrollPosition";
 import { useTranscriptSelection } from "../../lib/transcriptSelection";
 import { createAndActivateWorkspaceThread } from "../../lib/newThreadActions";
+import { NEW_THREAD_FALLBACK_RUNTIME } from "../../lib/newThreadRuntime";
 import { activateThreadContext } from "../../lib/threadActivation";
 import {
   ipc,
@@ -84,7 +78,13 @@ import {
 import { useThreadStore } from "../../stores/threadStore";
 import { toast } from "../../stores/toastStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
-import type { ApprovalResponse, ChatAttachment, CodexApp, CodexSkill, ContentBlock, Message, Thread } from "../../types";
+import type { ApprovalResponse, ContentBlock, Message, Thread } from "../../types";
+
+const MODEL_PICKER_PRIORITY: Readonly<Record<string, number>> = {
+  "gpt-6-astra": 0,
+  "gpt-6-sol": 1,
+  "gpt-6-luna": 2,
+};
 
 const PLAN_IMPLEMENTATION_QUESTION_ID = "plan_implementation_decision";
 const PLAN_IMPLEMENTATION_CHOICE = "Implement the plan";
@@ -115,20 +115,6 @@ const MessageBlocks = lazy(() =>
 const CodexTurnTranscript = lazy(() =>
   import("../chat/CodexTurnTranscript").then((module) => ({ default: module.CodexTurnTranscript })),
 );
-
-function fileNameFromPath(filePath: string): string {
-  return filePath.replace(/\\/g, "/").split("/").at(-1) || "attachment";
-}
-
-function guessMimeType(fileName: string): string | undefined {
-  const extension = fileName.split(".").at(-1)?.toLowerCase();
-  const types: Record<string, string> = {
-    png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
-    webp: "image/webp", pdf: "application/pdf", json: "application/json",
-    md: "text/markdown", txt: "text/plain", csv: "text/csv",
-  };
-  return extension ? types[extension] : undefined;
-}
 
 function messageBlocks(message: { content?: string; blocks?: ContentBlock[] }): ContentBlock[] {
   if (message.blocks?.length) return message.blocks;
@@ -164,18 +150,15 @@ function CopyMessageButton({ text }: { text: string }) {
 export function CodexChat() {
   const viewportRef = useRef<HTMLDivElement>(null);
   const transcriptRef = useRef<VirtualMessageTranscriptHandle>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const composerRef = useRef<CodexComposerHandle>(null);
   const nearBottomRef = useRef(true);
   const selectionPausedFollowRef = useRef(false);
-  const [input, setInput] = useState("");
-  const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [selectedModelId, setSelectedModelId] = useState("");
   const [reasoningEffort, setReasoningEffort] = useState<string | null>(null);
   const [newThreadServiceTier, setNewThreadServiceTier] = useState<"fast" | null>(null);
   const [policyOpen, setPolicyOpen] = useState(false);
   const [forkingMessageId, setForkingMessageId] = useState<string | null>(null);
   const [rollingBackMessageId, setRollingBackMessageId] = useState<string | null>(null);
-  const [referenceCatalog, setReferenceCatalog] = useState<{ skills: CodexSkill[]; apps: CodexApp[] } | null>(null);
   const [transcriptSequences, setTranscriptSequences] = useState<Record<string, number>>({});
   const [nativePlanTextByMessageId, setNativePlanTextByMessageId] = useState<Record<string, string>>({});
   const [implementingPlan, setImplementingPlan] = useState(false);
@@ -218,6 +201,10 @@ export function CodexChat() {
   const clearNewThreadMode = useThreadPlanModeStore((state) => state.clearNewThreadMode);
 
   const models = useMemo(() => engine?.models.filter((model) => !model.hidden) ?? [], [engine]);
+  // Keep available GPT-6 models together, preserving catalog order for other models.
+  const modelOptions = useMemo(() => [...models].sort((a, b) =>
+    (MODEL_PICKER_PRIORITY[a.id] ?? 3) - (MODEL_PICKER_PRIORITY[b.id] ?? 3),
+  ), [models]);
   const selectedModel = models.find((model) => model.id === selectedModelId) ?? models[0] ?? null;
   const composerModeScope = useMemo(() => resolveComposerModeScope({
     activeThreadId,
@@ -359,16 +346,14 @@ export function CodexChat() {
   }, [boundThreadId, savedScrollPosition]);
 
   useEffect(() => {
-    const preferredModel = readMetadataString(activeThread, "lastModelId") ?? activeThread?.modelId;
+    const preferredModel = readMetadataString(activeThread, "lastModelId")
+      ?? activeThread?.modelId
+      ?? NEW_THREAD_FALLBACK_RUNTIME.modelId;
     const nextModel = models.find((model) => model.id === preferredModel) ?? models.find((model) => model.isDefault) ?? models[0];
     if (!nextModel) return;
     setSelectedModelId(nextModel.id);
     setReasoningEffort(resolveReasoningEffortForModel(nextModel, readMetadataString(activeThread, "reasoningEffort")));
   }, [activeThread?.id, models]);
-
-  useEffect(() => {
-    setReferenceCatalog(null);
-  }, [workspace?.rootPath]);
 
   useEffect(() => {
     setNewThreadServiceTier(null);
@@ -446,15 +431,6 @@ export function CodexChat() {
       stopListening?.();
     };
   }, []);
-
-  useEffect(() => {
-    if (!input.includes("$") || referenceCatalog || !workspace?.rootPath) return;
-    let cancelled = false;
-    void Promise.all([ipc.listCodexSkills(workspace.rootPath), ipc.listCodexApps()])
-      .then(([skills, apps]) => { if (!cancelled) setReferenceCatalog({ skills, apps }); })
-      .catch(() => { if (!cancelled) setReferenceCatalog({ skills: [], apps: [] }); });
-    return () => { cancelled = true; };
-  }, [input, referenceCatalog, workspace?.rootPath]);
 
   useEffect(() => {
     const viewport = viewportRef.current;
@@ -545,8 +521,7 @@ export function CodexChat() {
     if (!confirmed) return;
 
     setRollingBackMessageId(message.id);
-    setInput(context.text);
-    setAttachments(context.attachments);
+    composerRef.current?.setDraft(context);
     if (activeThreadId) {
       disarmPlanImplementationPrompt(activeThreadId);
       setThreadMode(activeThreadId, context.planMode ? "plan" : "default");
@@ -555,7 +530,7 @@ export function CodexChat() {
     nearBottomRef.current = true;
     requestAnimationFrame(() => {
       transcriptRef.current?.scrollToEnd();
-      textareaRef.current?.focus();
+      composerRef.current?.focus();
     });
 
     try {
@@ -592,55 +567,11 @@ export function CodexChat() {
     }
   }
 
-  function addPaths(paths: string[]) {
-    setAttachments((current) => {
-      const known = new Set(current.map((item) => item.filePath.toLowerCase()));
-      const added = paths
-        .map((filePath) => filePath.trim())
-        .filter((filePath) => filePath && !known.has(filePath.toLowerCase()))
-        .map((filePath) => {
-          const fileName = fileNameFromPath(filePath);
-          return { id: crypto.randomUUID(), fileName, filePath, sizeBytes: 0, mimeType: guessMimeType(fileName) };
-        });
-      return [...current, ...added];
-    });
-  }
-
-  async function chooseAttachments() {
-    const selected = await open({ multiple: true, directory: false, title: "Attach files" });
-    if (!selected) return;
-    addPaths(Array.isArray(selected) ? selected : [selected]);
-  }
-
-  async function savePastedImage(file: File): Promise<ChatAttachment | null> {
-    const dataUrl = await new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result));
-      reader.onerror = () => reject(reader.error);
-      reader.readAsDataURL(file);
-    });
-    const base64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
-    const saved = await ipc.savePastedImageAttachment(
-      file.name || `pasted-${Date.now()}.png`,
-      file.type || "image/png",
-      base64,
-    );
-    return { ...saved, id: crypto.randomUUID() };
-  }
-
-  function handlePaste(event: ClipboardEvent<HTMLTextAreaElement>) {
-    const images = [...event.clipboardData.files].filter((file) => file.type.startsWith("image/"));
-    if (!images.length) return;
-    event.preventDefault();
-    void Promise.all(images.map(savePastedImage)).then((saved) => {
-      setAttachments((current) => [...current, ...saved.filter((item): item is ChatAttachment => Boolean(item))]);
-    }).catch((pasteError) => toast.error(`Could not attach pasted image: ${String(pasteError)}`));
-  }
-
-  async function submit() {
-    const submittedInput = input;
-    const text = input.trim();
-    if (rollingBackMessageId || engineRollbackPending || (!text && !attachments.length) || !activeWorkspaceId || !composerModeScopeReady) return;
+  async function submit(
+    { text, attachments, inputItems }: CodexComposerSubmission,
+    onAccepted: () => void,
+  ): Promise<boolean> {
+    if (rollingBackMessageId || engineRollbackPending || (!text && !attachments.length) || !activeWorkspaceId || !composerModeScopeReady) return false;
     let targetThreadId = activeThreadId;
     const creatingThread = !targetThreadId;
     if (creatingThread) {
@@ -648,33 +579,17 @@ export function CodexChat() {
         serviceTier: fastMode ? "fast" : null,
       });
     }
-    if (!targetThreadId) return;
+    if (!targetThreadId) return false;
     if (creatingThread) clearNewThreadMode(activeWorkspaceId);
 
-    const submittedAttachments = attachments;
-    const inputItems = referenceCatalog ? buildCodexInputItems(text, referenceCatalog.skills, referenceCatalog.apps) : undefined;
-    let composerConsumed = false;
     const consumeSubmittedComposer = () => {
-      if (composerConsumed) return;
-      composerConsumed = true;
-      setInput("");
-      setAttachments([]);
       nearBottomRef.current = true;
-      requestAnimationFrame(() => textareaRef.current?.focus());
+      onAccepted();
     };
-    const restoreSubmittedComposer = () => {
-      if (!composerConsumed) return;
-      setInput((current) => {
-        if (!current) return submittedInput;
-        if (!submittedInput || current === submittedInput) return current;
-        return `${submittedInput}${submittedInput.endsWith("\n") ? "" : "\n"}${current}`;
-      });
-      setAttachments((current) => mergeUniqueChatAttachments(submittedAttachments, current));
-    };
-    const accepted = streaming
+    return streaming
       ? await steer(text, {
           threadIdOverride: targetThreadId,
-          attachments: submittedAttachments,
+          attachments,
           inputItems,
           planMode,
           onAccepted: consumeSubmittedComposer,
@@ -684,30 +599,11 @@ export function CodexChat() {
           engineId: "codex",
           modelId: selectedModel?.id ?? null,
           reasoningEffort,
-          attachments: submittedAttachments,
+          attachments,
           inputItems,
           planMode,
           onAccepted: consumeSubmittedComposer,
         });
-    if (accepted) {
-      // The store invokes this synchronously when it inserts the optimistic turn.
-      // Keep the fallback for alternate implementations and test doubles.
-      consumeSubmittedComposer();
-    } else {
-      restoreSubmittedComposer();
-    }
-  }
-
-  function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.shiftKey && event.key === "Tab" && !streaming && composerModeScopeReady) {
-      event.preventDefault();
-      setPlanMode(!planMode);
-      return;
-    }
-    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
-      event.preventDefault();
-      void submit();
-    }
   }
 
   async function submitPendingToolInput(response: ApprovalResponse) {
@@ -864,22 +760,25 @@ export function CodexChat() {
           )}
         </Suspense>
         {message.role === "assistant" && message.status !== "streaming" && (
-          <div className="codex-message-actions">
-            <CopyMessageButton text={copyText} />
-            {canForkMessage && (
-              <button
-                className="codex-fork-message"
-                type="button"
-                title={isForkingMessage ? "Forking conversation" : "Fork from here"}
-                aria-label={isForkingMessage ? "Forking conversation" : "Fork from here"}
-                disabled={forkingMessageId !== null || rollingBackMessageId !== null}
-                onClick={() => void forkFromMessage(message)}
-              >
-                {isForkingMessage
-                  ? <LoaderCircle size={12} className="codex-spin" />
-                  : <GitBranch size={12} />}
-              </button>
-            )}
+          <div className="codex-message-footer">
+            <div className="codex-message-actions">
+              <CopyMessageButton text={copyText} />
+              {canForkMessage && (
+                <button
+                  className="codex-fork-message"
+                  type="button"
+                  title={isForkingMessage ? "Forking conversation" : "Fork from here"}
+                  aria-label={isForkingMessage ? "Forking conversation" : "Fork from here"}
+                  disabled={forkingMessageId !== null || rollingBackMessageId !== null}
+                  onClick={() => void forkFromMessage(message)}
+                >
+                  {isForkingMessage
+                    ? <LoaderCircle size={12} className="codex-spin" />
+                    : <GitBranch size={12} />}
+                </button>
+              )}
+            </div>
+            <MessageTimestamp createdAt={message.createdAt} />
           </div>
         )}
       </article>
@@ -1027,83 +926,64 @@ export function CodexChat() {
           {showSpecialComposer && planMode && (
             <div className="codex-composer-mode"><ListChecks size={12} /> Plan mode</div>
           )}
-          {pendingToolInputApproval ? (
-            <ToolInputQuestionnaire
-              key={pendingToolInputApproval.approvalId}
-              details={pendingToolInputApproval.details}
-              onSubmit={submitPendingToolInput}
-              onStop={cancel}
-              draftKey={`${activeThreadId}:${pendingToolInputApproval.approvalId}`}
-            />
-          ) : showPlanImplementationPrompt ? (
-            <ToolInputQuestionnaire
-              details={PLAN_IMPLEMENTATION_QUESTION_DETAILS}
-              onSubmit={handlePlanImplementationResponse}
-              submitLabel={implementingPlan ? "Starting…" : "Continue"}
-            />
-          ) : (
-            <>
-              {attachments.length > 0 && (
-                <div className="codex-composer-attachments" aria-label="Attached files">
-                  {attachments.map((attachment) => (
-                    <AttachmentChip
-                      key={attachment.id}
-                      attachment={attachment}
-                      composerPreview
-                      removeLabel={`Remove ${attachment.fileName}`}
-                      onRemove={() => setAttachments((items) => items.filter((item) => item.id !== attachment.id))}
-                    />
-                  ))}
-                </div>
-              )}
-              <textarea
-                ref={textareaRef}
-                rows={2}
-                value={input}
-                disabled={!activeWorkspaceId || !composerModeScopeReady}
-                placeholder={planMode ? "Ask Codex to make a plan…" : streaming ? "Steer the current turn…" : "Message Codex…"}
-                onChange={(event) => setInput(event.target.value)}
-                onKeyDown={handleKeyDown}
-                onPaste={handlePaste}
+          <CodexComposer
+            ref={composerRef}
+            workspaceRootPath={workspace.rootPath}
+            disabled={!activeWorkspaceId || !composerModeScopeReady}
+            submitDisabled={engineRollbackPending || rollingBackMessageId !== null || !selectedModel}
+            submitTitle={engineRollbackPending || rollingBackMessageId ? "Finishing history edit" : streaming ? "Steer" : "Send"}
+            placeholder={planMode ? "Ask Codex to make a plan…" : streaming ? "Steer the current turn…" : "Message Codex…"}
+            streaming={streaming}
+            onSubmit={submit}
+            onTogglePlanMode={() => setPlanMode(!planMode)}
+            onStop={cancel}
+            prompt={pendingToolInputApproval ? (
+              <ToolInputQuestionnaire
+                key={pendingToolInputApproval.approvalId}
+                details={pendingToolInputApproval.details}
+                onSubmit={submitPendingToolInput}
+                onStop={cancel}
+                draftKey={`${activeThreadId}:${pendingToolInputApproval.approvalId}`}
               />
-              <div className="codex-composer-toolbar">
-                <button type="button" onClick={() => void chooseAttachments()} disabled={!composerModeScopeReady} title="Attach files"><Paperclip size={14} /></button>
-                <button type="button" className={planMode ? "active" : ""} aria-pressed={planMode} onClick={() => setPlanMode(!planMode)} disabled={streaming || !composerModeScopeReady} title={`${planMode ? "Disable" : "Enable"} Plan mode (Shift+Tab)`}><ListChecks size={14} /> Plan</button>
-                <select value={selectedModel?.id ?? ""} onChange={(event) => {
-                  const model = models.find((item) => item.id === event.target.value) ?? null;
-                  setSelectedModelId(event.target.value);
-                  setReasoningEffort(resolveReasoningEffortForModel(model, reasoningEffort));
-                }} aria-label="Model">
-                  {models.map((model) => <option key={model.id} value={model.id}>{model.displayName || model.id}</option>)}
-                </select>
-                {selectedModel && selectedModel.supportedReasoningEfforts.length > 0 && (
-                  <label className="codex-effort"><Brain size={13} /><select value={reasoningEffort ?? ""} onChange={(event) => setReasoningEffort(event.target.value || null)} aria-label="Reasoning effort">
-                    {selectedModel.supportedReasoningEfforts.map((option) => <option key={option.reasoningEffort} value={option.reasoningEffort}>{option.reasoningEffort}</option>)}
-                  </select></label>
-                )}
-                <button
-                  type="button"
-                  className={`codex-fast ${fastMode ? "active" : ""}`}
-                  aria-label="Fast mode"
-                  aria-pressed={fastMode}
-                  onClick={() => setFastMode(!fastMode)}
-                  disabled={streaming || !composerModeScopeReady}
-                  title={`${fastMode ? "Disable" : "Enable"} Fast mode`}
-                >
-                  <Zap size={12} /> Fast
-                </button>
-                <CodexUsageLimits
-                  usage={usage}
-                  threadId={activeThreadId === boundThreadId ? activeThreadId : null}
-                  planType={codexPlanType}
-                  onRefresh={ipc.refreshThreadUsageLimits}
-                />
-                <span className="spacer" />
-                {streaming && <button type="button" onClick={() => void cancel()} title="Stop"><Square size={13} /></button>}
-                <button className="send" type="button" disabled={engineRollbackPending || rollingBackMessageId !== null || (!input.trim() && !attachments.length) || !selectedModel || !composerModeScopeReady} onClick={() => void submit()} title={engineRollbackPending || rollingBackMessageId ? "Finishing history edit" : streaming ? "Steer" : "Send"}><Send size={14} /></button>
-              </div>
-            </>
-          )}
+            ) : showPlanImplementationPrompt ? (
+              <ToolInputQuestionnaire
+                details={PLAN_IMPLEMENTATION_QUESTION_DETAILS}
+                onSubmit={handlePlanImplementationResponse}
+                submitLabel={implementingPlan ? "Starting…" : "Continue"}
+              />
+            ) : null}
+          >
+            <button type="button" className={planMode ? "active" : ""} aria-pressed={planMode} onClick={() => setPlanMode(!planMode)} disabled={streaming || !composerModeScopeReady} title={`${planMode ? "Disable" : "Enable"} Plan mode (Shift+Tab)`}><ListChecks size={14} /> Plan</button>
+            <select value={selectedModel?.id ?? ""} onChange={(event) => {
+              const model = models.find((item) => item.id === event.target.value) ?? null;
+              setSelectedModelId(event.target.value);
+              setReasoningEffort(resolveReasoningEffortForModel(model, reasoningEffort));
+            }} aria-label="Model">
+              {modelOptions.map((model) => <option key={model.id} value={model.id}>{model.displayName || model.id}</option>)}
+            </select>
+            {selectedModel && selectedModel.supportedReasoningEfforts.length > 0 && (
+              <label className="codex-effort"><Brain size={13} /><select value={reasoningEffort ?? ""} onChange={(event) => setReasoningEffort(event.target.value || null)} aria-label="Reasoning effort">
+                {selectedModel.supportedReasoningEfforts.map((option) => <option key={option.reasoningEffort} value={option.reasoningEffort}>{option.reasoningEffort}</option>)}
+              </select></label>
+            )}
+            <button
+              type="button"
+              className={`codex-fast ${fastMode ? "active" : ""}`}
+              aria-label="Fast mode"
+              aria-pressed={fastMode}
+              onClick={() => setFastMode(!fastMode)}
+              disabled={streaming || !composerModeScopeReady}
+              title={`${fastMode ? "Disable" : "Enable"} Fast mode`}
+            >
+              <Zap size={12} /> Fast
+            </button>
+            <CodexUsageLimits
+              usage={usage}
+              threadId={activeThreadId === boundThreadId ? activeThreadId : null}
+              planType={codexPlanType}
+              onRefresh={ipc.refreshThreadUsageLimits}
+            />
+          </CodexComposer>
         </div>
       </div>
     </main>

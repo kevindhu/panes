@@ -336,11 +336,44 @@ impl Engine for CodexEngine {
                 supported_reasoning_efforts: frontier_reasoning_efforts(false),
             },
             ModelInfo {
-                id: "gpt-5.6-sol".to_string(),
-                display_name: "GPT-5.6-Sol".to_string(),
-                description: "Latest frontier agentic coding model.".to_string(),
+                id: "gpt-6-sol".to_string(),
+                display_name: "GPT-6-Sol".to_string(),
+                description: "Built for complex coding and agentic workflows.".to_string(),
                 hidden: false,
                 is_default: true,
+                upgrade: None,
+                availability_nux: None,
+                upgrade_info: None,
+                input_modalities: vec!["text".to_string(), "image".to_string()],
+                attachment_modalities: vec!["text".to_string(), "image".to_string()],
+                limits: None,
+                supports_personality: false,
+                default_reasoning_effort: "medium".to_string(),
+                supported_reasoning_efforts: frontier_reasoning_efforts(true),
+            },
+            ModelInfo {
+                id: "gpt-6-luna".to_string(),
+                display_name: "GPT-6-Luna".to_string(),
+                description: "Efficient model for focused coding and high-volume tasks."
+                    .to_string(),
+                hidden: false,
+                is_default: false,
+                upgrade: None,
+                availability_nux: None,
+                upgrade_info: None,
+                input_modalities: vec!["text".to_string(), "image".to_string()],
+                attachment_modalities: vec!["text".to_string(), "image".to_string()],
+                limits: None,
+                supports_personality: false,
+                default_reasoning_effort: "medium".to_string(),
+                supported_reasoning_efforts: frontier_reasoning_efforts(false),
+            },
+            ModelInfo {
+                id: "gpt-5.6-sol".to_string(),
+                display_name: "GPT-5.6-Sol".to_string(),
+                description: "Reliable agentic workhorse for everyday tasks.".to_string(),
+                hidden: false,
+                is_default: false,
                 upgrade: None,
                 availability_nux: None,
                 upgrade_info: None,
@@ -10506,6 +10539,31 @@ mod tests {
         let engine = CodexEngine::default();
         let models = engine.models();
 
+        for (id, display_name, include_ultra) in [
+            ("gpt-6-sol", "GPT-6-Sol", true),
+            ("gpt-6-luna", "GPT-6-Luna", false),
+        ] {
+            let model = models.iter().find(|model| model.id == id).unwrap();
+            assert_eq!(model.display_name, display_name);
+            assert!(!model.hidden);
+            assert_eq!(model.is_default, id == "gpt-6-sol");
+            assert_eq!(model.default_reasoning_effort, "medium");
+            assert_eq!(model.input_modalities, vec!["text", "image"]);
+            assert_eq!(model.attachment_modalities, vec!["text", "image"]);
+            let mut expected_efforts = vec!["low", "medium", "high", "xhigh", "max"];
+            if include_ultra {
+                expected_efforts.push("ultra");
+            }
+            assert_eq!(
+                model
+                    .supported_reasoning_efforts
+                    .iter()
+                    .map(|option| option.reasoning_effort.as_str())
+                    .collect::<Vec<_>>(),
+                expected_efforts
+            );
+        }
+
         let astra = models
             .iter()
             .find(|model| model.id == "gpt-6-astra")
@@ -10528,7 +10586,7 @@ mod tests {
             .find(|model| model.id == "gpt-5.6-sol")
             .expect("static fallback should include gpt-5.6-sol");
         assert_eq!(gpt56_sol.display_name, "GPT-5.6-Sol");
-        assert!(gpt56_sol.is_default);
+        assert!(!gpt56_sol.is_default);
         assert_eq!(gpt56_sol.default_reasoning_effort, "low");
         assert!(gpt56_sol
             .supported_reasoning_efforts

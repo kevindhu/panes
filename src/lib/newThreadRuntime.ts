@@ -13,7 +13,7 @@ export type ComposerRuntimeSnapshot = NewThreadRuntimeSelection;
 
 export const NEW_THREAD_FALLBACK_RUNTIME: NewThreadRuntimeSelection = {
   engineId: "codex",
-  modelId: "gpt-5.6-sol",
+  modelId: "gpt-6-sol",
   reasoningEffort: "high",
   serviceTier: null,
 };
@@ -146,10 +146,12 @@ export function resolveNewThreadRuntime({
   composerRuntime,
   activeThread,
 }: ResolveNewThreadRuntimeInput): NewThreadRuntimeSelection {
+  const fallbackModel = engines.find((engine) => engine.id === NEW_THREAD_FALLBACK_RUNTIME.engineId)
+    ?.models.find((model) => model.id === NEW_THREAD_FALLBACK_RUNTIME.modelId);
   const candidates: Array<NewThreadRuntimeSelection | null> = [
     composerRuntime ?? null,
     activeThread ? runtimeFromThread(activeThread) : null,
-    NEW_THREAD_FALLBACK_RUNTIME,
+    fallbackModel?.hidden ? null : NEW_THREAD_FALLBACK_RUNTIME,
   ];
 
   for (const candidate of candidates) {

@@ -9,8 +9,11 @@ const mockIpc = vi.hoisted(() => ({
   sendMessage: vi.fn(),
   savePastedImageAttachment: vi.fn(),
   forkCodexThreadAtTurn: vi.fn(),
+  rollbackCodexThread: vi.fn(),
   setThreadCodexConfig: vi.fn(),
   respondApproval: vi.fn(),
+  listCodexSkills: vi.fn(),
+  listCodexApps: vi.fn(),
 }));
 const mockListeners = vi.hoisted(() => ({
   transcriptUpdated: null as null | ((event: {
@@ -19,9 +22,11 @@ const mockListeners = vi.hoisted(() => ({
     lastSourceSequence: number;
   }) => void),
   assistantTurnRenderCount: 0,
+  messageBlocksRenderCount: 0,
 }));
 
-vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
+const mockDialog = vi.hoisted(() => ({ open: vi.fn() }));
+vi.mock("@tauri-apps/plugin-dialog", () => mockDialog);
 
 vi.mock("../../lib/codexIpc", () => ({
   ipc: mockIpc,
@@ -34,11 +39,12 @@ vi.mock("../../lib/codexIpc", () => ({
 }));
 
 vi.mock("../chat/MessageBlocks", () => ({
-  MessageBlocks: ({ blocks }: { blocks: ContentBlock[] }) => (
-    <>{blocks.map((block, index) => block.type === "text"
+  MessageBlocks: ({ blocks }: { blocks: ContentBlock[] }) => {
+    mockListeners.messageBlocksRenderCount += 1;
+    return <>{blocks.map((block, index) => block.type === "text"
       ? <span key={index}>{block.content}</span>
-      : null)}</>
-  ),
+      : null)}</>;
+  },
 }));
 
 vi.mock("../chat/CodexTurnTranscript", () => ({
@@ -83,8 +89,11 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockIpc.setThreadCodexConfig.mockResolvedValue(thread);
   mockIpc.respondApproval.mockResolvedValue(undefined);
+  mockIpc.listCodexSkills.mockResolvedValue([]);
+  mockIpc.listCodexApps.mockResolvedValue([]);
   mockListeners.transcriptUpdated = null;
   mockListeners.assistantTurnRenderCount = 0;
+  mockListeners.messageBlocksRenderCount = 0;
   localStorage.clear();
   sessionStorage.clear();
   resetLiveQuestionnaireDraftsForTests();
@@ -161,6 +170,25 @@ beforeEach(() => {
   root = createRoot(container);
 });
 
+it.each([null, "native-turn-1"])("shows one message timestamp with or without a native turn (%s)", async (nativeTurnId) => {
+  useChatStore.setState({
+    messages: [{
+      id: "assistant-date", schemaVersion: 1, threadId: thread.id,
+      role: "assistant", status: "completed", content: "Response",
+      nativeTurnId, createdAt: "2026-08-26 18:00:00",
+    }],
+  });
+  await act(async () => root.render(<CodexChat />));
+  const dates = container.querySelectorAll<HTMLTimeElement>('.codex-message-footer time');
+  expect(dates).toHaveLength(1);
+  expect(dates[0].dateTime).toBe("2026-08-26T18:00:00.000Z");
+  expect(dates[0].closest('.codex-message')?.getAttribute('data-message-id')).toBe("assistant-date");
+  await act(async () => useChatStore.setState((state) => ({
+    messages: state.messages.map((message) => ({ ...message, status: "streaming" })),
+  })));
+  expect(container.querySelector('.codex-message-timestamp')).toBeNull();
+});
+
 it("shows multiple async questions alongside steering and submits only the selected request", async () => {
   useChatStore.setState({
     streaming: true, status: "streaming",
@@ -210,6 +238,132 @@ afterEach(async () => {
 });
 
 describe("CodexChat submission", () => {
+  async function typeDraft(text: string) {
+    const textarea = container.querySelector<HTMLTextAreaElement>(".codex-composer textarea")!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set?.call(textarea, text);
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    return textarea;
+  }
+
+  it.each([false, true])("keeps typing local to the composer in a long thread (streaming: %s)", async (streaming) => {
+    const messages: Message[] = Array.from({ length: 100 }, (_, index) => ({
+      id: `long-thread-${index}`,
+      threadId: thread.id,
+      schemaVersion: 1,
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `Message ${index}: ${"Long transcript content. ".repeat(100)}`,
+      status: streaming && index === 99 ? "streaming" : "completed",
+      createdAt: thread.createdAt,
+    }));
+    useChatStore.setState({ messages, streaming, status: streaming ? "streaming" : "idle" });
+    await act(async () => root.render(<CodexChat />));
+    expect(container.querySelectorAll(".codex-message")).toHaveLength(messages.length);
+    expect(container.querySelector(".is-virtualized")).toBeNull();
+    const rendersBeforeTyping = {
+      assistant: mockListeners.assistantTurnRenderCount,
+      user: mockListeners.messageBlocksRenderCount,
+    };
+    expect(rendersBeforeTyping.assistant).toBeGreaterThan(0);
+    expect(rendersBeforeTyping.user).toBeGreaterThan(0);
+    const textarea = container.querySelector<HTMLTextAreaElement>(".codex-composer textarea")!;
+    expect(container.querySelector<HTMLButtonElement>("button.send")?.disabled).toBe(true);
+    for (const character of "Follow up") {
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set?.call(textarea, textarea.value + character);
+        textarea.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+    }
+    expect(textarea.value).toBe("Follow up");
+    expect(container.querySelector<HTMLButtonElement>("button.send")?.disabled).toBe(false);
+    expect(mockListeners.assistantTurnRenderCount).toBe(rendersBeforeTyping.assistant);
+    expect(mockListeners.messageBlocksRenderCount).toBe(rendersBeforeTyping.user);
+
+    // A real transcript update must still render without losing the draft.
+    await act(async () => mockListeners.transcriptUpdated?.({
+      threadId: thread.id,
+      assistantMessageId: "long-thread-99",
+      lastSourceSequence: 42,
+    }));
+    expect(container.querySelector('[data-message-id="long-thread-99"] [data-testid="assistant-turn"]')?.getAttribute("data-refresh-sequence")).toBe("42");
+    expect(textarea.value).toBe("Follow up");
+  });
+
+  it.each(["visible", "hidden", "missing"])("groups available GPT-6 models first without changing the selected model (%s)", async (availability) => {
+    const engine = useEngineStore.getState().engines[0];
+    const otherModelIds = ["gpt-5.6-sol", "future-model", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"];
+    const gpt6ModelIds = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"];
+    const catalogIds = [...otherModelIds];
+    if (availability !== "missing") {
+      catalogIds.splice(1, 0, "gpt-6-luna");
+      catalogIds.splice(3, 0, "gpt-6-sol");
+      catalogIds.push("gpt-6-astra");
+    }
+    const catalog = catalogIds.map((id) => ({
+      ...engine.models[0],
+      id,
+      displayName: id,
+      isDefault: id === "gpt-5.6-sol",
+      hidden: gpt6ModelIds.includes(id) && availability === "hidden",
+    }));
+    useEngineStore.setState({ engines: [{ ...engine, models: catalog }] });
+    useThreadStore.setState({ threads: [{ ...thread, modelId: "gpt-5.6-luna" }] });
+
+    await act(async () => root.render(<CodexChat />));
+
+    const picker = container.querySelector<HTMLSelectElement>('select[aria-label="Model"]');
+    expect(Array.from(picker?.options ?? [], (option) => option.value)).toEqual(
+      availability === "visible" ? [...gpt6ModelIds, ...otherModelIds] : otherModelIds,
+    );
+    expect(picker?.value).toBe("gpt-5.6-luna");
+    expect(catalog.map((model) => model.id)).toEqual(catalogIds);
+    expect(mockIpc.setThreadCodexConfig).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { modelId: "gpt-6-sol", displayName: "GPT-6 Sol", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"], defaultEffort: "medium", expectedEffort: "ultra" },
+    { modelId: "gpt-6-luna", displayName: "GPT-6 Luna", efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "high", expectedEffort: "high" },
+  ])("submits $modelId with the reasoning options from its catalog", async ({ modelId, displayName, efforts, defaultEffort, expectedEffort }) => {
+    const engine = useEngineStore.getState().engines[0];
+    const previousModel = {
+      ...engine.models[0],
+      id: "gpt-5.6-sol",
+      supportedReasoningEfforts: [{ reasoningEffort: "ultra", description: "" }],
+    };
+    useEngineStore.setState({ engines: [{ ...engine, models: [previousModel, {
+      ...previousModel,
+      id: modelId,
+      displayName,
+      isDefault: false,
+      defaultReasoningEffort: defaultEffort,
+      supportedReasoningEfforts: efforts.map((reasoningEffort) => ({ reasoningEffort, description: "" })),
+    }] }] });
+    useThreadStore.setState({ threads: [{
+      ...thread,
+      modelId: previousModel.id,
+      engineMetadata: { reasoningEffort: "ultra" },
+    }] });
+    mockIpc.sendMessage.mockResolvedValueOnce("assistant-new-model");
+    await act(async () => root.render(<CodexChat />));
+    const picker = container.querySelector<HTMLSelectElement>('select[aria-label="Model"]')!;
+    await act(async () => {
+      picker.value = modelId;
+      picker.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    expect(picker.selectedOptions[0].textContent).toBe(displayName);
+    const effortPicker = container.querySelector<HTMLSelectElement>('select[aria-label="Reasoning effort"]')!;
+    expect(Array.from(effortPicker.options, (option) => option.value)).toEqual(efforts);
+    expect(effortPicker.value).toBe(expectedEffort);
+    const textarea = await typeDraft("Use the selected model");
+    await act(async () => textarea.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter" })));
+    expect(mockIpc.sendMessage).toHaveBeenCalledOnce();
+    expect(mockIpc.sendMessage.mock.calls[0].slice(0, 4)).toEqual([
+      thread.id, "Use the selected model", modelId, expectedEffort,
+    ]);
+  });
+
   it("shows compatibility rollback progress before the user tries to send", async () => {
     const pendingThread: Thread = {
       ...thread,
@@ -301,6 +455,19 @@ describe("CodexChat submission", () => {
     await act(async () => fastButton?.click());
     expect(fastButton?.getAttribute("aria-pressed")).toBe("true");
     expect(mockIpc.setThreadCodexConfig).not.toHaveBeenCalled();
+  });
+
+  it("selects GPT-6 Sol for a new conversation when the catalog still defaults to GPT-5.6 Sol", async () => {
+    const engine = useEngineStore.getState().engines[0];
+    const oldDefault = { ...engine.models[0], id: "gpt-5.6-sol", isDefault: true };
+    const gpt6Sol = { ...oldDefault, id: "gpt-6-sol", displayName: "GPT-6 Sol", isDefault: false };
+    useEngineStore.setState({ engines: [{ ...engine, models: [oldDefault, gpt6Sol] }] });
+    useThreadStore.setState({ threads: [], threadsByWorkspace: { "workspace-1": [] }, activeThreadId: null });
+    useChatStore.setState({ threadId: null });
+
+    await act(async () => root.render(<CodexChat />));
+
+    expect(container.querySelector<HTMLSelectElement>('select[aria-label="Model"]')?.value).toBe("gpt-6-sol");
   });
 
   it("does not rerender the visible transcript for a background thread status update", async () => {
@@ -526,6 +693,10 @@ describe("CodexChat submission", () => {
   });
 
   it("removes only the selected pasted image", async () => {
+    useChatStore.setState({ messages: [{
+      id: "assistant-attachments", threadId: thread.id, schemaVersion: 1,
+      role: "assistant", content: "Existing history", status: "completed", createdAt: thread.createdAt,
+    }] });
     class TestFileReader {
       result: string | null = null;
       error: DOMException | null = null;
@@ -546,6 +717,7 @@ describe("CodexChat submission", () => {
     }));
 
     await act(async () => root.render(<CodexChat />));
+    const rendersBeforeAttachments = mockListeners.assistantTurnRenderCount;
     const textarea = container.querySelector("textarea");
     expect(textarea).not.toBeNull();
 
@@ -577,6 +749,106 @@ describe("CodexChat submission", () => {
     expect(container.querySelector('[aria-label="Remove first.png"]')).not.toBeNull();
     expect(container.querySelector('[aria-label="Remove second.png"]')).toBeNull();
     expect(container.querySelector('[aria-label="Remove third.png"]')).not.toBeNull();
+    expect(mockListeners.assistantTurnRenderCount).toBe(rendersBeforeAttachments);
+  });
+
+  it("preserves the ordinary draft and attachments while a blocking question takes over", async () => {
+    await act(async () => root.render(<CodexChat />));
+    await typeDraft("Unsent follow-up");
+    mockDialog.open.mockResolvedValueOnce(["C:/attachments/notes.txt"]);
+    await act(async () => container.querySelector<HTMLButtonElement>('[title="Attach files"]')?.click());
+
+    await act(async () => useChatStore.setState({
+      streaming: true, status: "awaiting_approval",
+      messages: [{
+        id: "blocking-draft", threadId: thread.id, schemaVersion: 1, role: "assistant",
+        content: "", status: "streaming", createdAt: thread.createdAt,
+        blocks: [{ type: "approval", approvalId: "draft-question", actionType: "other", summary: "Question", status: "pending",
+          details: { _serverMethod: "item/tool/requestUserInput", isBlocking: true,
+            questions: [{ id: "scope", header: "Scope", question: "Which scope?", options: null }] } }],
+      }],
+    }));
+    expect(container.querySelector('.codex-questionnaire-answer')).not.toBeNull();
+    expect(container.querySelector('[aria-label="Remove notes.txt"]')).toBeNull();
+    await act(async () => useChatStore.setState({ messages: [], status: "streaming" }));
+    expect(container.querySelector<HTMLTextAreaElement>('.codex-composer textarea')?.value).toBe("Unsent follow-up");
+    expect(container.querySelector('[aria-label="Remove notes.txt"]')).not.toBeNull();
+  });
+
+  it("loads references once while typing a mention and keeps the transcript untouched", async () => {
+    let resolveApps!: (apps: []) => void;
+    mockIpc.listCodexApps.mockReturnValueOnce(new Promise<[]>((resolve) => { resolveApps = resolve; }));
+    useChatStore.setState({ messages: [{
+      id: "assistant-reference", threadId: thread.id, schemaVersion: 1, role: "assistant",
+      content: "Existing history", status: "completed", createdAt: thread.createdAt,
+    }] });
+    await act(async () => root.render(<CodexChat />));
+    const rendersBeforeTyping = mockListeners.assistantTurnRenderCount;
+    for (const text of ["$", "$s", "$sk", "$skill"]) await typeDraft(text);
+    expect(mockIpc.listCodexSkills).toHaveBeenCalledExactlyOnceWith("C:\\workspace");
+    expect(mockIpc.listCodexApps).toHaveBeenCalledOnce();
+    await act(async () => resolveApps([]));
+    expect(mockListeners.assistantTurnRenderCount).toBe(rendersBeforeTyping);
+    expect(container.querySelector<HTMLTextAreaElement>('.codex-composer textarea')?.value).toBe("$skill");
+  });
+
+  it("preserves keyboard behavior with a local draft", async () => {
+    mockIpc.sendMessage.mockReturnValueOnce(new Promise<string>(() => {}));
+    await act(async () => root.render(<CodexChat />));
+    const textarea = await typeDraft("Plan this change");
+    for (const options of [{ shiftKey: true }, { isComposing: true }]) {
+      await act(async () => {
+        textarea.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter", ...options }));
+      });
+    }
+    expect(mockIpc.sendMessage).not.toHaveBeenCalled();
+    await act(async () => textarea.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Tab", shiftKey: true })));
+    expect(useThreadPlanModeStore.getState().threadModes[thread.id]).toBe("plan");
+    expect(textarea.value).toBe("Plan this change");
+    await act(async () => textarea.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter" })));
+    expect(mockIpc.sendMessage).toHaveBeenCalledOnce();
+    expect(textarea.value).toBe("");
+  });
+
+  it("restores a failed submission without losing text or attachments added while sending", async () => {
+    let rejectSend!: (error: Error) => void;
+    mockIpc.sendMessage.mockReturnValueOnce(new Promise<string>((_resolve, reject) => { rejectSend = reject; }));
+    await act(async () => root.render(<CodexChat />));
+    await typeDraft("Original draft");
+    mockDialog.open.mockResolvedValueOnce(["C:/attachments/original.txt"]);
+    await act(async () => container.querySelector<HTMLButtonElement>('[title="Attach files"]')?.click());
+    await act(async () => container.querySelector<HTMLButtonElement>('button.send')?.click());
+    expect(container.querySelector<HTMLTextAreaElement>('.codex-composer textarea')?.value).toBe("");
+    expect(container.querySelector('[aria-label="Remove original.txt"]')).toBeNull();
+    await typeDraft("More thoughts");
+    mockDialog.open.mockResolvedValueOnce(["C:/attachments/new.txt"]);
+    await act(async () => container.querySelector<HTMLButtonElement>('[title="Attach files"]')?.click());
+    await act(async () => rejectSend(new Error("Connection failed")));
+    expect(container.querySelector<HTMLTextAreaElement>('.codex-composer textarea')?.value).toBe("Original draft\nMore thoughts");
+    expect(container.querySelector('[aria-label="Remove original.txt"]')).not.toBeNull();
+    expect(container.querySelector('[aria-label="Remove new.txt"]')).not.toBeNull();
+  });
+
+  it("restores a history edit into the local composer with its attachments", async () => {
+    useChatStore.setState({ messages: [{
+      id: "rollback-user", threadId: thread.id, schemaVersion: 1, role: "user",
+      content: "Original message", status: "completed", createdAt: thread.createdAt,
+      blocks: [{ type: "attachment", fileName: "notes.txt", filePath: "C:/attachments/notes.txt", sizeBytes: 10, mimeType: "text/plain" }],
+    }] });
+    mockIpc.rollbackCodexThread.mockReturnValueOnce(new Promise<Thread>(() => {}));
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    try {
+      await act(async () => root.render(<CodexChat />));
+      await typeDraft("Replace this draft");
+      await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Roll back to here"]')?.click());
+      expect(mockIpc.rollbackCodexThread).toHaveBeenCalledWith(thread.id, 1, null);
+      expect(container.querySelector<HTMLTextAreaElement>('.codex-composer textarea')?.value).toBe("Original message");
+      expect(container.querySelector('[aria-label="Remove notes.txt"]')).not.toBeNull();
+      expect(document.activeElement).toBe(container.querySelector('.codex-composer textarea'));
+      expect(container.querySelector<HTMLButtonElement>('button.send')?.disabled).toBe(true);
+    } finally {
+      confirm.mockRestore();
+    }
   });
 
   it("removes a rollback-restored draft as soon as its optimistic bubble appears", async () => {

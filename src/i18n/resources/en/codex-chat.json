@@ -1,4 +1,8 @@
 {
+  "turnTimestamp": {
+    "justNow": "just now",
+    "toggle": "Toggle date and time: {{date}}"
+  },
   "asyncQuestions": {
     "label": "Question from Codex",
     "sent": "Answer sent",

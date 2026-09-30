@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { parseMessageCreatedAtTimestamp } from "../lib/messageTimestamp";
 import { isBlockingApproval } from "../lib/pendingQuestions";
 import {
   ipc,
@@ -2213,20 +2214,6 @@ function applyHydrationWindow(messages: Message[]): Message[] {
   }
 
   return nextMessages;
-}
-
-const SQLITE_MESSAGE_TIMESTAMP_PATTERN =
-  /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/;
-
-function parseMessageCreatedAtTimestamp(createdAt: string): number | null {
-  if (SQLITE_MESSAGE_TIMESTAMP_PATTERN.test(createdAt)) {
-    const normalized = `${createdAt.replace(" ", "T")}Z`;
-    const parsed = Date.parse(normalized);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-
-  const direct = Date.parse(createdAt);
-  return Number.isFinite(direct) ? direct : null;
 }
 
 function normalizeMessages(

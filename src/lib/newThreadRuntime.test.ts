@@ -11,6 +11,22 @@ const engines: EngineInfo[] = [
     name: "Codex",
     models: [
       {
+        id: "gpt-6-sol",
+        displayName: "GPT-6-Sol",
+        description: "Current",
+        hidden: false,
+        isDefault: false,
+        inputModalities: ["text"],
+        attachmentModalities: ["text"],
+        supportsPersonality: false,
+        defaultReasoningEffort: "medium",
+        supportedReasoningEfforts: [
+          { reasoningEffort: "low", description: "Fast" },
+          { reasoningEffort: "medium", description: "Balanced" },
+          { reasoningEffort: "high", description: "Deep" },
+        ],
+      },
+      {
         id: "gpt-5.6-sol",
         displayName: "GPT-5.6-Sol",
         description: "Latest",
@@ -155,7 +171,7 @@ describe("resolveNewThreadRuntime", () => {
     });
   });
 
-  it("falls back to codex gpt-5.6-sol high when no other preference exists", () => {
+  it("falls back to codex gpt-6-sol high even when the catalog marks another model as default", () => {
     expect(
       resolveNewThreadRuntime({
         engines,
@@ -168,7 +184,7 @@ describe("resolveNewThreadRuntime", () => {
       {
         ...engines[0],
         models: engines[0].models
-          .filter((model) => model.id !== "gpt-5.6-sol")
+          .filter((model) => model.id !== "gpt-6-sol")
           .map((model) => ({
             ...model,
             isDefault: model.id === "gpt-5.5",
@@ -183,6 +199,22 @@ describe("resolveNewThreadRuntime", () => {
     ).toEqual({
       engineId: "codex",
       modelId: "gpt-5.5",
+      reasoningEffort: "high",
+      serviceTier: null,
+    });
+  });
+
+  it("uses the visible catalog default when GPT-6 Sol is hidden", () => {
+    const hiddenCatalog: EngineInfo[] = [{
+      ...engines[0],
+      models: engines[0].models.map((model) => model.id === "gpt-6-sol"
+        ? { ...model, hidden: true }
+        : model),
+    }];
+
+    expect(resolveNewThreadRuntime({ engines: hiddenCatalog })).toEqual({
+      engineId: "codex",
+      modelId: "gpt-5.6-sol",
       reasoningEffort: "high",
       serviceTier: null,
     });
