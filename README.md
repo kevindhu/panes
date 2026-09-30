@@ -46,6 +46,11 @@ pnpm install
 pnpm tauri:dev
 ```
 
+`pnpm tauri:dev` uses a separate database, configuration, and logs in the `dev`
+subdirectory of Panes' data directory (`%LOCALAPPDATA%\Panes\dev` on Windows).
+It starts with its own workspace list and never migrates the packaged app's data.
+This prevents development startup recovery from interrupting a running packaged app.
+
 Useful checks:
 
 ```bash

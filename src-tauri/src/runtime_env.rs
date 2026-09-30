@@ -47,16 +47,39 @@ pub fn platform_id() -> &'static str {
 }
 
 pub fn app_data_dir() -> PathBuf {
-    app_data_dir_for(
+    runtime_data_dirs().0
+}
+
+fn runtime_data_dirs() -> (PathBuf, Option<PathBuf>) {
+    let current = app_data_dir_for(
         cfg!(target_os = "windows"),
         local_app_data_dir().as_deref(),
         roaming_app_data_dir().as_deref(),
         home_dir().as_deref(),
+    );
+    let legacy = home_dir().map(|home| legacy_app_data_dir_for(&home));
+    data_dirs_for_runtime(
+        current,
+        legacy,
+        env::var("PANES_DEV_RUNTIME").as_deref() == Ok("1"),
     )
 }
 
+fn data_dirs_for_runtime(
+    current: PathBuf,
+    legacy: Option<PathBuf>,
+    development: bool,
+) -> (PathBuf, Option<PathBuf>) {
+    if development {
+        // No legacy migration: development must never move the user's real data.
+        (current.join("dev"), None)
+    } else {
+        (current, legacy)
+    }
+}
+
 pub fn legacy_app_data_dir() -> Option<PathBuf> {
-    home_dir().map(|home| legacy_app_data_dir_for(&home))
+    runtime_data_dirs().1
 }
 
 pub fn migrate_legacy_app_data_dir() -> std::io::Result<()> {
@@ -1310,6 +1333,31 @@ mod tests {
         let rendered = normalize_path(&from_home_drive);
         assert!(rendered.starts_with("C:"));
         assert!(rendered.ends_with("/Users/panes"));
+    }
+
+    #[test]
+    fn development_data_dirs_do_not_migrate_packaged_data() {
+        let root = std::env::temp_dir().join(format!("panes-dev-data-{}", Uuid::new_v4()));
+        let current = root.join("Panes");
+        let legacy = root.join("legacy");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("workspaces.db"), b"existing user data").unwrap();
+
+        let (dev_data, dev_legacy) =
+            data_dirs_for_runtime(current.clone(), Some(legacy.clone()), true);
+        assert_eq!(dev_data, current.join("dev"));
+        assert!(dev_legacy.is_none());
+        migrate_legacy_app_data_dir_for(&dev_data, dev_legacy.as_deref()).unwrap();
+        assert!(!dev_data.exists());
+        assert_eq!(
+            fs::read(legacy.join("workspaces.db")).unwrap(),
+            b"existing user data"
+        );
+        assert_eq!(
+            data_dirs_for_runtime(current.clone(), Some(legacy.clone()), false),
+            (current, Some(legacy))
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
