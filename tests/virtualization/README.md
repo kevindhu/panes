@@ -18,6 +18,27 @@ allow at most 2 CSS pixels of drift. Mounted-row counts must remain bounded,
 including when text is selected. The harness intentionally uses variable heights
 and groups 200 rows under a single message ID.
 
+## Command and activity widths
+
+Open `http://localhost:1430/tests/virtualization/width.html` and press **Run width
+checks**. This uses the production native renderer and styles, with inert fixture
+strings for the reported PowerShell commands, Bash, long paths, encoded command
+arguments, tool calls, searches, reasoning, unknown activities, and file diffs.
+The eleven checks cover collapsed and expanded/raw views at 900, 520, 320, and
+220 CSS pixels, complete command retention, local JSON/diff scrolling, and
+virtualized expansion, width reflow, unmount, and restoration. They check actual
+element bounds and the viewport's scroll width, so clipping overflow at the
+viewport alone cannot make them pass.
+
+Before the fix, long command rows grew to more than 4,200px inside an 808px
+transcript column. Long tool, search, and reasoning headers also exceeded the
+column. The native grid now uses a shrinkable column and activity rows can shrink
+to it. Long search queries wrap within their detail section. Commands retain
+their exact text; JSON and diffs retain independent horizontal scrolling. The
+virtualizer's existing measurement observer handles changed heights; expansion
+and narrowing the command pane preserved the reading anchor within 0.2px in
+the browser check without overlapping the next row.
+
 ## Local session replay
 
 `http://localhost:1430/tests/virtualization/session.html` renders the production
@@ -26,6 +47,7 @@ audit fixture**, then **Run session checks**. The fixture is intentionally absen
 from Git. It reads `.agent-workspace/virtualization-session.json` from this
 checkout. Native image assets and exact raw-event IPC require the desktop app;
 the browser fixture tests the semantic timeline and layout.
+History browsing and pane resizing also check native activity-row bounds.
 
 To export another fixture, first make a disposable database copy with the desired
 session and its native transcript tables. Do not point this helper at production:

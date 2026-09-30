@@ -328,7 +328,9 @@ button:disabled { cursor: default; }
 .toast-container { position: fixed; right: 14px; bottom: 14px; z-index: 1500; display: grid; gap: 7px; }
 
 /* Native Codex transcript -------------------------------------------------- */
-.codex-native-transcript { display: grid; gap: 9px; min-width: 0; }
+/* Virtual activity rows are direct grid children, outside the group's old
+   clipping boundary. Size the column from the pane, not a nowrap command/path. */
+.codex-native-transcript { display: grid; grid-template-columns: minmax(0, 1fr); gap: 9px; min-width: 0; }
 .codex-native-message { padding: 6px 14px; }
 .codex-native-loading { opacity: .86; }
 .codex-native-group {
@@ -387,6 +389,7 @@ button:disabled { cursor: default; }
 .codex-native-plan-progress li.running svg { color: var(--accent); }
 .codex-native-plan-progress li.interrupted { color: var(--text-2); }
 .codex-native-plan-progress li.interrupted svg { color: var(--warning); }
+.codex-native-activity-row { min-width: 0; }
 .codex-native-activity-row + .codex-native-activity-row { border-top: 1px solid var(--border); }
 .codex-native-activity-header {
   min-height: 39px;
@@ -439,7 +442,7 @@ button:disabled { cursor: default; }
 .codex-native-empty-output { padding: 7px 9px; border: 1px dashed var(--border); border-radius: 6px; color: var(--text-3); font-size: 10.5px; }
 .codex-native-reasoning-unavailable { padding: 2px 0; color: var(--text-3); font-size: 10.5px; }
 .codex-native-search-operation { width: max-content; border-radius: 999px; padding: 2px 7px; background: color-mix(in srgb, var(--accent) 10%, var(--bg-2)); color: var(--accent); font: 9px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; text-transform: uppercase; }
-.codex-native-search-queries { display: grid; gap: 5px; margin: 0; padding: 8px 10px 8px 30px; border: 1px solid var(--border); border-radius: 7px; background: var(--code-bg); color: var(--text-2); font: 10.75px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; user-select: text; }
+.codex-native-search-queries { display: grid; gap: 5px; margin: 0; padding: 8px 10px 8px 30px; border: 1px solid var(--border); border-radius: 7px; background: var(--code-bg); color: var(--text-2); font: 10.75px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; user-select: text; }
 .codex-native-search-results { overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
 .codex-native-search-result + .codex-native-search-result { border-top: 1px solid var(--border); }
 .codex-native-search-result > summary { min-height: 38px; display: flex; align-items: center; gap: 8px; padding: 7px 10px; cursor: pointer; list-style: none; }

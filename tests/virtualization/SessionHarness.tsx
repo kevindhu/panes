@@ -59,6 +59,12 @@ function SessionHarness() {
       setResults([...log]);
     };
     const assert = (value: boolean, message: string) => { if (!value) throw new Error(message); };
+    const assertRowWidths = () => {
+      for (const row of viewport.current!.querySelectorAll<HTMLElement>(".codex-native-activity-row")) {
+        const boundary = row.closest(".codex-native-transcript")!.getBoundingClientRect();
+        assert(row.getBoundingClientRect().right <= boundary.right + 1, `${row.dataset.itemType} exceeds transcript width`);
+      }
+    };
     await check("Latest and bounded DOM", async () => {
       handle.current!.scrollToEnd(); await frames(12);
       const v = viewport.current!; const gap = v.scrollHeight - v.clientHeight - v.scrollTop;
@@ -73,6 +79,7 @@ function SessionHarness() {
         v.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true }));
         v.scrollTop = (v.scrollHeight - v.clientHeight) * ratio;
         v.dispatchEvent(new Event("scroll")); await frames();
+        assertRowWidths();
         maxMounted = Math.max(maxMounted, v.querySelectorAll("[data-transcript-row]").length);
         assert(v.querySelectorAll("[data-transcript-row]").length < 60, "Unbounded mounted rows");
       }
@@ -80,6 +87,7 @@ function SessionHarness() {
     });
     await check("Narrower pane retains reading anchor", async () => {
       const before = anchor(); flushSync(() => setWidth(520)); await frames(12);
+      assertRowWidths();
       const delta = drift(before); assert(delta < 2, `drift=${delta}px`); return `drift=${delta}px`;
     });
     await check("Session remount retains reading anchor", async () => {
