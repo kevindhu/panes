@@ -45,7 +45,7 @@ describe("VirtualMessageTranscript", () => {
     container.remove();
   });
 
-  it("keeps only a bounded tail mounted before the viewport can be measured", async () => {
+  it("keeps the bounded measurement tail hidden until the viewport can be positioned", async () => {
     const viewport = document.createElement("div");
     const viewportRef = createRef<HTMLDivElement>();
     viewportRef.current = viewport;
@@ -69,6 +69,7 @@ describe("VirtualMessageTranscript", () => {
     expect(mounted).toHaveLength(12);
     expect(mounted[0]?.getAttribute("data-message-id")).toBe("message-88");
     expect(mounted[11]?.getAttribute("data-message-id")).toBe("message-99");
+    expect(container.querySelector<HTMLElement>(".codex-virtual-transcript")?.style.visibility).toBe("hidden");
   });
 
   it("mounts only a visible chunk and overscan once the viewport is measurable", async () => {

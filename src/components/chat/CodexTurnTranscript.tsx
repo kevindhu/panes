@@ -26,6 +26,7 @@ import {
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -1450,7 +1451,7 @@ export function CodexTranscriptRenderer({
     estimatedHeight: 100,
     revision: snapshot.turn.lastSourceSequence,
   })), [body, snapshot.turn.messageId, snapshot.turn.lastSourceSequence]);
-  useEffect(() => { onRows?.(snapshot.turn.messageId, rows); }, [onRows, rows, snapshot.turn.messageId]);
+  useLayoutEffect(() => { onRows?.(snapshot.turn.messageId, rows); }, [onRows, rows, snapshot.turn.messageId]);
   return onRows ? null : <ExactTranscriptContext.Provider value={{ messageId: snapshot.turn.messageId, display: snapshot.display ?? false }}>{body}</ExactTranscriptContext.Provider>;
 }
 
@@ -1503,9 +1504,9 @@ export const CodexTurnTranscript = memo(function CodexTurnTranscript({
       </div>
   ), [resolved, error, retry, blocks, fullFallback, status, workspaceRootPath, messageId, onApproval, onLoadActionOutput]);
   const fallbackRows = useMemo<TranscriptRow[]>(() => [{
-    key: messageId, messageId, content: fallback, estimatedHeight: 120,
-  }], [messageId, fallback]);
-  useEffect(() => { if (!snapshot) onRows?.(messageId, fallbackRows); }, [snapshot, onRows, messageId, fallbackRows]);
+    key: messageId, messageId, content: fallback, estimatedHeight: 120, pending: !resolved,
+  }], [messageId, fallback, resolved]);
+  useLayoutEffect(() => { if (!snapshot) onRows?.(messageId, fallbackRows); }, [snapshot, onRows, messageId, fallbackRows]);
   if (!snapshot) return onRows ? null : fallback;
   return (
     <CodexTranscriptRenderer

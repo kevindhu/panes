@@ -23,6 +23,8 @@ function Harness() {
   const [restore, setRestore] = useState<ChatScrollPosition | null>(null);
   const [epoch, setEpoch] = useState(0);
   const [hydrating, setHydrating] = useState(false);
+  const [tailReady, setTailReady] = useState(false);
+  const [windowed, setWindowed] = useState(false);
   const [start, setStart] = useState(0);
   const [count, setCount] = useState(1200);
   const [grown, setGrown] = useState<Record<string, number>>({});
@@ -51,6 +53,7 @@ function Harness() {
     const node = viewport.current!.querySelector<HTMLElement>(`[data-transcript-row="${before.key}"]`);
     return node ? Math.abs(node.getBoundingClientRect().top - viewport.current!.getBoundingClientRect().top - before.offset) : Infinity;
   };
+  const isPresented = () => getComputedStyle(viewport.current!.querySelector<HTMLElement>(".codex-virtual-transcript")!).visibility !== "hidden";
   const browse = async (top: number) => {
     const v = viewport.current!;
     v.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true }));
@@ -115,19 +118,29 @@ function Harness() {
       const before = readAnchor();
       const position = saved.current;
       flushSync(() => { setRestore(position); setEpoch(value => value + 1); });
-      await frames(12);
+      let wrongFrames = 0;
+      for (let i = 0; i < 12; i++) {
+        await frames(1);
+        const list = viewport.current!.querySelector<HTMLElement>(".codex-virtual-transcript")!;
+        if (getComputedStyle(list).visibility !== "hidden" && displacement(before) > 2) wrongFrames++;
+      }
       const drift = displacement(before);
-      assert(drift <= 2, `drift=${drift}`);
+      assert(isPresented() && drift <= 2 && wrongFrames === 0, `visible=${isPresented()}, drift=${drift}, wrong painted frames=${wrongFrames}`);
       return `anchor drift ${drift}px`;
     });
     await check("Restoration waits for native rows to hydrate", async () => {
       const before = readAnchor(); const position = saved.current;
       flushSync(() => { setRestore(position); setHydrating(true); setEpoch(value => value + 1); });
-      await frames();
-      flushSync(() => setHydrating(false)); await frames(12);
+      let wrongFrames = 0;
+      for (let i = 0; i < 24; i++) {
+        if (i === 12) flushSync(() => setHydrating(false));
+        await frames(1);
+        const list = viewport.current!.querySelector<HTMLElement>(".codex-virtual-transcript")!;
+        if (getComputedStyle(list).visibility !== "hidden" && displacement(before) > 2) wrongFrames++;
+      }
       const drift = displacement(before);
-      assert(drift <= 2, `drift=${drift}, saved=${JSON.stringify(saved.current)}`);
-      return `anchor drift ${drift}px`;
+      assert(isPresented() && drift <= 2 && wrongFrames === 0, `visible=${isPresented()}, drift=${drift}, wrong painted frames=${wrongFrames}`);
+      return `anchor drift ${drift}px; no wrong painted frames`;
     });
     await check("Expansion survives virtual unmount", async () => {
       const before = readAnchor();
@@ -173,6 +186,58 @@ function Harness() {
       assert(gap <= 2, `gap=${gap}`);
       return `gap=${gap}px`;
     });
+    await check("Cold latest never paints temporary rows or waits for offscreen history", async () => {
+      flushSync(() => { setRestore(null); setHydrating(true); setTailReady(false); setEpoch(value => value + 1); });
+      let wrongFrames = 0;
+      for (let i = 0; i < 24; i++) {
+        if (i === 6) flushSync(() => setTailReady(true));
+        if (i === 12) {
+          assert(isPresented(), "Latest still hidden after its own turn loaded");
+          flushSync(() => setHydrating(false));
+        }
+        await frames(1);
+        if (isPresented()) {
+          const v = viewport.current!;
+          const end = v.querySelector<HTMLElement>('[data-transcript-row="row-1199"]');
+          if (i < 6 || !end || Math.abs(end.getBoundingClientRect().bottom - v.getBoundingClientRect().bottom + 1) > 2) wrongFrames++;
+        }
+      }
+      assert(isPresented() && wrongFrames === 0, `visible=${isPresented()}, wrong painted frames=${wrongFrames}`);
+      return "no wrong painted frames; ready before older turns loaded";
+    });
+    await check("User input cancels pending restoration", async () => {
+      await browse(viewport.current!.scrollHeight * 0.45);
+      const position = saved.current;
+      flushSync(() => { setRestore(position); setHydrating(true); setTailReady(false); setEpoch(value => value + 1); });
+      await frames(2);
+      viewport.current!.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true }));
+      await frames(2);
+      assert(isPresented(), "User could not take over pending restoration");
+      flushSync(() => setHydrating(false)); await frames();
+      assert(isPresented(), "Transcript hid again after hydration");
+      return "immediate control retained";
+    });
+    await check("Saved position outside the initial history window", async () => {
+      await browse(viewport.current!.scrollHeight * 0.45);
+      const before = readAnchor(); const position = saved.current;
+      flushSync(() => { setRestore(position); setWindowed(true); setEpoch(value => value + 1); });
+      let wrongFrames = 0;
+      for (let i = 0; i < 18; i++) {
+        if (i === 6) flushSync(() => setWindowed(false));
+        await frames(1);
+        if (isPresented() && displacement(before) > 2) wrongFrames++;
+      }
+      assert(isPresented() && wrongFrames === 0, `visible=${isPresented()}, wrong painted frames=${wrongFrames}`);
+      return "no wrong painted frames during history paging";
+    });
+    await check("Removed saved row and unreachable offset do not leave a blank chat", async () => {
+      const position = { ...saved.current!, anchorRowId: "removed-row", anchorMessageId: rows.at(-1)!.messageId, anchorOffset: -1_000_000 };
+      flushSync(() => { setRestore(position); setEpoch(value => value + 1); }); await frames(12);
+      assert(isPresented(), "Removed row with a clamped offset left chat hidden");
+      flushSync(() => { setRestore({ ...position, anchorMessageId: "removed-message" }); setEpoch(value => value + 1); }); await frames(12);
+      assert(isPresented(), "Removed message left chat hidden");
+      return "resolved fallback is visible at the reachable position";
+    });
     setRunning(false);
   }
   return <main style={{ font: "14px system-ui", color: "#222", padding: 20 }}>
@@ -183,7 +248,10 @@ function Harness() {
     <span> {following ? "Following output" : "Reading history"}</span>
     <table><tbody>{results.map(result => <tr key={result.name}><td>{result.name}</td><td>{result.outcome}</td></tr>)}</tbody></table>
     <div ref={viewport} tabIndex={0} aria-label="Transcript" style={{ width, height: 540, overflow: "auto", overflowAnchor: "none", border: "1px solid #444", marginTop: 16 }}>
-      <VirtualMessageTranscript key={epoch} ref={transcript} rows={hydrating ? [...new Set(rows.map(row => row.messageId))].map(id => ({ key: id, messageId: id, estimatedHeight: 100, content: <div style={{ height: 100 }}>Loading turn</div> })) : rows} messages={[]} viewportRef={viewport}
+      <VirtualMessageTranscript key={epoch} ref={transcript} rows={hydrating ? [...new Set(rows.map(row => row.messageId))].flatMap<TranscriptRow>(id => tailReady && id === rows.at(-1)?.messageId
+        ? rows.filter(row => row.messageId === id)
+        : [{ key: id, messageId: id, estimatedHeight: 100, pending: true, content: <div style={{ height: 100 }}>Loading turn</div> }]) : windowed ? rows.slice(-100) : rows} messages={[]} viewportRef={viewport}
+        historyPending={windowed}
         restorePosition={restore} selectedMessageRange={selectedMessageRange} layoutRevision="harness"
         renderMessage={() => null} onFollowChange={setFollowing} onPositionChange={position => { saved.current = position; }} />
     </div>

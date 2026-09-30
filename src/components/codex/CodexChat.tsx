@@ -258,6 +258,16 @@ export function CodexChat() {
     () => boundThreadId ? readChatScrollPosition(boundThreadId) : null,
     [boundThreadId],
   );
+  const transcriptSources = useMemo(() => {
+    const sources = displayedMessages.filter(message => message.role === "assistant").slice().reverse();
+    if (savedScrollPosition?.nearBottom !== false) return sources;
+    const indexes = new Map(displayedMessages.map((message, index) => [message.id, index]));
+    const anchorIndex = indexes.get(savedScrollPosition.anchorMessageId ?? "");
+    // Load the reading turn and its neighbors first, including when the saved
+    // anchor is a user message between two assistant turns.
+    if (anchorIndex !== undefined) sources.sort((a, b) => Math.abs(indexes.get(a.id)! - anchorIndex) - Math.abs(indexes.get(b.id)! - anchorIndex));
+    return sources;
+  }, [displayedMessages, savedScrollPosition]);
   useEffect(() => {
     if (savedScrollPosition?.anchorMessageId && !savedScrollPosition.nearBottom && hasOlderMessages
       && !loadingOlderMessages && !error && !displayedMessages.some(message => message.id === savedScrollPosition.anchorMessageId)) {
@@ -828,7 +838,7 @@ export function CodexChat() {
         )}
         {!activeThread && <div className="codex-welcome"><h1>What should we work on?</h1><p>Codex can inspect, edit, test, and explain anything in {workspace.name}.</p></div>}
         {activeThread && boundThreadId !== activeThread.id && <div className="codex-loading">Loading conversation…</div>}
-        {displayedMessages.filter(message => message.role === "assistant").slice().reverse().map(message => (
+        {transcriptSources.map(message => (
           <CodexTranscriptSource key={message.id} message={message}
             refreshSequence={transcriptSequences[message.id] ?? 0} workspaceRootPath={workspace.rootPath}
             onRows={publishRows} onApproval={approval} onPlanText={recordNativePlanText}
@@ -842,7 +852,7 @@ export function CodexChat() {
             key: message.id, messageId: message.id, content: renderMessage(message), estimatedHeight: 110,
           }] : [
             ...(nativeRows[message.id] ?? [{ key: message.id, messageId: message.id,
-              content: <div className="codex-loading">Loading transcript?</div>, estimatedHeight: 120 }])
+              content: null, estimatedHeight: 120, pending: true }])
               .map(row => ({ ...row, content: renderMessage(message, row.content, "body") })),
             { key: `${message.id}/footer`, messageId: message.id,
               content: renderMessage(message, null, "footer"), estimatedHeight: 60 },
@@ -855,6 +865,9 @@ export function CodexChat() {
           onPositionChange={position => { if (boundThreadId) saveChatScrollPosition(boundThreadId, position); }}
           viewportRef={viewportRef}
           restorePosition={savedScrollPosition}
+          historyPending={Boolean(savedScrollPosition?.anchorMessageId && !savedScrollPosition.nearBottom
+            && !displayedMessages.some(message => message.id === savedScrollPosition.anchorMessageId)
+            && (hasOlderMessages || loadingOlderMessages) && !error)}
           selectedMessageRange={selectedMessageRange}
           layoutRevision={`${hasOlderMessages}:${loadingOlderMessages}:${showSpecialComposer}`}
           virtualizationEnabled={CHAT_TRANSCRIPT_VIRTUALIZATION_ENABLED}

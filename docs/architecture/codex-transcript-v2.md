@@ -220,6 +220,16 @@ forks, and the exact reader:
   the paged drawer is independent of the display projection's event subset.
 
 Snapshot reads have a concurrency limit of two, with live reads prioritized.
+On session entry, the saved reading turn and nearby turns are scheduled before
+background history. Temporary rows explicitly carry unresolved status. Native
+row publication and viewport initialization run during layout. The initial
+transcript stays unpainted until its destination is resolved, positioned, and
+covered by measured rows; it does not wait for offscreen history or a fixed timer.
+Temporary geometry never overwrites the saved reading anchor. User scroll input
+cancels this initial restoration, and later streaming/scrolling never hides the
+transcript again. Removed anchors and load failures resolve to reachable fallback
+content instead of leaving the transcript hidden.
+
 The cross-session snapshot cache has an approximate 32 MiB payload budget as well
 as an entry limit. Active loaded sources still retain their projections; this is
 a DOM bound and reduced transfer path, not an unlimited-session memory guarantee.

@@ -5,10 +5,15 @@ Run `pnpm exec vite --config tests/virtualization/vite.config.ts`, then open
 This uses the production virtualizer, disclosure store, and selection controller
 in a real browser. It does not connect to an engine or modify a session.
 
-The eleven checks cover the initial bottom position, upward intent within 160px of
+The fifteen checks cover the initial bottom position, upward intent within 160px of
 the bottom, delayed height growth above the reader, prepending history, width
 reflow, session remount, delayed native hydration, retained expansion, selection within a giant turn,
-retained keyboard focus, and explicit return to following output. Anchor checks
+retained keyboard focus, explicit return to following output, cold latest loading,
+user cancellation, history paging during restoration, and stale saved positions.
+Remount and hydration checks sample every animation frame: a hidden loading
+transcript is allowed, but a visible wrong position fails even if it later settles.
+The transcript must become visible once the destination loads, without waiting
+for unrelated offscreen turns. Anchor checks
 allow at most 2 CSS pixels of drift. Mounted-row counts must remain bounded,
 including when text is selected. The harness intentionally uses variable heights
 and groups 200 rows under a single message ID.
@@ -49,6 +54,14 @@ at the bottom and at most 29 during the tested history jumps. Narrowing the pane
 and remounting preserved the anchor within 0.4px. These are observed test results,
 not a guarantee for every viewport, font, session, or device.
 
+The follow-up first-paint regression reproduced 12 wrong-location frames during
+delayed hydration in the original implementation. The corrected implementation
+passed with zero wrong-location frames. In the large-session replay, both warm
+remount and cold, batched native hydration painted no incorrect position; the
+saved location became visible after 2 of 56 turns arrived. This exercises browser
+layout and the real native projection, with simulated asynchronous delivery; it
+does not measure desktop IPC latency.
+
 For this session the display message DTOs totaled 163,193 bytes. Serialized native
 snapshots fell from 192,641,646 bytes to 28,160,933 bytes. All session data remains
 local and the production database was opened read-only during diagnosis/copying.
@@ -59,8 +72,9 @@ unrelated cached plugin test suites in this local checkout from being collected.
 Rust checks are `cargo fmt -- --check`, `cargo check --locked`, and the library
 tests filtered to `codex_transcript`, `db::messages`, and
 `commands::transcript_display`. Run `pnpm check:codex-schema` for the installed
-CLI contract. The final run passed 469 frontend tests across 49 files, 39
-relevant Rust tests, and the 19-item-type schema contract. The local export test
+CLI contract. The follow-up run passed 472 frontend tests across 49 files. The
+initial implementation also passed 39 relevant Rust tests and the 19-item-type
+schema contract. The local export test
 also passed when explicitly invoked.
 
 The Tauri development app was launched successfully. Automated Windows UI

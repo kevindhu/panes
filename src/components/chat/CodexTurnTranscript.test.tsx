@@ -15,6 +15,7 @@ const mockGetEvent = vi.hoisted(() => vi.fn());
 vi.mock("../../lib/codexIpc", () => ({
   ipc: {
     getCodexTurnSnapshot: mockGetCodexTurnSnapshot,
+    getMessageBlocks: async () => [],
     getCodexTurnEvents: mockGetEvents,
     getCodexTurnEvent: mockGetEvent,
   },
@@ -1074,6 +1075,21 @@ describe("CodexTranscriptRenderer", () => {
       completedJson: JSON.stringify({ type: "agentMessage", text: "An earlier message" }) }, ...current.items] };
     await act(async () => root.render(<CodexTranscriptRenderer snapshot={next} status="completed" onApproval={vi.fn()} onRows={publish} />));
     expect(keys.every(key => rows.some(row => row.key === key))).toBe(true);
+  });
+
+  it.each(["native", "legacy", "error"])("marks temporary rows pending until the %s read resolves", async (kind) => {
+    let resolve!: (value: CodexTurnSnapshot | null) => void;
+    let reject!: (reason: Error) => void;
+    mockGetCodexTurnSnapshot.mockImplementation(() => new Promise<CodexTurnSnapshot | null>((yes, no) => { resolve = yes; reject = no; }));
+    let rows: TranscriptRow[] = [];
+    const publish = (_id: string, value: TranscriptRow[]) => { rows = value; };
+    await act(async () => root.render(<CodexTurnTranscript messageId="assistant-1" blocks={[]} status="completed"
+      refreshSequence={0} onApproval={vi.fn()} onRows={publish} />));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.pending).toBe(true);
+    await act(async () => { if (kind === "error") reject(new Error("Read unavailable")); else resolve(kind === "native" ? snapshot() : null); });
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every(row => !row.pending)).toBe(true);
   });
 
   it("keeps large output out of the DOM preview while allowing the complete value to be revealed", async () => {

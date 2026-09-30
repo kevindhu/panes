@@ -17,6 +17,7 @@ const frames = async (n = 8) => { for (let i = 0; i < n; i++) await new Promise(
 function SessionHarness() {
   const [fixture, setFixture] = useState<Fixture | null>(null);
   const [native, setNative] = useState<Record<string, TranscriptRow[]>>({});
+  const [available, setAvailable] = useState<Set<string> | null>(null);
   const [results, setResults] = useState<string[]>([]);
   const [width, setWidth] = useState(900);
   const [epoch, setEpoch] = useState(0);
@@ -29,7 +30,7 @@ function SessionHarness() {
   const snapshots = useMemo(() => new Map(fixture?.snapshots.map(snapshot => [snapshot.turn.messageId, { ...snapshot, display: true }])), [fixture]);
   const rows = useMemo(() => fixture?.messages.flatMap(message => message.role === "assistant" && native[message.id]
     ? native[message.id]!.map(row => ({ ...row, content: <article className="codex-message assistant codex-message-part">{row.content}</article> }))
-    : [{ key: message.id, messageId: message.id, estimatedHeight: 100, content: <article className={`codex-message ${message.role}`}><MessageBlocks blocks={message.blocks ?? [{ type: "text", content: message.content ?? "" }]} onApproval={noApproval} /></article> }]) ?? [], [fixture, native]);
+    : [{ key: message.id, messageId: message.id, estimatedHeight: 100, pending: snapshots.has(message.id), content: <article className={`codex-message ${message.role}`}><MessageBlocks blocks={message.blocks ?? [{ type: "text", content: message.content ?? "" }]} onApproval={noApproval} /></article> }]) ?? [], [fixture, native, snapshots]);
   async function load() {
     setRunning(true);
     try {
@@ -50,6 +51,7 @@ function SessionHarness() {
     const node = [...viewport.current!.querySelectorAll<HTMLElement>("[data-transcript-row]")].find(row => row.dataset.transcriptRow === before.key);
     return node ? Math.abs(node.getBoundingClientRect().top - viewport.current!.getBoundingClientRect().top - before.offset) : Infinity;
   };
+  const isPresented = () => getComputedStyle(viewport.current!.querySelector<HTMLElement>(".codex-virtual-transcript")!).visibility !== "hidden";
   async function run() {
     setRunning(true); const log: string[] = [];
     const check = async (name: string, action: () => Promise<string>) => {
@@ -61,7 +63,7 @@ function SessionHarness() {
       handle.current!.scrollToEnd(); await frames(12);
       const v = viewport.current!; const gap = v.scrollHeight - v.clientHeight - v.scrollTop;
       const mounted = v.querySelectorAll("[data-transcript-row]").length;
-      assert(gap < 2 && mounted < 60, `gap=${gap}, mounted=${mounted}`);
+      assert(isPresented() && gap < 2 && mounted < 60, `visible=${isPresented()}, gap=${gap}, mounted=${mounted}`);
       return `${mounted}/${rows.length} rows; bottom gap ${gap}px`;
     });
     await check("Browsing the complete large session", async () => {
@@ -82,8 +84,27 @@ function SessionHarness() {
     });
     await check("Session remount retains reading anchor", async () => {
       const before = anchor(); const position = saved.current;
-      flushSync(() => { setRestore(position); setEpoch(value => value + 1); }); await frames(12);
-      const delta = drift(before); assert(delta < 2, `drift=${delta}px`); return `drift=${delta}px`;
+      flushSync(() => { setRestore(position); setEpoch(value => value + 1); });
+      let wrongFrames = 0;
+      for (let i = 0; i < 12; i++) { await frames(1); if (isPresented() && drift(before) > 2) wrongFrames++; }
+      const delta = drift(before); assert(isPresented() && delta < 2 && wrongFrames === 0, `drift=${delta}px, wrong frames=${wrongFrames}`);
+      return `drift=${delta}px; no wrong painted frames`;
+    });
+    await check("Cold restoration while native turns arrive in batches", async () => {
+      const before = anchor(); const position = saved.current;
+      const ids = [...snapshots.keys()].reverse().sort((a, b) => Number(b === position?.anchorMessageId) - Number(a === position?.anchorMessageId));
+      flushSync(() => { setRestore(position); setNative({}); setAvailable(new Set()); setEpoch(value => value + 1); });
+      let wrongFrames = 0, firstVisible = -1;
+      for (let i = 0; i < ids.length + 8; i += 2) {
+        if (i > 0) flushSync(() => setAvailable(new Set(ids.slice(0, i))));
+        await frames(1);
+        if (isPresented()) {
+          if (firstVisible < 0) firstVisible = i;
+          if (drift(before) > 2) wrongFrames++;
+        }
+      }
+      assert(isPresented() && wrongFrames === 0 && firstVisible < ids.length, `visible=${isPresented()}, first visible batch=${firstVisible}, wrong frames=${wrongFrames}, drift=${drift(before)}`);
+      return `no wrong painted frames; shown after ${firstVisible}/${ids.length} turns arrived`;
     });
     setRunning(false);
   }
@@ -95,7 +116,7 @@ function SessionHarness() {
     <button onClick={() => handle.current?.scrollToEnd()}>Jump to latest</button>
     <p>{rows.length} logical rows; {Object.keys(native).length} loaded native turns</p>
     <ul>{results.map(result => <li key={result}>{result}</li>)}</ul>
-    {fixture?.messages.filter(message => snapshots.has(message.id)).map(message => <CodexTranscriptRenderer key={message.id}
+    {fixture?.messages.filter(message => snapshots.has(message.id) && (!available || available.has(message.id))).map(message => <CodexTranscriptRenderer key={message.id}
       snapshot={snapshots.get(message.id)!} status={message.status} legacyBlocks={message.blocks} onApproval={noApproval} onRows={publish} />)}
     <div style={{ width }}><div ref={viewport} tabIndex={0} className="codex-message-viewport is-virtualized" style={{ width: "100%", height: 650, flex: "none", border: "1px solid #888" }}>
       <VirtualMessageTranscript key={epoch} ref={handle} messages={[]} rows={rows} viewportRef={viewport} restorePosition={restore}

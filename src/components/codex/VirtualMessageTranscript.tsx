@@ -18,6 +18,7 @@ interface Props {
   restorePosition: ChatScrollPosition | null;
   selectedMessageRange: TranscriptSelectionMessageRange | null;
   layoutRevision: string;
+  historyPending?: boolean;
   virtualizationEnabled?: boolean;
   renderMessage: (message: Message) => ReactNode;
   onFollowChange?: (following: boolean) => void;
@@ -36,13 +37,17 @@ export function virtualRangeWithPinnedInterval(range: Range, interval: readonly 
 /** One owner for scroll writes. Geometry changes never imply user follow intent. */
 export const VirtualMessageTranscript = forwardRef<VirtualMessageTranscriptHandle, Props>(function VirtualMessageTranscript({
   messages, rows: suppliedRows, viewportRef, restorePosition, selectedMessageRange,
-  layoutRevision, virtualizationEnabled = CHAT_TRANSCRIPT_VIRTUALIZATION_ENABLED,
+  layoutRevision, historyPending = false, virtualizationEnabled = CHAT_TRANSCRIPT_VIRTUALIZATION_ENABLED,
   renderMessage, onFollowChange, onPositionChange,
 }, forwardedRef) {
   const containerRef = useRef<HTMLDivElement>(null);
+  // Child layout effects run before the enclosing viewport's ref is attached.
+  // The container is a direct child of that viewport and is already in the DOM.
+  const getViewport = useCallback(() => viewportRef.current ?? containerRef.current?.parentElement as HTMLDivElement | null, [viewportRef]);
   const [width, setWidth] = useState(820);
   const [margin, setMargin] = useState(0);
   const [ready, setReady] = useState(false);
+  const [presented, setPresented] = useState(!virtualizationEnabled);
   const [, redraw] = useState(0);
   const following = useRef(restorePosition?.nearBottom ?? true);
   const anchor = useRef<Anchor | null>(restorePosition?.anchorMessageId ? {
@@ -56,7 +61,7 @@ export const VirtualMessageTranscript = forwardRef<VirtualMessageTranscriptHandl
   const previousScrollTop = useRef(0);
   const callbacks = useRef({ onFollowChange, onPositionChange });
   callbacks.current = { onFollowChange, onPositionChange };
-  const rows = useMemo(() => suppliedRows ?? messages.map(message => ({
+  const rows = useMemo<TranscriptRow[]>(() => suppliedRows ?? messages.map(message => ({
     key: message.id, messageId: message.id, content: renderMessage(message),
     estimatedHeight: estimateMessageHeight(message, width),
   })), [suppliedRows, messages, renderMessage, width]);
@@ -83,13 +88,18 @@ export const VirtualMessageTranscript = forwardRef<VirtualMessageTranscriptHandl
   }, [keySignature, selectedMessageRange]);
   const getItemKey = useCallback((index: number) => rowsRef.current[index]!.key, [keySignature]);
   const virtualizer = useVirtualizer<HTMLDivElement, HTMLDivElement>({
-    count: rows.length, getScrollElement: () => viewportRef.current, getItemKey,
+    count: rows.length, getScrollElement: getViewport, getItemKey,
     estimateSize: index => heights.get(measurementKey(width, rows[index]!)) ?? rows[index]!.estimatedHeight,
     overscan: 8, scrollMargin: margin, enabled: virtualizationEnabled && ready,
     initialRect: { width: 820, height: 800 },
     initialOffset: following.current ? Math.max(0, rows.reduce((n, row) => n + row.estimatedHeight, 0) - 800) : restorePosition?.scrollTop ?? 0,
     rangeExtractor: range => {
       const indexes = virtualRangeWithPinnedInterval(range, selectedInterval);
+      // Measure the actual destination on the first commit, even when estimated
+      // heights put the virtualizer's initial offset in a different range.
+      if (following.current && !presented) {
+        for (let i = Math.max(0, rows.length - 12); i < rows.length; i++) if (!indexes.includes(i)) indexes.push(i);
+      }
       if (anchorIndex !== undefined && anchorIndex >= 0 && !indexes.includes(anchorIndex)) indexes.push(anchorIndex);
       const focusedKey = document.activeElement?.closest<HTMLElement>("[data-transcript-row]")?.dataset.transcriptRow;
       const focusedIndex = focusedKey ? indexByKey.get(focusedKey) : undefined;
@@ -107,7 +117,7 @@ export const VirtualMessageTranscript = forwardRef<VirtualMessageTranscriptHandl
     callbacks.current.onFollowChange?.(value);
   }, []);
   const publishPosition = useCallback(() => {
-    const viewport = viewportRef.current;
+    const viewport = getViewport();
     if (!viewport) return;
     const distance = Math.max(0, viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop);
     callbacks.current.onPositionChange?.({
@@ -115,9 +125,9 @@ export const VirtualMessageTranscript = forwardRef<VirtualMessageTranscriptHandl
       anchorMessageId: anchor.current?.messageId ?? null,
       anchorRowId: anchor.current?.key, anchorOffset: anchor.current?.offset ?? 0,
     });
-  }, [viewportRef]);
+  }, [getViewport]);
   const capture = useCallback(() => {
-    const viewport = viewportRef.current;
+    const viewport = getViewport();
     if (!viewport) return;
     const top = viewport.getBoundingClientRect().top;
     const nodes = [...viewport.querySelectorAll<HTMLElement>("[data-transcript-row]")];
@@ -137,9 +147,10 @@ export const VirtualMessageTranscript = forwardRef<VirtualMessageTranscriptHandl
       if (item && row) anchor.current = { key: row.key, messageId: row.messageId, offset: item.start - viewport.scrollTop };
     }
     publishPosition();
-  }, [viewportRef, virtualizer, publishPosition]);
+  }, [getViewport, virtualizer, publishPosition]);
   const pause = useCallback(() => {
     restoring.current = false;
+    setPresented(true);
     setFollowing(false);
     writtenOffset.current = null;
     capture();
@@ -149,8 +160,8 @@ export const VirtualMessageTranscript = forwardRef<VirtualMessageTranscriptHandl
     scrollToEnd: () => { restoring.current = false; setFollowing(true); anchor.current = null; redraw(n => n + 1); },
   }), [pause, setFollowing]);
 
-  useEffect(() => {
-    const viewport = viewportRef.current;
+  useLayoutEffect(() => {
+    const viewport = getViewport();
     if (!viewport) return;
     const size = () => {
       if (!viewport.clientHeight) return;
@@ -165,16 +176,16 @@ export const VirtualMessageTranscript = forwardRef<VirtualMessageTranscriptHandl
     observer?.observe(viewport);
     if (containerRef.current) observer?.observe(containerRef.current);
     return () => observer?.disconnect();
-  }, [viewportRef, layoutRevision]);
+  }, [getViewport, layoutRevision]);
 
   useLayoutEffect(() => { virtualizer.measure(); }, [width, virtualizer]);
 
   useEffect(() => {
-    const viewport = viewportRef.current;
+    const viewport = getViewport();
     if (!viewport) return;
     const onWheel = (event: WheelEvent) => {
       userScrolling.current = true;
-      if (event.deltaY < 0) pause();
+      if (event.deltaY < 0 || !presented) pause();
     };
     const onKey = (event: KeyboardEvent) => {
       if ((event.target as HTMLElement).closest("input,textarea,select,[contenteditable=true]")) return;
@@ -193,7 +204,7 @@ export const VirtualMessageTranscript = forwardRef<VirtualMessageTranscriptHandl
         previousScrollTop.current = offset;
         return;
       }
-      if (restoring.current && !pointerActive.current && !userScrolling.current) return;
+      if ((!presented || restoring.current) && !pointerActive.current && !userScrolling.current) return;
       if (pointerActive.current || userScrolling.current) {
         if (offset < previousScrollTop.current - 1) setFollowing(false);
         const atEnd = viewport.scrollHeight - viewport.clientHeight - offset <= 2;
@@ -216,14 +227,15 @@ export const VirtualMessageTranscript = forwardRef<VirtualMessageTranscriptHandl
       viewport.removeEventListener("touchstart", onTouch);
       viewport.removeEventListener("scroll", onScroll, true);
     };
-  }, [capture, pause, setFollowing, viewportRef]);
+  }, [capture, pause, setFollowing, getViewport, presented]);
 
   // Layout effects and ResizeObserver settle before paint. No timed restoration
   // loop can pull the user back after they begin reading.
   useLayoutEffect(() => {
-    const viewport = viewportRef.current;
+    const viewport = getViewport();
     if (!viewport || !viewport.clientHeight || !rows.length) return;
     let target: number | undefined;
+    let anchorStart: number | undefined;
     if (following.current) target = viewport.scrollHeight - viewport.clientHeight;
     else if (anchor.current && !virtualizationEnabled) {
       const node = [...viewport.querySelectorAll<HTMLElement>("[data-transcript-row]")].find(node => node.dataset.transcriptRow === anchor.current!.key);
@@ -231,14 +243,26 @@ export const VirtualMessageTranscript = forwardRef<VirtualMessageTranscriptHandl
     }
     else if (anchor.current && ready) {
       let index = indexByKey.get(anchor.current.key);
-      if (index !== undefined) restoring.current = false;
+      if (index !== undefined && !rows[index]!.pending) restoring.current = false;
       if (index === undefined) {
         index = rows.findIndex(row => row.messageId === anchor.current!.messageId);
-        if (index >= 0 && !restoring.current) anchor.current = { ...anchor.current, key: rows[index]!.key };
+        if (index >= 0 && !rows[index]!.pending) {
+          restoring.current = false;
+          anchor.current = { ...anchor.current, key: rows[index]!.key };
+        }
+        // A removed row/turn must not leave the conversation hidden forever.
+        if (index < 0 && !historyPending) {
+          restoring.current = false;
+          anchor.current = null;
+          target = restorePosition?.scrollTop ?? 0;
+        }
       }
       if (index !== undefined && index >= 0) {
         const item = virtualizer.getVirtualItems().find(item => item.index === index);
-        if (item) target = item.start - anchor.current.offset;
+        if (item && anchor.current) {
+          anchorStart = item.start;
+          target = item.start - anchor.current.offset;
+        }
       }
     }
     if (target !== undefined) {
@@ -249,13 +273,43 @@ export const VirtualMessageTranscript = forwardRef<VirtualMessageTranscriptHandl
         previousScrollTop.current = target;
       }
     }
+    if (!presented && virtualizationEnabled) {
+      if (!ready || historyPending || (restoring.current && !following.current)) return;
+      const container = containerRef.current!;
+      const viewportRect = viewport.getBoundingClientRect();
+      const containerRect = container.getBoundingClientRect();
+      const top = Math.max(viewportRect.top, containerRect.top);
+      const bottom = Math.min(viewportRect.top + viewport.clientHeight, containerRect.bottom);
+      const pendingMessages = new Set(rows.filter(row => row.pending).map(row => row.messageId));
+      const destination = following.current ? rows.at(-1)?.messageId : anchor.current?.messageId;
+      if (destination && pendingMessages.has(destination)) return;
+      const nodes = [...container.querySelectorAll<HTMLElement>("[data-transcript-row]")];
+      if (anchor.current && !following.current) {
+        const node = nodes.find(node => node.dataset.transcriptRow === anchor.current!.key);
+        // Near an edge, a saved offset may no longer be reachable after reflow.
+        const expectedOffset = anchorStart !== undefined && target !== undefined ? anchorStart - target : anchor.current.offset;
+        if (!node || Math.abs(node.getBoundingClientRect().top - viewportRect.top - expectedOffset) > 2) return;
+      }
+      // A scroll write updates the virtual range on the next scroll event. Do
+      // not reveal empty space or a partially measured range in the meantime.
+      let covered = top;
+      for (const node of nodes) {
+        const rect = node.getBoundingClientRect();
+        if (rect.bottom <= top || rect.top >= bottom) continue;
+        if (pendingMessages.has(node.dataset.messageId!) || rect.top > covered + 2) return;
+        covered = Math.max(covered, rect.bottom);
+      }
+      if (covered < bottom - 2 || (target !== undefined && Math.abs(viewport.scrollTop - target) > 2)) return;
+      setPresented(true);
+    }
     if (following.current || !anchor.current) capture();
     else publishPosition();
   });
 
   const items = virtualizer.getVirtualItems();
   const coldRows = !ready ? rows.slice(-12) : [];
-  return <div ref={containerRef} className="codex-virtual-transcript" style={ready && virtualizationEnabled ? { height: virtualizer.getTotalSize() } : undefined}>
+  return <div ref={containerRef} className="codex-virtual-transcript" aria-busy={virtualizationEnabled && !presented}
+    style={{ height: ready && virtualizationEnabled ? virtualizer.getTotalSize() : undefined, visibility: virtualizationEnabled && !presented ? "hidden" : undefined }}>
     {!virtualizationEnabled ? rows.map(row => <div key={row.key} data-transcript-row={row.key} data-message-id={row.messageId}>{row.content}</div>) : <>
       {coldRows.map(row => <div key={row.key} data-transcript-row={row.key} data-message-id={row.messageId}>{row.content}</div>)}
       {items.map(item => {
