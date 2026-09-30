@@ -843,9 +843,24 @@ pub fn get_thread_messages_window(
     cursor: Option<&MessageWindowCursorDto>,
     limit: usize,
 ) -> anyhow::Result<MessageWindowDto> {
+    get_thread_messages_window_for_display(db, thread_id, cursor, limit, false)
+}
+
+pub fn get_thread_messages_window_for_display(
+    db: &Database,
+    thread_id: &str,
+    cursor: Option<&MessageWindowCursorDto>,
+    limit: usize,
+    display: bool,
+) -> anyhow::Result<MessageWindowDto> {
     let conn = db.connect()?;
     let mut stmt = conn.prepare(
-        "SELECT id, thread_id, role, content, blocks_json, schema_version, status,
+        "SELECT id, thread_id, role, content,
+            CASE WHEN ?6 AND json_valid(blocks_json) AND EXISTS (
+              SELECT 1 FROM codex_turns WHERE message_id = messages.id
+            ) THEN (SELECT json_group_array(json(value)) FROM json_each(blocks_json)
+              WHERE json_extract(value, '$.type') IN ('text','steer','approval','attachment','notice','error'))
+            ELSE blocks_json END AS blocks_json, schema_version, status,
             token_input, token_output, turn_engine_id, turn_model_id, turn_reasoning_effort, created_at,
             rowid, native_turn_id
      FROM messages
@@ -875,7 +890,8 @@ pub fn get_thread_messages_window(
             cursor_created_at,
             cursor_row_id,
             cursor_id,
-            query_limit
+            query_limit,
+            display
         ],
         |row| {
             let message = map_message_row(row)?;

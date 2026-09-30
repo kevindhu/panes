@@ -1,3 +1,5 @@
+import { createContext, useContext } from "react";
+import { useTranscriptDisclosure } from "../../lib/transcriptViewState";
 import {
   memo,
   useCallback,
@@ -350,9 +352,14 @@ function buildBlockSegments(blocks: ContentBlock[], isStreaming?: boolean): Bloc
 
 /* ── Diff Block ── */
 
-function MessageDiffBlock({ block }: { block: DiffBlock }) {
+const LegacyViewContext = createContext("legacy");
+function useLegacyDisclosure(key: string, initial = false) {
+  return useTranscriptDisclosure(`${useContext(LegacyViewContext)}:${key}`, initial);
+}
+
+function MessageDiffBlock({ block, stateKey }: { block: DiffBlock; stateKey: string }) {
   const { t } = useTranslation("chat");
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useLegacyDisclosure(`diff:${stateKey}`);
   const raw = String(block.diff ?? "");
   const fallbackFilename = useMemo(() => extractDiffFilename(raw), [raw]);
   const {
@@ -435,7 +442,7 @@ function ThinkingBlockView({
   selectionScopeId: string;
 }) {
   const { t } = useTranslation("chat");
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useTranscriptDisclosure(`${selectionScopeId}:thinking`, false);
   const content = String(block.content ?? "");
 
   const durationSec = block.durationMs != null ? Math.round(block.durationMs / 1000) : null;
@@ -797,7 +804,7 @@ function ActionBlockView({
     actionDetails.progressKind === "mcp" && typeof actionDetails.progressMessage === "string"
       ? actionDetails.progressMessage
       : null;
-  const [expanded, setExpanded] = useState(() => images.length > 0);
+  const [expanded, setExpanded] = useLegacyDisclosure(`action:${block.actionId}`, images.length > 0);
   const previousImageCountRef = useRef(images.length);
   const [loadingDeferredOutput, setLoadingDeferredOutput] = useState(false);
   const [deferredOutputError, setDeferredOutputError] = useState<string | null>(null);
@@ -1040,7 +1047,7 @@ function ActionGroupView({
   workspaceRootPath?: string | null;
 }) {
   const { t } = useTranslation("chat");
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useLegacyDisclosure(`actions:${blocks[0]?.actionId}`);
 
   const typeCounts = useMemo(() => {
     const counts: Record<string, number> = {};
@@ -1672,7 +1679,7 @@ function renderSingleBlock(
   if (block.type === "diff") {
     return (
       <div key={blockKey} className="msg-action-card">
-        <MessageDiffBlock block={block} />
+        <MessageDiffBlock block={block} stateKey={selectionScopeId} />
       </div>
     );
   }
@@ -1782,6 +1789,7 @@ function MessageBlocksView({
   );
 
   return (
+    <LegacyViewContext.Provider value={resolvedSelectionNamespace}>
     <div
       className="message-blocks"
       data-transcript-selection-scope={resolvedSelectionNamespace}
@@ -1841,6 +1849,7 @@ function MessageBlocksView({
                   return (
                     <MessageDiffBlock
                       key={getMessageBlockKey(inner.block, inner.index, safeBlocks)}
+                      stateKey={getSelectionBlockScopeKey(inner.block, inner.index, safeBlocks)}
                       block={inner.block as DiffBlock}
                     />
                   );
@@ -1885,6 +1894,7 @@ function MessageBlocksView({
         );
       })}
     </div>
+    </LegacyViewContext.Provider>
   );
 }
 

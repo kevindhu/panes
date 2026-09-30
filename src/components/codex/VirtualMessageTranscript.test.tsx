@@ -65,10 +65,10 @@ describe("VirtualMessageTranscript", () => {
       );
     });
 
-    const mounted = container.querySelectorAll("[data-message-id]");
-    expect(mounted).toHaveLength(30);
-    expect(mounted[0]?.getAttribute("data-message-id")).toBe("message-70");
-    expect(mounted[29]?.getAttribute("data-message-id")).toBe("message-99");
+    const mounted = container.querySelectorAll("[data-transcript-row]");
+    expect(mounted).toHaveLength(12);
+    expect(mounted[0]?.getAttribute("data-message-id")).toBe("message-88");
+    expect(mounted[11]?.getAttribute("data-message-id")).toBe("message-99");
   });
 
   it("mounts only a visible chunk and overscan once the viewport is measurable", async () => {
@@ -107,12 +107,12 @@ describe("VirtualMessageTranscript", () => {
       await new Promise((resolve) => window.setTimeout(resolve, 30));
     });
 
-    const mounted = container.querySelectorAll("[data-message-id]");
+    const mounted = container.querySelectorAll("[data-transcript-row]");
     expect(mounted.length).toBeGreaterThan(0);
     expect(mounted.length).toBeLessThan(30);
   });
 
-  it("renders the complete transcript while the production virtualization switch is off", async () => {
+  it("renders the complete transcript when explicitly disabled for diagnosis", async () => {
     const viewport = document.createElement("div");
     const viewportRef = createRef<HTMLDivElement>();
     viewportRef.current = viewport;
@@ -126,13 +126,14 @@ describe("VirtualMessageTranscript", () => {
           restorePosition={null}
           selectedMessageRange={null}
           layoutRevision="stable"
+          virtualizationEnabled={false}
           renderMessage={(item) => <article data-message-id={item.id}>{item.content}</article>}
         />,
       );
     });
 
-    expect(CHAT_TRANSCRIPT_VIRTUALIZATION_ENABLED).toBe(false);
-    expect(container.querySelectorAll("[data-message-id]")).toHaveLength(100);
+    expect(CHAT_TRANSCRIPT_VIRTUALIZATION_ENABLED).toBe(true);
+    expect(container.querySelectorAll("[data-transcript-row]")).toHaveLength(100);
   });
 
   it("adds the complete selected interval to the normal virtual range", () => {

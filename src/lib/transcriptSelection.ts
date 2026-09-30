@@ -26,6 +26,7 @@ const TRANSCRIPT_SELECTION_IGNORED_SELECTOR = [
 export interface TranscriptSelectionEndpoint {
   scopeId: string;
   messageId: string | null;
+  rowId?: string;
   offset: number;
   before: string;
   after: string;
@@ -69,6 +70,8 @@ interface TranscriptSelectionController {
 export interface TranscriptSelectionMessageRange {
   anchorMessageId: string;
   focusMessageId: string;
+  anchorRowId?: string;
+  focusRowId?: string;
 }
 
 function eventElement(target: EventTarget | null): Element | null {
@@ -115,6 +118,7 @@ function endpointForSelectionPoint(
   return {
     scopeId,
     messageId: message?.dataset.messageId ?? null,
+    rowId: scope.closest<HTMLElement>("[data-transcript-row]")?.dataset.transcriptRow,
     offset: textOffset,
     before: scopeText.slice(Math.max(0, textOffset - ENDPOINT_CONTEXT_CHARS), textOffset),
     after: scopeText.slice(textOffset, textOffset + ENDPOINT_CONTEXT_CHARS),
@@ -485,11 +489,14 @@ export function useTranscriptSelection({
       ? {
           anchorMessageId: bookmark.anchor.messageId,
           focusMessageId: bookmark.focus.messageId,
+          anchorRowId: bookmark.anchor.rowId,
+          focusRowId: bookmark.focus.rowId,
         }
       : null;
     setSelectedMessageRange((current) => (
       current?.anchorMessageId === nextRange?.anchorMessageId &&
-      current?.focusMessageId === nextRange?.focusMessageId
+      current?.focusMessageId === nextRange?.focusMessageId &&
+      current?.anchorRowId === nextRange?.anchorRowId && current?.focusRowId === nextRange?.focusRowId
         ? current
         : nextRange
     ));

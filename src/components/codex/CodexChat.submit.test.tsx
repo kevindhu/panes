@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 
-import { act } from "react";
+import { act, useEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { PublishTranscriptRows } from "./transcriptRows";
 import type { ContentBlock, Message, Thread } from "../../types";
 
 const mockIpc = vi.hoisted(() => ({
@@ -48,9 +49,11 @@ vi.mock("../chat/MessageBlocks", () => ({
 }));
 
 vi.mock("../chat/CodexTurnTranscript", () => ({
-  CodexTurnTranscript: ({ refreshSequence }: { refreshSequence: number }) => {
+  CodexTurnTranscript: ({ messageId, refreshSequence, onRows }: { messageId: string; refreshSequence: number; onRows?: PublishTranscriptRows }) => {
     mockListeners.assistantTurnRenderCount += 1;
-    return <div data-testid="assistant-turn" data-refresh-sequence={refreshSequence} />;
+    useEffect(() => { onRows?.(messageId, [{ key: messageId, messageId, estimatedHeight: 100,
+      content: <div data-testid="assistant-turn" data-refresh-sequence={refreshSequence} /> }]); }, [messageId, refreshSequence, onRows]);
+    return onRows ? null : <div data-testid="assistant-turn" data-refresh-sequence={refreshSequence} />;
   },
 }));
 
@@ -259,8 +262,8 @@ describe("CodexChat submission", () => {
     }));
     useChatStore.setState({ messages, streaming, status: streaming ? "streaming" : "idle" });
     await act(async () => root.render(<CodexChat />));
-    expect(container.querySelectorAll(".codex-message")).toHaveLength(messages.length);
-    expect(container.querySelector(".is-virtualized")).toBeNull();
+    expect(container.querySelectorAll(".codex-message").length).toBeLessThan(30);
+    expect(container.querySelector(".is-virtualized")).not.toBeNull();
     const rendersBeforeTyping = {
       assistant: mockListeners.assistantTurnRenderCount,
       user: mockListeners.messageBlocksRenderCount,
@@ -608,7 +611,7 @@ describe("CodexChat submission", () => {
 
     expect(document.getSelection()?.isCollapsed).toBe(true);
     expect(container.querySelector(".codex-jump-latest")).toBeNull();
-    expect(viewport.scrollTop).toBe(500);
+    expect(viewport.scrollTop).toBe(400);
   });
 
   it("forks a completed prior turn while the newest turn keeps streaming", async () => {

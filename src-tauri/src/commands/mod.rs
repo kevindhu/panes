@@ -7,3 +7,5 @@ pub mod power;
 pub mod threads;
 mod turn_diff;
 pub mod workspace;
+
+pub mod transcript_display;

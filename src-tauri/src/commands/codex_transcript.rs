@@ -248,13 +248,32 @@ pub async fn get_codex_turn_snapshot(
     state: tauri::State<'_, AppState>,
     assistant_message_id: String,
     after_source_sequence: Option<u64>,
+    display: Option<bool>,
 ) -> Result<Option<CodexTurnSnapshot>, String> {
     let database = state.db.clone();
-    tokio::task::spawn_blocking(move || match after_source_sequence {
-        Some(cursor) => {
-            db::codex_transcript::load_turn_snapshot_after(&database, &assistant_message_id, cursor)
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Option<CodexTurnSnapshot>> {
+        let mut snapshot = if display.unwrap_or(false) {
+            db::codex_transcript::load_turn_snapshot_view(
+                &database,
+                &assistant_message_id,
+                after_source_sequence.unwrap_or(0),
+                true,
+            )?
+        } else if let Some(sequence) = after_source_sequence {
+            db::codex_transcript::load_turn_snapshot_after(
+                &database,
+                &assistant_message_id,
+                sequence,
+            )?
+        } else {
+            db::codex_transcript::load_turn_snapshot(&database, &assistant_message_id)?
+        };
+        if display.unwrap_or(false) {
+            if let Some(snapshot) = &mut snapshot {
+                super::transcript_display::compact_snapshot(snapshot)?;
+            }
         }
-        None => db::codex_transcript::load_turn_snapshot(&database, &assistant_message_id),
+        Ok(snapshot)
     })
     .await
     .map_err(|error| format!("Codex snapshot task failed to join: {error}"))?

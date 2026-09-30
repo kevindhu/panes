@@ -1,16 +1,22 @@
 // @vitest-environment jsdom
+import { resetTranscriptViewStateForTests } from "../../lib/transcriptViewState";
 
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { TranscriptRow } from "../codex/transcriptRows";
 import type { CodexTurnSnapshot } from "../../types";
 import capturedQuestion from "../../lib/__fixtures__/codex-async-question.json";
 
 const mockGetCodexTurnSnapshot = vi.hoisted(() => vi.fn());
+const mockGetEvents = vi.hoisted(() => vi.fn());
+const mockGetEvent = vi.hoisted(() => vi.fn());
 
 vi.mock("../../lib/codexIpc", () => ({
   ipc: {
     getCodexTurnSnapshot: mockGetCodexTurnSnapshot,
+    getCodexTurnEvents: mockGetEvents,
+    getCodexTurnEvent: mockGetEvent,
   },
 }));
 
@@ -153,6 +159,7 @@ describe("CodexTranscriptRenderer", () => {
       .IS_REACT_ACT_ENVIRONMENT = true;
     vi.clearAllMocks();
     resetCodexTurnSnapshotCacheForTests();
+    resetTranscriptViewStateForTests();
     mockGetCodexTurnSnapshot.mockResolvedValue(null);
     container = document.createElement("div");
     document.body.appendChild(container);
@@ -324,7 +331,7 @@ describe("CodexTranscriptRenderer", () => {
       ));
       const summary = container.querySelector(".codex-native-turn-diff")!;
       expect(summary.textContent).toContain("All changes this turn +1 -1");
-      await act(async () => summary.querySelector<HTMLButtonElement>(".codex-native-activity-header")!.click());
+      if (!reload) await act(async () => summary.querySelector<HTMLButtonElement>(".codex-native-activity-header")!.click());
       expect(summary.querySelector(".codex-native-diff")?.textContent).toContain("-old+shell edit");
       expect(container.querySelectorAll('[data-item-type="turnDiff"]')).toHaveLength(1);
     }
@@ -1034,6 +1041,41 @@ describe("CodexTranscriptRenderer", () => {
     expect(container.querySelector(".legacy-action-input .action-output-pre")?.textContent).toBe(fullCommand);
   });
 
+  it("pages raw event headers and only reads exact JSON when opened", async () => {
+    const current = { ...snapshot(), display: true, eventCount: 49806 };
+    const page = Array.from({ length: 100 }, (_, i) => ({ ...current.events[0]!, id: i + 1, sourceSequence: i + 1 }));
+    mockGetEvents.mockResolvedValue(page);
+    mockGetEvent.mockResolvedValue('{ "exact": "retained bytes" }');
+    await act(async () => root.render(<CodexTranscriptRenderer snapshot={current} status="completed" onApproval={vi.fn()} />));
+    expect(mockGetEvents).not.toHaveBeenCalled();
+    expect(container.querySelector(".codex-native-events")?.textContent).toContain("49806");
+    await act(async () => container.querySelector<HTMLButtonElement>(".codex-native-events > button")!.click());
+    expect(mockGetEvents).toHaveBeenCalledWith("assistant-1", 0);
+    expect(container.querySelectorAll(".codex-native-event-row")).toHaveLength(100);
+    expect(mockGetEvent).not.toHaveBeenCalled();
+    await act(async () => container.querySelector<HTMLButtonElement>(".codex-native-event-row > button")!.click());
+    expect(mockGetEvent).toHaveBeenCalledWith("assistant-1", 1);
+    expect(container.textContent).toContain('{ "exact": "retained bytes" }');
+  });
+
+  it("publishes individual stable rows inside a giant assistant turn", async () => {
+    const current = snapshot();
+    current.items = Array.from({ length: 197 }, (_, index) => ({ ...current.items[0]!,
+      itemId: `command-${index}`, firstSourceSequence: index + 1, lastSourceSequence: index + 1,
+    }));
+    let rows: TranscriptRow[] = [];
+    const publish = (_id: string, value: TranscriptRow[]) => { rows = value; };
+    await act(async () => root.render(<CodexTranscriptRenderer snapshot={current} status="completed" onApproval={vi.fn()} onRows={publish} />));
+    expect(rows.filter(row => row.key.includes("/item:command-"))).toHaveLength(197);
+    expect(new Set(rows.map(row => row.key)).size).toBe(rows.length);
+    expect(container.textContent).toBe("");
+    const keys = rows.map(row => row.key);
+    const next = { ...current, items: [{ ...current.items[0]!, itemId: "earlier", itemType: "agentMessage", firstSourceSequence: 0,
+      completedJson: JSON.stringify({ type: "agentMessage", text: "An earlier message" }) }, ...current.items] };
+    await act(async () => root.render(<CodexTranscriptRenderer snapshot={next} status="completed" onApproval={vi.fn()} onRows={publish} />));
+    expect(keys.every(key => rows.some(row => row.key === key))).toBe(true);
+  });
+
   it("keeps large output out of the DOM preview while allowing the complete value to be revealed", async () => {
     const large = `${"x".repeat(170_000)}END-SENTINEL`;
     const largeSnapshot = snapshot();
@@ -1065,5 +1107,8 @@ describe("CodexTranscriptRenderer", () => {
     expect(showAll?.textContent).toContain("Show all");
     await act(async () => showAll?.click());
     expect(row?.textContent).toContain("END-SENTINEL");
+    await act(async () => root.render(null));
+    await act(async () => root.render(<CodexTranscriptRenderer snapshot={largeSnapshot} status="completed" onApproval={vi.fn()} />));
+    expect(container.querySelector('[data-item-type="commandExecution"]')?.textContent).toContain("END-SENTINEL");
   });
 });
