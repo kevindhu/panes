@@ -386,6 +386,7 @@ function normalizeCandidateSource(
     return {};
   }
 
+  if (normalized.startsWith("panes-image:")) return { sourceUrl: normalized };
   const localPath = resolveLocalImagePath(normalized, workspaceRootPath);
   if (localPath) {
     return { filePath: localPath };
@@ -450,6 +451,7 @@ function dataUrlFromBase64(value?: string | null, mimeType?: string | null): str
   if (!normalized) {
     return null;
   }
+  if (normalized.startsWith("panes-image:")) return normalized;
   const safeUrl = normalizeSafeImageUrl(normalized);
   if (safeUrl?.startsWith("data:image/")) {
     return safeUrl;

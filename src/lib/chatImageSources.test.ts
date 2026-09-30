@@ -9,6 +9,12 @@ import {
 const PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
 describe("chatImageSources", () => {
+  it("keeps deferred native image references intact until a row requests them", () => {
+    const source = 'panes-image:["m","i","completed_json","/content/0/data","image/png"]';
+    const images = extractChatImagesFromPayload({ type: "mcpToolCall", result: { content: [{ type: "image", data: source, mimeType: "image/png" }] } });
+    expect(images).toHaveLength(1);
+    expect(images[0]?.sourceUrl).toBe(source);
+  });
   it("normalizes local, remote, protocol-relative, and embedded sources", () => {
     expect(createChatImageDescriptor({
       origin: "markdown",

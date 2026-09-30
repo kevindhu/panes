@@ -200,6 +200,8 @@ export interface CodexItemStreamChunkRecord {
 }
 
 export interface CodexTurnSnapshot {
+  eventCount?: number;
+  display?: boolean;
   turn: CodexTurnRecord;
   events: CodexTurnEventRecord[];
   items: CodexTurnItemRecord[];

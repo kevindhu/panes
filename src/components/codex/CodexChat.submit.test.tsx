@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 
-import { act } from "react";
+import { act, useEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { PublishTranscriptRows } from "./transcriptRows";
 import type { ContentBlock, Message, Thread } from "../../types";
 
 const mockIpc = vi.hoisted(() => ({
@@ -48,9 +49,11 @@ vi.mock("../chat/MessageBlocks", () => ({
 }));
 
 vi.mock("../chat/CodexTurnTranscript", () => ({
-  CodexTurnTranscript: ({ refreshSequence }: { refreshSequence: number }) => {
+  CodexTurnTranscript: ({ messageId, refreshSequence, onRows }: { messageId: string; refreshSequence: number; onRows?: PublishTranscriptRows }) => {
     mockListeners.assistantTurnRenderCount += 1;
-    return <div data-testid="assistant-turn" data-refresh-sequence={refreshSequence} />;
+    useEffect(() => { onRows?.(messageId, [{ key: messageId, messageId, estimatedHeight: 100,
+      content: <div data-testid="assistant-turn" data-refresh-sequence={refreshSequence} /> }]); }, [messageId, refreshSequence, onRows]);
+    return onRows ? null : <div data-testid="assistant-turn" data-refresh-sequence={refreshSequence} />;
   },
 }));
 
@@ -61,6 +64,7 @@ import { useThreadStore } from "../../stores/threadStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
 import { initializeCodexI18n } from "../../i18n/codex";
 import { CodexChat } from "./CodexChat";
+import { readChatScrollPosition, resetChatScrollPositionsForTests, saveChatScrollPosition } from "../../lib/chatScrollPosition";
 import { resetLiveQuestionnaireDraftsForTests } from "../chat/ToolInputQuestionnaire";
 
 const thread: Thread = {
@@ -97,6 +101,7 @@ beforeEach(() => {
   localStorage.clear();
   sessionStorage.clear();
   resetLiveQuestionnaireDraftsForTests();
+  resetChatScrollPositionsForTests();
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
@@ -259,8 +264,8 @@ describe("CodexChat submission", () => {
     }));
     useChatStore.setState({ messages, streaming, status: streaming ? "streaming" : "idle" });
     await act(async () => root.render(<CodexChat />));
-    expect(container.querySelectorAll(".codex-message")).toHaveLength(messages.length);
-    expect(container.querySelector(".is-virtualized")).toBeNull();
+    expect(container.querySelectorAll(".codex-message").length).toBeLessThan(30);
+    expect(container.querySelector(".is-virtualized")).not.toBeNull();
     const rendersBeforeTyping = {
       assistant: mockListeners.assistantTurnRenderCount,
       user: mockListeners.messageBlocksRenderCount,
@@ -559,6 +564,35 @@ describe("CodexChat submission", () => {
     expect(turn()?.getAttribute("data-refresh-sequence")).toBe("51");
   });
 
+  it.each([false, true])("restores Jump to latest with a saved history position (staged switch: %s)", async (staged) => {
+    const other = { ...thread, id: "thread-2", title: "Other session" };
+    useThreadStore.setState({ threads: [thread, other], threadsByWorkspace: { "workspace-1": [thread, other] } });
+    const position = { scrollTop: 12000, distanceFromBottom: 80000, nearBottom: false,
+      anchorMessageId: "history-message", anchorRowId: "history-message/item:command", anchorOffset: -12 };
+    saveChatScrollPosition(thread.id, position);
+    await act(async () => root.render(<CodexChat />));
+    expect(container.querySelector(".codex-jump-latest")).not.toBeNull();
+
+    const switchTo = async (id: string) => {
+      await act(async () => {
+        useThreadStore.setState({ activeThreadId: id });
+        if (!staged) useChatStore.setState({ threadId: id });
+      });
+      if (staged) {
+        expect(container.querySelector(".codex-jump-latest")).toBeNull();
+        await act(async () => useChatStore.setState({ threadId: id }));
+      }
+    };
+    await switchTo(other.id);
+    expect(container.querySelector(".codex-jump-latest")).toBeNull();
+    await switchTo(thread.id);
+    const button = container.querySelector<HTMLButtonElement>(".codex-jump-latest");
+    expect(button).not.toBeNull();
+    expect(readChatScrollPosition(thread.id)).toEqual(position);
+    await act(async () => button!.click());
+    expect(container.querySelector(".codex-jump-latest")).toBeNull();
+  });
+
   it("pauses live auto-follow for a selection until Jump to latest is used", async () => {
     const message: Message = {
       id: "user-message-selection",
@@ -608,7 +642,7 @@ describe("CodexChat submission", () => {
 
     expect(document.getSelection()?.isCollapsed).toBe(true);
     expect(container.querySelector(".codex-jump-latest")).toBeNull();
-    expect(viewport.scrollTop).toBe(500);
+    expect(viewport.scrollTop).toBe(400);
   });
 
   it("forks a completed prior turn while the newest turn keeps streaming", async () => {

@@ -2,11 +2,12 @@
 
 import { act, createRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Message } from "../../types";
 import {
   CHAT_TRANSCRIPT_VIRTUALIZATION_ENABLED,
   VirtualMessageTranscript,
+  type VirtualMessageTranscriptHandle,
   virtualRangeWithPinnedInterval,
 } from "./VirtualMessageTranscript";
 import {
@@ -45,7 +46,7 @@ describe("VirtualMessageTranscript", () => {
     container.remove();
   });
 
-  it("keeps only a bounded tail mounted before the viewport can be measured", async () => {
+  it("keeps the bounded measurement tail hidden until the viewport can be positioned", async () => {
     const viewport = document.createElement("div");
     const viewportRef = createRef<HTMLDivElement>();
     viewportRef.current = viewport;
@@ -65,10 +66,11 @@ describe("VirtualMessageTranscript", () => {
       );
     });
 
-    const mounted = container.querySelectorAll("[data-message-id]");
-    expect(mounted).toHaveLength(30);
-    expect(mounted[0]?.getAttribute("data-message-id")).toBe("message-70");
-    expect(mounted[29]?.getAttribute("data-message-id")).toBe("message-99");
+    const mounted = container.querySelectorAll("[data-transcript-row]");
+    expect(mounted).toHaveLength(12);
+    expect(mounted[0]?.getAttribute("data-message-id")).toBe("message-88");
+    expect(mounted[11]?.getAttribute("data-message-id")).toBe("message-99");
+    expect(container.querySelector<HTMLElement>(".codex-virtual-transcript")?.style.visibility).toBe("hidden");
   });
 
   it("mounts only a visible chunk and overscan once the viewport is measurable", async () => {
@@ -107,12 +109,12 @@ describe("VirtualMessageTranscript", () => {
       await new Promise((resolve) => window.setTimeout(resolve, 30));
     });
 
-    const mounted = container.querySelectorAll("[data-message-id]");
+    const mounted = container.querySelectorAll("[data-transcript-row]");
     expect(mounted.length).toBeGreaterThan(0);
     expect(mounted.length).toBeLessThan(30);
   });
 
-  it("renders the complete transcript while the production virtualization switch is off", async () => {
+  it("renders the complete transcript when explicitly disabled for diagnosis", async () => {
     const viewport = document.createElement("div");
     const viewportRef = createRef<HTMLDivElement>();
     viewportRef.current = viewport;
@@ -126,13 +128,14 @@ describe("VirtualMessageTranscript", () => {
           restorePosition={null}
           selectedMessageRange={null}
           layoutRevision="stable"
+          virtualizationEnabled={false}
           renderMessage={(item) => <article data-message-id={item.id}>{item.content}</article>}
         />,
       );
     });
 
-    expect(CHAT_TRANSCRIPT_VIRTUALIZATION_ENABLED).toBe(false);
-    expect(container.querySelectorAll("[data-message-id]")).toHaveLength(100);
+    expect(CHAT_TRANSCRIPT_VIRTUALIZATION_ENABLED).toBe(true);
+    expect(container.querySelectorAll("[data-transcript-row]")).toHaveLength(100);
   });
 
   it("adds the complete selected interval to the normal virtual range", () => {
@@ -145,6 +148,54 @@ describe("VirtualMessageTranscript", () => {
       10, 11, 12,
       38, 39, 40, 41, 42, 43, 44, 45, 46,
     ]);
+  });
+
+  it.each(["content shrink", "small offset correction"])("keeps following after Jump to latest and %s", async (change) => {
+    const viewport = document.createElement("div");
+    let height = 1000;
+    Object.defineProperties(viewport, { clientHeight: { value: 100 }, scrollHeight: { get: () => height } });
+    const viewportRef = createRef<HTMLDivElement>(); viewportRef.current = viewport;
+    const handle = createRef<VirtualMessageTranscriptHandle>();
+    const following = vi.fn();
+    await act(async () => root.render(<VirtualMessageTranscript ref={handle} messages={[message(0)]}
+      viewportRef={viewportRef} restorePosition={null} selectedMessageRange={null} layoutRevision="test"
+      virtualizationEnabled={false} renderMessage={() => null} onFollowChange={following} />));
+    await act(async () => {
+      viewport.dispatchEvent(new Event("scroll"));
+      viewport.dispatchEvent(new WheelEvent("wheel", { deltaY: -100 }));
+      viewport.scrollTop = 700; viewport.dispatchEvent(new Event("scroll"));
+    });
+    expect(following).toHaveBeenLastCalledWith(false);
+    await act(async () => handle.current!.scrollToEnd());
+    expect(viewport.scrollTop).toBe(900);
+    expect(following).toHaveBeenLastCalledWith(true);
+    following.mockClear();
+    await act(async () => {
+      viewport.dispatchEvent(new Event("scroll")); // Read-back of our own jump.
+      if (change === "content shrink") height = 995;
+      viewport.scrollTop = 895; viewport.dispatchEvent(new Event("scroll"));
+    });
+    expect(following).not.toHaveBeenCalledWith(false);
+    await act(async () => viewport.dispatchEvent(new WheelEvent("wheel", { deltaY: -20 })));
+    expect(following).toHaveBeenLastCalledWith(false); // Fresh upward intent still pauses immediately.
+  });
+
+  it("resumes following when downward scrolling ends a few pixels from the bottom", async () => {
+    const viewport = document.createElement("div");
+    Object.defineProperties(viewport, { clientHeight: { value: 100 }, scrollHeight: { value: 1000 } });
+    const viewportRef = createRef<HTMLDivElement>(); viewportRef.current = viewport;
+    const following = vi.fn();
+    await act(async () => root.render(<VirtualMessageTranscript messages={[message(0)]}
+      viewportRef={viewportRef} restorePosition={null} selectedMessageRange={null} layoutRevision="test"
+      virtualizationEnabled={false} renderMessage={() => null} onFollowChange={following} />));
+    await act(async () => {
+      viewport.dispatchEvent(new Event("scroll"));
+      viewport.dispatchEvent(new WheelEvent("wheel", { deltaY: -100 }));
+      viewport.scrollTop = 700; viewport.dispatchEvent(new Event("scroll"));
+      viewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 100 }));
+      viewport.scrollTop = 895; viewport.dispatchEvent(new Event("scroll"));
+    });
+    expect(following).toHaveBeenLastCalledWith(true);
   });
 
   it("estimates short user rows near their compact rendered height", () => {

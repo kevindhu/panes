@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { resetTranscriptViewStateForTests } from "../../lib/transcriptViewState";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -75,6 +76,7 @@ describe("MessageBlocks streaming text", () => {
   let root: Root;
 
   beforeEach(() => {
+    resetTranscriptViewStateForTests();
     vi.clearAllMocks();
     container = document.createElement("div");
     document.body.appendChild(container);
@@ -88,6 +90,18 @@ describe("MessageBlocks streaming text", () => {
     globalThis.getSelection?.()?.removeAllRanges();
     container.remove();
     document.body.innerHTML = "";
+  });
+
+  it("preserves expanded compatibility thinking across virtual unmount", async () => {
+    const blocks: ContentBlock[] = [{ type: "thinking", content: "Previously expanded thought" }];
+    const render = () => <MessageBlocks blocks={blocks} selectionNamespace="message:persistent-legacy" onApproval={vi.fn()} />;
+    await act(async () => root.render(render()));
+    await act(async () => container.querySelector<HTMLElement>('[aria-expanded="false"]')!.click());
+    expect(container.querySelector('[aria-expanded="true"]')).not.toBeNull();
+    await act(async () => root.render(null));
+    await act(async () => root.render(render()));
+    expect(container.querySelector('[aria-expanded="true"]')).not.toBeNull();
+    expect(container.textContent).toContain("Previously expanded thought");
   });
 
   it("opens a plain-text web link on a plain click despite an unrelated text selection", async () => {

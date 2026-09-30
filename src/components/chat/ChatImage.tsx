@@ -50,6 +50,7 @@ interface ChatImageGalleryProps {
 
 interface ImageFrame {
   width: number;
+  height: number;
 }
 
 const imageFrameCache = new Map<string, ImageFrame>();
@@ -59,7 +60,8 @@ export function useChatImageAsset(
   thumbnailOptions: AttachmentImageAssetOptions = DEFAULT_THUMBNAIL_OPTIONS,
   preloadFull = true,
 ): ChatImageAssetState {
-  const directSource = image.sourceUrl?.trim() || null;
+  const deferredSource = image.sourceUrl?.startsWith("panes-image:") ? image.sourceUrl : null;
+  const directSource = deferredSource ? null : image.sourceUrl?.trim() || null;
   const initialFilePath = image.filePath?.trim() || "";
   const initialThumbnail = initialFilePath
     ? getCachedAttachmentImageAssetUrl(initialFilePath, image.mimeType, thumbnailOptions)
@@ -85,13 +87,13 @@ export function useChatImageAsset(
     if (resolvedFilePathRef.current) {
       return resolvedFilePathRef.current;
     }
-    if (!directSource?.startsWith("data:image/")) {
+    if (!deferredSource && !directSource?.startsWith("data:image/")) {
       return "";
     }
     if (!embeddedRequestRef.current) {
       const requestToken = requestTokenRef.current;
       let request: Promise<string | null>;
-      request = cacheEmbeddedImageDataUrl(directSource, image.mimeType)
+      request = cacheEmbeddedImageDataUrl(deferredSource ?? directSource!, image.mimeType)
         .then((asset) => {
           const nextPath = asset?.filePath?.trim() ?? "";
           if (nextPath && requestTokenRef.current === requestToken) {
@@ -109,7 +111,7 @@ export function useChatImageAsset(
       embeddedRequestRef.current = request;
     }
     return (await embeddedRequestRef.current) ?? "";
-  }, [directSource, image.mimeType]);
+  }, [deferredSource, directSource, image.mimeType]);
 
   const requestThumbnail = useCallback(async (): Promise<string | null> => {
     const requestToken = requestTokenRef.current;
@@ -391,7 +393,7 @@ export function ChatImagePreview({
     <button
       type="button"
       className={buttonClass}
-      style={frameStyle}
+      style={{ ...frameStyle, ...(frame ? { aspectRatio: `${frame.width} / ${frame.height}` } : {}) }}
       data-panes-chat-image-id={image.id}
       data-panes-markdown-local-image-path={image.filePath}
       data-panes-markdown-local-image-mime={image.mimeType}
@@ -493,5 +495,6 @@ function fitInlineFrame(naturalWidth: number, naturalHeight: number): ImageFrame
   }
   return {
     width: Math.max(1, Math.round(width)),
+    height: Math.max(1, Math.round(height)),
   };
 }

@@ -226,6 +226,17 @@ export function cacheEmbeddedImageDataUrl(
   source: string,
   mimeType?: string | null,
 ): Promise<PreparedAttachmentImageAsset | null> {
+  if (source.startsWith("panes-image:") && isTauriEnvironment()) {
+    const cached = touchMapEntry(embeddedImageAssetCache, source);
+    if (cached) return cached;
+    const request = ipc.prepareCodexTranscriptImage(source).catch(error => {
+      embeddedImageAssetCache.delete(source);
+      throw error;
+    });
+    embeddedImageAssetCache.set(source, request);
+    trimMap(embeddedImageAssetCache, EMBEDDED_IMAGE_CACHE_LIMIT);
+    return request;
+  }
   const parsed = parseEmbeddedImageDataUrl(source, mimeType);
   if (!parsed || !isTauriEnvironment()) {
     return Promise.resolve(null);

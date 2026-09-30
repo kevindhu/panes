@@ -1,3 +1,6 @@
+import type { ReactNode } from "react";
+import { CodexTranscriptSource } from "./CodexTranscriptSource";
+import type { TranscriptRow } from "./transcriptRows";
 import {
   ArrowDown,
   Brain,
@@ -50,7 +53,6 @@ import {
   canForkCodexMessageHistory,
 } from "../../lib/codexThreadCapabilities";
 import {
-  captureChatScrollPosition,
   readChatScrollPosition,
   saveChatScrollPosition,
 } from "../../lib/chatScrollPosition";
@@ -148,6 +150,10 @@ function CopyMessageButton({ text }: { text: string }) {
 }
 
 export function CodexChat() {
+  const [nativeRows, setNativeRows] = useState<Record<string, TranscriptRow[]>>({});
+  const publishRows = useCallback((messageId: string, rows: TranscriptRow[]) => {
+    setNativeRows(current => current[messageId] === rows ? current : { ...current, [messageId]: rows });
+  }, []);
   const viewportRef = useRef<HTMLDivElement>(null);
   const transcriptRef = useRef<VirtualMessageTranscriptHandle>(null);
   const composerRef = useRef<CodexComposerHandle>(null);
@@ -243,10 +249,31 @@ export function CodexChat() {
     if (!rollingBackMessageId) return messages;
     return messagesBeforeEditableUserTurn(messages, rollingBackMessageId) ?? messages;
   }, [messages, rollingBackMessageId]);
+  useEffect(() => {
+    const ids = new Set(displayedMessages.map(message => message.id));
+    setNativeRows(current => Object.keys(current).some(id => !ids.has(id))
+      ? Object.fromEntries(Object.entries(current).filter(([id]) => ids.has(id))) : current);
+  }, [displayedMessages]);
   const savedScrollPosition = useMemo(
     () => boundThreadId ? readChatScrollPosition(boundThreadId) : null,
     [boundThreadId],
   );
+  const transcriptSources = useMemo(() => {
+    const sources = displayedMessages.filter(message => message.role === "assistant").slice().reverse();
+    if (savedScrollPosition?.nearBottom !== false) return sources;
+    const indexes = new Map(displayedMessages.map((message, index) => [message.id, index]));
+    const anchorIndex = indexes.get(savedScrollPosition.anchorMessageId ?? "");
+    // Load the reading turn and its neighbors first, including when the saved
+    // anchor is a user message between two assistant turns.
+    if (anchorIndex !== undefined) sources.sort((a, b) => Math.abs(indexes.get(a.id)! - anchorIndex) - Math.abs(indexes.get(b.id)! - anchorIndex));
+    return sources;
+  }, [displayedMessages, savedScrollPosition]);
+  useEffect(() => {
+    if (savedScrollPosition?.anchorMessageId && !savedScrollPosition.nearBottom && hasOlderMessages
+      && !loadingOlderMessages && !error && !displayedMessages.some(message => message.id === savedScrollPosition.anchorMessageId)) {
+      void loadOlderMessages();
+    }
+  }, [savedScrollPosition, displayedMessages, hasOlderMessages, loadingOlderMessages, error, loadOlderMessages]);
   const visibleTranscriptRevision = useMemo(
     () => displayedMessages
       .map((message) => `${message.id}:${transcriptSequences[message.id] ?? 0}`)
@@ -300,7 +327,6 @@ export function CodexChat() {
   }, [stopScrollRestoration]);
 
   const {
-    active: transcriptSelectionActive,
     clearSelection: clearTranscriptSelection,
     selectedMessageRange,
   } = useTranscriptSelection({
@@ -321,29 +347,9 @@ export function CodexChat() {
   }, [clearTranscriptSelection, stopScrollRestoration]);
 
   useEffect(() => {
-    const captureCurrentThread = () => {
-      const viewport = viewportRef.current;
-      const currentThreadId = useChatStore.getState().threadId;
-      if (!viewport || !currentThreadId) return;
-      saveChatScrollPosition(
-        currentThreadId,
-        captureChatScrollPosition(viewport),
-      );
-    };
-    const unsubscribe = useThreadStore.subscribe((next, previous) => {
-      if (next.activeThreadId !== previous.activeThreadId) {
-        captureCurrentThread();
-      }
-    });
-    return () => {
-      captureCurrentThread();
-      unsubscribe();
-    };
-  }, []);
-
-  useEffect(() => {
     nearBottomRef.current = savedScrollPosition?.nearBottom ?? true;
-  }, [boundThreadId, savedScrollPosition]);
+    setHasUnseenOutput(boundThreadId === activeThreadId && !nearBottomRef.current);
+  }, [activeThreadId, boundThreadId, savedScrollPosition]);
 
   useEffect(() => {
     const preferredModel = readMetadataString(activeThread, "lastModelId")
@@ -365,7 +371,6 @@ export function CodexChat() {
     setTranscriptSequences({});
     setNativePlanTextByMessageId({});
     setImplementingPlan(false);
-    setHasUnseenOutput(false);
     selectionPausedFollowRef.current = false;
     previousStreamingRef.current = false;
   }, [activeThreadId]);
@@ -433,14 +438,7 @@ export function CodexChat() {
   }, []);
 
   useEffect(() => {
-    const viewport = viewportRef.current;
-    if (!viewport) return;
-    if (nearBottomRef.current && !selectionPausedFollowRef.current) {
-      transcriptRef.current?.scrollToEnd();
-      setHasUnseenOutput(false);
-      return;
-    }
-    if (selectionPausedFollowRef.current || streaming) {
+    if (!nearBottomRef.current && (selectionPausedFollowRef.current || streaming)) {
       setHasUnseenOutput(true);
     }
   }, [messages, streaming, visibleTranscriptRevision]);
@@ -700,7 +698,7 @@ export function CodexChat() {
     void updateServiceTier(enabled ? "fast" : "inherit");
   }
 
-  function renderMessage(message: Message) {
+  function renderMessage(message: Message, body?: ReactNode, part: "complete" | "body" | "footer" = "complete") {
     const blocks = messageBlocks(message);
     const copyText = message.content ?? blocks
       .filter((block) => block.type === "text")
@@ -712,11 +710,11 @@ export function CodexChat() {
     const isRollingBackMessage = rollingBackMessageId === message.id;
     return (
       <article
-        className={`codex-message ${message.role}`}
+        className={`codex-message ${message.role} ${part !== "complete" ? "codex-message-part" : ""} ${part === "footer" ? "is-footer" : ""}`}
         data-message-id={message.id}
         data-transcript-selection-scope={`message:${message.id}`}
       >
-        {message.role === "user" && (
+        {part === "complete" && message.role === "user" && (
           <div className="codex-message-label">
             <CopyMessageButton text={copyText} />
             {canRollbackMessage && (
@@ -735,8 +733,8 @@ export function CodexChat() {
             )}
           </div>
         )}
-        <Suspense fallback={<div className="codex-loading">Rendering…</div>}>
-          {message.role === "assistant" ? (
+        {part !== "footer" && <Suspense fallback={<div className="codex-loading">Rendering…</div>}>
+          {part === "body" ? body : message.role === "assistant" ? (
             <CodexTurnTranscript
               messageId={message.id}
               blocks={blocks}
@@ -758,8 +756,8 @@ export function CodexChat() {
               onLoadActionOutput={(actionId) => hydrateActionOutput(message.id, actionId)}
             />
           )}
-        </Suspense>
-        {message.role === "assistant" && message.status !== "streaming" && (
+        </Suspense>}
+        {part !== "body" && message.role === "assistant" && message.status !== "streaming" && (
           <div className="codex-message-footer">
             <div className="codex-message-actions">
               <CopyMessageButton text={copyText} />
@@ -832,24 +830,6 @@ export function CodexChat() {
       <div
         ref={viewportRef}
         className={`codex-message-viewport ${showSpecialComposer ? "awaiting-input" : ""} ${CHAT_TRANSCRIPT_VIRTUALIZATION_ENABLED ? "is-virtualized" : ""}`}
-        onWheelCapture={stopScrollRestoration}
-        onPointerDownCapture={stopScrollRestoration}
-        onTouchStartCapture={stopScrollRestoration}
-        onKeyDownCapture={(event) => {
-          if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) {
-            stopScrollRestoration();
-          }
-        }}
-        onScroll={(event) => {
-          const element = event.currentTarget;
-          const position = captureChatScrollPosition(element);
-          nearBottomRef.current = position.nearBottom;
-          if (position.nearBottom && !transcriptSelectionActive) {
-            selectionPausedFollowRef.current = false;
-            setHasUnseenOutput(false);
-          }
-          if (boundThreadId) saveChatScrollPosition(boundThreadId, position);
-        }}
       >
         {hasOlderMessages && (
           <button className="codex-load-older" type="button" disabled={loadingOlderMessages} onClick={() => void loadOlderMessages()}>
@@ -858,12 +838,36 @@ export function CodexChat() {
         )}
         {!activeThread && <div className="codex-welcome"><h1>What should we work on?</h1><p>Codex can inspect, edit, test, and explain anything in {workspace.name}.</p></div>}
         {activeThread && boundThreadId !== activeThread.id && <div className="codex-loading">Loading conversation…</div>}
+        {transcriptSources.map(message => (
+          <CodexTranscriptSource key={message.id} message={message}
+            refreshSequence={transcriptSequences[message.id] ?? 0} workspaceRootPath={workspace.rootPath}
+            onRows={publishRows} onApproval={approval} onPlanText={recordNativePlanText}
+            hydrateActionOutput={hydrateActionOutput} />
+        ))}
         <VirtualMessageTranscript
           key={boundThreadId ?? "unbound"}
           ref={transcriptRef}
           messages={displayedMessages}
+          rows={displayedMessages.flatMap(message => message.role !== "assistant" ? [{
+            key: message.id, messageId: message.id, content: renderMessage(message), estimatedHeight: 110,
+          }] : [
+            ...(nativeRows[message.id] ?? [{ key: message.id, messageId: message.id,
+              content: null, estimatedHeight: 120, pending: true }])
+              .map(row => ({ ...row, content: renderMessage(message, row.content, "body") })),
+            { key: `${message.id}/footer`, messageId: message.id,
+              content: renderMessage(message, null, "footer"), estimatedHeight: 60 },
+          ])}
+          onFollowChange={following => {
+            nearBottomRef.current = following;
+            if (following) { selectionPausedFollowRef.current = false; setHasUnseenOutput(false); }
+            else setHasUnseenOutput(true);
+          }}
+          onPositionChange={position => { if (boundThreadId) saveChatScrollPosition(boundThreadId, position); }}
           viewportRef={viewportRef}
           restorePosition={savedScrollPosition}
+          historyPending={Boolean(savedScrollPosition?.anchorMessageId && !savedScrollPosition.nearBottom
+            && !displayedMessages.some(message => message.id === savedScrollPosition.anchorMessageId)
+            && (hasOlderMessages || loadingOlderMessages) && !error)}
           selectedMessageRange={selectedMessageRange}
           layoutRevision={`${hasOlderMessages}:${loadingOlderMessages}:${showSpecialComposer}`}
           virtualizationEnabled={CHAT_TRANSCRIPT_VIRTUALIZATION_ENABLED}
