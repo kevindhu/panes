@@ -164,6 +164,38 @@ pub fn set_engine_thread_id(
     Ok(())
 }
 
+/// An app-server thread can be indexed before its rollout file is durable. It is
+/// safe to replace only if Panes has never received an assistant turn or action.
+pub fn can_replace_empty_codex_thread(
+    db: &Database,
+    thread_id: &str,
+    engine_thread_id: &str,
+) -> anyhow::Result<bool> {
+    let conn = db.connect()?;
+    let safe: bool = conn
+        .query_row(
+            "SELECT EXISTS (
+           SELECT 1 FROM threads
+           WHERE id = ?1 AND engine_id = 'codex' AND engine_thread_id = ?2
+             AND NOT EXISTS (SELECT 1 FROM codex_turns WHERE thread_id = ?1)
+             AND NOT EXISTS (SELECT 1 FROM actions WHERE thread_id = ?1)
+             AND NOT EXISTS (SELECT 1 FROM approvals WHERE thread_id = ?1)
+             AND NOT EXISTS (SELECT 1 FROM engine_event_logs WHERE thread_id = ?1)
+             AND NOT EXISTS (
+               SELECT 1 FROM messages WHERE thread_id = ?1 AND role = 'assistant'
+                 AND (status NOT IN ('interrupted', 'error')
+                   OR NULLIF(TRIM(COALESCE(content, '')), '') IS NOT NULL
+                   OR TRIM(COALESCE(blocks_json, '[]')) NOT IN ('[]', 'null')
+                   OR native_turn_id IS NOT NULL)
+             )
+         )",
+            params![thread_id, engine_thread_id],
+            |row| row.get(0),
+        )
+        .context("failed to check whether Codex thread has durable history")?;
+    Ok(safe)
+}
+
 pub fn delete_thread(db: &Database, thread_id: &str) -> anyhow::Result<()> {
     let conn = db.connect()?;
     let affected = conn
@@ -747,6 +779,33 @@ mod tests {
         let workspace =
             workspaces::upsert_workspace(db, root.to_string_lossy().as_ref(), Some(1)).unwrap();
         create_thread(db, &workspace.id, None, "codex", "gpt-5.3-codex", title).unwrap()
+    }
+
+    #[test]
+    fn missing_rollout_recovery_requires_empty_native_history() {
+        let db = test_db();
+        let thread = test_thread(&db, "Missing rollout");
+        set_engine_thread_id(&db, &thread.id, "missing-native-id").unwrap();
+        messages::insert_user_message(&db, &thread.id, "Plant eggs", None, None, None, None)
+            .unwrap();
+        let assistant =
+            messages::insert_assistant_placeholder(&db, &thread.id, Some("codex"), None, None)
+                .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE messages SET status = 'interrupted' WHERE id = ?1",
+            params![assistant.id],
+        )
+        .unwrap();
+        assert!(can_replace_empty_codex_thread(&db, &thread.id, "missing-native-id").unwrap());
+        assert!(!can_replace_empty_codex_thread(&db, &thread.id, "different-id").unwrap());
+
+        conn.execute(
+            "UPDATE messages SET content = 'Partial answer' WHERE id = ?1",
+            params![assistant.id],
+        )
+        .unwrap();
+        assert!(!can_replace_empty_codex_thread(&db, &thread.id, "missing-native-id").unwrap());
     }
 
     #[test]

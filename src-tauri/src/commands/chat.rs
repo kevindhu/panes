@@ -1303,11 +1303,55 @@ pub async fn send_message(
         output_schema: thread_output_schema(thread.engine_metadata.as_ref()),
     };
 
-    let initialized_thread = state
+    let initialized_thread = match state
         .engines
-        .ensure_engine_thread(&thread, Some(effective_model_id.as_str()), scope, sandbox)
+        .ensure_engine_thread(
+            &thread,
+            Some(effective_model_id.as_str()),
+            scope.clone(),
+            sandbox.clone(),
+        )
         .await
-        .map_err(err_to_string)?;
+    {
+        Ok(started) => started,
+        Err(error) => {
+            let missing_rollout = thread
+                .engine_thread_id
+                .as_deref()
+                .is_some_and(|native_id| is_missing_codex_rollout_error(&error, native_id));
+            if !missing_rollout {
+                return Err(err_to_string(error));
+            }
+            let old_native_id = thread.engine_thread_id.as_deref().unwrap();
+            let safe_to_replace = run_db(db.clone(), {
+                let thread_id = thread.id.clone();
+                let old_native_id = old_native_id.to_string();
+                move |db| {
+                    db::threads::can_replace_empty_codex_thread(db, &thread_id, &old_native_id)
+                }
+            })
+            .await?;
+            if !safe_to_replace {
+                return Err(err_to_string(error));
+            }
+            log::warn!(
+                "Codex rollout for empty thread {} is missing; starting a new native thread for local thread {}",
+                old_native_id, thread.id
+            );
+            let mut fresh_thread = thread.clone();
+            fresh_thread.engine_thread_id = None;
+            state
+                .engines
+                .ensure_engine_thread(
+                    &fresh_thread,
+                    Some(effective_model_id.as_str()),
+                    scope,
+                    sandbox,
+                )
+                .await
+                .map_err(err_to_string)?
+        }
+    };
     let engine_thread_id = initialized_thread.engine_thread_id;
     if let Some(mode) = initialized_thread.history_mode {
         let mut metadata = thread.engine_metadata.clone().unwrap_or_else(|| json!({}));
@@ -5614,6 +5658,20 @@ mod tests {
     use rusqlite::params;
     use uuid::Uuid;
 
+    #[test]
+    fn missing_rollout_error_must_name_the_saved_thread() {
+        let missing = anyhow::anyhow!(
+            "thread/resume: rpc error -32600: no rollout found for thread id native-123"
+        )
+        .context("failed to resume persisted codex thread native-123");
+        assert!(is_missing_codex_rollout_error(&missing, "native-123"));
+        assert!(!is_missing_codex_rollout_error(&missing, "native-456"));
+        assert!(!is_missing_codex_rollout_error(
+            &anyhow::anyhow!("thread/resume: rpc error -32600: access denied"),
+            "native-123"
+        ));
+    }
+
     fn test_app_state() -> AppState {
         let root = std::env::temp_dir().join(format!("panes-chat-cmd-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("failed to create temp root");
@@ -7272,4 +7330,8 @@ async fn model_supports_personality(state: &AppState, engine_id: &str, model_id:
 
 fn err_to_string(error: impl std::fmt::Display) -> String {
     format!("{error:#}")
+}
+
+fn is_missing_codex_rollout_error(error: &anyhow::Error, native_id: &str) -> bool {
+    format!("{error:#}").contains(&format!("no rollout found for thread id {native_id}"))
 }
