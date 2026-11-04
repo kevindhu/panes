@@ -11,6 +11,22 @@ const engines: EngineInfo[] = [
     name: "Codex",
     models: [
       {
+        id: "gpt-6-astra",
+        displayName: "GPT-6-Astra",
+        description: "Current",
+        hidden: false,
+        isDefault: false,
+        inputModalities: ["text"],
+        attachmentModalities: ["text"],
+        supportsPersonality: false,
+        defaultReasoningEffort: "medium",
+        supportedReasoningEfforts: [
+          { reasoningEffort: "low", description: "Fast" },
+          { reasoningEffort: "medium", description: "Balanced" },
+          { reasoningEffort: "high", description: "Deep" },
+        ],
+      },
+      {
         id: "gpt-6-sol",
         displayName: "GPT-6-Sol",
         description: "Current",
@@ -171,7 +187,7 @@ describe("resolveNewThreadRuntime", () => {
     });
   });
 
-  it("falls back to codex gpt-6-sol high even when the catalog marks another model as default", () => {
+  it("prefers codex gpt-6-astra high even when the catalog marks another model as default", () => {
     expect(
       resolveNewThreadRuntime({
         engines,
@@ -184,7 +200,7 @@ describe("resolveNewThreadRuntime", () => {
       {
         ...engines[0],
         models: engines[0].models
-          .filter((model) => model.id !== "gpt-6-sol")
+          .filter((model) => model.id !== "gpt-6-astra")
           .map((model) => ({
             ...model,
             isDefault: model.id === "gpt-5.5",
@@ -204,10 +220,10 @@ describe("resolveNewThreadRuntime", () => {
     });
   });
 
-  it("uses the visible catalog default when GPT-6 Sol is hidden", () => {
+  it("uses the visible catalog default when GPT-6 Astra is hidden", () => {
     const hiddenCatalog: EngineInfo[] = [{
       ...engines[0],
-      models: engines[0].models.map((model) => model.id === "gpt-6-sol"
+      models: engines[0].models.map((model) => model.id === "gpt-6-astra"
         ? { ...model, hidden: true }
         : model),
     }];

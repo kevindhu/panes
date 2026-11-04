@@ -13,7 +13,7 @@ export type ComposerRuntimeSnapshot = NewThreadRuntimeSelection;
 
 export const NEW_THREAD_FALLBACK_RUNTIME: NewThreadRuntimeSelection = {
   engineId: "codex",
-  modelId: "gpt-6-sol",
+  modelId: "gpt-6-astra",
   reasoningEffort: "high",
   serviceTier: null,
 };
