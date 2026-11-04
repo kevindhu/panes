@@ -2,6 +2,7 @@
 //! The temporary index and object store never change the user's staging area or refs.
 use std::{
     path::{Path, PathBuf},
+    sync::Once,
     time::Duration,
 };
 
@@ -10,6 +11,11 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::{process_utils::configure_tokio_command, runtime_env};
+
+/// Older than any realistic turn, so the sweep never touches a live snapshot.
+const STALE_STORAGE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Earlier versions kept snapshots directly in the system temp directory.
+const LEGACY_TEMP_STORAGE_PREFIX: &str = "panes-turn-diff-";
 
 struct Snapshot {
     root: PathBuf,
@@ -20,13 +26,95 @@ struct Snapshot {
 
 impl Drop for Snapshot {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.storage);
+        // A just-killed Git can hold object files open briefly after termination.
+        for attempt in 0..5 {
+            match std::fs::remove_dir_all(&self.storage) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(error) if attempt == 4 => log::warn!(
+                    "failed to remove turn diff storage {}: {error}",
+                    self.storage.display()
+                ),
+                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
     }
 }
 
+/// Snapshots live outside the system temp directory: Windows re-tags every file in
+/// %TEMP% at each logon, so a leaked object store there slows sign-in.
+fn storage_dir() -> PathBuf {
+    if cfg!(test) {
+        std::env::temp_dir().join("panes-turn-diff-tests")
+    } else {
+        runtime_env::app_data_dir().join("turn-diff")
+    }
+}
+
+/// Removes snapshot stores orphaned by crashes or forced exits, once per process.
+fn remove_stale_storage() {
+    static SWEEP: Once = Once::new();
+    SWEEP.call_once(|| {
+        tokio::task::spawn_blocking(|| {
+            remove_stale_entries(&storage_dir(), "");
+            remove_stale_entries(&std::env::temp_dir(), LEGACY_TEMP_STORAGE_PREFIX);
+        });
+    });
+}
+
+fn remove_stale_entries(dir: &Path, prefix: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(prefix) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > STALE_STORAGE_AGE);
+        if stale {
+            if let Err(error) = std::fs::remove_dir_all(entry.path()) {
+                log::warn!(
+                    "failed to remove stale turn diff storage {}: {error}",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+}
+
+/// Git for Windows' `cmd\git.exe` and `bin\git.exe` are launchers that run the real
+/// binary as a child. Killing a launcher on timeout or cancellation orphans that child,
+/// which keeps writing objects into a store this module has already tried to delete.
+fn git_executable() -> Option<PathBuf> {
+    let resolved = runtime_env::resolve_executable("git")?;
+    Some(real_git_for_launcher(&resolved).unwrap_or(resolved))
+}
+
+fn real_git_for_launcher(resolved: &Path) -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let launcher_dir = resolved.parent()?;
+    let is_launcher_dir = launcher_dir
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("cmd") || name.eq_ignore_ascii_case("bin"));
+    if !is_launcher_dir {
+        return None;
+    }
+    let install_root = launcher_dir.parent()?;
+    ["mingw64", "clangarm64", "mingw32"]
+        .iter()
+        .map(|prefix| install_root.join(prefix).join("bin").join("git.exe"))
+        .find(|candidate| candidate.is_file())
+}
+
 async fn git(root: &Path, snapshot: Option<&Snapshot>, args: &[&str]) -> anyhow::Result<String> {
-    let mut command =
-        Command::new(runtime_env::resolve_executable("git").context("Git not found")?);
+    let mut command = Command::new(git_executable().context("Git not found")?);
     configure_tokio_command(&mut command);
     command
         .current_dir(root)
@@ -82,7 +170,7 @@ impl Snapshot {
         .await?;
         let mut snapshot = Self {
             root,
-            storage: std::env::temp_dir().join(format!("panes-turn-diff-{}", Uuid::new_v4())),
+            storage: storage_dir().join(Uuid::new_v4().to_string()),
             objects: PathBuf::from(objects.trim()),
             before: String::new(),
         };
@@ -135,6 +223,7 @@ pub(super) struct TurnDiffCapture(Vec<Snapshot>);
 
 impl TurnDiffCapture {
     pub(super) async fn start(paths: &[String]) -> anyhow::Result<Self> {
+        remove_stale_storage();
         let mut snapshots = Vec::new();
         for path in paths {
             let root = PathBuf::from(
@@ -310,5 +399,57 @@ mod tests {
         let diff = capture.finish().await.unwrap();
         assert!(diff.contains("-first\n+first updated"));
         assert!(diff.contains("-second\n+second updated"));
+    }
+
+    fn make_stale(path: &Path) {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_WRITE_ATTRIBUTES on a directory handle (FILE_FLAG_BACKUP_SEMANTICS).
+            options.access_mode(0x100).custom_flags(0x0200_0000);
+        }
+        options
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - STALE_STORAGE_AGE * 2)
+            .unwrap();
+    }
+
+    #[test]
+    fn sweep_removes_only_stale_prefixed_storage() {
+        let dir = Repo(std::env::temp_dir().join(format!("panes-sweep-test-{}", Uuid::new_v4())));
+        let stale = dir.0.join("panes-turn-diff-stale");
+        let fresh = dir.0.join("panes-turn-diff-fresh");
+        let unrelated = dir.0.join("unrelated");
+        for path in [&stale, &fresh, &unrelated] {
+            std::fs::create_dir_all(path.join("objects")).unwrap();
+            std::fs::write(path.join("objects").join("blob"), "x").unwrap();
+        }
+        make_stale(&stale);
+        make_stale(&unrelated);
+        remove_stale_entries(&dir.0, LEGACY_TEMP_STORAGE_PREFIX);
+        assert!(!stale.exists());
+        assert!(fresh.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn launcher_resolves_to_real_git_on_windows() {
+        let install =
+            Repo(std::env::temp_dir().join(format!("panes-git-layout-{}", Uuid::new_v4())));
+        let launcher = install.0.join("cmd").join("git.exe");
+        let real = install.0.join("mingw64").join("bin").join("git.exe");
+        for path in [&launcher, &real] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        if cfg!(windows) {
+            assert_eq!(real_git_for_launcher(&launcher), Some(real.clone()));
+        } else {
+            assert_eq!(real_git_for_launcher(&launcher), None);
+        }
+        assert_eq!(real_git_for_launcher(&real), None);
     }
 }
