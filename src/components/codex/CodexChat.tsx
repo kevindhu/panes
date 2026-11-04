@@ -84,8 +84,9 @@ import type { ApprovalResponse, ContentBlock, Message, Thread } from "../../type
 
 const MODEL_PICKER_PRIORITY: Readonly<Record<string, number>> = {
   "gpt-6-astra": 0,
-  "gpt-6-sol": 1,
-  "gpt-6-luna": 2,
+  "gpt-6.1-sol": 1,
+  "gpt-6-sol": 2,
+  "gpt-6-luna": 3,
 };
 
 const PLAN_IMPLEMENTATION_QUESTION_ID = "plan_implementation_decision";
@@ -209,7 +210,7 @@ export function CodexChat() {
   const models = useMemo(() => engine?.models.filter((model) => !model.hidden) ?? [], [engine]);
   // Keep available GPT-6 models together, preserving catalog order for other models.
   const modelOptions = useMemo(() => [...models].sort((a, b) =>
-    (MODEL_PICKER_PRIORITY[a.id] ?? 3) - (MODEL_PICKER_PRIORITY[b.id] ?? 3),
+    (MODEL_PICKER_PRIORITY[a.id] ?? 4) - (MODEL_PICKER_PRIORITY[b.id] ?? 4),
   ), [models]);
   const selectedModel = models.find((model) => model.id === selectedModelId) ?? models[0] ?? null;
   const composerModeScope = useMemo(() => resolveComposerModeScope({

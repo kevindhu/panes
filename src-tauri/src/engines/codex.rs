@@ -324,6 +324,22 @@ impl Engine for CodexEngine {
                 description: "Our most capable model, built for the hardest end-to-end work."
                     .to_string(),
                 hidden: false,
+                is_default: true,
+                upgrade: None,
+                availability_nux: None,
+                upgrade_info: None,
+                input_modalities: vec!["text".to_string(), "image".to_string()],
+                attachment_modalities: vec!["text".to_string(), "image".to_string()],
+                limits: None,
+                supports_personality: false,
+                default_reasoning_effort: "medium".to_string(),
+                supported_reasoning_efforts: frontier_reasoning_efforts(false),
+            },
+            ModelInfo {
+                id: "gpt-6.1-sol".to_string(),
+                display_name: "GPT-6.1-Sol".to_string(),
+                description: "Near-Astra performance for complex work at a lower cost.".to_string(),
+                hidden: false,
                 is_default: false,
                 upgrade: None,
                 availability_nux: None,
@@ -340,7 +356,7 @@ impl Engine for CodexEngine {
                 display_name: "GPT-6-Sol".to_string(),
                 description: "Built for complex coding and agentic workflows.".to_string(),
                 hidden: false,
-                is_default: true,
+                is_default: false,
                 upgrade: None,
                 availability_nux: None,
                 upgrade_info: None,
@@ -2661,6 +2677,7 @@ impl CodexEngine {
     pub async fn list_models_runtime(&self) -> Vec<ModelInfo> {
         match self.fetch_models_from_server().await {
             Ok(models) if !models.is_empty() => {
+                let models = self.include_gpt_6_1_sol(models);
                 self.store_runtime_model_cache(models.clone()).await;
                 models
             }
@@ -2670,6 +2687,19 @@ impl CodexEngine {
                 self.runtime_model_fallback().await
             }
         }
+    }
+
+    fn include_gpt_6_1_sol(&self, mut models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+        if !models.iter().any(|model| model.id == "gpt-6.1-sol") {
+            if let Some(model) = self
+                .models()
+                .into_iter()
+                .find(|model| model.id == "gpt-6.1-sol")
+            {
+                models.push(model);
+            }
+        }
+        models
     }
 
     pub async fn runtime_model_fallback(&self) -> Vec<ModelInfo> {
@@ -10540,13 +10570,14 @@ mod tests {
         let models = engine.models();
 
         for (id, display_name, include_ultra) in [
+            ("gpt-6.1-sol", "GPT-6.1-Sol", false),
             ("gpt-6-sol", "GPT-6-Sol", true),
             ("gpt-6-luna", "GPT-6-Luna", false),
         ] {
             let model = models.iter().find(|model| model.id == id).unwrap();
             assert_eq!(model.display_name, display_name);
             assert!(!model.hidden);
-            assert_eq!(model.is_default, id == "gpt-6-sol");
+            assert!(!model.is_default);
             assert_eq!(model.default_reasoning_effort, "medium");
             assert_eq!(model.input_modalities, vec!["text", "image"]);
             assert_eq!(model.attachment_modalities, vec!["text", "image"]);
@@ -10570,7 +10601,7 @@ mod tests {
             .expect("static fallback should include gpt-6-astra");
         assert_eq!(astra.display_name, "GPT-6-Astra");
         assert!(!astra.hidden);
-        assert!(!astra.is_default);
+        assert!(astra.is_default);
         assert_eq!(astra.default_reasoning_effort, "medium");
         assert_eq!(
             astra
@@ -10641,6 +10672,36 @@ mod tests {
                 .map(|model| model.hidden),
             Some(true)
         );
+    }
+
+    #[test]
+    fn runtime_model_catalog_adds_gpt_6_1_sol_only_when_missing() {
+        let engine = CodexEngine::default();
+        let live_models = engine
+            .models()
+            .into_iter()
+            .filter(|model| model.id != "gpt-6.1-sol")
+            .collect();
+        let merged = engine.include_gpt_6_1_sol(live_models);
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|model| model.id == "gpt-6.1-sol")
+                .count(),
+            1
+        );
+
+        let mut live_sol = merged
+            .iter()
+            .find(|model| model.id == "gpt-6.1-sol")
+            .unwrap()
+            .clone();
+        live_sol.hidden = true;
+        live_sol.display_name = "Codex-provided Sol".to_string();
+        let preserved = engine.include_gpt_6_1_sol(vec![live_sol]);
+        assert_eq!(preserved.len(), 1);
+        assert!(preserved[0].hidden);
+        assert_eq!(preserved[0].display_name, "Codex-provided Sol");
     }
 
     #[tokio::test]

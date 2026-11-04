@@ -298,12 +298,13 @@ describe("CodexChat submission", () => {
   it.each(["visible", "hidden", "missing"])("groups available GPT-6 models first without changing the selected model (%s)", async (availability) => {
     const engine = useEngineStore.getState().engines[0];
     const otherModelIds = ["gpt-5.6-sol", "future-model", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"];
-    const gpt6ModelIds = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"];
+    const gpt6ModelIds = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"];
     const catalogIds = [...otherModelIds];
     if (availability !== "missing") {
       catalogIds.splice(1, 0, "gpt-6-luna");
       catalogIds.splice(3, 0, "gpt-6-sol");
       catalogIds.push("gpt-6-astra");
+      catalogIds.push("gpt-6.1-sol");
     }
     const catalog = catalogIds.map((id) => ({
       ...engine.models[0],
@@ -327,6 +328,7 @@ describe("CodexChat submission", () => {
   });
 
   it.each([
+    { modelId: "gpt-6.1-sol", displayName: "GPT-6.1 Sol", efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", expectedEffort: "medium" },
     { modelId: "gpt-6-sol", displayName: "GPT-6 Sol", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"], defaultEffort: "medium", expectedEffort: "ultra" },
     { modelId: "gpt-6-luna", displayName: "GPT-6 Luna", efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "high", expectedEffort: "high" },
   ])("submits $modelId with the reasoning options from its catalog", async ({ modelId, displayName, efforts, defaultEffort, expectedEffort }) => {
@@ -462,17 +464,17 @@ describe("CodexChat submission", () => {
     expect(mockIpc.setThreadCodexConfig).not.toHaveBeenCalled();
   });
 
-  it("selects GPT-6 Sol for a new conversation when the catalog still defaults to GPT-5.6 Sol", async () => {
+  it("selects GPT-6 Astra for a new conversation when the catalog still defaults to GPT-5.6 Sol", async () => {
     const engine = useEngineStore.getState().engines[0];
     const oldDefault = { ...engine.models[0], id: "gpt-5.6-sol", isDefault: true };
-    const gpt6Sol = { ...oldDefault, id: "gpt-6-sol", displayName: "GPT-6 Sol", isDefault: false };
-    useEngineStore.setState({ engines: [{ ...engine, models: [oldDefault, gpt6Sol] }] });
+    const gpt6Astra = { ...oldDefault, id: "gpt-6-astra", displayName: "GPT-6 Astra", isDefault: false };
+    useEngineStore.setState({ engines: [{ ...engine, models: [oldDefault, gpt6Astra] }] });
     useThreadStore.setState({ threads: [], threadsByWorkspace: { "workspace-1": [] }, activeThreadId: null });
     useChatStore.setState({ threadId: null });
 
     await act(async () => root.render(<CodexChat />));
 
-    expect(container.querySelector<HTMLSelectElement>('select[aria-label="Model"]')?.value).toBe("gpt-6-sol");
+    expect(container.querySelector<HTMLSelectElement>('select[aria-label="Model"]')?.value).toBe("gpt-6-astra");
   });
 
   it("does not rerender the visible transcript for a background thread status update", async () => {
