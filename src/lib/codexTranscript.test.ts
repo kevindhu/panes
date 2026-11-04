@@ -696,3 +696,13 @@ describe("Codex transcript projection", () => {
     });
   });
 });
+
+it("bounds live display aggregate diffs while keeping the full ledger merge lossless", () => {
+  const first: CodexTurnSnapshot = { turn: turn(1), items: [], chunks: [], events: [event(1, 1, "turn/diff/updated", { diff: "old" })] };
+  const next: CodexTurnSnapshot = { turn: turn(2), items: [], chunks: [], events: [event(2, 2, "turn/diff/updated", { diff: "new" })] };
+  expect(mergeCodexTurnSnapshot(first, next).events).toHaveLength(2);
+  const display = mergeCodexTurnSnapshot({ ...first, display: true, eventCount: 1 }, { ...next, display: true, eventCount: 2 });
+  expect(display.events).toEqual(next.events);
+  expect(display.eventCount).toBe(2);
+  expect(projectCodexTranscript(display).turnDiff).toEqual(projectCodexTranscript(mergeCodexTurnSnapshot(first, next)).turnDiff);
+});

@@ -178,6 +178,78 @@ expandable and expose whatever command/search input the older message retained, 
 explicit no-output state. It does not claim to reconstruct fields that older Panes versions
 discarded.
 
+## Virtualized presentation and display reads
+
+`CodexTranscriptSource` stays mounted for each loaded assistant message while
+`VirtualMessageTranscript` mounts only visible semantic rows and overscan. An
+assistant turn is split into stable item/message rows, activity-group headers,
+supplements, and footers. A single large turn therefore does not defeat windowing.
+The same `CodexTranscriptRenderer` supplies virtual rows and standalone rendering;
+there is no second transcript projector. Pre-v2 history retains the compatibility
+renderer and uses message-level windowing.
+
+The virtualizer owns all automatic scroll writes. It stores a stable row ID,
+message ID, and pixel offset when reading history. Upward wheel intent stops
+following immediately; proximity to the bottom alone does not turn following
+back on. Reaching the bottom through user scrolling or choosing Jump to latest
+resumes following. Resize measurements, hydration, and prepended pages compensate
+against the reading anchor. Browser scroll anchoring and TanStack's independent
+size compensation are disabled to avoid competing corrections. Width changes
+invalidate measurements, and changing row order updates the key mapping. Selected
+rows and the focused control remain mounted. Disclosure/page state lives outside
+virtual rows, and snapshot reads do not depend on whether a row is mounted.
+
+The frontend requests `display: true` for message windows and native snapshots.
+This is a read-side optimization, separate from capture, persistence, import,
+forks, and the exact reader:
+
+- Message windows omit redundant compatibility activity bodies only when a v2
+  ledger exists. Text and supplementary notices, approvals, attachments, errors,
+  and steers remain available. A native-load failure can fetch complete legacy
+  blocks for the compatibility fallback.
+- A snapshot is read within one SQLite read transaction. Display snapshots keep
+  items and stream chunks, relevant projection events, unknown events, and the
+  latest aggregate diff. Routine item lifecycle/delta events need not be copied
+  a second time into the display DTO. `eventCount` records the complete ledger
+  count. Incremental display merges also discard superseded aggregate diffs.
+- Embedded item images become stable local references. Visible image rows resolve
+  them through the existing validated image cache. The stored item JSON is never
+  rewritten. Raw started/completed item JSON remains available on demand.
+- The native-event drawer requests 100 headers at a time and loads an event's
+  exact params string when expanded. Every original event remains inspectable;
+  the paged drawer is independent of the display projection's event subset.
+
+Snapshot reads have a concurrency limit of two, with live reads prioritized.
+On session entry, the saved reading turn and nearby turns are scheduled before
+background history. Temporary rows explicitly carry unresolved status. Native
+row publication and viewport initialization run during layout. The initial
+transcript stays unpainted until its destination is resolved, positioned, and
+covered by measured rows; it does not wait for offscreen history or a fixed timer.
+Temporary geometry never overwrites the saved reading anchor. User scroll input
+cancels this initial restoration, and later streaming/scrolling never hides the
+transcript again. Removed anchors and load failures resolve to reachable fallback
+content instead of leaving the transcript hidden.
+
+The cross-session snapshot cache has an approximate 32 MiB payload budget as well
+as an entry limit. Active loaded sources still retain their projections; this is
+a DOM bound and reduced transfer path, not an unlimited-session memory guarantee.
+Explicitly revealing an entire large value can still create a large DOM, and
+native browser Find covers mounted content. Transcript-wide search should use
+the database-backed search path rather than assuming every row is mounted.
+
+The design retains the existing TanStack dependency. Its
+[virtualizer API](https://tanstack.com/virtual/latest/docs/api/virtualizer)
+supports stable keys, dynamic measurements, overscan, and custom pinned ranges.
+[Upstream Panes](https://github.com/wygoralves/panes) and
+[Roo Code's chat implementation](https://github.com/RooCodeInc/Roo-Code/blob/main/webview-ui/src/components/chat/ChatView.tsx)
+were reviewed during the investigation. The chosen implementation keeps one
+scroll owner and explicit follow intent without importing another chat list
+framework. Claude Desktop is a behavior reference; its private implementation
+has not been verified or copied.
+
+See [the browser checks and local-session audit](../../tests/virtualization/README.md)
+for reproducible validation and the outstanding desktop inspection step.
+
 ## Phase 1 acceptance gates
 
 - Exact preservation of an output payload larger than all legacy caps.

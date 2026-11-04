@@ -27,6 +27,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("../../lib/codexIpc", () => ({
   ipc: {
     cacheEmbeddedChatImage: mockCacheEmbeddedChatImage,
+    prepareCodexTranscriptImage: mockCacheEmbeddedChatImage,
     prepareAttachmentImageAsset: mockPrepareAttachmentImageAsset,
     readAttachmentImageBytes: vi.fn(async () => new ArrayBuffer(0)),
     copyAttachmentImageToClipboard: vi.fn(async () => undefined),
@@ -66,6 +67,21 @@ describe("ChatImagePreview", () => {
     await act(async () => root.unmount());
     resetAttachmentImageCachesForTests();
     container.remove();
+  });
+
+  it("materializes a deferred native image without assigning its reference to img src", async () => {
+    const reference = 'panes-image:["m","i","completed_json","/image","image/png"]';
+    await act(async () => {
+      root.render(<ChatImagePreview image={{ id: "deferred", origin: "mcp", fileName: "image.png", alt: "preview", sourceUrl: reference }} />);
+      await new Promise(resolve => setTimeout(resolve, 0));
+    });
+    expect(mockCacheEmbeddedChatImage).toHaveBeenCalledWith(reference);
+    expect(container.querySelector("img")?.getAttribute("src")).toContain("asset://");
+    expect(container.querySelector("img")?.getAttribute("src")).not.toContain("panes-image:");
+    await act(async () => root.render(null));
+    await act(async () => root.render(<ChatImagePreview image={{ id: "deferred", origin: "mcp", fileName: "image.png", alt: "preview", sourceUrl: reference }} />));
+    expect(mockCacheEmbeddedChatImage).toHaveBeenCalledTimes(1);
+
   });
 
   it("materializes an embedded image once without retriggering its own load effect", async () => {

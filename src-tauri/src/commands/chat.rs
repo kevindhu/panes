@@ -2324,6 +2324,7 @@ pub async fn get_thread_messages_window(
     thread_id: String,
     cursor: Option<MessageWindowCursorDto>,
     limit: Option<usize>,
+    display: Option<bool>,
 ) -> Result<MessageWindowDto, String> {
     if cursor.is_none() {
         crate::commands::threads::backfill_codex_history_mode(
@@ -2336,12 +2337,22 @@ pub async fn get_thread_messages_window(
     let clamped_limit = requested_limit.clamp(1, MESSAGE_WINDOW_MAX_LIMIT);
 
     run_db(state.db.clone(), move |db| {
-        let window = db::messages::get_thread_messages_window(
-            db,
-            &thread_id,
-            cursor.as_ref(),
-            clamped_limit,
-        )?;
+        let window = if display.unwrap_or(false) {
+            db::messages::get_thread_messages_window_for_display(
+                db,
+                &thread_id,
+                cursor.as_ref(),
+                clamped_limit,
+                true,
+            )?
+        } else {
+            db::messages::get_thread_messages_window(
+                db,
+                &thread_id,
+                cursor.as_ref(),
+                clamped_limit,
+            )?
+        };
         db::threads::reconcile_stale_running_thread_status_from_transcript(db, &thread_id)?;
         Ok(window)
     })

@@ -1,4 +1,12 @@
 {
+  "nativeTranscript": {
+    "loadingItem": "Loading exact item...",
+    "loadingEvent": "Loading exact event...",
+    "loadingEvents": "Loading events...",
+    "previousEvents": "Previous events",
+    "nextEvents": "Next events",
+    "page": "Page {{page}} of {{count}}"
+  },
   "turnTimestamp": {
     "justNow": "just now",
     "toggle": "Toggle date and time: {{date}}"

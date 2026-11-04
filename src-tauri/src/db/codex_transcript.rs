@@ -106,6 +106,8 @@ pub struct CodexItemStreamChunkRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexTurnSnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_count: Option<usize>,
     pub turn: CodexTurnRecord,
     pub events: Vec<CodexTurnEventRecord>,
     pub items: Vec<CodexTurnItemRecord>,
@@ -769,7 +771,18 @@ pub fn load_turn_snapshot_after(
     assistant_message_id: &str,
     after_source_sequence: u64,
 ) -> anyhow::Result<Option<CodexTurnSnapshot>> {
-    let conn = db.connect()?;
+    load_turn_snapshot_view(db, assistant_message_id, after_source_sequence, false)
+}
+
+pub fn load_turn_snapshot_view(
+    db: &Database,
+    assistant_message_id: &str,
+    after_source_sequence: u64,
+    display: bool,
+) -> anyhow::Result<Option<CodexTurnSnapshot>> {
+    let connection = db.connect()?;
+    // Keep the cursor, completed items, and deltas on one SQLite read snapshot.
+    let conn = connection.unchecked_transaction()?;
     let turn = conn
         .query_row(
             "SELECT id, thread_id, message_id, native_thread_id, native_turn_id, status,
@@ -805,16 +818,32 @@ pub fn load_turn_snapshot_after(
     let after_source_sequence = i64::try_from(after_source_sequence)
         .context("Codex snapshot cursor exceeds SQLite integer range")?;
 
+    let event_count = if display {
+        Some(conn.query_row(
+            "SELECT count(*) FROM codex_turn_events WHERE turn_id = ?1",
+            params![assistant_message_id],
+            |row| row.get::<_, i64>(0),
+        )? as usize)
+    } else {
+        None
+    };
     let mut event_statement = conn.prepare(
-        "SELECT id, source_sequence, event_kind, method, request_id, native_thread_id,
-                native_turn_id, params_json, observed_at_ms
+        "SELECT id, source_sequence, event_kind, method, request_id, native_thread_id, native_turn_id,
+                params_json, observed_at_ms
          FROM codex_turn_events
          WHERE turn_id = ?1 AND source_sequence > ?2
+           AND (NOT ?3 OR NOT (event_kind = 'notification' AND method IN (
+             'item/started', 'item/completed', 'item/agentMessage/delta',
+             'item/reasoning/textDelta', 'item/reasoning/summaryTextDelta', 'item/reasoning/summaryPartAdded',
+             'item/commandExecution/outputDelta', 'item/fileChange/outputDelta', 'item/plan/delta')))
+           AND (NOT ?3 OR method != 'turn/diff/updated' OR source_sequence = (
+             SELECT max(source_sequence) FROM codex_turn_events
+             WHERE turn_id = ?1 AND method IN ('turn/diff/updated', 'panes/turnDiff/completed')))
          ORDER BY source_sequence ASC",
     )?;
     let events = event_statement
         .query_map(
-            params![assistant_message_id, after_source_sequence],
+            params![assistant_message_id, after_source_sequence, display],
             |row| {
                 Ok(CodexTurnEventRecord {
                     id: row.get(0)?,
@@ -886,6 +915,7 @@ pub fn load_turn_snapshot_after(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Some(CodexTurnSnapshot {
+        event_count,
         turn,
         events,
         items,
@@ -1058,6 +1088,88 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn display_reads_keep_projection_and_exact_ledger_independent() {
+        let (db, path) = create_test_database("display");
+        record_native_event_batch(
+            &db,
+            LOCAL_THREAD_ID,
+            ASSISTANT_MESSAGE_ID,
+            &replay_fixture_events(),
+        )
+        .unwrap();
+        let exact = load_turn_snapshot(&db, ASSISTANT_MESSAGE_ID)
+            .unwrap()
+            .unwrap();
+        let display = load_turn_snapshot_view(&db, ASSISTANT_MESSAGE_ID, 0, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(display.items, exact.items);
+        assert_eq!(display.chunks, exact.chunks);
+        assert_eq!(display.event_count, Some(exact.events.len()));
+        assert!(display.events.len() < exact.events.len());
+        for event in &display.events {
+            let original = exact
+                .events
+                .iter()
+                .find(|e| e.source_sequence == event.source_sequence)
+                .unwrap();
+            assert_eq!(event.id, original.id);
+            if event.method.starts_with("future/") || event.event_kind != "notification" {
+                assert_eq!(event.params_json, original.params_json);
+            }
+        }
+        let mut compact = display;
+        crate::commands::transcript_display::compact_snapshot(&mut compact).unwrap();
+        assert!(compact.turn.started_json.is_none());
+        assert_eq!(
+            load_turn_snapshot(&db, ASSISTANT_MESSAGE_ID)
+                .unwrap()
+                .unwrap(),
+            exact
+        );
+        let conn = db.connect().unwrap();
+        let blocks = r#"[{"type":"text","content":"answer"},{"type":"thinking","content":"compatibility only"},{"type":"notice","kind":"warning","message":"keep"}]"#;
+        conn.execute(
+            "UPDATE messages SET blocks_json = ?1 WHERE id = ?2",
+            params![blocks, ASSISTANT_MESSAGE_ID],
+        )
+        .unwrap();
+        drop(conn);
+        let lean = crate::db::messages::get_thread_messages_window_for_display(
+            &db,
+            LOCAL_THREAD_ID,
+            None,
+            80,
+            true,
+        )
+        .unwrap();
+        let full = crate::db::messages::get_thread_messages_window(&db, LOCAL_THREAD_ID, None, 80)
+            .unwrap();
+        assert_eq!(
+            lean.messages[0]
+                .blocks
+                .as_ref()
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            full.messages[0]
+                .blocks
+                .as_ref()
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        drop(db);
+        remove_test_database(&path);
     }
 
     #[test]

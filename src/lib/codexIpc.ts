@@ -73,13 +73,23 @@ export const ipc = {
     invoke<SteerMessageReceipt>("steer_message", { threadId, message, attachments: attachments ?? null, inputItems: inputItems ?? null, planMode: planMode ?? null, steerId: steerId ?? null }),
   cancelTurn: (threadId: string) => invoke<void>("cancel_turn", { threadId }),
   respondApproval: (threadId: string, approvalId: string, response: ApprovalResponse) => invoke<void>("respond_to_approval", { threadId, approvalId, response }),
-  getThreadMessagesWindow: (threadId: string, cursor?: MessageWindowCursor | null, limit?: number | null) => invoke<MessageWindow>("get_thread_messages_window", { threadId, cursor: cursor ?? null, limit: limit ?? null }),
+  getThreadMessagesWindow: (threadId: string, cursor?: MessageWindowCursor | null, limit?: number | null) => invoke<MessageWindow>("get_thread_messages_window", { threadId, cursor: cursor ?? null, limit: limit ?? null, display: true }),
   getActionOutput: (messageId: string, actionId: string) => invoke<ActionOutputPayload>("get_action_output", { messageId, actionId }),
   getCodexTurnSnapshot: (assistantMessageId: string, afterSourceSequence?: number | null) =>
     invoke<CodexTurnSnapshot | null>("get_codex_turn_snapshot", {
       assistantMessageId,
       afterSourceSequence: afterSourceSequence ?? null,
-    }),
+      display: true,
+    }).then(snapshot => snapshot ? { ...snapshot, display: true } : null),
+  getCodexTurnEvents: (assistantMessageId: string, offset: number) =>
+    invoke<import("../types").CodexTurnEventRecord[]>("get_codex_turn_events", { assistantMessageId, offset }),
+  getCodexTurnEvent: (assistantMessageId: string, sourceSequence: number) =>
+    invoke<string>("get_codex_turn_event", { assistantMessageId, sourceSequence }),
+  getCodexTurnItem: (assistantMessageId: string, itemId: string) =>
+    invoke<{ started: string | null; completed: string | null }>("get_codex_turn_item", { assistantMessageId, itemId }),
+  prepareCodexTranscriptImage: (source: string) =>
+    invoke<PreparedAttachmentImageAsset>("prepare_codex_transcript_image", { source }),
+  getMessageBlocks: (messageId: string) => invoke<import("../types").ContentBlock[] | null>("get_message_blocks", { messageId }),
   searchMessages: (workspaceId: string, query: string) => invoke<SearchResult[]>("search_messages", { workspaceId, query }),
   listEngines: () => invoke<EngineInfo[]>("list_engines"),
   engineHealth: (engineId: string) => invoke<EngineHealth>("engine_health", { engineId }),

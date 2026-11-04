@@ -5,6 +5,7 @@ export interface ChatScrollPosition {
   distanceFromBottom: number;
   nearBottom: boolean;
   anchorMessageId: string | null;
+  anchorRowId?: string;
   anchorOffset: number;
 }
 

@@ -1,3 +1,9 @@
+import { useTranslation } from "react-i18next";
+import { createContext, useContext } from "react";
+import { readTranscript } from "../../lib/transcriptReadQueue";
+import { isValidElement, memo } from "react";
+import { useTranscriptDisclosure, useTranscriptPage, useTranscriptViewRevision, readTranscriptDisclosure } from "../../lib/transcriptViewState";
+import type { TranscriptRow, PublishTranscriptRows } from "../codex/transcriptRows";
 import {
   AlertTriangle,
   Brain,
@@ -20,6 +26,7 @@ import {
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -58,6 +65,14 @@ import { ChatImageGallery } from "./ChatImage";
 
 const LARGE_TEXT_PREVIEW_CHARS = 160_000;
 const MAX_CACHED_CODEX_TURN_SNAPSHOTS = 120;
+const DetailIdentityContext = createContext("detail");
+function flattenRows(children: ReactNode): ReactNode[] {
+  return Array.isArray(children) ? children.flatMap(flattenRows) : children == null || typeof children === "boolean" ? [] : [children];
+}
+const ExactTranscriptContext = createContext<{ messageId: string; display: boolean }>({ messageId: "", display: false });
+const snapshotSizes = new Map<string, number>();
+let snapshotBytes = 0;
+const MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024;
 const codexTurnSnapshotCache = new Map<string, CodexTurnSnapshot>();
 const codexTranscriptProjectionCache = new WeakMap<
   CodexTurnSnapshot,
@@ -84,17 +99,27 @@ function writeCachedCodexTurnSnapshot(
   messageId: string,
   snapshot: CodexTurnSnapshot,
 ): void {
+  const size = 2 * (snapshot.events.reduce((n, e) => n + e.paramsJson.length + 160, 0)
+    + snapshot.items.reduce((n, i) => n + (i.startedJson?.length ?? 0) + (i.completedJson?.length ?? 0), 0)
+    + snapshot.chunks.reduce((n, c) => n + c.content.length + 160, 0));
+  snapshotBytes -= snapshotSizes.get(messageId) ?? 0;
+  snapshotBytes += size;
+  snapshotSizes.set(messageId, size);
   codexTurnSnapshotCache.delete(messageId);
   codexTurnSnapshotCache.set(messageId, snapshot);
-  while (codexTurnSnapshotCache.size > MAX_CACHED_CODEX_TURN_SNAPSHOTS) {
+  while (codexTurnSnapshotCache.size > MAX_CACHED_CODEX_TURN_SNAPSHOTS || snapshotBytes > MAX_SNAPSHOT_BYTES) {
     const oldestMessageId = codexTurnSnapshotCache.keys().next().value as string | undefined;
     if (!oldestMessageId) break;
     codexTurnSnapshotCache.delete(oldestMessageId);
+    snapshotBytes -= snapshotSizes.get(oldestMessageId) ?? 0;
+    snapshotSizes.delete(oldestMessageId);
   }
 }
 
 export function resetCodexTurnSnapshotCacheForTests(): void {
   codexTurnSnapshotCache.clear();
+  snapshotSizes.clear();
+  snapshotBytes = 0;
 }
 
 interface CodexTurnTranscriptProps {
@@ -107,6 +132,7 @@ interface CodexTurnTranscriptProps {
   onApproval: (approvalId: string, response: ApprovalResponse) => void;
   onLoadActionOutput?: (actionId: string) => Promise<void>;
   onPlanText?: (messageId: string, planText: string | null) => void;
+  onRows?: PublishTranscriptRows;
 }
 
 interface CodexTranscriptRendererProps {
@@ -118,6 +144,7 @@ interface CodexTranscriptRendererProps {
   onApproval: (approvalId: string, response: ApprovalResponse) => void;
   loadError?: string | null;
   onPlanText?: (planText: string | null) => void;
+  onRows?: PublishTranscriptRows;
 }
 
 type TurnDisplayStatus = "running" | "completed" | "error" | "interrupted";
@@ -155,6 +182,8 @@ function useCodexTurnSnapshot(
   const [error, setError] = useState<string | null>(null);
   const snapshotRef = useRef<CodexTurnSnapshot | null>(initialSnapshot);
   const mountedRef = useRef(true);
+  const streamingRef = useRef(status === "streaming");
+  streamingRef.current = status === "streaming";
   const inFlightRef = useRef(false);
   const queuedRef = useRef(false);
 
@@ -175,10 +204,13 @@ function useCodexTurnSnapshot(
       do {
         queuedRef.current = false;
         const cursor = snapshotRef.current?.turn.lastSourceSequence ?? 0;
-        const incoming = await ipc.getCodexTurnSnapshot(messageId, cursor);
+        const incoming = await readTranscript(() => mountedRef.current ? ipc.getCodexTurnSnapshot(messageId, cursor) : Promise.resolve(null), streamingRef.current);
         if (!mountedRef.current) return;
         if (incoming) {
-          const merged = mergeCodexTurnSnapshot(snapshotRef.current, incoming);
+          const previous = snapshotRef.current;
+          const unchanged = previous && incoming.events.length === 0 && incoming.items.length === 0
+            && incoming.chunks.length === 0 && JSON.stringify(previous.turn) === JSON.stringify(incoming.turn);
+          const merged = unchanged ? previous : mergeCodexTurnSnapshot(previous, incoming);
           snapshotRef.current = merged;
           writeCachedCodexTurnSnapshot(messageId, merged);
           setSnapshot(merged);
@@ -292,7 +324,8 @@ function ExpandableText({
   className?: string;
   previewChars?: number;
 }) {
-  const [showAll, setShowAll] = useState(false);
+  const scope = useContext(DetailIdentityContext);
+  const [showAll, setShowAll] = useTranscriptDisclosure(`${scope}:text:${className}`, false);
   const truncated = text.length > previewChars;
   const visible = truncated && !showAll ? text.slice(0, previewChars) : text;
   return (
@@ -314,12 +347,21 @@ function ExpandableText({
   );
 }
 
+function PersistentDetails({ stateKey, className, children }: { stateKey: string; className: string; children: ReactNode }) {
+  const scope = useContext(DetailIdentityContext);
+  const [open, setOpen] = useTranscriptDisclosure(`${scope}:details:${stateKey}`, false);
+  return <details className={className} open={open} onToggle={event => setOpen(event.currentTarget.open)}>{children}</details>;
+}
+
 function DetailSection({ label, children }: { label: string; children: ReactNode }) {
+  const scope = useContext(DetailIdentityContext);
   return (
+    <DetailIdentityContext.Provider value={`${scope}:${label}`}>
     <section className="codex-native-detail-section">
       <div className="codex-native-detail-label">{label}</div>
       {children}
     </section>
+    </DetailIdentityContext.Provider>
   );
 }
 
@@ -332,7 +374,8 @@ function JsonSection({ label, value }: { label: string; value: unknown }) {
 }
 
 function DiffText({ diff }: { diff: string }) {
-  const [showAll, setShowAll] = useState(false);
+  const scope = useContext(DetailIdentityContext);
+  const [showAll, setShowAll] = useTranscriptDisclosure(`${scope}:diff`, false);
   const truncated = diff.length > LARGE_TEXT_PREVIEW_CHARS;
   const visible = truncated && !showAll ? diff.slice(0, LARGE_TEXT_PREVIEW_CHARS) : diff;
   return (
@@ -469,7 +512,7 @@ function WebSearchDetails({
         {details.results.length > 0 ? (
           <div className="codex-native-search-results">
             {details.results.map((result, index) => (
-              <details className="codex-native-search-result" key={`${result.refId ?? result.url ?? result.title}:${index}`}>
+              <PersistentDetails stateKey={`${result.refId ?? result.url ?? result.title}:${index}`} className="codex-native-search-result" key={`${result.refId ?? result.url ?? result.title}:${index}`}>
                 <summary>
                   <span>{result.title}</span>
                   {result.domain && <small>{result.domain}</small>}
@@ -489,7 +532,7 @@ function WebSearchDetails({
                     </div>
                   )}
                 </div>
-              </details>
+              </PersistentDetails>
             ))}
           </div>
         ) : (
@@ -531,6 +574,34 @@ function ReasoningDetails({ activity }: { activity: CodexTranscriptActivity }) {
   );
 }
 
+function ExactItemLifecycle({ activity }: { activity: CodexTranscriptActivity }) {
+  const { t } = useTranslation("chat");
+  const { messageId, display } = useContext(ExactTranscriptContext);
+  const [open, setOpen] = useTranscriptDisclosure(`${messageId}:raw:${activity.id}`, false);
+  const [exact, setExact] = useState<{ started: string | null; completed: string | null } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open || !display || !activity.itemId) return;
+    let alive = true;
+    void ipc.getCodexTurnItem(messageId, activity.itemId).then(value => { if (alive) setExact(value); })
+      .catch(error => { if (alive) setError(String(error)); });
+    return () => { alive = false; };
+  }, [open, display, messageId, activity.itemId, activity.completedPayload]);
+  return <details className="codex-native-raw-item" open={open} onToggle={event => setOpen(event.currentTarget.open)}>
+    <summary>{activity.itemId ? "Raw item lifecycle" : "Raw event parameters"}</summary>
+    {open && (display && activity.itemId ? <>
+      {error && <div role="alert">{error}</div>}
+      {!exact && !error && <div>{t("nativeTranscript.loadingItem")}</div>}
+      {exact?.started && <DetailSection label="Started item"><ExpandableText text={exact.started} className="json" /></DetailSection>}
+      {exact?.completed && <DetailSection label="Completed item (authoritative)"><ExpandableText text={exact.completed} className="json" /></DetailSection>}
+    </> : <>
+      {activity.startedPayload && <JsonSection label="Started item" value={activity.startedPayload} />}
+      {activity.completedPayload && <JsonSection label="Completed item (authoritative)" value={activity.completedPayload} />}
+      {!activity.startedPayload && !activity.completedPayload && <ExpandableText text={prettyJson(activity.payload)} className="json" />}
+    </>)}
+  </details>;
+}
+
 function ActivityDetails({
   activity,
   turnStatus,
@@ -553,12 +624,7 @@ function ActivityDetails({
       {!["command", "file", "mcp", "search", "reasoning", "plan", "diff"].includes(activity.activityKind) && (
         <JsonSection label="Details" value={activity.payload} />
       )}
-      <details className="codex-native-raw-item">
-        <summary>{activity.itemId ? "Raw item lifecycle" : "Raw event parameters"}</summary>
-        {activity.startedPayload && <JsonSection label="Started item" value={activity.startedPayload} />}
-        {activity.completedPayload && <JsonSection label="Completed item (authoritative)" value={activity.completedPayload} />}
-        {!activity.startedPayload && !activity.completedPayload && <ExpandableText text={prettyJson(activity.payload)} className="json" />}
-      </details>
+      <ExactItemLifecycle activity={activity} />
     </div>
   );
 }
@@ -614,7 +680,7 @@ function ActivityRow({
     }),
     [activity.id, activity.itemId, activity.itemType, activity.payload, activity.title, workspaceRootPath],
   );
-  const [expanded, setExpanded] = useState(() => activity.activityKind === "file" || images.length > 0);
+  const [expanded, setExpanded] = useTranscriptDisclosure(`${selectionNamespace}:activity:${activity.id}`, activity.activityKind === "file" || images.length > 0);
   const previousImageCountRef = useRef(images.length);
   useEffect(() => {
     if (previousImageCountRef.current === 0 && images.length > 0) {
@@ -645,7 +711,7 @@ function ActivityRow({
       {expanded && images.length > 0 && (
         <ChatImageGallery images={images} className="codex-native-activity-images" />
       )}
-      {expanded && <ActivityDetails activity={activity} turnStatus={turnStatus} />}
+      {expanded && <DetailIdentityContext.Provider value={`${selectionNamespace}:${activity.id}`}><ActivityDetails activity={activity} turnStatus={turnStatus} /></DetailIdentityContext.Provider>}
     </div>
   );
 }
@@ -679,7 +745,7 @@ function NativePlanEntry({
   selectionNamespace: string;
 }) {
   const text = stripProposedPlanEnvelope(reasoningText(entry).plan);
-  const [expanded, setExpanded] = useState(true);
+  const [expanded, setExpanded] = useTranscriptDisclosure(`${selectionNamespace}:plan:${entry.id}`, true);
   if (!text) return (
     <ActivityRow
       activity={entry}
@@ -789,17 +855,19 @@ function ActivityGroup({
   selectionNamespace,
   turnStatus,
   workspaceRootPath,
+  headerOnly = false,
 }: {
   activities: CodexTranscriptActivity[];
   selectionNamespace: string;
   turnStatus: TurnDisplayStatus;
   workspaceRootPath?: string | null;
+  headerOnly?: boolean;
 }) {
   const displayStatuses = activities.map((activity) => activityDisplayStatus(activity, turnStatus));
   const running = displayStatuses.some((status) => status === "running" || status === "pending");
   const interrupted = displayStatuses.some((status) => status === "interrupted");
   const failures = displayStatuses.filter((status) => status === "error").length;
-  const [expanded, setExpanded] = useState(true);
+  const [expanded, setExpanded] = useTranscriptDisclosure(`${selectionNamespace}:group:${activities[0]?.id}`, true);
   const toolKinds = new Set<CodexActivityKind>(["command", "file", "mcp", "search", "image", "diff"]);
   const toolCount = activities.filter((activity) => toolKinds.has(activity.activityKind)).length;
   const thoughtCount = activities.filter((activity) => activity.activityKind === "reasoning").length;
@@ -830,7 +898,7 @@ function ActivityGroup({
             ? <AlertTriangle size={13} className="codex-native-error" />
             : <CheckCircle2 size={13} />}
       </button>
-      {expanded && (
+      {expanded && !headerOnly && (
         <div className="codex-native-group-body">
           {activities.map((activity) => (
             <ActivityRow
@@ -974,7 +1042,7 @@ function SteerTimelineEntry({
         selectionNamespace={`${selectionNamespace}:entry:${entry.id}:blocks`}
         onApproval={onApproval}
       />
-      <details className="codex-native-steer-details">
+      <PersistentDetails stateKey={`${selectionNamespace}:${entry.id}:delivery`} className="codex-native-steer-details">
         <summary>Delivery details</summary>
         {!entry.exact && (
           <div className="codex-native-legacy-anchor">
@@ -988,41 +1056,70 @@ function SteerTimelineEntry({
             Source sequence: {entry.sequence}
           </div>
         )}
-      </details>
+      </PersistentDetails>
     </section>
   );
 }
 
 function NativeEventRow({ event }: { event: CodexTurnEventRecord }) {
-  const [expanded, setExpanded] = useState(false);
-  return (
-    <div className="codex-native-event-row">
-      <button type="button" aria-expanded={expanded} onClick={() => setExpanded((current) => !current)}>
-        <ChevronRight size={11} className={`codex-native-chevron ${expanded ? "open" : ""}`} />
-        <span>{event.method}</span>
-        <small>#{event.sourceSequence} · {event.eventKind}</small>
-      </button>
-      {expanded && (
-        <div className="codex-native-event-body">
-          {event.requestId && <div className="codex-native-meta-value">Request ID: {event.requestId}</div>}
-          <ExpandableText text={event.paramsJson} className="json" />
-        </div>
-      )}
-    </div>
-  );
+  const { t } = useTranslation("chat");
+  const { messageId, display } = useContext(ExactTranscriptContext);
+  const [expanded, setExpanded] = useTranscriptDisclosure(`${messageId}:event:${event.id}`, false);
+  const [exact, setExact] = useState<string | null>(display ? null : event.paramsJson);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!expanded || !display) return;
+    let alive = true;
+    void ipc.getCodexTurnEvent(messageId, event.sourceSequence).then(value => { if (alive) setExact(value); })
+      .catch(error => { if (alive) setError(String(error)); });
+    return () => { alive = false; };
+  }, [expanded, display, messageId, event.sourceSequence]);
+  return <div className="codex-native-event-row">
+    <button type="button" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>
+      <ChevronRight size={11} className={`codex-native-chevron ${expanded ? "open" : ""}`} />
+      <span>{event.method}</span><small>#{event.sourceSequence} ? {event.eventKind}</small>
+    </button>
+    {expanded && <div className="codex-native-event-body">
+      {event.requestId && <div>Request: {event.requestId}</div>}
+      {error ? <div role="alert">{error}</div> : exact === null ? t("nativeTranscript.loadingEvent") : <DetailIdentityContext.Provider value={`${messageId}:event:${event.id}`}><ExpandableText text={exact} className="json" /></DetailIdentityContext.Provider>}
+    </div>}
+  </div>;
 }
 
-function NativeEventsDrawer({ events }: { events: CodexTurnEventRecord[] }) {
-  const [expanded, setExpanded] = useState(false);
-  return (
-    <section className="codex-native-events">
-      <button type="button" aria-expanded={expanded} onClick={() => setExpanded((current) => !current)}>
-        <ChevronRight size={11} className={`codex-native-chevron ${expanded ? "open" : ""}`} />
-        Native events ({events.length})
-      </button>
-      {expanded && <div>{events.map((event) => <NativeEventRow key={event.id} event={event} />)}</div>}
-    </section>
-  );
+function NativeEventsDrawer({ events, eventCount }: { events: CodexTurnEventRecord[]; eventCount?: number }) {
+  const { t } = useTranslation("chat");
+  const { messageId } = useContext(ExactTranscriptContext);
+  const [expanded, setExpanded] = useTranscriptDisclosure(`${messageId}:events`, false);
+  const [page, setPage] = useTranscriptPage(`${messageId}:events-page`);
+  const count = eventCount ?? events.length;
+  const pageCount = Math.max(1, Math.ceil(count / 100));
+  const current = Math.min(page, pageCount - 1);
+  const [pageEvents, setPageEvents] = useState<CodexTurnEventRecord[] | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!expanded || eventCount === undefined) return;
+    let alive = true;
+    setPageEvents(null); setLoadError(null);
+    void ipc.getCodexTurnEvents(messageId, current * 100).then(events => { if (alive) setPageEvents(events); })
+      .catch(error => { if (alive) setLoadError(String(error)); });
+    return () => { alive = false; };
+  }, [expanded, messageId, current, eventCount]);
+  return <section className="codex-native-events">
+    <button type="button" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>
+      <ChevronRight size={11} className={`codex-native-chevron ${expanded ? "open" : ""}`} />
+      Native events ({count})
+    </button>
+    {expanded && <div>
+      {pageCount > 1 && <div className="codex-native-event-pages">
+        <button disabled={current === 0} onClick={() => setPage(current - 1)}>{t("nativeTranscript.previousEvents")}</button>
+        <span>{t("nativeTranscript.page", { page: current + 1, count: pageCount })}</span>
+        <button disabled={current + 1 === pageCount} onClick={() => setPage(current + 1)}>{t("nativeTranscript.nextEvents")}</button>
+      </div>}
+      {loadError && <div role="alert">{loadError}</div>}
+      {eventCount !== undefined && !pageEvents && !loadError && <div>{t("nativeTranscript.loadingEvents")}</div>}
+      {(eventCount === undefined ? events.slice(current * 100, current * 100 + 100) : pageEvents ?? []).map(event => <NativeEventRow key={event.id} event={event} />)}
+    </div>}
+  </section>;
 }
 
 function statusFromTurn(
@@ -1166,7 +1263,9 @@ export function CodexTranscriptRenderer({
   onApproval,
   loadError,
   onPlanText,
+  onRows,
 }: CodexTranscriptRendererProps) {
+  const viewRevision = useTranscriptViewRevision();
   const projection = useMemo(() => readCodexTranscriptProjection(snapshot), [snapshot]);
   const turnStatus = statusFromTurn(snapshot, status);
   const finalPlanText = useMemo(() => nativePlanText(projection.entries), [projection.entries]);
@@ -1195,7 +1294,7 @@ export function CodexTranscriptRenderer({
     ],
   );
   const selectionNamespace = `message:${snapshot.turn.messageId}`;
-  return (
+  const body = useMemo(() => (
     <div
       className="codex-native-transcript"
       data-source-sequence={snapshot.turn.lastSourceSequence}
@@ -1215,15 +1314,15 @@ export function CodexTranscriptRenderer({
           );
         }
         if (segment.kind === "activities") {
-          return (
-            <ActivityGroup
-              key={`activities:${segment.entries[0]?.id ?? "empty"}`}
-              activities={segment.entries}
-              selectionNamespace={selectionNamespace}
-              turnStatus={turnStatus}
-              workspaceRootPath={workspaceRootPath}
-            />
-          );
+          const groupKey = `${selectionNamespace}:group:${segment.entries[0]?.id}`;
+          return [
+            <ActivityGroup key={`group:${segment.entries[0]?.id}`} activities={segment.entries}
+              selectionNamespace={selectionNamespace} turnStatus={turnStatus}
+              workspaceRootPath={workspaceRootPath} headerOnly={Boolean(onRows)} />,
+            ...(onRows && readTranscriptDisclosure(groupKey, true) ? segment.entries.map(entry =>
+              <ActivityRow key={entry.id} activity={entry} selectionNamespace={selectionNamespace}
+                turnStatus={turnStatus} workspaceRootPath={workspaceRootPath} />) : []),
+          ];
         }
         if (segment.kind === "plan") {
           return (
@@ -1304,7 +1403,7 @@ export function CodexTranscriptRenderer({
         );
       })}
       {supplements.length > 0 && (
-        <div className="codex-native-supplements">
+        <div key="supplements" className="codex-native-supplements">
           <MessageBlocks
             blocks={supplements}
             workspaceRootPath={workspaceRootPath}
@@ -1315,14 +1414,14 @@ export function CodexTranscriptRenderer({
       )}
       {projection.plan && !projection.entries.some((entry) => entry.kind === "planProgress") && (
         <NativePlanProgress
-          plan={projection.plan}
+          key="plan-progress" plan={projection.plan}
           sourceSequence={snapshot.turn.lastSourceSequence + 0.5}
           selectionScopeId={`${selectionNamespace}:plan-progress`}
           turnStatus={turnStatus}
         />
       )}
       {projection.turnDiff && (
-        <section className="codex-native-group codex-native-turn-diff" aria-label="All changes this turn">
+        <section key="turn-diff" className="codex-native-group codex-native-turn-diff" aria-label="All changes this turn">
           <ActivityRow
             key={projection.turnDiff.id}
             activity={projection.turnDiff}
@@ -1332,9 +1431,9 @@ export function CodexTranscriptRenderer({
           />
         </section>
       )}
-      {loadError && <div className="codex-native-sync-warning"><AlertTriangle size={12} /> Transcript refresh failed: {loadError}</div>}
-      <NativeEventsDrawer events={projection.events} />
-      <TurnFooter
+      {loadError && <div key="sync-warning" className="codex-native-sync-warning"><AlertTriangle size={12} /> Transcript refresh failed: {loadError}</div>}
+      <NativeEventsDrawer key="native-events" events={projection.events} eventCount={snapshot.eventCount} />
+      <TurnFooter key="turn-footer"
         snapshot={snapshot}
         entries={projection.entries}
         status={status}
@@ -1343,10 +1442,20 @@ export function CodexTranscriptRenderer({
         plan={projection.plan}
       />
     </div>
-  );
+  ), [segments, supplements, projection, snapshot, status, tokenUsage, workspaceRootPath,
+    onApproval, loadError, selectionNamespace, turnStatus, interleaved.entries, viewRevision, onRows]);
+  const rows = useMemo<TranscriptRow[]>(() => flattenRows(body.props.children).map((content, index) => ({
+    key: `${snapshot.turn.messageId}/${isValidElement(content) ? content.key ?? index : index}`,
+    messageId: snapshot.turn.messageId,
+    content: <ExactTranscriptContext.Provider value={{ messageId: snapshot.turn.messageId, display: snapshot.display ?? false }}><div className="codex-native-transcript codex-native-virtual-part" data-source-sequence={snapshot.turn.lastSourceSequence} data-transcript-selection-scope={`${selectionNamespace}:row:${isValidElement(content) ? content.key : index}`}>{content}</div></ExactTranscriptContext.Provider>,
+    estimatedHeight: 100,
+    revision: snapshot.turn.lastSourceSequence,
+  })), [body, snapshot.turn.messageId, snapshot.turn.lastSourceSequence]);
+  useLayoutEffect(() => { onRows?.(snapshot.turn.messageId, rows); }, [onRows, rows, snapshot.turn.messageId]);
+  return onRows ? null : <ExactTranscriptContext.Provider value={{ messageId: snapshot.turn.messageId, display: snapshot.display ?? false }}>{body}</ExactTranscriptContext.Provider>;
 }
 
-export function CodexTurnTranscript({
+export const CodexTurnTranscript = memo(function CodexTurnTranscript({
   messageId,
   blocks,
   status,
@@ -1356,6 +1465,7 @@ export function CodexTurnTranscript({
   onApproval,
   onLoadActionOutput,
   onPlanText,
+  onRows,
 }: CodexTurnTranscriptProps) {
   const { snapshot, resolved, error, retry } = useCodexTurnSnapshot(messageId, refreshSequence, status);
   const reportPlanText = useCallback(
@@ -1365,8 +1475,16 @@ export function CodexTurnTranscript({
   useEffect(() => {
     if (!snapshot) onPlanText?.(messageId, null);
   }, [messageId, onPlanText, snapshot]);
-  if (!snapshot) {
-    return (
+  const [fullFallback, setFullFallback] = useState<ContentBlock[] | null>(null);
+  useEffect(() => {
+    if (!error || snapshot) return;
+    let alive = true;
+    void ipc.getMessageBlocks(messageId).then(value => {
+      if (alive && Array.isArray(value)) setFullFallback(value);
+    }).catch(() => {});
+    return () => { alive = false; };
+  }, [error, snapshot, messageId]);
+  const fallback = useMemo(() => (
       <div className={resolved ? "codex-native-fallback" : "codex-native-loading"}>
         {error && (
           <div className="codex-native-sync-warning">
@@ -1376,7 +1494,7 @@ export function CodexTurnTranscript({
           </div>
         )}
         <MessageBlocks
-          blocks={blocks}
+          blocks={fullFallback ?? blocks}
           status={status}
           workspaceRootPath={workspaceRootPath}
           selectionNamespace={`message:${messageId}:fallback`}
@@ -1384,8 +1502,12 @@ export function CodexTurnTranscript({
           onLoadActionOutput={onLoadActionOutput}
         />
       </div>
-    );
-  }
+  ), [resolved, error, retry, blocks, fullFallback, status, workspaceRootPath, messageId, onApproval, onLoadActionOutput]);
+  const fallbackRows = useMemo<TranscriptRow[]>(() => [{
+    key: messageId, messageId, content: fallback, estimatedHeight: 120, pending: !resolved,
+  }], [messageId, fallback, resolved]);
+  useLayoutEffect(() => { if (!snapshot) onRows?.(messageId, fallbackRows); }, [snapshot, onRows, messageId, fallbackRows]);
+  if (!snapshot) return onRows ? null : fallback;
   return (
     <CodexTranscriptRenderer
       snapshot={snapshot}
@@ -1396,9 +1518,10 @@ export function CodexTurnTranscript({
       onApproval={onApproval}
       loadError={error}
       onPlanText={reportPlanText}
+      onRows={onRows}
     />
   );
-}
+});
 
 export function codexItemPayloadForTest(snapshot: CodexTurnSnapshot, itemId: string) {
   const item = snapshot.items.find((candidate) => candidate.itemId === itemId);

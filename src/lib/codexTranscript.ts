@@ -1024,6 +1024,8 @@ export function mergeCodexTurnSnapshot(
 ): CodexTurnSnapshot {
   if (!current || current.turn.id !== incoming.turn.id) {
     return {
+      display: incoming.display,
+      eventCount: incoming.eventCount,
       turn: incoming.turn,
       events: [...incoming.events].sort((left, right) => left.sourceSequence - right.sourceSequence),
       items: [...incoming.items].sort((left, right) => left.firstSourceSequence - right.firstSourceSequence || left.itemId.localeCompare(right.itemId)),
@@ -1041,6 +1043,14 @@ export function mergeCodexTurnSnapshot(
     events.set(event.sourceSequence, event);
   }
 
+  if (incoming.display) {
+    // Older aggregate diffs are available through the exact-event reader. Keep
+    // live memory consistent with a fresh display snapshot after long turns.
+    const diffs = [...events.values()].filter(event => event.method === "turn/diff/updated" || event.method === "panes/turnDiff/completed");
+    const latest = Math.max(-1, ...diffs.map(event => event.sourceSequence));
+    for (const event of diffs) if (event.sourceSequence < latest) events.delete(event.sourceSequence);
+  }
+
   const items = new Map(current.items.map((item) => [item.itemId, item]));
   for (const item of incoming.items) items.set(item.itemId, item);
 
@@ -1055,6 +1065,8 @@ export function mergeCodexTurnSnapshot(
   }
 
   return {
+    display: incoming.display,
+    eventCount: incoming.eventCount,
     turn: incoming.turn,
     events: [...events.values()].sort((left, right) => left.sourceSequence - right.sourceSequence),
     items: [...items.values()].sort((left, right) => left.firstSourceSequence - right.firstSourceSequence || left.itemId.localeCompare(right.itemId)),
